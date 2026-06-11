@@ -1,0 +1,3 @@
+#!/bin/sh
+cd /app/syntax_bridge || exit 1
+exec ./syntax_bridge "$@"

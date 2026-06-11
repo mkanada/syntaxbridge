@@ -1,0 +1,16 @@
+[package]
+name = "syntax_bridge_rust"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+flutter_rust_bridge = "=2.12.0"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tree-sitter = "0.24"
+tree-sitter-cpp = "0.23"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }

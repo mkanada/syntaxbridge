@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.mkanada.syntaxbridge</id>
+  <name>Syntax Bridge</name>
+  <summary>Flutter desktop app calling Rust through flutter_rust_bridge</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>Syntax Bridge is a desktop prototype that calls Rust code from Flutter using flutter_rust_bridge.</p>
+  </description>
+  <launchable type="desktop-id">io.github.mkanada.syntaxbridge.desktop</launchable>
+  <releases>
+    <release version="1.0.0" date="2026-06-11" />
+  </releases>
+</component>
