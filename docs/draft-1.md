@@ -21,7 +21,7 @@ O aplicativo sendo criado será uma aplicação desktop. A versão inicial deve 
 
 A parte Rust deve ser integrada ao aplicativo Flutter como biblioteca nativa via `flutter_rust_bridge` e empacotada junto com a aplicação desktop, sem depender de um serviço ou processo separado.
 
-No Linux, a distribuição inicial deve seguir o formato Flatpak com empacotamento autossuficiente. O usuário deve precisar baixar e instalar apenas a ferramenta para usá-la, sem instalar manualmente CMake, Clang, LSPs, Dart SDK, gtest, KLEE, SQLite ou outros componentes previstos pelo fluxo principal.
+No Linux, a distribuição inicial deve seguir o formato Flatpak com empacotamento autossuficiente. O usuário deve precisar baixar e instalar apenas a ferramenta para usá-la, sem instalar manualmente CMake, Clang/libclang, Dart SDK, Dart analysis server, gtest, KLEE, SQLite ou outros componentes previstos pelo fluxo principal.
 
 O Flatpak deve incluir o aplicativo Flutter, a biblioteca nativa Rust e as ferramentas necessárias para análise, build, validação, testes e geração de código. O objetivo é reduzir ao máximo dependências externas, controlar as versões usadas pela ferramenta e tornar a execução reproduzível entre distribuições Linux compatíveis com Flatpak.
 
@@ -34,7 +34,7 @@ O uso de `musl` pode ser avaliado para componentes Rust isolados, mas não deve 
 Responsabilidades esperadas:
 
 - Importar e indexar projetos C++.
-- Coordenar chamadas às ferramentas empacotadas com a aplicação, como Tree-sitter, CMake, Clang, LSPs, KLEE e gtest.
+- Coordenar chamadas às ferramentas empacotadas com a aplicação, como Tree-sitter, CMake, Clang/libclang, Dart analysis server, KLEE e gtest.
 - Persistir informações no SQLite.
 - Construir modelos intermediários do código C++.
 - Executar regras de mapeamento e conversão.
@@ -48,7 +48,7 @@ Responsabilidades esperadas:
 - Apresentar o projeto importado ao usuário.
 - Exibir etapas da conversão.
 - Solicitar decisões quando houver ambiguidade.
-- Exibir diagnósticos de compilação, LSP e testes.
+- Exibir diagnósticos de compilação, análise Dart e testes.
 - Permitir revisar mapeamentos, nomes, tipos e estrutura gerada.
 - Mostrar progresso da conversão incremental.
 
@@ -135,26 +135,29 @@ As ferramentas previstas devem ser distribuídas junto com o Flatpak sempre que 
 
 Estratégia inicial de empacotamento:
 
-- Tree-sitter e grammar C++ empacotados ou integrados ao núcleo Rust.
+- Tree-sitter e grammar C++ empacotados ou integrados ao núcleo Rust para preservar comentários e os aspectos visuais do código fonte.
 - CMake empacotado para configurar e reproduzir builds C++ dentro do ambiente controlado.
-- Clang/LLVM empacotado para compilação, análise semântica e integração com `compile_commands.json`.
-- LSP C++ empacotado, preferencialmente via `clangd` da mesma família LLVM incluída.
+- Clang/LLVM e libclang empacotados para compilação, análise semântica, grafo chamador-chamado e integração com `compile_commands.json`.
 - Dart SDK empacotado para compilação, testes e execução das ferramentas Dart.
-- LSP Dart empacotado via analysis server incluído no Dart SDK.
+- Dart analysis server empacotado via Dart SDK.
 - gtest empacotado ou disponibilizado como recurso interno para a geração e execução de testes C++.
 - KLEE empacotado desde a primeira versão, junto com as dependências necessárias para sua execução dentro do Flatpak.
 - SQLite integrado ao núcleo Rust ou empacotado como biblioteca, sem exigir instalação externa.
 
 ### Tree-sitter
 
-Responsável por analisar sintaticamente os arquivos C++ e extrair a árvore de sintaxe.
+Responsável principalmente por preservar comentários e aspectos visuais do código fonte C++. O Tree-sitter deve ser usado como uma camada sintática leve e tolerante para localizar trechos do arquivo original, manter ranges de origem e permitir que a conversão gere Dart sem perder comentários relevantes.
+
+O Tree-sitter não deve ser a fonte principal de informações semânticas de C++. Tipos reais, símbolos resolvidos, referências e relações chamador-chamado devem vir do libclang. Quando houver sobreposição, o Tree-sitter deve ser tratado como fonte visual/sintática e o libclang como fonte semântica.
 
 Usos esperados:
 
-- Identificar declarações de classes, structs, enums, funções e métodos.
-- Identificar variáveis, parâmetros, tipos, namespaces e chamadas.
-- Extrair relações entre trechos de código.
-- Apoiar a criação de um modelo intermediário do código fonte.
+- Preservar comentários associados a classes, structs, enums, funções, métodos, campos e variáveis.
+- Preservar comentários soltos dentro de corpos de função, entre comandos, entre blocos e em separadores visuais.
+- Preservar ranges de origem, ordem dos trechos, layout relevante e relação entre comentários e código próximo.
+- Apoiar a UI na navegação visual do código fonte original.
+- Apoiar a reconstrução do código Dart com rastreabilidade visual para o trecho C++ de origem.
+- Fornecer uma estrutura sintática auxiliar para correlacionar comentários e ranges com os símbolos semânticos obtidos pelo libclang.
 
 ### CMake
 
@@ -167,28 +170,33 @@ Usos esperados:
 - Construir versões isoladas ou instrumentadas para testes.
 - Possivelmente gerar informações auxiliares para Clang.
 
-### Clang
+### Clang e libclang
 
-Responsável por fornecer análise semântica mais profunda do código C++.
+Responsáveis pela validação de compilação e pela análise semântica do código C++. O `clang`/`clang++` deve ser usado para compilar e validar o código original, enquanto o `libclang` deve ser usado pelo núcleo Rust como API programática para extrair informações semânticas não visuais.
+
+O libclang é a fonte principal para dados que dependem da compreensão real do compilador. Essas informações devem ser persistidas no SQLite e correlacionadas aos ranges e comentários preservados pelo Tree-sitter.
+
+Usos esperados de `clang`/`clang++`:
+
+- Validar que o código C++ original compila no ambiente controlado.
+- Compilar fixtures, testes C++ e unidades isoladas durante a captura de comportamento.
+- Apoiar a geração ou validação de `compile_commands.json` quando necessário.
+
+Usos esperados de `libclang`:
+
+- Resolver tipos reais após includes, macros, typedefs, templates e overloads.
+- Extrair símbolos, declarações, definições e referências.
+- Construir relações chamador-chamado entre funções e métodos.
+- Identificar namespaces, assinaturas, parâmetros, tipos de retorno, campos, métodos, herança e dependências entre tipos.
+- Fornecer diagnósticos semânticos do C++ original.
+- Consumir `compile_commands.json` para analisar cada translation unit com as mesmas flags do projeto original.
+- Fornecer todas as informações semânticas não ligadas ao aspecto visual do código.
+
+### Dart analysis server
+
+Responsável por validações e diagnósticos do código Dart gerado.
 
 Usos esperados:
-
-- Resolver tipos reais após includes, templates e overloads.
-- Validar compilação do código original.
-- Apoiar extração de informações que o Tree-sitter sozinho não garante.
-- Possivelmente gerar ou consumir `compile_commands.json`.
-
-### LSP C++ e Dart
-
-Responsáveis por validações, diagnósticos e informações estruturais das linguagens.
-
-Usos esperados para C++:
-
-- Diagnósticos do código original.
-- Resolução de símbolos.
-- Navegação entre definições e usos.
-
-Usos esperados para Dart:
 
 - Diagnósticos do código gerado.
 - Formatação e organização de imports.
@@ -230,8 +238,8 @@ Verificações esperadas:
 - Tree-sitter disponível e com grammar C++ configurada.
 - CMake disponível.
 - Clang disponível.
-- LSP C++ disponível.
-- LSP Dart disponível.
+- libclang disponível.
+- Dart analysis server disponível.
 - SDK Dart disponível.
 - gtest disponível ou configurável.
 - KLEE disponível.
@@ -368,28 +376,26 @@ Resultado esperado:
 - Dados de comportamento persistidos no SQLite.
 - Base para gerar testes equivalentes em Dart.
 
-### 7. Extração estrutural com Tree-sitter
+### 7. Extração visual com Tree-sitter e semântica com libclang
 
-A ferramenta deve varrer cada arquivo fonte e coletar informações sintáticas.
+A ferramenta deve varrer cada arquivo fonte em duas camadas complementares. A primeira camada usa Tree-sitter para coletar comentários, ranges e aspectos visuais do código. A segunda camada usa libclang para coletar informações semânticas não visuais com base nas translation units reais do projeto.
+
+As duas camadas devem ser correlacionadas por arquivo, linha, coluna e range de origem. O objetivo é permitir que cada símbolo semântico obtido pelo libclang possa ser associado ao trecho visual correspondente preservado pelo Tree-sitter, incluindo comentários próximos, comentários internos e organização do código original.
 
 Informações esperadas:
 
-- Declarações de tipos.
-- Declarações de funções e métodos.
-- Parâmetros e retornos.
-- Corpos de funções.
-- Variáveis locais.
-- Atribuições.
-- Condicionais.
-- Loops.
-- Chamadas de função.
-- Acessos a membros.
-- Includes e namespaces.
+- Comentários associados a declarações, coletados com Tree-sitter.
+- Comentários soltos entre comandos, blocos ou seções do arquivo, coletados com Tree-sitter.
+- Ranges de origem para declarações, corpos, blocos e comentários, coletados com Tree-sitter.
+- Layout e organização visual relevante para reconstrução, coletados com Tree-sitter.
+- Símbolos, tipos, chamadas, includes, namespaces e relações chamador-chamado obtidos via libclang.
+- Associação persistida entre cada símbolo semântico do libclang e os ranges/comentários correspondentes do Tree-sitter.
 
 Resultado esperado:
 
-- Modelo sintático persistido.
+- Modelo visual e semântico persistido.
 - Relação entre código fonte original e elementos internos da ferramenta.
+- Base para gerar Dart preservando comentários e rastreabilidade visual sem abrir mão da semântica precisa do C++.
 
 ### 8. Mapeamento de tipos, nomes e símbolos
 
@@ -442,7 +448,7 @@ Resultado esperado:
 
 - Projeto Dart inicial.
 - Código Dart estruturalmente válido.
-- Diagnósticos do LSP Dart e/ou compilador Dart.
+- Diagnósticos do Dart analysis server e/ou compilador Dart.
 
 ### 10. Conversão incremental das implementações
 
@@ -524,7 +530,7 @@ Ao final de uma conversão bem-sucedida, a ferramenta deve produzir:
 ## Riscos técnicos
 
 - C++ possui recursos sem equivalente direto em Dart.
-- Tree-sitter fornece sintaxe, mas não resolve toda a semântica necessária.
+- Tree-sitter e libclang precisam ser correlacionados por ranges de origem para unir preservação visual/comentários e semântica precisa.
 - Templates, macros, overloads e ponteiros podem exigir tratamento especial.
 - Gerar mocks automaticamente pode ser difícil em código com muitas dependências.
 - Capturar comportamento apenas por testes pode não cobrir todos os caminhos.
@@ -560,6 +566,6 @@ Ao final de uma conversão bem-sucedida, a ferramenta deve produzir:
 22. A ferramenta deve suportar edição manual do código Dart gerado sem sobrescrever alterações do usuário?
 23. Qual deve ser o formato dos relatórios de conversão?
 24. Como a ferramenta deve lidar com bibliotecas C++ externas sem equivalente em Dart?
-25. A validação por LSP será obrigatória ou complementar a compilação/testes?
+25. A validação pelo Dart analysis server será obrigatória ou complementar a compilação/testes?
 26. O conteúdo de `tmp/verovio-port2` e `tmp/legacy-bridge` deve ser apenas referência conceitual ou deve ser migrado parcialmente para a implementação atual?
 27. O projeto `verovio` deve ser copiado para dentro deste repositório, referenciado externamente ou baixado automaticamente por algum script?

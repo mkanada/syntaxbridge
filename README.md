@@ -7,7 +7,7 @@ The first real-world target used to drive development is `verovio`. This keeps t
 ## Project Goals
 
 - Import C++ projects or individual C++ files.
-- Parse and analyze C++ structure, symbols, types and dependencies.
+- Parse the visual structure of C++ code with Tree-sitter, preserving comments and source layout as much as possible, and use libclang for semantic information such as symbols, types and dependencies.
 - Generate equivalent Dart code incrementally.
 - Ask the user for decisions when conversion rules are ambiguous.
 - Persist mapping and conversion decisions in SQLite.
@@ -43,7 +43,7 @@ The intended workflow is:
 
 ## Tooling Direction
 
-Planned or expected tools include Tree-sitter, CMake, Clang, C++ and Dart language servers, gtest, KLEE and SQLite.
+Planned or expected tools include Tree-sitter, CMake, Clang/libclang, the Dart analysis server, gtest, KLEE and SQLite.
 
 Development follows a TDD workflow: start with a failing test, implement the smallest correct change, then run the test again and confirm it passes.
 

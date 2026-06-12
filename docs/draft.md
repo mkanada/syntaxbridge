@@ -10,8 +10,8 @@ Para desenvolver a ferramenta atual, o projeto que será usado será o 'verovio'
 
 - Tree-sitter
 - Cmake
-- Clang
-- Lsp CPP e Dart
+- Clang/libclang
+- Dart analysis server
 - klee e gtest
 - Sqlite
 
@@ -27,7 +27,8 @@ Para desenvolver a ferramenta atual, o projeto que será usado será o 'verovio'
     - Bibliotecas que já existam por padrão no Dart como XML, Json, etc
 - Criar mapa de chamador-chamado e identificar os tipos menos chamados.
 - Começando pelos menos chamados, criar os testes unitários ‘mockados’ e gravar o comportamento. ‘Função X, com valor Y, chama A, B e C com valores ‘a1’, ‘b1’, ‘c1’ e retorna ‘X1’.
-- Varrer cada código fonte, coletando as informações geradas pelo ‘tree-sitter’.
+- Varrer cada código fonte, coletando com Tree-sitter os comentários e as informações ligadas ao aspecto visual do código.
+- Coletar com libclang as informações semânticas não visuais, como tipos, símbolos e relações chamador-chamado.
 - Realizar o mapeamento dos tipos, nomes de variáveis e métodos/funções.
 - Gerar o código sem implementação para validar a estrutura.
 - Pelo que está gravado no sqlite, procurar as funções/métodos mais simples. Realizar conversão em ordem crescente, usando os mapealmentos de nomes gravados anteriormente.
