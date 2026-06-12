@@ -6,6 +6,8 @@ Definir como o aplicativo vai embutir, via `modules` do Flatpak, as bibliotecas 
 
 O T2 deve terminar com uma especificacao implementavel para baixar, fixar versoes, empacotar como modulos Flatpak, localizar e validar as ferramentas usadas pelo nucleo Rust e pelo aplicativo Flatpak.
 
+Estado atual: T2.1, T2.2 e T2.3 estao concluidos. T2.4, CMake empacotado, e o proximo passo.
+
 ## Escopo
 
 Ferramentas e bibliotecas inicialmente cobertas:
@@ -85,6 +87,8 @@ Mesmo nos casos integrados ao binario Rust, como SQLite e Tree-sitter, a decisao
 ## Manifesto de Ferramentas
 
 Criar um manifesto legivel pela aplicacao, por exemplo `/app/syntax-bridge/tools/manifest.toml`.
+
+O manifesto fisico deve ser introduzido quando a primeira ferramenta externa empacotada como modulo Flatpak for adicionada, inicialmente no T2.4. SQLite e Tree-sitter C++ ja estao integrados ao modulo principal Rust e devem aparecer no manifesto como ferramentas/bibliotecas fornecidas pelo modulo principal quando o arquivo for criado.
 
 Campos minimos por ferramenta:
 
@@ -183,6 +187,20 @@ Checking CMAKE...failed: bundled binary not found
 ```
 
 Os itens abaixo devem ser feitos sempre em TDD: primeiro criar ou ajustar o teste que falha, depois implementar a funcionalidade minima, depois executar os testes e validar a aplicacao.
+
+Resumo das ferramentas:
+
+| Ferramenta | Status | Empacotamento planejado/atual | Proximo passo |
+| --- | --- | --- | --- |
+| Diagnostics pipeline | Concluido | Modulo principal Rust/Flutter | Manter como base dos novos probes |
+| SQLite | Concluido | `rusqlite` com `bundled` no modulo principal Rust | Registrar no manifesto quando ele for criado |
+| Tree-sitter C++ | Concluido | Crates Rust no modulo principal Rust | Registrar no manifesto quando ele for criado |
+| CMake | Pendente | Modulo Flatpak dedicado | Implementar T2.4 |
+| LLVM/Clang/libclang | Pendente | Modulo Flatpak coeso para a mesma distribuicao LLVM | Implementar T2.5 |
+| Dart SDK | Pendente | Modulo Flatpak dedicado | Implementar T2.6 |
+| Dart analysis server | Pendente | Dentro do Dart SDK empacotado | Implementar T2.7 |
+| gtest | Pendente | Modulo Flatpak ou fonte compilada para fixtures | Implementar T2.8 |
+| KLEE | Pendente/risco | Modulo Flatpak se viavel; bloqueio tecnico documentado se necessario | Implementar T2.9 |
 
 ### T2.1 [x] - Infraestrutura de Diagnostico na Tela Inicial
 

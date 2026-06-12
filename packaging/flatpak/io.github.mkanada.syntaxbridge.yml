@@ -32,4 +32,4 @@ modules:
       - type: file
         path: io.github.mkanada.syntaxbridge.metainfo.xml
       - type: file
-        path: ../../app/packaging/flatpak/io.github.mkanada.syntaxbridge.svg
+        path: io.github.mkanada.syntaxbridge.svg

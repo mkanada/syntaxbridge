@@ -1,17 +1,20 @@
-# syntax_bridge
+# Syntax Bridge App
 
-A new Flutter project.
+Flutter desktop frontend for Syntax Bridge.
 
-## Getting Started
+The app calls the Rust core through `flutter_rust_bridge` and shows diagnostics for the conversion environment. The project is currently focused on Linux desktop and Flatpak packaging.
 
-This project is a starting point for a Flutter application.
+## Development
 
-A few resources to get you started if this is your first Flutter project:
+Common checks from this directory:
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+```sh
+flutter test
+flutter test integration_test/simple_test.dart -d linux
+```
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+Rust checks live under `rust/`:
+
+```sh
+cargo test
+```

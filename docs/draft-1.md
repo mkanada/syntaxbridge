@@ -141,7 +141,7 @@ Estratégia inicial de empacotamento:
 - Dart SDK empacotado para compilação, testes e execução das ferramentas Dart.
 - Dart analysis server empacotado via Dart SDK.
 - gtest empacotado ou disponibilizado como recurso interno para a geração e execução de testes C++.
-- KLEE empacotado desde a primeira versão, junto com as dependências necessárias para sua execução dentro do Flatpak.
+- KLEE empacotado quando viável dentro do Flatpak inicial; se houver bloqueio técnico relevante, ele deve ser documentado e exibido como diagnóstico claro.
 - SQLite integrado ao núcleo Rust ou empacotado como biblioteca, sem exigir instalação externa.
 
 ### Tree-sitter
@@ -547,7 +547,7 @@ Ao final de uma conversão bem-sucedida, a ferramenta deve produzir:
 3. O alvo inicial gerado em Dart será um pacote Dart puro, um app Flutter, uma biblioteca ou outro formato?
 4. A interface Flutter será a única interface da ferramenta ou também existirá uma CLI para automação e testes?
 5. O núcleo Rust deve ser organizado como biblioteca reutilizável, binário, workspace com múltiplos crates ou outro formato?
-6. O nome correto da ponte será `flutter_rust_bridge`? O rascunho original escreve `flutte-rust-bridge`, que parece ser apenas um erro de digitação.
+6. Resolvido: o nome correto da ponte é `flutter_rust_bridge`; a grafia diferente no rascunho original era erro de digitação.
 7. O usuário deve interagir durante a conversão inteira ou a ferramenta deve executar em lote e perguntar apenas nos bloqueios?
 8. Os mocks devem ser gerados automaticamente, manualmente ou por um fluxo semi-automático?
 9. Como será definido que uma função é "simples" para priorização?

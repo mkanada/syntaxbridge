@@ -1,8 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=Syntax Bridge
-Comment=Flutter desktop app calling Rust through flutter_rust_bridge
-Exec=syntax_bridge
-Icon=io.github.mkanada.syntaxbridge
-Categories=Development;
-StartupNotify=true
