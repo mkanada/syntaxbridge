@@ -2,9 +2,9 @@
 
 ## Objetivo
 
-Definir como o aplicativo vai embutir as bibliotecas e ferramentas externas necessarias ao fluxo principal, e criar uma estrutura de testes que comprove que a aplicacao esta usando as ferramentas empacotadas, nao ferramentas instaladas no computador do usuario.
+Definir como o aplicativo vai embutir, via `modules` do Flatpak, as bibliotecas e ferramentas externas necessarias ao fluxo principal, e criar uma estrutura de testes que comprove que a aplicacao esta usando as ferramentas empacotadas, nao ferramentas instaladas no computador do usuario.
 
-O T2 deve terminar com uma especificacao implementavel para baixar, fixar versoes, empacotar, localizar e validar as ferramentas usadas pelo nucleo Rust e pelo aplicativo Flatpak.
+O T2 deve terminar com uma especificacao implementavel para baixar, fixar versoes, empacotar como modulos Flatpak, localizar e validar as ferramentas usadas pelo nucleo Rust e pelo aplicativo Flatpak.
 
 ## Escopo
 
@@ -13,7 +13,6 @@ Ferramentas e bibliotecas inicialmente cobertas:
 - Tree-sitter e grammar C++.
 - CMake.
 - Clang, clang++ e libclang.
-- clangd.
 - Dart SDK.
 - Dart analysis server.
 - gtest.
@@ -26,29 +25,36 @@ O foco inicial e Linux desktop via Flatpak. Suporte futuro a outros sistemas pod
 
 Ao final do T2, o projeto deve ter:
 
-- Manifesto das ferramentas embutidas, com nome, versao, origem, checksum e caminho interno esperado.
-- Estrutura de diretorios padrao para ferramentas vendorizadas.
+- Manifesto das ferramentas embutidas, com nome, versao, origem, checksum, modulo Flatpak responsavel e caminho interno esperado.
+- Estrutura de diretorios padrao para ferramentas instaladas pelos `modules` do Flatpak.
 - Codigo Rust para resolver caminhos das ferramentas embutidas.
 - Comando de diagnostico para validar o ambiente empacotado.
-- Testes automatizados que falham quando uma ferramenta do host e usada por engano.
+- Validacoes automatizadas de que as ferramentas resolvidas estao dentro da raiz empacotada.
 - Plano de integracao com o Flatpak.
 - Tela inicial exibindo, a cada execucao, o resultado dos testes das ferramentas ja empacotadas.
 
 ## Decisao de Empacotamento
 
-As ferramentas devem ser tratadas como artefatos versionados e reproduziveis. Cada artefato deve ter versao fixa e checksum conhecido.
+As ferramentas devem ser tratadas como artefatos versionados e reproduziveis instalados por `modules` do Flatpak. Cada ferramenta ou biblioteca que o `syntax-bridge` precisa deve ter um modulo Flatpak proprio ou um modulo compartilhado claramente identificado, com versao fixa, origem declarada e checksum conhecido.
 
-Estrutura proposta:
+Em cada etapa de planejamento e implementacao de uma ferramenta, o fluxo de empacotamento deve seguir esta ordem:
+
+1. Buscar primeiro executaveis ou pacotes ja compilados para Linux x64 publicados oficialmente pelo projeto da ferramenta ou por uma fonte confiavel.
+2. Se houver artefato precompilado adequado, criar um modulo Flatpak que baixe esse artefato, valide o checksum e instale apenas os arquivos necessarios abaixo de `/app`.
+3. Se nao houver artefato precompilado adequado, incorporar a ferramenta como modulo Flatpak baixando os fontes, validando o checksum e compilando-a durante o build do Flatpak.
+4. Registrar no manifesto se o modulo usa binario precompilado ou build a partir dos fontes.
+5. Validar que o runtime final nao depende de executaveis ou bibliotecas do host.
+
+Estrutura de instalacao proposta dentro do Flatpak:
 
 ```text
-vendor/
-  linux-x64/
+/app/syntax-bridge/
+  tools/
     manifest.toml
     llvm/
       bin/
         clang
         clang++
-        clangd
       lib/
         libclang.so
     cmake/
@@ -68,20 +74,27 @@ vendor/
     licenses/
 ```
 
-Para SQLite, a decisao preferencial e usar a biblioteca integrada ao crate Rust escolhido, por exemplo `rusqlite` com `bundled`, evitando depender de `sqlite3` do host.
+Para SQLite, a decisao preferencial e usar a biblioteca integrada ao crate Rust escolhido, por exemplo `rusqlite` com `bundled`, compilada dentro do modulo principal da aplicacao no Flatpak, evitando depender de `sqlite3` do host.
 
-Para Tree-sitter, a decisao preferencial e compilar a grammar C++ junto ao binario Rust por crate, evitando depender de binario externo.
+Para Tree-sitter, a decisao preferencial e compilar a grammar C++ junto ao binario Rust por crate, dentro do modulo principal da aplicacao no Flatpak, evitando depender de binario externo.
+
+Tree-sitter e necessario para preservar, da melhor forma possivel, comentarios e aspectos visuais do codigo C++ original. Informacoes semanticas nao visuais, como tipos, simbolos, referencias e relacoes chamador-chamado, devem ser obtidas pelo libclang.
+
+Mesmo nos casos integrados ao binario Rust, como SQLite e Tree-sitter, a decisao deve ser documentada como parte do modulo principal do empacotamento Flatpak. Se uma dependencia deixar de ser fornecida por crate bundled no futuro, ela deve seguir a mesma regra: primeiro buscar artefato Linux precompilado; se nao existir, criar modulo Flatpak que baixa e compila os fontes.
 
 ## Manifesto de Ferramentas
 
-Criar um manifesto legivel pela aplicacao, por exemplo `vendor/linux-x64/manifest.toml`.
+Criar um manifesto legivel pela aplicacao, por exemplo `/app/syntax-bridge/tools/manifest.toml`.
 
 Campos minimos por ferramenta:
 
 - `id`: identificador interno estavel, como `clang`, `cmake`, `dart`, `klee`.
 - `version`: versao esperada.
-- `path`: caminho relativo ao diretorio `vendor/linux-x64`.
+- `path`: caminho relativo ao diretorio `/app/syntax-bridge/tools` no Flatpak.
 - `sha256`: checksum do binario principal ou do pacote baixado.
+- `flatpak_module`: nome do modulo Flatpak que instalou a ferramenta.
+- `source_kind`: `precompiled_linux_x64` quando usa artefato ja compilado ou `source_build` quando compila a partir dos fontes.
+- `source_url`: URL do artefato ou dos fontes usados pelo modulo.
 - `probe_args`: argumentos usados para obter versao, como `--version`.
 - `expected_output`: trecho esperado na saida do probe.
 - `required`: se a ausencia bloqueia o fluxo principal.
@@ -93,17 +106,13 @@ Exemplo conceitual:
 id = "cmake"
 version = "3.30.5"
 path = "cmake/bin/cmake"
+flatpak_module = "cmake"
+source_kind = "precompiled_linux_x64"
+source_url = "https://example.invalid/cmake-linux-x86_64.tar.gz"
 probe_args = ["--version"]
 expected_output = "cmake version 3.30.5"
 required = true
 
-[[tools]]
-id = "clangd"
-version = "18.1.8"
-path = "llvm/bin/clangd"
-probe_args = ["--version"]
-expected_output = "clangd version 18.1.8"
-required = true
 ```
 
 ## Resolucao de Caminhos
@@ -118,8 +127,8 @@ Toda execucao deve passar por um resolvedor central, por exemplo:
 
 Regras:
 
-- Em desenvolvimento, a raiz pode vir de uma variavel como `SYNTAX_BRIDGE_VENDOR_DIR`.
-- No Flatpak, a raiz deve ser derivada do local instalado da aplicacao, por exemplo abaixo de `/app/`.
+- Em desenvolvimento, a raiz pode vir de uma variavel como `SYNTAX_BRIDGE_TOOLS_DIR`, apontando para uma arvore equivalente a gerada pelos modulos Flatpak.
+- No Flatpak, a raiz deve ser derivada do local instalado da aplicacao, por exemplo `/app/syntax-bridge/tools`.
 - O `PATH` pode ser ajustado para dependencias secundarias, mas o executavel principal deve sempre ser absoluto.
 - Variaveis como `LD_LIBRARY_PATH`, `LIBCLANG_PATH` e equivalentes devem apontar primeiro para bibliotecas empacotadas.
 
@@ -127,7 +136,7 @@ Regras:
 
 Cada ferramenta deve ter um probe especifico. O probe deve validar tres coisas:
 
-- O arquivo executado esta dentro da raiz vendorizada esperada.
+- O arquivo executado esta dentro da raiz instalada pelos modulos Flatpak.
 - A versao retornada corresponde ao manifesto.
 - A ferramenta consegue executar uma operacao minima real, nao apenas imprimir versao.
 
@@ -135,43 +144,25 @@ Probes iniciais:
 
 - CMake: `cmake --version` e configuracao de um projeto CMake minimo temporario.
 - Clang: `clang++ --version` e compilacao de um `main.cpp` minimo.
-- libclang: carregamento via Rust e consulta basica da versao.
-- clangd: `clangd --version` e inicializacao LSP minima em teste isolado.
+- libclang: carregamento via Rust, consulta basica da versao e extracao semantica minima de simbolos/tipos.
 - Dart SDK: `dart --version` e execucao de um arquivo Dart minimo.
 - Dart analysis server: inicializacao minima ou verificacao do snapshot dentro do SDK empacotado.
-- gtest: compilacao e execucao de um teste C++ minimo usando includes e libs vendorizadas.
+- gtest: compilacao e execucao de um teste C++ minimo usando includes e libs instaladas pelo modulo Flatpak.
 - KLEE: `klee --version` e execucao minima em um bitcode simples, se viavel no sandbox.
 - SQLite: abrir banco em memoria, criar tabela, inserir e consultar linha.
 - Tree-sitter C++: parse de um trecho C++ minimo e verificacao do no raiz esperado.
-
-## Testes Contra Uso Acidental do Host
-
-O ponto central do T2 e provar que uma ferramenta instalada no computador do usuario nao esta sendo usada por engano.
-
-Estrutura de testes proposta:
-
-1. Criar um diretorio temporario `fake-host-bin`.
-2. Inserir executaveis falsos chamados `cmake`, `clang`, `clang++`, `clangd`, `dart` e `klee`.
-3. Cada executavel falso deve falhar de forma identificavel, por exemplo imprimindo `HOST_TOOL_USED` e retornando codigo diferente de zero.
-4. Executar os probes com `PATH` apontando primeiro para `fake-host-bin`.
-5. O teste passa somente se nenhum probe executar os binarios falsos.
-
-Esse teste deve ser automatizado no Rust e deve verificar stderr/stdout para garantir que `HOST_TOOL_USED` nunca aparece.
-
-Tambem deve existir um teste negativo controlado para provar que o fake funciona: ao executar `Command::new("cmake")` com o `PATH` contaminado, o binario falso deve ser chamado.
 
 ## Fluxo TDD
 
 Implementar o T2 seguindo esta ordem:
 
-1. Criar teste que monta `fake-host-bin` e comprova que uma chamada ingenua por nome cairia no host falso.
-2. Criar teste que chama o resolvedor de ferramentas e espera caminho absoluto dentro de `vendor/linux-x64`.
-3. Rodar os testes e confirmar falha por falta do resolvedor.
-4. Implementar `BundledTools` e `ToolRunner` de forma minima.
-5. Criar probes de versao para uma primeira ferramenta, preferencialmente CMake.
-6. Rodar os testes ate passarem.
-7. Repetir para Clang, Dart, Tree-sitter, SQLite, gtest, clangd e KLEE.
-8. Adicionar diagnostico agregado que retorna relatorio estruturado para a UI Flutter.
+1. Criar teste que chama o resolvedor de ferramentas e espera caminho absoluto dentro da raiz de ferramentas instalada pelos modulos Flatpak, por exemplo `/app/syntax-bridge/tools` no pacote final.
+2. Rodar os testes e confirmar falha por falta do resolvedor.
+3. Implementar `BundledTools` e `ToolRunner` de forma minima.
+4. Criar probes de versao para uma primeira ferramenta, preferencialmente CMake.
+5. Rodar os testes ate passarem.
+6. Repetir para LLVM/Clang/libclang, Dart, Tree-sitter, SQLite, gtest e KLEE, sempre registrando se o modulo Flatpak usara artefato Linux precompilado ou build a partir dos fontes.
+7. Adicionar diagnostico agregado que retorna relatorio estruturado para a UI Flutter.
 
 ## Subtarefas de Implementacao Incremental
 
@@ -220,55 +211,59 @@ Status: concluida. Verificado com `cargo test`, `flutter test` e `flutter test i
 
 ### T2.2 [x] - SQLite Embutido
 
-Objetivo: empacotar SQLite como biblioteca integrada ao nucleo Rust, sem depender do binario `sqlite3` do host.
+Objetivo: empacotar SQLite como biblioteca integrada ao nucleo Rust no modulo principal do Flatpak, sem depender do binario `sqlite3` do host.
 
 Entregas:
 
-- Configurar o crate SQLite escolhido para usar biblioteca bundled, preferencialmente `rusqlite` com feature `bundled`.
+- Configurar o crate SQLite escolhido para usar biblioteca bundled, preferencialmente `rusqlite` com feature `bundled`, compilada pelo modulo principal da aplicacao no Flatpak.
+- Documentar no manifesto que SQLite e fornecido pelo modulo principal; se a estrategia bundled deixar de ser viavel, buscar artefato Linux x64 precompilado e, na ausencia dele, criar modulo Flatpak que baixa e compila os fontes.
 - Criar probe que abre banco em memoria, cria tabela, insere e consulta uma linha.
 - Adicionar o resultado `Checking SQLite...ok` na tela inicial.
 
 Testes:
 
 - Teste unitario do probe SQLite.
-- Teste com `PATH` contaminado por fake `sqlite3`, garantindo que o probe nao executa binario externo.
+- Teste garantindo que o probe nao executa binario externo.
 
 Criterio de conclusao:
 
 - Ao executar a aplicacao, a tela inicial mostra `Checking SQLite...ok`.
 
-Status: concluida. SQLite foi integrado como biblioteca bundled via Rust, com probe em banco em memoria e teste com `PATH` contaminado por `fake-host-bin/sqlite3`. Verificado com `cargo test`, `flutter test` e `flutter test integration_test/simple_test.dart -d linux`. A execucao real mostra `Checking SQLite...ok` no terminal.
+Status: concluida. SQLite foi integrado como biblioteca bundled via Rust, compilada pelo modulo principal da aplicacao no Flatpak, com probe em banco em memoria e teste garantindo que nao executa binario externo. Verificado com `cargo test`, `flutter test` e `flutter test integration_test/simple_test.dart -d linux`. A execucao real mostra `Checking SQLite...ok` no terminal.
 
 ### T2.3 [x] - Tree-sitter C++ Embutido
 
-Objetivo: compilar Tree-sitter e a grammar C++ junto ao nucleo Rust.
+Objetivo: compilar Tree-sitter e a grammar C++ junto ao nucleo Rust no modulo principal do Flatpak para preservar comentarios e aspectos visuais do codigo C++ original.
 
 Entregas:
 
-- Adicionar dependencias Rust de Tree-sitter e grammar C++.
+- Adicionar dependencias Rust de Tree-sitter e grammar C++ para compilacao pelo modulo principal da aplicacao no Flatpak.
+- Documentar no manifesto que Tree-sitter C++ e fornecido pelo modulo principal; se a estrategia via crate deixar de ser viavel, buscar artefato Linux x64 precompilado e, na ausencia dele, criar modulo Flatpak que baixa e compila os fontes.
 - Criar probe que faz parse de um trecho C++ minimo, por exemplo `int main() { return 0; }`.
 - Validar que o no raiz e compativel com uma translation unit C++.
+- Validar preservacao de comentarios em um trecho C++ minimo, incluindo comentario associado e comentario solto.
 - Adicionar o resultado `Checking Tree-sitter C++...ok` na tela inicial.
 
 Testes:
 
 - Teste unitario do parser C++ minimo.
+- Teste unitario para captura de comentarios e ranges de origem.
 - Teste garantindo que a verificacao nao depende de binario externo.
 
 Criterio de conclusao:
 
 - Ao executar a aplicacao, a tela inicial mostra `Checking Tree-sitter C++...ok`.
 
-Status: concluida. Tree-sitter e grammar C++ foram integrados ao nucleo Rust, com probe de parse para `int main() { return 0; }` e teste com `PATH` contaminado por `fake-host-bin/tree-sitter`. Verificado com `cargo test`, `flutter test` e `flutter test integration_test/simple_test.dart -d linux`. A execucao real mostra `Checking Tree-sitter C++...ok` no terminal.
+Status: concluida. Tree-sitter e grammar C++ foram integrados ao nucleo Rust, compilados pelo modulo principal da aplicacao no Flatpak, com probe de parse para `int main() { return 0; }` e teste garantindo que nao depende de binario externo. Verificado com `cargo test`, `flutter test` e `flutter test integration_test/simple_test.dart -d linux`. A execucao real mostra `Checking Tree-sitter C++...ok` no terminal.
 
 ### T2.4 - CMake Empacotado
 
-Objetivo: empacotar CMake e garantir que o sistema usa o CMake vendorizado, nao o instalado no host.
+Objetivo: empacotar CMake como modulo Flatpak e garantir que o sistema usa o CMake instalado em `/app`, nao o instalado no host.
 
 Entregas:
 
-- Criar ou adaptar mecanismo de download/vendor para CMake Linux x64.
-- Registrar CMake no manifesto com versao, caminho e checksum.
+- Buscar artefato oficial de CMake ja compilado para Linux x64; se nao houver artefato adequado, criar modulo Flatpak que baixa os fontes e compila CMake.
+- Registrar CMake no manifesto com versao, caminho, checksum, nome do modulo Flatpak e tipo de origem.
 - Implementar `BundledTools::tool_path(ToolId::CMake)`.
 - Criar probe `cmake --version` usando caminho absoluto.
 - Criar probe funcional que configura um projeto CMake minimo em diretorio temporario.
@@ -276,85 +271,50 @@ Entregas:
 
 Testes:
 
-- Teste que cria `fake-host-bin/cmake` e coloca esse diretorio no inicio do `PATH`.
-- Teste positivo garantindo que o probe usa o caminho vendorizado absoluto.
-- Teste negativo controlado garantindo que uma chamada ingenua `Command::new("cmake")` cairia no fake.
+- Teste positivo garantindo que o probe usa o caminho absoluto instalado pelo modulo Flatpak.
+- Teste garantindo que o caminho resolvido esta dentro da raiz de ferramentas empacotadas.
 
 Criterio de conclusao:
 
 - Ao executar a aplicacao, a tela inicial mostra `Checking CMAKE...ok`.
 
-### T2.5 - Clang e Clang++ Empacotados
+### T2.5 - LLVM/Clang e libclang Empacotados
 
-Objetivo: empacotar compilador C++ e garantir compilacao minima usando somente o binario vendorizado.
+Objetivo: empacotar LLVM/Clang como modulo Flatpak unico, garantindo que `clang`, `clang++` e `libclang` venham da mesma distribuicao e versao do LLVM instalada em `/app`.
 
 Entregas:
 
-- Adicionar Clang e Clang++ ao manifesto.
-- Implementar resolucao de caminho para `clang` e `clang++`.
+- Buscar uma unica distribuicao oficial de LLVM/Clang ja compilada para Linux x64 contendo `clang`, `clang++` e `libclang`; se nao houver artefato adequado, criar modulo Flatpak que baixa os fontes e compila LLVM/Clang.
+- Registrar no manifesto a versao comum do LLVM usada por `clang`, `clang++` e `libclang`, com modulo Flatpak, tipo de origem, origem unica e checksums dos artefatos relevantes.
+- Validar no manifesto que os tres componentes pertencem a mesma distribuicao LLVM e nao podem ser atualizados separadamente.
+- Implementar resolucao de caminho para `clang`, `clang++` e `libclang.so`.
+- Configurar `LIBCLANG_PATH` ou mecanismo equivalente apontando para a biblioteca empacotada da mesma distribuicao LLVM.
 - Criar probe `clang++ --version`.
 - Criar probe funcional que compila um `main.cpp` minimo em diretorio temporario.
-- Adicionar o resultado `Checking Clang C++...ok` na tela inicial.
+- Criar probe que carrega `libclang`, consulta a versao e extrai simbolos/tipos de uma translation unit minima.
+- Criar teste inicial de relacao chamador-chamado simples via libclang.
+- Adicionar os resultados `Checking Clang C++...ok` e `Checking libclang...ok` na tela inicial.
 
 Testes:
 
-- Teste com `fake-host-bin/clang` e `fake-host-bin/clang++` no inicio do `PATH`.
-- Teste garantindo que a compilacao usa o executavel vendorizado.
-- Teste verificando que `HOST_TOOL_USED` nao aparece em stdout/stderr.
+- Teste garantindo que a compilacao usa o executavel instalado pelo modulo Flatpak.
+- Teste garantindo que os caminhos resolvidos de `clang`, `clang++` e `libclang.so` estao dentro da mesma raiz LLVM empacotada.
+- Teste garantindo que a versao detectada de `clang++` e a versao detectada de `libclang` correspondem a mesma versao LLVM registrada no manifesto.
+- Teste com variaveis de ambiente apontando para local invalido, garantindo que o resolvedor sobrescreve para o caminho instalado pelo modulo Flatpak.
+- Teste garantindo que informacoes semanticas nao visuais venham do libclang, nao de Tree-sitter.
 
 Criterio de conclusao:
 
-- Ao executar a aplicacao, a tela inicial mostra `Checking Clang C++...ok`.
+- Ao executar a aplicacao, a tela inicial mostra `Checking Clang C++...ok` e `Checking libclang...ok`, ambos usando a mesma distribuicao LLVM empacotada.
 
-### T2.6 - libclang Empacotado
+### T2.6 - Dart SDK Empacotado
 
-Objetivo: empacotar `libclang` para analise semantica e garantir carregamento da biblioteca vendorizada.
-
-Entregas:
-
-- Adicionar `libclang.so` ao manifesto.
-- Configurar `LIBCLANG_PATH` ou mecanismo equivalente apontando para a biblioteca empacotada.
-- Criar probe que carrega `libclang` e consulta a versao.
-- Adicionar o resultado `Checking libclang...ok` na tela inicial.
-
-Testes:
-
-- Teste garantindo que o caminho carregado esta dentro de `vendor/linux-x64/llvm/lib`.
-- Teste com variaveis de ambiente contaminadas apontando para local invalido, garantindo que o resolvedor sobrescreve para o caminho vendorizado.
-
-Criterio de conclusao:
-
-- Ao executar a aplicacao, a tela inicial mostra `Checking libclang...ok`.
-
-### T2.7 - clangd Empacotado
-
-Objetivo: empacotar o LSP C++ e validar que ele inicia a partir do binario vendorizado.
+Objetivo: empacotar Dart SDK como modulo Flatpak para validar codigo Dart gerado sem depender do Dart instalado no host.
 
 Entregas:
 
-- Adicionar `clangd` ao manifesto.
-- Implementar resolucao de caminho para `clangd`.
-- Criar probe `clangd --version`.
-- Criar probe LSP minimo, com inicializacao e encerramento controlados, se viavel no tempo do T2.
-- Adicionar o resultado `Checking clangd...ok` na tela inicial.
-
-Testes:
-
-- Teste com `fake-host-bin/clangd` no inicio do `PATH`.
-- Teste garantindo que o processo iniciado e o vendorizado.
-- Teste verificando timeout para evitar travamento da tela inicial.
-
-Criterio de conclusao:
-
-- Ao executar a aplicacao, a tela inicial mostra `Checking clangd...ok`.
-
-### T2.8 - Dart SDK Empacotado
-
-Objetivo: empacotar Dart SDK para validar codigo Dart gerado sem depender do Dart instalado no host.
-
-Entregas:
-
-- Adicionar Dart SDK ao manifesto.
+- Buscar artefato oficial do Dart SDK ja compilado para Linux x64; se nao houver artefato adequado, criar modulo Flatpak que baixa os fontes e compila o SDK, ou documentar bloqueio tecnico se o build completo nao for viavel no T2.
+- Adicionar Dart SDK ao manifesto com modulo Flatpak, tipo de origem e checksum.
 - Implementar resolucao de caminho para `dart`.
 - Criar probe `dart --version`.
 - Criar probe funcional que executa um arquivo Dart minimo em diretorio temporario.
@@ -362,63 +322,64 @@ Entregas:
 
 Testes:
 
-- Teste com `fake-host-bin/dart` no inicio do `PATH`.
-- Teste garantindo que o probe usa o Dart vendorizado.
+- Teste garantindo que o probe usa o Dart instalado pelo modulo Flatpak.
 - Teste verificando que um programa Dart minimo retorna codigo zero.
 
 Criterio de conclusao:
 
 - Ao executar a aplicacao, a tela inicial mostra `Checking Dart SDK...ok`.
 
-### T2.9 - Dart Analysis Server Empacotado
+### T2.7 - Dart Analysis Server Empacotado
 
-Objetivo: validar que o analysis server usado pelo futuro LSP Dart vem do SDK empacotado.
+Objetivo: validar que o Dart analysis server usado para diagnosticos do codigo Dart gerado vem do SDK empacotado pelo modulo Flatpak.
 
 Entregas:
 
-- Registrar o snapshot ou comando do analysis server no manifesto.
-- Criar probe que verifica a existencia do snapshot dentro do Dart SDK vendorizado.
+- Buscar o analysis server dentro do artefato oficial do Dart SDK ja compilado para Linux x64; se o SDK precisar ser compilado, garantir que o snapshot seja produzido pelo modulo Flatpak.
+- Registrar o snapshot ou comando do analysis server no manifesto com modulo Flatpak, tipo de origem e checksum.
+- Criar probe que verifica a existencia do snapshot dentro do Dart SDK instalado pelo modulo Flatpak.
 - Criar probe de inicializacao minima, se viavel sem tornar a abertura da aplicacao lenta.
 - Adicionar o resultado `Checking Dart analysis server...ok` na tela inicial.
 
 Testes:
 
-- Teste garantindo que o snapshot esta abaixo do Dart SDK vendorizado.
-- Teste com `PATH` contaminado garantindo que nenhum Dart do host e executado.
-- Teste com timeout para processo LSP, quando o probe de inicializacao for ativado.
+- Teste garantindo que o snapshot esta abaixo do Dart SDK instalado pelo modulo Flatpak.
+- Teste garantindo que nenhum Dart fora do SDK empacotado e executado.
+- Teste com timeout para o processo do analysis server, quando o probe de inicializacao for ativado.
 
 Criterio de conclusao:
 
 - Ao executar a aplicacao, a tela inicial mostra `Checking Dart analysis server...ok`.
 
-### T2.10 - gtest Empacotado
+### T2.8 - gtest Empacotado
 
 Objetivo: disponibilizar gtest para gerar e executar testes C++ do comportamento original.
 
 Entregas:
 
-- Decidir se gtest sera empacotado como fonte, biblioteca precompilada ou modulo CMake interno.
-- Registrar includes e libs no manifesto, se aplicavel.
-- Criar probe que compila e executa um teste gtest minimo usando o Clang/CMake vendorizado.
+- Buscar artefato oficial de gtest ja compilado para Linux x64; se nao houver artefato adequado, criar modulo Flatpak que baixa os fontes e compila gtest.
+- Registrar includes e libs no manifesto, com modulo Flatpak, tipo de origem e checksum.
+- Criar probe que compila e executa um teste gtest minimo usando o Clang/CMake instalados pelos modulos Flatpak.
 - Adicionar o resultado `Checking gtest...ok` na tela inicial.
 
 Testes:
 
 - Teste de compilacao de fixture gtest minima.
-- Teste garantindo que CMake e Clang usados pelo probe sao os vendorizados.
+- Teste garantindo que CMake e Clang usados pelo probe sao os instalados pelos modulos Flatpak.
 - Teste verificando saida de teste gtest com sucesso.
 
 Criterio de conclusao:
 
 - Ao executar a aplicacao, a tela inicial mostra `Checking gtest...ok`.
 
-### T2.11 - KLEE Empacotado
+### T2.9 - KLEE Empacotado
 
-Objetivo: empacotar KLEE ou documentar tecnicamente o bloqueio caso ele nao seja viavel dentro do Flatpak inicial.
+Objetivo: empacotar KLEE como modulo Flatpak ou documentar tecnicamente o bloqueio caso ele nao seja viavel dentro do Flatpak inicial.
 
 Entregas:
 
-- Adicionar KLEE ao manifesto quando houver artefato viavel.
+- Buscar artefato oficial de KLEE ja compilado para Linux x64; se nao houver artefato adequado, criar modulo Flatpak que baixa os fontes e compila KLEE, ou documentar bloqueio tecnico se isso nao for viavel no sandbox inicial.
+- Adicionar KLEE ao manifesto quando houver artefato viavel, com modulo Flatpak, tipo de origem e checksum.
 - Implementar resolucao de caminho para `klee`.
 - Criar probe `klee --version`.
 - Criar probe funcional com bitcode minimo, se viavel no sandbox.
@@ -426,7 +387,6 @@ Entregas:
 
 Testes:
 
-- Teste com `fake-host-bin/klee` no inicio do `PATH`.
 - Teste garantindo que o probe nao chama KLEE do host.
 - Teste funcional com timeout, quando o probe de execucao for ativado.
 
@@ -434,14 +394,15 @@ Criterio de conclusao:
 
 - Ao executar a aplicacao, a tela inicial mostra o status de KLEE usando somente o resolvedor de ferramentas embutidas.
 
-### T2.12 - Validacao Flatpak Completa
+### T2.10 - Validacao Flatpak Completa
 
 Objetivo: garantir que todas as verificacoes funcionam no aplicativo instalado como Flatpak.
 
 Entregas:
 
-- Incluir `vendor/linux-x64` no pacote Flatpak.
-- Garantir permissoes de execucao dos binarios empacotados.
+- Declarar todos os artefatos em `modules` do manifesto Flatpak, um modulo por ferramenta ou por conjunto coeso de ferramentas.
+- Garantir que cada modulo busque primeiro artefato Linux x64 precompilado e, quando ele nao existir, baixe os fontes e compile durante o build do Flatpak.
+- Garantir permissoes de execucao dos binarios instalados pelos modulos Flatpak.
 - Garantir caminhos internos estaveis dentro do sandbox.
 - Executar a aplicacao instalada e validar a tela inicial com todos os checks.
 
@@ -473,20 +434,22 @@ Esse relatorio deve deixar claro quando a falha e problema do pacote instalado, 
 
 ## Integracao com Flatpak
 
-O Flatpak deve instalar os artefatos em local previsivel dentro do sandbox, preferencialmente abaixo de `/app/syntax-bridge/vendor/linux-x64` ou equivalente.
+O Flatpak deve instalar os artefatos em local previsivel dentro do sandbox, preferencialmente abaixo de `/app/syntax-bridge/tools` ou equivalente, sempre por meio de `modules` declarados no manifesto Flatpak.
+
+Cada modulo deve documentar a decisao de origem: artefato Linux x64 ja compilado quando disponivel; download dos fontes e compilacao no build do Flatpak quando nao houver artefato adequado.
 
 Pontos a validar:
 
 - Os binarios possuem permissao de execucao.
 - Bibliotecas dinamicas empacotadas sao encontradas sem depender do host.
 - O sandbox permite criar diretorios temporarios para builds e probes.
-- O Dart SDK e clangd conseguem rodar dentro do sandbox.
+- O Dart SDK e o Dart analysis server conseguem rodar dentro do sandbox.
 - KLEE e suas dependencias funcionam ou ficam marcados como risco tecnico documentado.
 
 ## Riscos Tecnicos
 
 - KLEE pode exigir dependencias, permissao ou modelo de execucao dificil dentro do Flatpak.
-- Misturar versoes diferentes de clang, clangd e libclang pode gerar inconsistencias.
+- Se `clang`, `clang++` e `libclang` nao vierem da mesma distribuicao LLVM, podem ocorrer inconsistencias de compilacao e analise semantica.
 - gtest pode ser melhor distribuido como fonte compilada por projeto de teste, em vez de biblioteca precompilada.
 - Algumas ferramentas podem carregar bibliotecas dinamicas do host se `LD_LIBRARY_PATH` nao for controlado.
 - Projetos C++ importados podem depender de bibliotecas externas que nao fazem parte do pacote da ferramenta.
@@ -498,7 +461,7 @@ O T2 pode ser marcado como concluido quando:
 - Existe manifesto de ferramentas com versoes e caminhos esperados.
 - Existe resolvedor central de ferramentas embutidas.
 - Nenhuma chamada principal a ferramenta externa depende diretamente do `PATH` do host.
-- Ha testes automatizados com `fake-host-bin` comprovando que ferramentas do host nao sao usadas.
+- Ha validacoes automatizadas comprovando que as ferramentas resolvidas ficam dentro da raiz empacotada.
 - Ha probes reais para as ferramentas obrigatorias.
 - Ha relatorio de diagnostico consumivel pela interface Flutter.
 - O Flatpak instalado executa o diagnostico e mostra que usa os binarios empacotados.
