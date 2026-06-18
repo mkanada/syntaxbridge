@@ -1,8 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=Syntax Bridge
-Comment=Interactive C++ to Dart conversion tool
-Exec=syntax-bridge
-Icon=io.github.mkanada.syntaxbridge
-Terminal=false
-Categories=Development;
