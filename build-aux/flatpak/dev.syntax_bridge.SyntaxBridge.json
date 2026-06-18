@@ -1,0 +1,36 @@
+{
+  "app-id": "dev.syntax_bridge.SyntaxBridge",
+  "runtime": "org.freedesktop.Sdk",
+  "runtime-version": "25.08",
+  "sdk": "org.freedesktop.Sdk",
+  "sdk-extensions": [
+    "org.freedesktop.Sdk.Extension.rust-stable",
+    "org.freedesktop.Sdk.Extension.llvm21"
+  ],
+  "command": "syntax-bridge-server",
+  "finish-args": [],
+  "modules": [
+    {
+      "name": "syntax-bridge-server",
+      "buildsystem": "simple",
+      "build-commands": [
+        ". /usr/lib/sdk/rust-stable/enable.sh && . /usr/lib/sdk/llvm21/enable.sh && cargo --offline build --release -p syntax-bridge-server",
+        ". /usr/lib/sdk/rust-stable/enable.sh && . /usr/lib/sdk/llvm21/enable.sh && cargo --offline test --release --no-run -p syntax-bridge-server",
+        "install -Dm755 target/release/syntax-bridge-server /app/libexec/syntax-bridge-server",
+        "test_bin=\"$(find target/release/deps -maxdepth 1 -type f -perm -111 -name 'toolchain_availability-*' | head -n 1)\" && install -Dm755 \"$test_bin\" /app/libexec/syntax-bridge-toolchain-tests-bin",
+        "install -Dm755 build-aux/flatpak/syntax-bridge-server /app/bin/syntax-bridge-server",
+        "install -Dm755 build-aux/flatpak/syntax-bridge-toolchain-tests /app/bin/syntax-bridge-toolchain-tests"
+      ],
+      "sources": [
+        {
+          "type": "dir",
+          "path": "../..",
+          "skip": [
+            ".git",
+            "target"
+          ]
+        }
+      ]
+    }
+  ]
+}

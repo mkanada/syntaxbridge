@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+if [ -f /usr/lib/sdk/llvm21/enable.sh ]; then
+  . /usr/lib/sdk/llvm21/enable.sh
+fi
+
+exec /app/libexec/syntax-bridge-toolchain-tests-bin "$@"
+

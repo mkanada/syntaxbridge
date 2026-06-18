@@ -3,7 +3,7 @@ IDE de transpilação de C/C++ para Dart. A arquitetura deve permitir expansão 
 
 ### Aspectos técnicos
 Arquitetura:
-  - Cliente servidor
+  - Cliente-servidor
     - Parte servidor: Rust
     - Parte cliente (UI): Flutter
 
@@ -12,17 +12,24 @@ Ferramentas que serão usadas:
     - libclang
     - clang
     - clang++
-    - cmake
+    - CMake
+    - tree-sitter
   
   - Para análise dos artefatos de saída:
-    - dart sdk
+    - Dart SDK
       
   - Para geração de testes unitários de entrada:
-    - klee
-    - gunit
+    - KLEE
+    - GoogleTest (gtest)
       
   - Para persistência:
     - SQLite
 
 Ferramentas de empacotamento:
-  - Linux: flatpak
+  - Linux: Flatpak
+
+### Metodologia de desenvolvimento
+- TDD. Tudo começa com um teste que falha e termina com um teste que passa. 
+- Todos os testes devem ser rodados dentro do ambiente do Flatpak, para garantir que as ferramentas de desenvolvimento deste projeto não 
+  interfiram nas ferramentas de compilação que deverão ser embutidas neste sistema.
+-
