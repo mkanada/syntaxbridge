@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+
+exec /app/libexec/syntax-bridge-server-health-tests-bin "$@"

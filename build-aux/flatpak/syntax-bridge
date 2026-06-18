@@ -1,0 +1,24 @@
+#!/bin/sh
+set -eu
+
+server_addr="${SYNTAX_BRIDGE_SERVER_ADDR:-127.0.0.1:37651}"
+export SYNTAX_BRIDGE_SERVER_URL="${SYNTAX_BRIDGE_SERVER_URL:-http://${server_addr}}"
+
+/app/bin/syntax-bridge-server --addr "${server_addr}" &
+server_pid="$!"
+
+cleanup() {
+  kill "${server_pid}" 2>/dev/null || true
+  wait "${server_pid}" 2>/dev/null || true
+}
+
+trap cleanup EXIT INT TERM
+
+set +e
+/app/lib/syntax-bridge/syntax_bridge "$@"
+status="$?"
+set -e
+
+cleanup
+trap - EXIT INT TERM
+exit "${status}"

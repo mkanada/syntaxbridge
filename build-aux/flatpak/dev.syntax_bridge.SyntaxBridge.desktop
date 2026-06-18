@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Syntax Bridge
+Exec=syntax-bridge
+Icon=dev.syntax_bridge.SyntaxBridge
+Terminal=false
+Categories=Development;IDE;

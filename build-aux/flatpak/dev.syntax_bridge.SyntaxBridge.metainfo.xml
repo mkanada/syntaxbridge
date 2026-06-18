@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.syntax_bridge.SyntaxBridge</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Syntax Bridge</name>
+  <summary>IDE for C and C++ to Dart transpilation</summary>
+  <description>
+    <p>
+      Syntax Bridge is an early desktop IDE prototype with a Flutter interface
+      connected to a Rust backend.
+    </p>
+  </description>
+  <launchable type="desktop-id">dev.syntax_bridge.SyntaxBridge.desktop</launchable>
+  <categories>
+    <category>Development</category>
+    <category>IDE</category>
+  </categories>
+</component>

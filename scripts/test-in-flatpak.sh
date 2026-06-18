@@ -8,6 +8,7 @@ LLVM_SDK="${FLATPAK_LLVM_SDK:-/usr/lib/sdk/llvm21/enable.sh}"
 
 flatpak run \
   --devel \
+  --share=network \
   --filesystem="${ROOT_DIR}:rw" \
   --env=CARGO_HOME=/tmp/syntax-bridge-cargo-home \
   --env=CARGO_TARGET_DIR=/tmp/syntax-bridge-cargo-target \
@@ -27,4 +28,3 @@ cd "$repo_dir"
 cargo --offline test "$@"
 ' \
   sh "${ROOT_DIR}" "${RUST_SDK}" "${LLVM_SDK}" "$@"
-

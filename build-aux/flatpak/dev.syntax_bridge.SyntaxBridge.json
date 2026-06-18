@@ -7,8 +7,14 @@
     "org.freedesktop.Sdk.Extension.rust-stable",
     "org.freedesktop.Sdk.Extension.llvm21"
   ],
-  "command": "syntax-bridge-server",
-  "finish-args": [],
+  "command": "syntax-bridge",
+  "finish-args": [
+    "--share=ipc",
+    "--share=network",
+    "--socket=fallback-x11",
+    "--socket=wayland",
+    "--device=dri"
+  ],
   "modules": [
     {
       "name": "syntax-bridge-server",
@@ -18,8 +24,17 @@
         ". /usr/lib/sdk/rust-stable/enable.sh && . /usr/lib/sdk/llvm21/enable.sh && cargo --offline test --release --no-run -p syntax-bridge-server",
         "install -Dm755 target/release/syntax-bridge-server /app/libexec/syntax-bridge-server",
         "test_bin=\"$(find target/release/deps -maxdepth 1 -type f -perm -111 -name 'toolchain_availability-*' | head -n 1)\" && install -Dm755 \"$test_bin\" /app/libexec/syntax-bridge-toolchain-tests-bin",
+        "server_test_bin=\"$(find target/release/deps -maxdepth 1 -type f -perm -111 -name 'server_health-*' | head -n 1)\" && install -Dm755 \"$server_test_bin\" /app/libexec/syntax-bridge-server-health-tests-bin",
+        "test -x client/flutter/build/linux/x64/release/bundle/syntax_bridge",
+        "mkdir -p /app/lib/syntax-bridge",
+        "cp -a client/flutter/build/linux/x64/release/bundle/. /app/lib/syntax-bridge/",
+        "install -Dm755 build-aux/flatpak/syntax-bridge /app/bin/syntax-bridge",
         "install -Dm755 build-aux/flatpak/syntax-bridge-server /app/bin/syntax-bridge-server",
-        "install -Dm755 build-aux/flatpak/syntax-bridge-toolchain-tests /app/bin/syntax-bridge-toolchain-tests"
+        "install -Dm755 build-aux/flatpak/syntax-bridge-server-health-tests /app/bin/syntax-bridge-server-health-tests",
+        "install -Dm755 build-aux/flatpak/syntax-bridge-toolchain-tests /app/bin/syntax-bridge-toolchain-tests",
+        "install -Dm644 build-aux/flatpak/dev.syntax_bridge.SyntaxBridge.desktop /app/share/applications/dev.syntax_bridge.SyntaxBridge.desktop",
+        "install -Dm644 build-aux/flatpak/dev.syntax_bridge.SyntaxBridge.svg /app/share/icons/hicolor/scalable/apps/dev.syntax_bridge.SyntaxBridge.svg",
+        "install -Dm644 build-aux/flatpak/dev.syntax_bridge.SyntaxBridge.metainfo.xml /app/share/metainfo/dev.syntax_bridge.SyntaxBridge.metainfo.xml"
       ],
       "sources": [
         {

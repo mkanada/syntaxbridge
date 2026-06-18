@@ -9,6 +9,11 @@ STATE_DIR="${FLATPAK_STATE_DIR:-/tmp/syntax-bridge-flatpak-state}"
 
 flatpak info org.flatpak.Builder >/dev/null
 
+(
+  cd "${ROOT_DIR}/client/flutter"
+  flutter build linux --release
+)
+
 flatpak run \
   --filesystem="${ROOT_DIR}:rw" \
   --filesystem=/tmp:rw \
@@ -21,4 +26,4 @@ flatpak run \
   "${MANIFEST}"
 
 flatpak run --command=syntax-bridge-toolchain-tests "${APP_ID}"
-
+flatpak run --command=syntax-bridge-server-health-tests "${APP_ID}"
