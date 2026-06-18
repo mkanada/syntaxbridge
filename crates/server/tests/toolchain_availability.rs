@@ -26,6 +26,23 @@ int main() {
 }
 "#;
 
+const DART_SOURCE: &str = r#"
+class Counter {
+  const Counter(this.value);
+
+  final int value;
+
+  int add(int delta) => value + delta;
+}
+
+void main() {
+  const counter = Counter(7);
+  if (counter.add(5) != 12) {
+    throw StateError('unexpected counter value');
+  }
+}
+"#;
+
 #[test]
 fn libclang_parses_a_small_cpp_translation_unit() {
     let workspace = TempWorkspace::new("libclang").expect("create temporary workspace");
@@ -324,6 +341,36 @@ fn has_descendant_kind(node: tree_sitter::Node<'_>, expected_kind: &str) -> bool
     }
 
     false
+}
+
+#[test]
+fn dart_sdk_analyzes_and_runs_a_small_dart_program() {
+    let workspace = TempWorkspace::new("dart").expect("create temporary workspace");
+    let source_path = workspace.path().join("sample.dart");
+
+    fs::write(&source_path, DART_SOURCE).expect("write Dart fixture");
+
+    let disable_analytics = Command::new("dart")
+        .arg("--disable-analytics")
+        .output()
+        .expect("run dart --disable-analytics");
+
+    assert_success(disable_analytics);
+
+    let analyze = Command::new("dart")
+        .arg("analyze")
+        .arg(&source_path)
+        .output()
+        .expect("run dart analyze");
+
+    assert_success(analyze);
+
+    let run = Command::new("dart")
+        .arg(&source_path)
+        .output()
+        .expect("run Dart fixture");
+
+    assert_success(run);
 }
 
 fn assert_success(output: Output) {

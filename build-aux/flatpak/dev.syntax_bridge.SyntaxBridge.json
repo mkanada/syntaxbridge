@@ -17,6 +17,22 @@
   ],
   "modules": [
     {
+      "name": "dart-sdk",
+      "buildsystem": "simple",
+      "build-commands": [
+        "mkdir -p /app/lib/dart-sdk /app/bin",
+        "cp -a bin include lib LICENSE README dartdoc_options.yaml revision sdk_packages.yaml version /app/lib/dart-sdk/",
+        "ln -s ../lib/dart-sdk/bin/dart /app/bin/dart"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://storage.googleapis.com/dart-archive/channels/stable/release/3.12.2/sdk/dartsdk-linux-x64-release.zip",
+          "sha256": "28e47b44cf075f36771046c068bb0d174201cf9c7608744aed1cc23204299c2d"
+        }
+      ]
+    },
+    {
       "name": "syntax-bridge-server",
       "buildsystem": "simple",
       "build-commands": [
