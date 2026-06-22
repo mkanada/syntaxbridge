@@ -1,0 +1,34 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+import 'support/screenshot_capture.dart';
+
+void main() {
+  testWidgets('captures a rendered screen as an image artifact', (
+    tester,
+  ) async {
+    final captureKey = GlobalKey();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: RepaintBoundary(
+          key: captureKey,
+          child: const Scaffold(
+            body: Center(child: Text('Syntax Bridge screenshot probe')),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final artifact = await captureTestScreen(
+      tester,
+      name: 'screenshot-probe',
+      boundaryKey: captureKey,
+    );
+
+    expect(artifact.path, endsWith('screenshot-probe.bmp'));
+    expect(artifact.existsSync(), isTrue);
+    expect(artifact.lengthSync(), greaterThan(0));
+  });
+}

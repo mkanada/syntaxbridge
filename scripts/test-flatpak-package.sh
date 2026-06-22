@@ -27,3 +27,4 @@ flatpak run \
 
 flatpak run --command=syntax-bridge-toolchain-tests "${APP_ID}"
 flatpak run --command=syntax-bridge-server-health-tests "${APP_ID}"
+flatpak run --command=syntax-bridge-project-ingest-tests "${APP_ID}"
