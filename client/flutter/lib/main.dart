@@ -6,6 +6,7 @@ import 'src/io/path_picker.dart';
 import 'src/logging/cli_log.dart';
 import 'src/server/http_server_client.dart';
 import 'src/server/server_client.dart';
+import 'src/ui/ide_theme.dart';
 import 'src/ui/server_status_page.dart';
 
 export 'src/io/path_picker.dart';
@@ -38,11 +39,58 @@ class SyntaxBridgeApp extends StatelessWidget {
       title: 'Syntax Bridge',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
+        useMaterial3: true,
+        brightness: Brightness.dark,
         colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF006A6A),
-          brightness: Brightness.light,
+          seedColor: IdePalette.teal,
+          brightness: Brightness.dark,
         ),
-        scaffoldBackgroundColor: const Color(0xFFF6F7F8),
+        scaffoldBackgroundColor: IdePalette.background,
+        canvasColor: IdePalette.panel,
+        dividerColor: IdePalette.border,
+        textTheme: ThemeData.dark().textTheme.apply(
+          bodyColor: IdePalette.text,
+          displayColor: IdePalette.text,
+        ),
+        inputDecorationTheme: InputDecorationTheme(
+          filled: true,
+          fillColor: IdePalette.editor,
+          labelStyle: const TextStyle(color: IdePalette.muted),
+          prefixIconColor: IdePalette.muted,
+          suffixIconColor: IdePalette.softText,
+          enabledBorder: OutlineInputBorder(
+            borderSide: const BorderSide(color: IdePalette.border),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderSide: const BorderSide(color: IdePalette.teal),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          disabledBorder: OutlineInputBorder(
+            borderSide: const BorderSide(color: IdePalette.border),
+            borderRadius: BorderRadius.circular(6),
+          ),
+        ),
+        filledButtonTheme: FilledButtonThemeData(
+          style: FilledButton.styleFrom(
+            backgroundColor: IdePalette.teal,
+            foregroundColor: IdePalette.background,
+            disabledBackgroundColor: IdePalette.selection,
+            disabledForegroundColor: IdePalette.muted,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(6),
+            ),
+          ),
+        ),
+        outlinedButtonTheme: OutlinedButtonThemeData(
+          style: OutlinedButton.styleFrom(
+            foregroundColor: IdePalette.softText,
+            side: const BorderSide(color: IdePalette.border),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(6),
+            ),
+          ),
+        ),
       ),
       home: ServerStatusPage(
         serverClient: serverClient ?? HttpServerClient.fromEnvironment(),

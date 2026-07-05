@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import 'ide_theme.dart';
+
 enum DockSide { left, right, top, bottom }
 
 extension DockSideLabel on DockSide {
@@ -42,28 +44,42 @@ class DockablePanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Material(
-      color: const Color(0xFFFFFFFF),
-      clipBehavior: Clip.antiAlias,
-      shape: RoundedRectangleBorder(
-        side: const BorderSide(color: Color(0xFFD0D7D9)),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          _DockablePanelHeader(
-            title: title,
-            icon: icon,
-            side: side,
-            onClose: onClose,
-            onDockSide: onDockSide,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final body = SingleChildScrollView(
+          padding: const EdgeInsets.all(14),
+          child: child,
+        );
+
+        return Material(
+          color: IdePalette.sideBar,
+          clipBehavior: Clip.antiAlias,
+          shape: RoundedRectangleBorder(
+            side: const BorderSide(color: IdePalette.border),
+            borderRadius: BorderRadius.circular(6),
           ),
-          const Divider(height: 1),
-          Padding(padding: const EdgeInsets.all(16), child: child),
-        ],
-      ),
+          child: Column(
+            mainAxisSize: constraints.maxHeight.isFinite
+                ? MainAxisSize.max
+                : MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _DockablePanelHeader(
+                title: title,
+                icon: icon,
+                side: side,
+                onClose: onClose,
+                onDockSide: onDockSide,
+              ),
+              const Divider(height: 1, color: IdePalette.border),
+              if (constraints.maxHeight.isFinite)
+                Expanded(child: body)
+              else
+                body,
+            ],
+          ),
+        );
+      },
     );
   }
 }
@@ -85,27 +101,30 @@ class _DockablePanelHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final textTheme = Theme.of(context).textTheme;
-
     return Padding(
       padding: const EdgeInsetsDirectional.only(start: 12, end: 4),
       child: SizedBox(
         height: 44,
         child: Row(
           children: [
-            Icon(icon, size: 20),
+            Icon(icon, size: 18, color: IdePalette.muted),
             const SizedBox(width: 8),
             Expanded(
               child: Text(
                 title,
                 overflow: TextOverflow.ellipsis,
-                style: textTheme.titleMedium,
+                style: const TextStyle(
+                  color: IdePalette.text,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w700,
+                ),
               ),
             ),
             PopupMenuButton<DockSide>(
               tooltip: 'Dock $title panel',
               initialValue: side,
-              icon: const Icon(Icons.dock_outlined),
+              color: IdePalette.panel,
+              icon: const Icon(Icons.dock_outlined, color: IdePalette.muted),
               onSelected: onDockSide,
               itemBuilder: (context) => [
                 for (final dockSide in DockSide.values)
@@ -124,7 +143,7 @@ class _DockablePanelHeader extends StatelessWidget {
             IconButton(
               tooltip: 'Close $title panel',
               onPressed: onClose,
-              icon: const Icon(Icons.close),
+              icon: const Icon(Icons.close, color: IdePalette.muted),
             ),
           ],
         ),

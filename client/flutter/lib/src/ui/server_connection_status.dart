@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../project/project_models.dart';
+import 'ide_theme.dart';
 
 class ServerConnectionStatus extends StatelessWidget {
   const ServerConnectionStatus({
@@ -25,9 +26,12 @@ class ServerConnectionStatus extends StatelessWidget {
           children: [
             Text(
               'Server connection',
-              style: Theme.of(context).textTheme.headlineSmall,
+              style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                color: IdePalette.text,
+                fontWeight: FontWeight.w700,
+              ),
             ),
-            const SizedBox(height: 20),
+            const SizedBox(height: 14),
             Row(
               children: [
                 Icon(
@@ -37,10 +41,10 @@ class ServerConnectionStatus extends StatelessWidget {
                       ? Icons.error
                       : Icons.sync,
                   color: connected
-                      ? const Color(0xFF237A57)
+                      ? IdePalette.green
                       : failed
-                      ? const Color(0xFFB3261E)
-                      : const Color(0xFF7B6324),
+                      ? IdePalette.red
+                      : IdePalette.amber,
                 ),
                 const SizedBox(width: 10),
                 Text(
@@ -49,20 +53,24 @@ class ServerConnectionStatus extends StatelessWidget {
                       : failed
                       ? 'Disconnected'
                       : 'Connecting',
-                  style: Theme.of(context).textTheme.titleMedium,
+                  style: Theme.of(
+                    context,
+                  ).textTheme.titleMedium?.copyWith(color: IdePalette.softText),
                 ),
                 const Spacer(),
                 IconButton(
                   tooltip: 'Refresh',
                   onPressed: onRefresh,
-                  icon: const Icon(Icons.refresh),
+                  icon: const Icon(Icons.refresh, color: IdePalette.muted),
                 ),
               ],
             ),
-            const Divider(height: 32),
+            const Divider(height: 28, color: IdePalette.border),
             Text(
               snapshot.data?.service ?? 'syntax-bridge-server',
-              style: Theme.of(context).textTheme.bodyLarge,
+              style: Theme.of(
+                context,
+              ).textTheme.bodyLarge?.copyWith(color: IdePalette.codeText),
             ),
           ],
         );

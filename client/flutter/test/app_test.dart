@@ -21,6 +21,28 @@ void main() {
     expect(find.text('syntax-bridge-server'), findsOneWidget);
   });
 
+  testWidgets('renders the project workflow inside IDE chrome', (tester) async {
+    tester.view
+      ..devicePixelRatio = 1
+      ..physicalSize = const Size(1280, 900);
+    addTearDown(tester.view.reset);
+
+    await tester.pumpWidget(
+      SyntaxBridgeApp(
+        serverClient: _FakeServerClient(
+          const ServerStatus(service: 'syntax-bridge-server', status: 'ok'),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.byTooltip('Explorer'), findsOneWidget);
+    expect(find.text('Syntax Bridge workspace'), findsOneWidget);
+    expect(find.text('Project setup'), findsOneWidget);
+    expect(find.text('Execution log'), findsOneWidget);
+    expect(find.text('0 errors, 0 warnings'), findsOneWidget);
+  });
+
   testWidgets('creates a project and shows returned compilation units', (
     tester,
   ) async {
@@ -30,72 +52,6 @@ void main() {
         name: 'counter',
         projectDir: '/tmp/projects/counter',
         inputSourceDir: '/tmp/projects/counter/input-source',
-        buildLayers: [
-          BuildLayer(
-            index: 0,
-            targets: [
-              BuildTarget(
-                id: 'syntax_bridge_core::@fixture',
-                name: 'syntax_bridge_core',
-                kind: 'STATIC_LIBRARY',
-              ),
-            ],
-          ),
-          BuildLayer(
-            index: 1,
-            targets: [
-              BuildTarget(
-                id: 'syntax_bridge_parser::@fixture',
-                name: 'syntax_bridge_parser',
-                kind: 'STATIC_LIBRARY',
-              ),
-            ],
-          ),
-          BuildLayer(
-            index: 2,
-            targets: [
-              BuildTarget(
-                id: 'syntax_bridge_app::@fixture',
-                name: 'syntax_bridge_app',
-                kind: 'EXECUTABLE',
-              ),
-            ],
-          ),
-        ],
-        buildDependencyLayers: [
-          BuildDependencyLayer(
-            index: 0,
-            items: [
-              BuildDependencyItem(
-                id: 'object:core',
-                name: 'src/core.cpp',
-                kind: 'OBJECT',
-                dependencies: [],
-              ),
-              BuildDependencyItem(
-                id: 'object:main',
-                name: 'src/main.cpp',
-                kind: 'OBJECT',
-                dependencies: [],
-              ),
-            ],
-          ),
-          BuildDependencyLayer(
-            index: 1,
-            items: [
-              BuildDependencyItem(
-                id: 'target:app',
-                name: 'syntax_bridge_app',
-                kind: 'EXECUTABLE',
-                dependencies: [
-                  'src/main.cpp',
-                  'syntax_bridge_core',
-                  'syntax_bridge_parser',
-                ],
-              ),
-            ],
-          ),
-        ],
         compilationUnits: [
           CompilationUnit(
             directory: '/tmp/projects/counter/build',
@@ -126,24 +82,6 @@ void main() {
     expect(find.text('Execution log'), findsOneWidget);
     expect(find.text("Creating project 'counter'"), findsOneWidget);
     expect(find.text('Compilation units found: 1'), findsOneWidget);
-    expect(find.text('Build plan'), findsOneWidget);
-    expect(find.text('Layer 0'), findsOneWidget);
-    expect(find.text('syntax_bridge_core'), findsWidgets);
-    expect(find.text('Layer 1'), findsOneWidget);
-    expect(find.text('syntax_bridge_parser'), findsWidgets);
-    expect(find.text('Layer 2'), findsOneWidget);
-    expect(find.text('syntax_bridge_app'), findsWidgets);
-    expect(find.text('Build dependencies'), findsOneWidget);
-    expect(find.text('Item'), findsWidgets);
-    expect(find.text('Dependencies'), findsWidgets);
-    expect(find.text('Dependency layer 0'), findsOneWidget);
-    expect(find.text('src/core.cpp'), findsOneWidget);
-    expect(find.text('No dependencies'), findsWidgets);
-    expect(find.text('Dependency layer 1'), findsOneWidget);
-    expect(
-      find.text('src/main.cpp, syntax_bridge_core, syntax_bridge_parser'),
-      findsOneWidget,
-    );
     expect(find.text('Compilation units'), findsOneWidget);
     expect(find.text('input-source/fixture/main.cpp'), findsOneWidget);
     expect(
@@ -309,8 +247,6 @@ class _FakeServerClient implements ServerClient {
           name: 'empty',
           projectDir: '',
           inputSourceDir: '',
-          buildLayers: [],
-          buildDependencyLayers: [],
           compilationUnits: [],
         );
   }

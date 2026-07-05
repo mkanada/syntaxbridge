@@ -1,8 +1,6 @@
 import 'package:flutter/material.dart';
 
 import '../project/project_models.dart';
-import 'build_dependencies_view.dart';
-import 'build_plan_view.dart';
 
 class CompilationUnitsView extends StatelessWidget {
   const CompilationUnitsView({super.key, required this.project});
@@ -22,14 +20,6 @@ class CompilationUnitsView extends StatelessWidget {
         ),
         const SizedBox(height: 4),
         Text(project.projectDir, style: Theme.of(context).textTheme.bodyMedium),
-        if (project.buildLayers.isNotEmpty) ...[
-          const SizedBox(height: 24),
-          BuildPlanView(layers: project.buildLayers),
-        ],
-        if (project.buildDependencyLayers.isNotEmpty) ...[
-          const SizedBox(height: 24),
-          BuildDependenciesView(layers: project.buildDependencyLayers),
-        ],
         const SizedBox(height: 16),
         ListView.separated(
           shrinkWrap: true,

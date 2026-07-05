@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import 'execution_log.dart';
+import 'ide_theme.dart';
 
 class ExecutionLogView extends StatelessWidget {
   const ExecutionLogView({
@@ -25,23 +26,27 @@ class ExecutionLogView extends StatelessWidget {
         ],
         DecoratedBox(
           decoration: BoxDecoration(
-            color: const Color(0xFFFFFFFF),
-            border: Border.all(color: const Color(0xFFD0D7D9)),
-            borderRadius: BorderRadius.circular(8),
+            color: IdePalette.editor,
+            border: Border.all(color: IdePalette.border),
+            borderRadius: BorderRadius.circular(6),
           ),
           child: ConstrainedBox(
             constraints: const BoxConstraints(minHeight: 160, maxHeight: 280),
             child: entries.isEmpty
                 ? const Padding(
                     padding: EdgeInsets.all(16),
-                    child: Text('No events yet'),
+                    child: Text(
+                      'No events yet',
+                      style: TextStyle(color: IdePalette.muted),
+                    ),
                   )
                 : SingleChildScrollView(
                     padding: const EdgeInsets.symmetric(vertical: 8),
                     child: Column(
                       children: [
                         for (final (index, entry) in entries.indexed) ...[
-                          if (index > 0) const Divider(height: 1),
+                          if (index > 0)
+                            const Divider(height: 1, color: IdePalette.border),
                           ExecutionLogRow(entry: entry),
                         ],
                       ],
@@ -65,8 +70,14 @@ class ExecutionLogRow extends StatelessWidget {
       dense: true,
       minLeadingWidth: 24,
       leading: Icon(_icon, color: _color),
-      title: Text(entry.message),
-      subtitle: Text(_formattedTime(entry.timestamp)),
+      title: Text(
+        entry.message,
+        style: const TextStyle(color: IdePalette.codeText),
+      ),
+      subtitle: Text(
+        _formattedTime(entry.timestamp),
+        style: const TextStyle(color: IdePalette.muted),
+      ),
     );
   }
 
@@ -81,10 +92,10 @@ class ExecutionLogRow extends StatelessWidget {
 
   Color get _color {
     return switch (entry.level) {
-      ExecutionLogLevel.info => const Color(0xFF3F6068),
-      ExecutionLogLevel.success => const Color(0xFF237A57),
-      ExecutionLogLevel.warning => const Color(0xFF7B6324),
-      ExecutionLogLevel.error => const Color(0xFFB3261E),
+      ExecutionLogLevel.info => IdePalette.blue,
+      ExecutionLogLevel.success => IdePalette.green,
+      ExecutionLogLevel.warning => IdePalette.amber,
+      ExecutionLogLevel.error => IdePalette.red,
     };
   }
 

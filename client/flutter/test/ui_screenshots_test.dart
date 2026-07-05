@@ -100,8 +100,6 @@ class _FakeServerClient implements ServerClient {
           name: input.name,
           projectDir: '${input.workspaceDir}/${input.name}',
           inputSourceDir: '${input.workspaceDir}/${input.name}/input-source',
-          buildLayers: const [],
-          buildDependencyLayers: const [],
           compilationUnits: const [],
         );
   }
@@ -111,52 +109,6 @@ const _projectWithCompilationUnits = CreatedProject(
   name: 'counter',
   projectDir: '/tmp/projects/counter',
   inputSourceDir: '/tmp/projects/counter/input-source',
-  buildLayers: [
-    BuildLayer(
-      index: 0,
-      targets: [
-        BuildTarget(
-          id: 'syntax_bridge_core::@fixture',
-          name: 'syntax_bridge_core',
-          kind: 'STATIC_LIBRARY',
-        ),
-      ],
-    ),
-    BuildLayer(
-      index: 1,
-      targets: [
-        BuildTarget(
-          id: 'syntax_bridge_app::@fixture',
-          name: 'syntax_bridge_app',
-          kind: 'EXECUTABLE',
-        ),
-      ],
-    ),
-  ],
-  buildDependencyLayers: [
-    BuildDependencyLayer(
-      index: 0,
-      items: [
-        BuildDependencyItem(
-          id: 'object:main',
-          name: 'src/main.cpp',
-          kind: 'OBJECT',
-          dependencies: [],
-        ),
-      ],
-    ),
-    BuildDependencyLayer(
-      index: 1,
-      items: [
-        BuildDependencyItem(
-          id: 'target:app',
-          name: 'syntax_bridge_app',
-          kind: 'EXECUTABLE',
-          dependencies: ['src/main.cpp', 'syntax_bridge_core'],
-        ),
-      ],
-    ),
-  ],
   compilationUnits: [
     CompilationUnit(
       directory: '/tmp/projects/counter/build',
