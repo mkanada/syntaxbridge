@@ -7,6 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use syntax_bridge_server::ingest::{CreateProjectRequest, create_project};
+use syntax_bridge_server::persistence::GlobalStore;
+use syntax_bridge_server::project_service;
 use syntax_bridge_server::server::SyntaxBridgeServer;
 
 const CPP_SOURCE: &str = r#"
@@ -116,12 +118,50 @@ fn creates_project_in_specific_directory_and_extracts_verovio_tarball() {
 }
 
 #[test]
+fn create_project_persists_compilation_units_and_registers_project_globally() {
+    let workspace = TempWorkspace::new("ingest-persistence").expect("create temporary workspace");
+    let archive_path = workspace.path().join("fixture.tar.gz");
+    write_cmake_fixture_tarball(workspace.path(), &archive_path).expect("create fixture archive");
+    let global_db_path = workspace.path().join("global.db");
+
+    let project = project_service::create_project(
+        CreateProjectRequest {
+            name: "counter".to_owned(),
+            workspace_dir: workspace.path().join("projects"),
+            archive_path,
+        },
+        &global_db_path,
+    )
+    .expect("ingest and persist project");
+
+    let project_store = syntax_bridge_server::persistence::ProjectStore::open(
+        &project.project_dir.join("project.db"),
+    )
+    .expect("open project store");
+    let persisted_units = project_store
+        .list_compilation_units()
+        .expect("list persisted compilation units");
+    assert_eq!(persisted_units, project.compilation_units);
+
+    let global_store = GlobalStore::open(&global_db_path).expect("open global store");
+    let projects = global_store.list_projects().expect("list projects");
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0].name, "counter");
+    assert_eq!(projects[0].project_dir, project.project_dir);
+    assert_eq!(projects[0].source_language, "cpp");
+    assert_eq!(projects[0].target_language, "dart");
+    assert_eq!(projects[0].last_ingest_status, "success");
+}
+
+#[test]
 fn project_endpoint_returns_created_project_and_compilation_units() {
     let workspace = TempWorkspace::new("ingest-http").expect("create temporary workspace");
     let archive_path = workspace.path().join("fixture.tar.gz");
     write_cmake_fixture_tarball(workspace.path(), &archive_path).expect("create fixture archive");
 
-    let server = SyntaxBridgeServer::bind("127.0.0.1:0").expect("bind test server");
+    let server = SyntaxBridgeServer::bind("127.0.0.1:0")
+        .expect("bind test server")
+        .with_global_db_path(workspace.path().join("global.db"));
     let addr = server.local_addr().expect("read server address");
     let handle = server.spawn().expect("spawn test server");
 
@@ -168,6 +208,20 @@ fn project_endpoint_returns_created_project_and_compilation_units() {
             .is_some_and(|file| file.ends_with("main.cpp")),
         "response should include main.cpp unit: {response_body}"
     );
+
+    let global_store =
+        GlobalStore::open(&workspace.path().join("global.db")).expect("open global store");
+    let projects = global_store.list_projects().expect("list projects");
+    assert_eq!(
+        projects.len(),
+        1,
+        "expected the created project to be registered globally"
+    );
+    assert_eq!(projects[0].name, "counter");
+    assert_eq!(
+        projects[0].project_dir,
+        workspace.path().join("projects").join("counter")
+    );
 }
 
 #[test]
@@ -176,7 +230,9 @@ fn project_endpoint_accepts_chunked_json_requests() {
     let archive_path = workspace.path().join("fixture.tar.gz");
     write_cmake_fixture_tarball(workspace.path(), &archive_path).expect("create fixture archive");
 
-    let server = SyntaxBridgeServer::bind("127.0.0.1:0").expect("bind test server");
+    let server = SyntaxBridgeServer::bind("127.0.0.1:0")
+        .expect("bind test server")
+        .with_global_db_path(workspace.path().join("global.db"));
     let addr = server.local_addr().expect("read server address");
     let handle = server.spawn().expect("spawn test server");
 

@@ -1,11 +1,13 @@
 use std::fmt;
 use std::io;
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
-use axum::extract::Json;
+use axum::extract::{Json, State};
 use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -15,18 +17,31 @@ use serde_json::json;
 use tokio::runtime;
 use tokio::sync::oneshot;
 
-use crate::ingest::{CreateProjectRequest, IngestError, create_project};
+use crate::ingest::CreateProjectRequest;
+use crate::persistence;
+use crate::project_service::{self, ProjectCreationError};
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:37651";
 
 pub struct SyntaxBridgeServer {
     listener: TcpListener,
+    global_db_path: PathBuf,
 }
 
 impl SyntaxBridgeServer {
     pub fn bind(addr: impl ToSocketAddrs) -> io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
-        Ok(Self { listener })
+        Ok(Self {
+            listener,
+            global_db_path: persistence::default_global_db_path(),
+        })
+    }
+
+    /// Overrides where the global project registry database lives. Tests
+    /// use this to avoid touching the real user's data directory.
+    pub fn with_global_db_path(mut self, global_db_path: PathBuf) -> Self {
+        self.global_db_path = global_db_path;
+        self
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -55,7 +70,7 @@ impl SyntaxBridgeServer {
             .build()
             .map_err(io::Error::other)?;
 
-        runtime.block_on(serve_with_axum(self.listener, shutdown_rx))
+        runtime.block_on(serve_with_axum(self.listener, self.global_db_path, shutdown_rx))
     }
 }
 
@@ -89,13 +104,14 @@ pub fn run_blocking(addr: &str) -> io::Result<()> {
 
 async fn serve_with_axum(
     listener: TcpListener,
+    global_db_path: PathBuf,
     shutdown_rx: Option<oneshot::Receiver<()>>,
 ) -> io::Result<()> {
     listener.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
     log_server("serve loop started");
 
-    let serve = axum::serve(listener, app());
+    let serve = axum::serve(listener, app(global_db_path));
     match shutdown_rx {
         Some(shutdown_rx) => {
             serve
@@ -109,10 +125,20 @@ async fn serve_with_axum(
     }
 }
 
-fn app() -> Router {
+#[derive(Clone)]
+struct AppState {
+    global_db_path: Arc<PathBuf>,
+}
+
+fn app(global_db_path: PathBuf) -> Router {
+    let state = AppState {
+        global_db_path: Arc::new(global_db_path),
+    };
+
     Router::new()
         .route("/health", get(health))
         .route("/projects", post(create_project_from_http))
+        .with_state(state)
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -124,6 +150,7 @@ async fn health() -> Json<HealthResponse> {
 }
 
 async fn create_project_from_http(
+    State(state): State<AppState>,
     payload: Result<Json<CreateProjectRequest>, JsonRejection>,
 ) -> Response {
     let Json(request) = match payload {
@@ -144,7 +171,12 @@ async fn create_project_from_http(
         request.archive_path.display()
     ));
 
-    match tokio::task::spawn_blocking(move || create_project(request)).await {
+    let global_db_path = (*state.global_db_path).clone();
+    match tokio::task::spawn_blocking(move || {
+        project_service::create_project(request, &global_db_path)
+    })
+    .await
+    {
         Ok(Ok(project)) => {
             log_server(format_args!(
                 "project created: name={} project_dir={} units={}",
@@ -154,7 +186,7 @@ async fn create_project_from_http(
             ));
             json_response(StatusCode::CREATED, project)
         }
-        Ok(Err(error)) => ingest_error_response(error),
+        Ok(Err(error)) => project_creation_error_response(error),
         Err(error) => {
             log_server(format_args!("project ingest task failed: {error}"));
             json_response(
@@ -165,18 +197,18 @@ async fn create_project_from_http(
     }
 }
 
-fn ingest_error_response(error: IngestError) -> Response {
+fn project_creation_error_response(error: ProjectCreationError) -> Response {
     let status = if error.is_client_error() {
         StatusCode::BAD_REQUEST
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     };
     log_server(format_args!(
-        "project ingest failed: status={status} error={error:?}"
+        "project creation failed: status={status} error={error:?}"
     ));
     json_response(
         status,
-        json!({"error":"project_ingest_failed","message":error.to_string()}),
+        json!({"error":"project_creation_failed","message":error.to_string()}),
     )
 }
 

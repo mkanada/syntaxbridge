@@ -8,6 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::type_catalog::{TypeDeclaration, TypeDependency};
+
 #[derive(Debug, Deserialize)]
 pub struct CreateProjectRequest {
     #[serde(alias = "project_name")]
@@ -25,9 +27,16 @@ pub struct CreatedProject {
     pub build_dir: PathBuf,
     pub compile_commands_path: PathBuf,
     pub compilation_units: Vec<CompilationUnit>,
+    /// Populated by `project_service::create_project` after ingest, once the
+    /// compilation units are known: `ingest::create_project` itself has no
+    /// use for `libclang` and leaves this empty.
+    pub type_catalog: Vec<TypeDeclaration>,
+    /// Dependency edges between cataloged types (fields, base classes,
+    /// typedef/alias underlying types), populated alongside `type_catalog`.
+    pub type_dependencies: Vec<TypeDependency>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CompilationUnit {
     pub directory: String,
     pub file: String,
@@ -222,6 +231,8 @@ pub fn create_project(request: CreateProjectRequest) -> Result<CreatedProject, I
         build_dir,
         compile_commands_path,
         compilation_units,
+        type_catalog: Vec::new(),
+        type_dependencies: Vec::new(),
     })
 }
 
