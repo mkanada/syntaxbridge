@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::source_catalog::SourceFile;
 use crate::type_catalog::{TypeDeclaration, TypeDependency};
 
 #[derive(Debug, Deserialize)]
@@ -34,6 +35,11 @@ pub struct CreatedProject {
     /// Dependency edges between cataloged types (fields, base classes,
     /// typedef/alias underlying types), populated alongside `type_catalog`.
     pub type_dependencies: Vec<TypeDependency>,
+    /// Every source file belonging to the project: each compilation unit's
+    /// own file, plus the project-local headers it includes. Populated by
+    /// `project_service::create_project` alongside `type_catalog`, for the
+    /// same reason `type_catalog` itself is left empty here.
+    pub source_files: Vec<SourceFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -233,6 +239,7 @@ pub fn create_project(request: CreateProjectRequest) -> Result<CreatedProject, I
         compilation_units,
         type_catalog: Vec::new(),
         type_dependencies: Vec::new(),
+        source_files: Vec::new(),
     })
 }
 

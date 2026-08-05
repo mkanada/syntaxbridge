@@ -4,6 +4,7 @@ use std::path::Path;
 use rusqlite::{Connection, params};
 
 use crate::ingest::CompilationUnit;
+use crate::source_catalog::{SourceFile, SourceFileKind};
 use crate::type_catalog::{TypeDeclaration, TypeDeclarationKind, TypeDependency};
 
 use super::PersistenceError;
@@ -49,6 +50,11 @@ impl ProjectStore {
                 callee_file TEXT NOT NULL,
                 callee_line INTEGER NOT NULL,
                 callee_column INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS source_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL,
+                kind TEXT NOT NULL
             );",
         )?;
 
@@ -273,6 +279,46 @@ impl ProjectStore {
 
         Ok(dependencies)
     }
+
+    /// Replaces the full set of discovered source files with the ones from
+    /// the latest `libclang` extraction, since they describe the current
+    /// state of the source tree rather than an append-only history.
+    pub fn replace_source_files(&mut self, files: &[SourceFile]) -> Result<(), PersistenceError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM source_files", [])?;
+
+        for file in files {
+            transaction.execute(
+                "INSERT INTO source_files (path, kind) VALUES (?1, ?2)",
+                params![file.path, file.kind.as_str()],
+            )?;
+        }
+
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn list_source_files(&self) -> Result<Vec<SourceFile>, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT path, kind FROM source_files ORDER BY id")?;
+
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        let mut files = Vec::new();
+        for row in rows {
+            let (path, kind) = row?;
+            let Some(kind) = SourceFileKind::parse(&kind) else {
+                continue;
+            };
+
+            files.push(SourceFile { path, kind });
+        }
+
+        Ok(files)
+    }
 }
 
 #[cfg(test)]
@@ -451,6 +497,50 @@ mod tests {
             dependencies.is_empty(),
             "expected no type dependencies: {dependencies:?}"
         );
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    fn sample_source_files() -> Vec<SourceFile> {
+        vec![
+            SourceFile {
+                path: "/workspace/src/main.cpp".to_owned(),
+                kind: SourceFileKind::TranslationUnit,
+            },
+            SourceFile {
+                path: "/workspace/src/types.h".to_owned(),
+                kind: SourceFileKind::Header,
+            },
+        ]
+    }
+
+    #[test]
+    fn round_trips_source_files() {
+        let db_path = temp_db_path("project-source-files");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+        store
+            .replace_source_files(&sample_source_files())
+            .expect("persist source files");
+
+        let files = store.list_source_files().expect("list source files");
+        assert_eq!(files, sample_source_files());
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn replacing_source_files_clears_previous_entries() {
+        let db_path = temp_db_path("project-source-files-replace");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+        store
+            .replace_source_files(&sample_source_files())
+            .expect("persist source files");
+        store.replace_source_files(&[]).expect("clear source files");
+
+        let files = store.list_source_files().expect("list source files");
+        assert!(files.is_empty(), "expected no source files: {files:?}");
 
         let _ = fs::remove_file(&db_path);
     }

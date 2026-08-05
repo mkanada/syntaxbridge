@@ -22,6 +22,21 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(FilledButton, 'New project'));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(find.bySemanticsLabel('Project name'), 'counter');
+    await tester.enterText(
+      find.bySemanticsLabel('Workspace directory'),
+      '/tmp/projects',
+    );
+    await tester.enterText(
+      find.bySemanticsLabel('Source archive'),
+      '/tmp/source.tar.gz',
+    );
+    await tester.pump();
+    await tester.tap(find.widgetWithText(FilledButton, 'Create project'));
+    await tester.pumpAndSettle();
 
     final artifact = await captureTestScreen(
       tester,
@@ -47,6 +62,8 @@ void main() {
         ),
       ),
     );
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(FilledButton, 'New project'));
     await tester.pumpAndSettle();
 
     await tester.enterText(find.bySemanticsLabel('Project name'), 'counter');
@@ -103,6 +120,26 @@ class _FakeServerClient implements ServerClient {
           compilationUnits: const [],
         );
   }
+
+  @override
+  Future<List<RecentProject>> listRecentProjects() async => const [];
+
+  @override
+  Future<CreatedProject> openProject(String projectDir) async {
+    return project ??
+        const CreatedProject(
+          name: 'opened',
+          projectDir: '',
+          inputSourceDir: '',
+          compilationUnits: [],
+        );
+  }
+
+  @override
+  Future<String> readSourceFile({
+    required String projectDir,
+    required String path,
+  }) async => '';
 }
 
 const _projectWithCompilationUnits = CreatedProject(

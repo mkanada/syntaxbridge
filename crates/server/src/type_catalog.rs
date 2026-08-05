@@ -202,7 +202,10 @@ unsafe fn visit_translation_unit(
 /// Strips the compiler executable, the output flag and the source file
 /// itself from a compile command, leaving only the flags `libclang` needs
 /// (include paths, defines, the `-std` flag, and so on).
-fn build_clang_args(unit: &CompilationUnit) -> Vec<String> {
+///
+/// Exposed to `source_catalog`, which needs the same flags to parse each
+/// compilation unit's headers via `clang_getInclusions`.
+pub(crate) fn build_clang_args(unit: &CompilationUnit) -> Vec<String> {
     let tokens: Vec<String> = if !unit.arguments.is_empty() {
         unit.arguments.clone()
     } else if let Some(command) = &unit.command {
@@ -266,7 +269,12 @@ extern "C" fn visit_cursor(
         ) && let underlying = unsafe { clang_sys::clang_getTypedefDeclUnderlyingType(cursor) }
             && let Some(callee) = resolve_named_declaration(underlying, state.project_root)
         {
-            push_dependency(state.dependencies, state.dependency_seen, declaration, callee);
+            push_dependency(
+                state.dependencies,
+                state.dependency_seen,
+                declaration,
+                callee,
+            );
         }
     }
 
@@ -434,7 +442,7 @@ fn describe_cursor(
     })
 }
 
-unsafe fn cxstring_to_string(string: clang_sys::CXString) -> String {
+pub(crate) unsafe fn cxstring_to_string(string: clang_sys::CXString) -> String {
     unsafe {
         let c_str_ptr = clang_sys::clang_getCString(string);
         let value = if c_str_ptr.is_null() {
@@ -449,9 +457,16 @@ unsafe fn cxstring_to_string(string: clang_sys::CXString) -> String {
 }
 
 fn ensure_libclang_loaded() -> Result<(), TypeCatalogError> {
+    load_libclang().map_err(TypeCatalogError::LibclangUnavailable)
+}
+
+/// Loads `libclang` if it isn't already, shared with `source_catalog` so the
+/// dynamic-loading step (and its error message) stays consistent across the
+/// two `libclang`-backed extractors.
+pub(crate) fn load_libclang() -> Result<(), String> {
     if clang_sys::is_loaded() {
         return Ok(());
     }
 
-    clang_sys::load().map_err(TypeCatalogError::LibclangUnavailable)
+    clang_sys::load()
 }

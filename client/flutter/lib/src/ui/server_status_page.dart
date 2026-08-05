@@ -1,28 +1,32 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 
-import '../io/path_picker.dart';
+import '../io/screenshot_storage.dart';
 import '../logging/cli_log.dart';
-import '../project/project_creation_exception.dart';
+import '../project/project_error_message.dart';
 import '../project/project_models.dart';
 import '../server/server_client.dart';
 import 'dockable_panel.dart';
 import 'execution_log.dart';
 import 'execution_log_view.dart';
 import 'ide_theme.dart';
-import 'project_creation_pane.dart';
+import 'screen_capturer.dart';
 import 'server_connection_status.dart';
+import 'source_file_viewer.dart';
+import 'source_files_view.dart';
 
 class ServerStatusPage extends StatefulWidget {
   const ServerStatusPage({
     super.key,
     required this.serverClient,
-    required this.pathPicker,
+    required this.screenshotStorage,
+    required this.screenCapturer,
+    required this.project,
   });
 
   final ServerClient serverClient;
-  final PathPicker pathPicker;
+  final ScreenshotStorage screenshotStorage;
+  final ScreenCapturer screenCapturer;
+  final CreatedProject project;
 
   @override
   State<ServerStatusPage> createState() => _ServerStatusPageState();
@@ -30,18 +34,15 @@ class ServerStatusPage extends StatefulWidget {
 
 class _ServerStatusPageState extends State<ServerStatusPage> {
   late Future<ServerStatus> _status;
-  final _nameController = TextEditingController();
-  final _workspaceDirController = TextEditingController();
-  final _archivePathController = TextEditingController();
   final List<ExecutionLogEntry> _logs = [];
-  final Set<_IdePanel> _openPanels = {_IdePanel.project, _IdePanel.log};
+  final Set<_IdePanel> _openPanels = {_IdePanel.explorer, _IdePanel.log};
   final Map<_IdePanel, DockSide> _panelSides = {
-    _IdePanel.project: DockSide.left,
+    _IdePanel.explorer: DockSide.left,
     _IdePanel.log: DockSide.right,
   };
-  bool _creating = false;
-  CreatedProject? _project;
-  Object? _createError;
+  final _screenshotBoundaryKey = GlobalKey();
+  SourceFile? _selectedSourceFile;
+  Future<String>? _selectedSourceContent;
 
   @override
   void initState() {
@@ -55,121 +56,64 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     });
   }
 
-  @override
-  void dispose() {
-    _nameController.dispose();
-    _workspaceDirController.dispose();
-    _archivePathController.dispose();
-    super.dispose();
-  }
-
-  Future<void> _createProject() async {
-    final input = CreateProjectInput(
-      name: _nameController.text.trim(),
-      workspaceDir: _workspaceDirController.text.trim(),
-      archivePath: _archivePathController.text.trim(),
-    );
-
-    setState(() {
-      _creating = true;
-      _createError = null;
-    });
-    _addLog("Creating project '${input.name}'");
-    _addLog('Workspace directory: ${input.workspaceDir}');
-    _addLog('Source archive: ${input.archivePath}');
-    _addLog('Requesting project creation from server');
-
+  Future<void> _captureScreen() async {
     try {
-      final project = await widget.serverClient.createProject(input);
-
+      final pixelRatio = MediaQuery.of(context).devicePixelRatio;
+      final pngBytes = await widget.screenCapturer.capture(
+        _screenshotBoundaryKey,
+        pixelRatio: pixelRatio,
+      );
+      final path = await widget.screenshotStorage.save(pngBytes);
       if (!mounted) {
         return;
       }
 
-      setState(() {
-        _project = project;
-      });
-      _addLog(
-        'Project created: ${project.projectDir}',
-        level: ExecutionLogLevel.success,
-      );
-      _addLog(
-        'Compilation units found: ${project.compilationUnits.length}',
-        level: ExecutionLogLevel.success,
-      );
+      _addLog('Screenshot saved: $path', level: ExecutionLogLevel.success);
     } catch (error, stackTrace) {
       if (!mounted) {
         return;
       }
 
-      setState(() {
-        _createError = error;
-      });
-      cliLog('project creation exception: $error');
-      cliLog('project creation stack: $stackTrace');
+      cliLog('screenshot capture exception: $error');
+      cliLog('screenshot capture stack: $stackTrace');
       _addLog(
-        'Project creation failed: ${_errorMessage(error)}',
+        'Screenshot capture failed: ${projectErrorMessage(error)}',
         level: ExecutionLogLevel.error,
       );
-    } finally {
-      if (mounted) {
-        setState(() {
-          _creating = false;
-        });
-      }
     }
   }
 
-  Future<void> _chooseWorkspaceDirectory() async {
-    _addLog('Opening workspace directory picker');
-    final selected = await widget.pathPicker.pickWorkspaceDirectory();
-    if (!mounted) {
-      return;
-    }
-
-    if (selected == null) {
-      _addLog(
-        'Workspace directory selection cancelled',
-        level: ExecutionLogLevel.warning,
+  void _selectSourceFile(SourceFile file) {
+    _addLog('Opening ${file.path}');
+    setState(() {
+      _selectedSourceFile = file;
+      _selectedSourceContent = _loadSourceFileContent(
+        widget.project.projectDir,
+        file,
       );
-      return;
-    }
-
-    _setControllerText(_workspaceDirController, selected);
-    _addLog(
-      'Workspace directory selected: $selected',
-      level: ExecutionLogLevel.success,
-    );
+    });
   }
 
-  Future<void> _chooseSourceArchive() async {
-    _addLog('Opening source archive picker');
-    final selected = await widget.pathPicker.pickSourceArchive();
-    if (!mounted) {
-      return;
-    }
-
-    if (selected == null) {
-      _addLog(
-        'Source archive selection cancelled',
-        level: ExecutionLogLevel.warning,
+  Future<String> _loadSourceFileContent(
+    String projectDir,
+    SourceFile file,
+  ) async {
+    try {
+      final content = await widget.serverClient.readSourceFile(
+        projectDir: projectDir,
+        path: file.path,
       );
-      return;
+      _addLog('Loaded ${file.path}', level: ExecutionLogLevel.success);
+      return content;
+    } catch (error, stackTrace) {
+      cliLog('read source file exception: $error');
+      cliLog('read source file stack: $stackTrace');
+      _addLog(
+        'Failed to load ${file.path}: ${projectErrorMessage(error)}',
+        level: ExecutionLogLevel.error,
+      );
+      rethrow;
     }
-
-    _setControllerText(_archivePathController, selected);
-    _addLog(
-      'Source archive selected: $selected',
-      level: ExecutionLogLevel.success,
-    );
-  }
-
-  void _setControllerText(TextEditingController controller, String value) {
-    controller.value = TextEditingValue(
-      text: value,
-      selection: TextSelection.collapsed(offset: value.length),
-    );
-    setState(() {});
   }
 
   Future<ServerStatus> _loadServerStatus({bool notify = true}) async {
@@ -186,7 +130,7 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
       cliLog('server connection exception: $error');
       cliLog('server connection stack: $stackTrace');
       _addLog(
-        'Server connection failed: ${_errorMessage(error)}',
+        'Server connection failed: ${projectErrorMessage(error)}',
         level: ExecutionLogLevel.error,
       );
       rethrow;
@@ -215,21 +159,6 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     });
   }
 
-  String _errorMessage(Object error) {
-    return switch (error) {
-      ProjectCreationException(:final message) => message,
-      HttpException(:final message) => message,
-      _ => error.toString(),
-    };
-  }
-
-  bool get _canCreateProject {
-    return !_creating &&
-        _nameController.text.trim().isNotEmpty &&
-        _workspaceDirController.text.trim().isNotEmpty &&
-        _archivePathController.text.trim().isNotEmpty;
-  }
-
   void _openPanel(_IdePanel panel) {
     setState(() {
       _openPanels.add(panel);
@@ -251,86 +180,81 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: Column(
-        children: [
-          _TitleBar(onRefresh: _refresh),
-          Expanded(
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                final panels = _buildPanels();
+    return RepaintBoundary(
+      key: _screenshotBoundaryKey,
+      child: Scaffold(
+        body: Column(
+          children: [
+            _TitleBar(onRefresh: _refresh, onCaptureScreen: _captureScreen),
+            Expanded(
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final panels = _buildPanels();
 
-                return ColoredBox(
-                  color: IdePalette.background,
-                  child: _DockedWorkspace(
-                    compact: constraints.maxWidth < 980,
-                    closedPanels: [
-                      for (final panel in _IdePanel.values)
-                        if (!_openPanels.contains(panel))
-                          _ClosedPanelButton(
-                            title: panel.title,
-                            icon: panel.icon,
-                            onPressed: () => _openPanel(panel),
-                          ),
-                    ],
-                    topPanels: _panelsFor(
-                      panels,
-                      DockSide.top,
-                      constraints.maxWidth,
+                  return ColoredBox(
+                    color: IdePalette.background,
+                    child: _DockedWorkspace(
+                      compact: constraints.maxWidth < 980,
+                      closedPanels: [
+                        for (final panel in _IdePanel.values)
+                          if (!_openPanels.contains(panel))
+                            _ClosedPanelButton(
+                              title: panel.title,
+                              icon: panel.icon,
+                              onPressed: () => _openPanel(panel),
+                            ),
+                      ],
+                      topPanels: _panelsFor(
+                        panels,
+                        DockSide.top,
+                        constraints.maxWidth,
+                      ),
+                      leftPanels: _panelsFor(
+                        panels,
+                        DockSide.left,
+                        constraints.maxWidth,
+                      ),
+                      rightPanels: _panelsFor(
+                        panels,
+                        DockSide.right,
+                        constraints.maxWidth,
+                      ),
+                      bottomPanels: _panelsFor(
+                        panels,
+                        DockSide.bottom,
+                        constraints.maxWidth,
+                      ),
+                      child: _WorkspaceCenter(
+                        status: _status,
+                        project: widget.project,
+                        onRefresh: _refresh,
+                        selectedFile: _selectedSourceFile,
+                        selectedFileContent: _selectedSourceContent,
+                      ),
                     ),
-                    leftPanels: _panelsFor(
-                      panels,
-                      DockSide.left,
-                      constraints.maxWidth,
-                    ),
-                    rightPanels: _panelsFor(
-                      panels,
-                      DockSide.right,
-                      constraints.maxWidth,
-                    ),
-                    bottomPanels: _panelsFor(
-                      panels,
-                      DockSide.bottom,
-                      constraints.maxWidth,
-                    ),
-                    child: _WorkspaceCenter(
-                      status: _status,
-                      project: _project,
-                      onRefresh: _refresh,
-                    ),
-                  ),
-                );
-              },
+                  );
+                },
+              ),
             ),
-          ),
-          const _StatusBar(),
-        ],
+            const _StatusBar(),
+          ],
+        ),
       ),
     );
   }
 
   Map<_IdePanel, Widget> _buildPanels() {
     return {
-      _IdePanel.project: DockablePanel(
-        title: _IdePanel.project.title,
-        icon: _IdePanel.project.icon,
-        side: _panelSides[_IdePanel.project] ?? DockSide.left,
-        onClose: () => _closePanel(_IdePanel.project),
-        onDockSide: (side) => _dockPanel(_IdePanel.project, side),
-        child: ProjectCreationPane(
-          showTitle: false,
-          nameController: _nameController,
-          workspaceDirController: _workspaceDirController,
-          archivePathController: _archivePathController,
-          creating: _creating,
-          createError: _createError,
-          project: _project,
-          canCreateProject: _canCreateProject,
-          onChanged: () => setState(() {}),
-          onChooseWorkspaceDirectory: _chooseWorkspaceDirectory,
-          onChooseSourceArchive: _chooseSourceArchive,
-          onCreateProject: _createProject,
-          errorMessage: _errorMessage,
+      _IdePanel.explorer: DockablePanel(
+        title: _IdePanel.explorer.title,
+        icon: _IdePanel.explorer.icon,
+        side: _panelSides[_IdePanel.explorer] ?? DockSide.left,
+        onClose: () => _closePanel(_IdePanel.explorer),
+        onDockSide: (side) => _dockPanel(_IdePanel.explorer, side),
+        child: SourceFilesView(
+          project: widget.project,
+          onFileSelected: _selectSourceFile,
+          selectedPath: _selectedSourceFile?.path,
         ),
       ),
       _IdePanel.log: DockablePanel(
@@ -362,19 +286,19 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
   }
 }
 
-enum _IdePanel { project, log }
+enum _IdePanel { explorer, log }
 
 extension _IdePanelMetadata on _IdePanel {
   String get title {
     return switch (this) {
-      _IdePanel.project => 'Project setup',
+      _IdePanel.explorer => 'Explorer',
       _IdePanel.log => 'Execution log',
     };
   }
 
   IconData get icon {
     return switch (this) {
-      _IdePanel.project => Icons.create_new_folder_outlined,
+      _IdePanel.explorer => Icons.folder_open_outlined,
       _IdePanel.log => Icons.receipt_long_outlined,
     };
   }
@@ -579,9 +503,10 @@ class _RailIcon extends StatelessWidget {
 }
 
 class _TitleBar extends StatelessWidget {
-  const _TitleBar({required this.onRefresh});
+  const _TitleBar({required this.onRefresh, required this.onCaptureScreen});
 
   final VoidCallback onRefresh;
+  final VoidCallback onCaptureScreen;
 
   @override
   Widget build(BuildContext context) {
@@ -636,6 +561,11 @@ class _TitleBar extends StatelessWidget {
                 icon: Icons.refresh_rounded,
                 tooltip: 'Refresh',
                 onPressed: onRefresh,
+              ),
+              IdeToolbarIcon(
+                icon: Icons.screenshot_monitor_rounded,
+                tooltip: 'Capture screen',
+                onPressed: onCaptureScreen,
               ),
               const IdeToolbarIcon(
                 icon: Icons.settings_rounded,
@@ -705,40 +635,55 @@ class _WorkspaceCenter extends StatelessWidget {
     required this.status,
     required this.project,
     required this.onRefresh,
+    this.selectedFile,
+    this.selectedFileContent,
   });
 
   final Future<ServerStatus> status;
-  final CreatedProject? project;
+  final CreatedProject project;
   final VoidCallback onRefresh;
+  final SourceFile? selectedFile;
+  final Future<String>? selectedFileContent;
 
   @override
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
+    final selectedFile = this.selectedFile;
+    final selectedFileContent = this.selectedFileContent;
 
     return LayoutBuilder(
       builder: (context, constraints) {
-        final body = SingleChildScrollView(
-          padding: const EdgeInsets.all(18),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              ServerConnectionStatus(status: status, onRefresh: onRefresh),
-              const Divider(height: 40, color: IdePalette.border),
-              Text('Syntax Bridge workspace', style: textTheme.headlineSmall),
-              const SizedBox(height: 8),
-              Text(
-                project == null
-                    ? 'No project loaded'
-                    : 'Project: ${project!.name}',
-                style: textTheme.bodyLarge?.copyWith(
-                  color: IdePalette.softText,
+        final body = selectedFile != null && selectedFileContent != null
+            ? SourceFileViewer(
+                path: selectedFile.path,
+                content: selectedFileContent,
+              )
+            : SingleChildScrollView(
+                padding: const EdgeInsets.all(18),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    ServerConnectionStatus(
+                      status: status,
+                      onRefresh: onRefresh,
+                    ),
+                    const Divider(height: 40, color: IdePalette.border),
+                    Text(
+                      'Syntax Bridge workspace',
+                      style: textTheme.headlineSmall,
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Project: ${project.name}',
+                      style: textTheme.bodyLarge?.copyWith(
+                        color: IdePalette.softText,
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+                    const _WorkspaceCodePreview(),
+                  ],
                 ),
-              ),
-              const SizedBox(height: 18),
-              const _WorkspaceCodePreview(),
-            ],
-          ),
-        );
+              );
 
         return DecoratedBox(
           decoration: BoxDecoration(
@@ -759,22 +704,27 @@ class _WorkspaceCenter extends StatelessWidget {
                   color: IdePalette.tabBar,
                   border: Border(bottom: BorderSide(color: IdePalette.border)),
                 ),
-                child: const Row(
+                child: Row(
                   children: [
-                    Icon(Icons.code_rounded, color: IdePalette.teal, size: 17),
-                    SizedBox(width: 8),
+                    const Icon(
+                      Icons.code_rounded,
+                      color: IdePalette.teal,
+                      size: 17,
+                    ),
+                    const SizedBox(width: 8),
                     Expanded(
                       child: Text(
-                        'workspace.syntax-bridge',
+                        selectedFile?.path.split('/').last ??
+                            'workspace.syntax-bridge',
                         overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
+                        style: const TextStyle(
                           color: IdePalette.softText,
                           fontSize: 13,
                           fontWeight: FontWeight.w700,
                         ),
                       ),
                     ),
-                    Icon(
+                    const Icon(
                       Icons.more_vert_rounded,
                       color: IdePalette.muted,
                       size: 18,
@@ -785,7 +735,7 @@ class _WorkspaceCenter extends StatelessWidget {
               if (constraints.maxHeight.isFinite)
                 Expanded(child: body)
               else
-                body,
+                SizedBox(height: 480, child: body),
             ],
           ),
         );

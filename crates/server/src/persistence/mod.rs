@@ -93,7 +93,10 @@ mod tests {
 
     #[test]
     fn resolves_data_dir_from_xdg_data_home_when_set() {
-        let resolved = resolve_data_dir(Some("/custom/data".to_owned()), Some("/home/user".to_owned()));
+        let resolved = resolve_data_dir(
+            Some("/custom/data".to_owned()),
+            Some("/home/user".to_owned()),
+        );
         assert_eq!(resolved, PathBuf::from("/custom/data/syntax-bridge"));
     }
 

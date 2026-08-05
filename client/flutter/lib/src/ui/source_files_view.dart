@@ -2,38 +2,48 @@ import 'package:flutter/material.dart';
 
 import '../project/project_models.dart';
 
-class CompilationUnitsView extends StatelessWidget {
-  const CompilationUnitsView({super.key, required this.project});
+class SourceFilesView extends StatelessWidget {
+  const SourceFilesView({
+    super.key,
+    required this.project,
+    required this.onFileSelected,
+    this.selectedPath,
+  });
 
   final CreatedProject project;
+  final ValueChanged<SourceFile> onFileSelected;
+  final String? selectedPath;
 
   @override
   Widget build(BuildContext context) {
-    final units = project.compilationUnits;
+    final files = project.sourceFiles;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(
-          'Compilation units',
-          style: Theme.of(context).textTheme.headlineSmall,
-        ),
+        Text('Source files', style: Theme.of(context).textTheme.headlineSmall),
         const SizedBox(height: 4),
         Text(project.projectDir, style: Theme.of(context).textTheme.bodyMedium),
         const SizedBox(height: 16),
         ListView.separated(
           shrinkWrap: true,
           physics: const NeverScrollableScrollPhysics(),
-          itemCount: units.length,
+          itemCount: files.length,
           separatorBuilder: (context, index) => const Divider(height: 1),
           itemBuilder: (context, index) {
-            final unit = units[index];
-            final file = _projectRelativeFile(unit.file);
+            final file = files[index];
+            final relativePath = _projectRelativeFile(file.path);
 
             return ListTile(
               contentPadding: EdgeInsets.zero,
-              leading: const Icon(Icons.description),
-              title: Text(file),
+              selected: file.path == selectedPath,
+              leading: Icon(
+                file.kind == SourceFileKind.translationUnit
+                    ? Icons.description
+                    : Icons.article_outlined,
+              ),
+              title: Text(relativePath),
+              onTap: () => onFileSelected(file),
             );
           },
         ),

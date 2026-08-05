@@ -6,6 +6,8 @@ abstract class PathPicker {
   Future<String?> pickWorkspaceDirectory();
 
   Future<String?> pickSourceArchive();
+
+  Future<String?> pickExistingProjectDirectory();
 }
 
 class FilePickerPathPicker implements PathPicker {
@@ -33,6 +35,16 @@ class FilePickerPathPicker implements PathPicker {
 
     final path = result?.files.single.path;
     cliLog('source archive picker returned: ${path ?? '<cancelled>'}');
+    return path;
+  }
+
+  @override
+  Future<String?> pickExistingProjectDirectory() async {
+    cliLog('opening existing project directory picker');
+    final path = await FilePicker.getDirectoryPath(
+      dialogTitle: 'Choose an existing syntax-bridge project',
+    );
+    cliLog('existing project directory picker returned: ${path ?? '<cancelled>'}');
     return path;
   }
 }

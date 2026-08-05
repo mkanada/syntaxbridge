@@ -3,10 +3,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
+use serde::Serialize;
 
 use super::PersistenceError;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProjectRecord {
     pub name: String,
     pub project_dir: PathBuf,
@@ -92,6 +93,30 @@ impl GlobalStore {
 
         let records = statement
             .query_map([], |row| {
+                Ok(ProjectRecord {
+                    name: row.get(0)?,
+                    project_dir: PathBuf::from(row.get::<_, String>(1)?),
+                    source_language: row.get(2)?,
+                    target_language: row.get(3)?,
+                    last_ingest_status: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(records)
+    }
+
+    /// Lists the `limit` most recently opened projects, for the app's entry
+    /// screen: unlike `list_projects`, this only ever pulls `limit` rows out
+    /// of the database rather than every project ever created.
+    pub fn recent_projects(&self, limit: i64) -> Result<Vec<ProjectRecord>, PersistenceError> {
+        let mut statement = self.connection.prepare(
+            "SELECT name, project_dir, source_language, target_language, last_ingest_status
+             FROM projects ORDER BY last_opened_at_millis DESC LIMIT ?1",
+        )?;
+
+        let records = statement
+            .query_map(params![limit], |row| {
                 Ok(ProjectRecord {
                     name: row.get(0)?,
                     project_dir: PathBuf::from(row.get::<_, String>(1)?),
@@ -207,8 +232,39 @@ mod tests {
             .expect("re-open first project");
 
         let projects = store.list_projects().expect("list projects");
-        let names: Vec<_> = projects.iter().map(|project| project.name.as_str()).collect();
+        let names: Vec<_> = projects
+            .iter()
+            .map(|project| project.name.as_str())
+            .collect();
         assert_eq!(names, vec!["first", "second"]);
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn recent_projects_limits_to_the_most_recently_opened() {
+        let db_path = temp_db_path("global-recent-limit");
+        let store = GlobalStore::open(&db_path).expect("open global store");
+
+        for index in 0..7 {
+            store
+                .register_project(
+                    &format!("project-{index}"),
+                    Path::new(&format!("/tmp/syntax-bridge-projects/project-{index}")),
+                    "cpp",
+                    "dart",
+                    "success",
+                )
+                .expect("register project");
+            sleep(Duration::from_millis(5));
+        }
+
+        let recent = store.recent_projects(5).expect("list recent projects");
+        let names: Vec<_> = recent.iter().map(|project| project.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["project-6", "project-5", "project-4", "project-3", "project-2"]
+        );
 
         let _ = fs::remove_file(&db_path);
     }

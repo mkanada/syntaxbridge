@@ -154,6 +154,58 @@ fn create_project_persists_compilation_units_and_registers_project_globally() {
 }
 
 #[test]
+fn open_project_reloads_persisted_data_without_reingesting() {
+    let workspace = TempWorkspace::new("open-project").expect("create temporary workspace");
+    let archive_path = workspace.path().join("fixture.tar.gz");
+    write_cmake_fixture_tarball(workspace.path(), &archive_path).expect("create fixture archive");
+    let global_db_path = workspace.path().join("global.db");
+
+    let created = project_service::create_project(
+        CreateProjectRequest {
+            name: "counter".to_owned(),
+            workspace_dir: workspace.path().join("projects"),
+            archive_path,
+        },
+        &global_db_path,
+    )
+    .expect("ingest and persist project");
+
+    let opened = project_service::open_project(&created.project_dir, &global_db_path)
+        .expect("reopen persisted project");
+
+    assert_eq!(opened.name, "counter");
+    assert_eq!(opened.project_dir, created.project_dir);
+    assert_eq!(opened.input_source_dir, created.input_source_dir);
+    assert_eq!(opened.compilation_units, created.compilation_units);
+    assert_eq!(opened.source_files, created.source_files);
+
+    let global_store = GlobalStore::open(&global_db_path).expect("open global store");
+    let projects = global_store.list_projects().expect("list projects");
+    assert_eq!(
+        projects.len(),
+        1,
+        "reopening should touch the existing row, not duplicate it: {projects:#?}"
+    );
+}
+
+#[test]
+fn open_project_rejects_a_directory_without_a_project_database() {
+    let workspace =
+        TempWorkspace::new("open-project-missing").expect("create temporary workspace");
+    let bogus_dir = workspace.path().join("not-a-project");
+    fs::create_dir_all(&bogus_dir).expect("create bogus directory");
+    let global_db_path = workspace.path().join("global.db");
+
+    let error = project_service::open_project(&bogus_dir, &global_db_path)
+        .expect_err("opening a directory without project.db should fail");
+
+    assert!(
+        error.is_client_error(),
+        "missing project.db should be a client error: {error:?}"
+    );
+}
+
+#[test]
 fn project_endpoint_returns_created_project_and_compilation_units() {
     let workspace = TempWorkspace::new("ingest-http").expect("create temporary workspace");
     let archive_path = workspace.path().join("fixture.tar.gz");
@@ -263,6 +315,144 @@ fn project_endpoint_accepts_chunked_json_requests() {
 
     assert!(
         response.starts_with("HTTP/1.1 201 Created\r\n"),
+        "unexpected response: {response}"
+    );
+}
+
+#[test]
+fn recent_projects_endpoint_lists_the_last_created_project() {
+    let workspace = TempWorkspace::new("recent-http").expect("create temporary workspace");
+    let archive_path = workspace.path().join("fixture.tar.gz");
+    write_cmake_fixture_tarball(workspace.path(), &archive_path).expect("create fixture archive");
+    let global_db_path = workspace.path().join("global.db");
+
+    project_service::create_project(
+        CreateProjectRequest {
+            name: "counter".to_owned(),
+            workspace_dir: workspace.path().join("projects"),
+            archive_path,
+        },
+        &global_db_path,
+    )
+    .expect("ingest and persist project");
+
+    let server = SyntaxBridgeServer::bind("127.0.0.1:0")
+        .expect("bind test server")
+        .with_global_db_path(global_db_path);
+    let addr = server.local_addr().expect("read server address");
+    let handle = server.spawn().expect("spawn test server");
+
+    let mut stream = TcpStream::connect(addr).expect("connect to test server");
+    write!(
+        stream,
+        "GET /projects HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write request");
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read response");
+    handle.shutdown().expect("stop test server");
+
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK\r\n"),
+        "unexpected response: {response}"
+    );
+
+    let response_body = response
+        .split("\r\n\r\n")
+        .nth(1)
+        .expect("response has HTTP body");
+    let json: Value = serde_json::from_str(response_body).expect("parse response body");
+    let projects = json
+        .get("projects")
+        .and_then(Value::as_array)
+        .expect("response includes projects array");
+
+    assert_eq!(projects.len(), 1, "unexpected response body: {response_body}");
+    assert_eq!(projects[0]["name"], "counter");
+}
+
+#[test]
+fn open_project_endpoint_reloads_a_previously_ingested_project() {
+    let workspace = TempWorkspace::new("open-http").expect("create temporary workspace");
+    let archive_path = workspace.path().join("fixture.tar.gz");
+    write_cmake_fixture_tarball(workspace.path(), &archive_path).expect("create fixture archive");
+    let global_db_path = workspace.path().join("global.db");
+
+    let created = project_service::create_project(
+        CreateProjectRequest {
+            name: "counter".to_owned(),
+            workspace_dir: workspace.path().join("projects"),
+            archive_path,
+        },
+        &global_db_path,
+    )
+    .expect("ingest and persist project");
+
+    let server = SyntaxBridgeServer::bind("127.0.0.1:0")
+        .expect("bind test server")
+        .with_global_db_path(global_db_path);
+    let addr = server.local_addr().expect("read server address");
+    let handle = server.spawn().expect("spawn test server");
+
+    let body = serde_json::json!({ "project_dir": created.project_dir }).to_string();
+    let mut stream = TcpStream::connect(addr).expect("connect to test server");
+    write!(
+        stream,
+        "POST /projects/open HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .expect("write request");
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read response");
+    handle.shutdown().expect("stop test server");
+
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK\r\n"),
+        "unexpected response: {response}"
+    );
+
+    let response_body = response
+        .split("\r\n\r\n")
+        .nth(1)
+        .expect("response has HTTP body");
+    let json: Value = serde_json::from_str(response_body).expect("parse response body");
+    assert_eq!(json["name"], "counter");
+    let units = json
+        .get("compilation_units")
+        .and_then(Value::as_array)
+        .expect("response includes compilation_units array");
+    assert_eq!(units.len(), 1, "unexpected response body: {response_body}");
+}
+
+#[test]
+fn open_project_endpoint_returns_not_found_for_a_bogus_directory() {
+    let workspace = TempWorkspace::new("open-http-missing").expect("create temporary workspace");
+    let server = SyntaxBridgeServer::bind("127.0.0.1:0")
+        .expect("bind test server")
+        .with_global_db_path(workspace.path().join("global.db"));
+    let addr = server.local_addr().expect("read server address");
+    let handle = server.spawn().expect("spawn test server");
+
+    let body = serde_json::json!({ "project_dir": workspace.path().join("does-not-exist") })
+        .to_string();
+    let mut stream = TcpStream::connect(addr).expect("connect to test server");
+    write!(
+        stream,
+        "POST /projects/open HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .expect("write request");
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read response");
+    handle.shutdown().expect("stop test server");
+
+    assert!(
+        response.starts_with("HTTP/1.1 404 Not Found\r\n"),
         "unexpected response: {response}"
     );
 }

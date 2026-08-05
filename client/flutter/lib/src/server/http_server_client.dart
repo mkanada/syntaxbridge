@@ -58,6 +58,69 @@ class HttpServerClient implements ServerClient {
     return CreatedProject.fromJson(jsonDecode(body) as Map<String, Object?>);
   }
 
+  @override
+  Future<List<RecentProject>> listRecentProjects() async {
+    final url = baseUrl.resolve('/projects');
+    cliLog('HTTP GET $url');
+    final request = await _httpClient.getUrl(url);
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP GET $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException('Unexpected server status: ${response.statusCode}');
+    }
+
+    final json = jsonDecode(body) as Map<String, Object?>;
+    final projectsJson = json['projects'] as List<Object?>? ?? const <Object?>[];
+    return projectsJson
+        .whereType<Map<String, Object?>>()
+        .map(RecentProject.fromJson)
+        .toList();
+  }
+
+  @override
+  Future<CreatedProject> openProject(String projectDir) async {
+    final url = baseUrl.resolve('/projects/open');
+    final payload = jsonEncode({'project_dir': projectDir});
+    cliLog('HTTP POST $url payload=$payload');
+    final request = await _httpClient.postUrl(url);
+    request.headers.contentType = ContentType.json;
+    request.write(payload);
+
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP POST $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.ok) {
+      throw ProjectCreationException(_errorMessageFromBody(body));
+    }
+
+    return CreatedProject.fromJson(jsonDecode(body) as Map<String, Object?>);
+  }
+
+  @override
+  Future<String> readSourceFile({
+    required String projectDir,
+    required String path,
+  }) async {
+    final url = baseUrl
+        .resolve('/projects/source-file')
+        .replace(queryParameters: {'project_dir': projectDir, 'path': path});
+    cliLog('HTTP GET $url');
+    final request = await _httpClient.getUrl(url);
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP GET $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException(_errorMessageFromBody(body));
+    }
+
+    final json = jsonDecode(body) as Map<String, Object?>;
+    return json['content'] as String? ?? '';
+  }
+
   String _errorMessageFromBody(String body) {
     try {
       final json = jsonDecode(body);

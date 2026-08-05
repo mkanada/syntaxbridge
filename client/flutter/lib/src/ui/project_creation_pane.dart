@@ -1,8 +1,5 @@
 import 'package:flutter/material.dart';
 
-import '../project/project_models.dart';
-import 'compilation_units_view.dart';
-
 class ProjectCreationPane extends StatelessWidget {
   const ProjectCreationPane({
     super.key,
@@ -12,7 +9,6 @@ class ProjectCreationPane extends StatelessWidget {
     required this.archivePathController,
     required this.creating,
     required this.createError,
-    required this.project,
     required this.canCreateProject,
     required this.onChanged,
     required this.onChooseWorkspaceDirectory,
@@ -27,7 +23,6 @@ class ProjectCreationPane extends StatelessWidget {
   final TextEditingController archivePathController;
   final bool creating;
   final Object? createError;
-  final CreatedProject? project;
   final bool canCreateProject;
   final VoidCallback onChanged;
   final Future<void> Function() onChooseWorkspaceDirectory;
@@ -115,10 +110,6 @@ class ProjectCreationPane extends StatelessWidget {
           ),
           const SizedBox(height: 4),
           Text(errorMessage(createError!)),
-        ],
-        if (project != null) ...[
-          const Divider(height: 40),
-          CompilationUnitsView(project: project!),
         ],
       ],
     );
