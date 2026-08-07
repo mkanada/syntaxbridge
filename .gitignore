@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target/
 
+# CMake build artifacts dos recursos de teste
+/test-resources/*/build/
+
 # Temporary files
 /tmp/
 
