@@ -40,6 +40,10 @@ Este arquivo é a fonte única do roadmap. Os antigos `docs/plans/ingest.md` e
 `docs/plans/separate-compilation-units.md` foram absorvidos por US-1 e US-6,
 respectivamente, e removidos do repositório.
 
+`docs/plans/ui-lists.md` é o complemento de interface: enquanto este documento
+diz *o que* o usuário consegue fazer em cada passo, aquele diz *onde* cada lista
+aparece na UI e o que a interface atual precisa mudar para sustentá-la.
+
 ---
 
 ## US-1 — Criação de projeto e ingestão do input
