@@ -236,7 +236,6 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
                 },
               ),
             ),
-            const _StatusBar(),
           ],
         ),
       ),
@@ -357,66 +356,53 @@ class _DockedWorkspace extends StatelessWidget {
       );
     }
 
-    return Row(
-      children: [
-        const _ActivityRail(),
-        Expanded(
-          child: Padding(
-            padding: const EdgeInsets.all(8),
-            child: Column(
+    return Padding(
+      padding: const EdgeInsets.all(8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          if (closedPanels.isNotEmpty) ...[
+            _ClosedPanelsBar(children: closedPanels),
+            const SizedBox(height: 8),
+          ],
+          if (topPanels.isNotEmpty) ...[
+            SizedBox(
+              height: 180,
+              child: _PanelColumn(stretch: true, children: topPanels),
+            ),
+            const SizedBox(height: 8),
+          ],
+          Expanded(
+            child: Row(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                if (closedPanels.isNotEmpty) ...[
-                  _ClosedPanelsBar(children: closedPanels),
-                  const SizedBox(height: 8),
-                ],
-                if (topPanels.isNotEmpty) ...[
+                if (leftPanels.isNotEmpty) ...[
                   SizedBox(
-                    height: 180,
-                    child: _PanelColumn(stretch: true, children: topPanels),
+                    width: 360,
+                    child: _PanelColumn(stretch: true, children: leftPanels),
                   ),
-                  const SizedBox(height: 8),
+                  const SizedBox(width: 8),
                 ],
-                Expanded(
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      if (leftPanels.isNotEmpty) ...[
-                        SizedBox(
-                          width: 360,
-                          child: _PanelColumn(
-                            stretch: true,
-                            children: leftPanels,
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                      ],
-                      Expanded(child: child),
-                      if (rightPanels.isNotEmpty) ...[
-                        const SizedBox(width: 8),
-                        SizedBox(
-                          width: 360,
-                          child: _PanelColumn(
-                            stretch: true,
-                            children: rightPanels,
-                          ),
-                        ),
-                      ],
-                    ],
-                  ),
-                ),
-                if (bottomPanels.isNotEmpty) ...[
-                  const SizedBox(height: 8),
+                Expanded(child: child),
+                if (rightPanels.isNotEmpty) ...[
+                  const SizedBox(width: 8),
                   SizedBox(
-                    height: 230,
-                    child: _PanelColumn(stretch: true, children: bottomPanels),
+                    width: 360,
+                    child: _PanelColumn(stretch: true, children: rightPanels),
                   ),
                 ],
               ],
             ),
           ),
-        ),
-      ],
+          if (bottomPanels.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            SizedBox(
+              height: 230,
+              child: _PanelColumn(stretch: true, children: bottomPanels),
+            ),
+          ],
+        ],
+      ),
     );
   }
 }
@@ -440,68 +426,6 @@ class _ClosedPanelsBar extends StatelessWidget {
   }
 }
 
-class _ActivityRail extends StatelessWidget {
-  const _ActivityRail();
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 48,
-      color: IdePalette.activity,
-      child: const Column(
-        children: [
-          SizedBox(height: 10),
-          _RailIcon(
-            Icons.file_copy_rounded,
-            tooltip: 'Explorer',
-            selected: true,
-          ),
-          _RailIcon(Icons.search_rounded, tooltip: 'Search'),
-          _RailIcon(Icons.account_tree_rounded, tooltip: 'Source control'),
-          _RailIcon(Icons.bug_report_rounded, tooltip: 'Debug'),
-          _RailIcon(Icons.extension_rounded, tooltip: 'Extensions'),
-          Spacer(),
-          _RailIcon(Icons.person_rounded, tooltip: 'Account'),
-          _RailIcon(Icons.manage_accounts_rounded, tooltip: 'Settings'),
-          SizedBox(height: 8),
-        ],
-      ),
-    );
-  }
-}
-
-class _RailIcon extends StatelessWidget {
-  const _RailIcon(this.icon, {required this.tooltip, this.selected = false});
-
-  final IconData icon;
-  final String tooltip;
-  final bool selected;
-
-  @override
-  Widget build(BuildContext context) {
-    return Tooltip(
-      message: tooltip,
-      child: Container(
-        width: 48,
-        height: 44,
-        decoration: BoxDecoration(
-          border: Border(
-            left: BorderSide(
-              color: selected ? IdePalette.teal : Colors.transparent,
-              width: 3,
-            ),
-          ),
-        ),
-        child: Icon(
-          icon,
-          size: 21,
-          color: selected ? IdePalette.text : IdePalette.muted,
-        ),
-      ),
-    );
-  }
-}
-
 class _TitleBar extends StatelessWidget {
   const _TitleBar({required this.onRefresh, required this.onCaptureScreen});
 
@@ -516,115 +440,30 @@ class _TitleBar extends StatelessWidget {
         color: IdePalette.topBar,
         border: Border(bottom: BorderSide(color: IdePalette.border)),
       ),
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          final compact = constraints.maxWidth < 920;
-
-          return Row(
-            children: [
-              const SizedBox(width: 12),
-              const Icon(
-                Icons.grid_view_rounded,
-                size: 18,
-                color: IdePalette.teal,
-              ),
-              const SizedBox(width: 10),
-              if (compact)
-                const Expanded(
-                  child: Text(
-                    'Syntax Bridge',
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(fontWeight: FontWeight.w700),
-                  ),
-                )
-              else ...[
-                const Text(
-                  'Syntax Bridge',
-                  style: TextStyle(fontWeight: FontWeight.w700),
-                ),
-                const SizedBox(width: 22),
-                const _MenuText('File'),
-                const _MenuText('Edit'),
-                const _MenuText('Search'),
-                const _MenuText('Run'),
-                const _MenuText('Window'),
-                const Spacer(),
-                const _SearchBox(),
-                const SizedBox(width: 12),
-              ],
-              const IdeToolbarIcon(
-                icon: Icons.play_arrow_rounded,
-                tooltip: 'Run pipeline',
-                color: IdePalette.green,
-              ),
-              IdeToolbarIcon(
-                icon: Icons.refresh_rounded,
-                tooltip: 'Refresh',
-                onPressed: onRefresh,
-              ),
-              IdeToolbarIcon(
-                icon: Icons.screenshot_monitor_rounded,
-                tooltip: 'Capture screen',
-                onPressed: onCaptureScreen,
-              ),
-              const IdeToolbarIcon(
-                icon: Icons.settings_rounded,
-                tooltip: 'Settings',
-              ),
-              const SizedBox(width: 8),
-            ],
-          );
-        },
-      ),
-    );
-  }
-}
-
-class _SearchBox extends StatelessWidget {
-  const _SearchBox();
-
-  @override
-  Widget build(BuildContext context) {
-    return ConstrainedBox(
-      constraints: const BoxConstraints(maxWidth: 380, minWidth: 180),
-      child: Container(
-        height: 30,
-        padding: const EdgeInsets.symmetric(horizontal: 10),
-        decoration: BoxDecoration(
-          color: IdePalette.editor,
-          border: Border.all(color: IdePalette.border),
-          borderRadius: BorderRadius.circular(6),
-        ),
-        child: const Row(
-          children: [
-            Icon(Icons.search_rounded, size: 16, color: IdePalette.muted),
-            SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                'Search workspace',
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(color: IdePalette.muted, fontSize: 13),
-              ),
+      child: Row(
+        children: [
+          const SizedBox(width: 12),
+          const Icon(Icons.grid_view_rounded, size: 18, color: IdePalette.teal),
+          const SizedBox(width: 10),
+          const Expanded(
+            child: Text(
+              'Syntax Bridge',
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontWeight: FontWeight.w700),
             ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _MenuText extends StatelessWidget {
-  const _MenuText(this.label);
-
-  final String label;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 8),
-      child: Text(
-        label,
-        style: const TextStyle(color: IdePalette.softText, fontSize: 13),
+          ),
+          IdeToolbarIcon(
+            icon: Icons.refresh_rounded,
+            tooltip: 'Refresh',
+            onPressed: onRefresh,
+          ),
+          IdeToolbarIcon(
+            icon: Icons.screenshot_monitor_rounded,
+            tooltip: 'Capture screen',
+            onPressed: onCaptureScreen,
+          ),
+          const SizedBox(width: 8),
+        ],
       ),
     );
   }
@@ -679,8 +518,6 @@ class _WorkspaceCenter extends StatelessWidget {
                         color: IdePalette.softText,
                       ),
                     ),
-                    const SizedBox(height: 18),
-                    const _WorkspaceCodePreview(),
                   ],
                 ),
               );
@@ -697,41 +534,40 @@ class _WorkspaceCenter extends StatelessWidget {
                 : MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Container(
-                height: 40,
-                padding: const EdgeInsets.symmetric(horizontal: 14),
-                decoration: const BoxDecoration(
-                  color: IdePalette.tabBar,
-                  border: Border(bottom: BorderSide(color: IdePalette.border)),
-                ),
-                child: Row(
-                  children: [
-                    const Icon(
-                      Icons.code_rounded,
-                      color: IdePalette.teal,
-                      size: 17,
+              // The tab strip names the file actually open; with nothing open
+              // there is no tab to show.
+              if (selectedFile != null)
+                Container(
+                  height: 40,
+                  padding: const EdgeInsets.symmetric(horizontal: 14),
+                  decoration: const BoxDecoration(
+                    color: IdePalette.tabBar,
+                    border: Border(
+                      bottom: BorderSide(color: IdePalette.border),
                     ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        selectedFile?.path.split('/').last ??
-                            'workspace.syntax-bridge',
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: IdePalette.softText,
-                          fontSize: 13,
-                          fontWeight: FontWeight.w700,
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(
+                        Icons.code_rounded,
+                        color: IdePalette.teal,
+                        size: 17,
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          selectedFile.path.split('/').last,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: IdePalette.softText,
+                            fontSize: 13,
+                            fontWeight: FontWeight.w700,
+                          ),
                         ),
                       ),
-                    ),
-                    const Icon(
-                      Icons.more_vert_rounded,
-                      color: IdePalette.muted,
-                      size: 18,
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-              ),
               if (constraints.maxHeight.isFinite)
                 Expanded(child: body)
               else
@@ -741,103 +577,6 @@ class _WorkspaceCenter extends StatelessWidget {
         );
       },
     );
-  }
-}
-
-class _WorkspaceCodePreview extends StatelessWidget {
-  const _WorkspaceCodePreview();
-
-  @override
-  Widget build(BuildContext context) {
-    const lines = [
-      'input:',
-      '  language: c_cpp',
-      '  analysis: clang + cmake',
-      '',
-      'intermediate_model:',
-      '  build_graph: ready',
-      '  compilation_units: pending',
-      '',
-      'output:',
-      '  language: dart',
-      '  validation: unit_tests',
-    ];
-
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        color: const Color(0xFF0E1013),
-        border: Border.all(color: IdePalette.border),
-        borderRadius: BorderRadius.circular(6),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 10),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            for (final (index, line) in lines.indexed)
-              _CodePreviewLine(number: index + 1, code: line),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _CodePreviewLine extends StatelessWidget {
-  const _CodePreviewLine({required this.number, required this.code});
-
-  final int number;
-  final String code;
-
-  @override
-  Widget build(BuildContext context) {
-    return SizedBox(
-      height: 24,
-      child: Row(
-        children: [
-          SizedBox(
-            width: 42,
-            child: Text(
-              '$number',
-              textAlign: TextAlign.right,
-              style: const TextStyle(
-                color: IdePalette.lineNumber,
-                fontFamily: 'monospace',
-                fontSize: 13,
-              ),
-            ),
-          ),
-          const SizedBox(width: 14),
-          Expanded(
-            child: Text(
-              code,
-              softWrap: false,
-              overflow: TextOverflow.fade,
-              style: TextStyle(
-                color: _codeColor(code),
-                fontFamily: 'monospace',
-                fontSize: 13,
-                height: 1.3,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Color _codeColor(String code) {
-    final trimmed = code.trimLeft();
-    if (trimmed.endsWith(':')) {
-      return IdePalette.blue;
-    }
-    if (trimmed.contains('dart') || trimmed.contains('ready')) {
-      return IdePalette.green;
-    }
-    if (trimmed.contains('clang') || trimmed.contains('cmake')) {
-      return IdePalette.amber;
-    }
-    return IdePalette.codeText;
   }
 }
 
@@ -904,50 +643,6 @@ class _ClosedPanelButton extends StatelessWidget {
       onPressed: onPressed,
       icon: Icon(icon),
       label: Text(title),
-    );
-  }
-}
-
-class _StatusBar extends StatelessWidget {
-  const _StatusBar();
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      height: 26,
-      color: IdePalette.status,
-      padding: const EdgeInsets.symmetric(horizontal: 10),
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          final wide = constraints.maxWidth >= 900;
-
-          return Row(
-            children: [
-              const Icon(Icons.account_tree_rounded, size: 14),
-              const SizedBox(width: 6),
-              const Text('main', style: TextStyle(fontSize: 12)),
-              const SizedBox(width: 18),
-              const Icon(Icons.sync_rounded, size: 14),
-              const SizedBox(width: 6),
-              const Flexible(
-                child: Text(
-                  '0 errors, 0 warnings',
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(fontSize: 12),
-                ),
-              ),
-              const Spacer(),
-              const Text('C/C++ -> Dart', style: TextStyle(fontSize: 12)),
-              if (wide) ...[
-                const SizedBox(width: 18),
-                const Text('UTF-8', style: TextStyle(fontSize: 12)),
-                const SizedBox(width: 18),
-                const Text('Flatpak pending', style: TextStyle(fontSize: 12)),
-              ],
-            ],
-          );
-        },
-      ),
     );
   }
 }

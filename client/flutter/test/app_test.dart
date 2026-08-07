@@ -40,11 +40,65 @@ void main() {
     await tester.pumpAndSettle();
     await _skipToIde(tester);
 
-    expect(find.byTooltip('Explorer'), findsOneWidget);
     expect(find.text('Syntax Bridge workspace'), findsOneWidget);
     expect(find.text('Explorer'), findsOneWidget);
     expect(find.text('Execution log'), findsOneWidget);
-    expect(find.text('0 errors, 0 warnings'), findsOneWidget);
+    expect(find.byTooltip('Refresh'), findsWidgets);
+    expect(find.byTooltip('Capture screen'), findsOneWidget);
+  });
+
+  testWidgets('omits IDE chrome that syntax-bridge does not implement', (
+    tester,
+  ) async {
+    tester.view
+      ..devicePixelRatio = 1
+      ..physicalSize = const Size(1280, 900);
+    addTearDown(tester.view.reset);
+
+    await tester.pumpWidget(
+      SyntaxBridgeApp(
+        serverClient: _FakeServerClient(
+          const ServerStatus(service: 'syntax-bridge-server', status: 'ok'),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await _skipToIde(tester);
+
+    // Decorative VS Code menu bar: none of these open anything.
+    for (final menu in ['File', 'Edit', 'Search', 'Run', 'Window']) {
+      expect(find.text(menu), findsNothing, reason: 'dead "$menu" menu');
+    }
+
+    // Activity rail entries for features the app does not have.
+    for (final rail in [
+      'Search',
+      'Source control',
+      'Debug',
+      'Extensions',
+      'Account',
+      'Settings',
+    ]) {
+      expect(find.byTooltip(rail), findsNothing, reason: 'dead "$rail" rail');
+    }
+
+    // Toolbar buttons wired to nothing.
+    expect(find.byTooltip('Run pipeline'), findsNothing);
+    expect(find.byTooltip('Settings'), findsNothing);
+
+    // Search box that searches nothing.
+    expect(find.text('Search workspace'), findsNothing);
+
+    // Fabricated status bar readings.
+    expect(find.text('main'), findsNothing);
+    expect(find.text('0 errors, 0 warnings'), findsNothing);
+    expect(find.text('UTF-8'), findsNothing);
+    expect(find.text('Flatpak pending'), findsNothing);
+
+    // Hardcoded pipeline snippet presented as project state.
+    expect(find.text('workspace.syntax-bridge'), findsNothing);
+    expect(find.text('  build_graph: ready'), findsNothing);
+    expect(find.text('  compilation_units: pending'), findsNothing);
   });
 
   testWidgets('creates a project and shows returned source files', (

@@ -3,13 +3,11 @@ import 'package:flutter/material.dart';
 abstract final class IdePalette {
   static const background = Color(0xFF151618);
   static const topBar = Color(0xFF202124);
-  static const activity = Color(0xFF1B1C20);
   static const sideBar = Color(0xFF24262B);
   static const tabBar = Color(0xFF202227);
   static const editor = Color(0xFF101114);
   static const preview = Color(0xFF1A1C20);
   static const panel = Color(0xFF22242A);
-  static const status = Color(0xFF07685D);
   static const border = Color(0xFF343741);
   static const divider = Color(0xFF181A1F);
   static const dividerHover = Color(0xFF26313A);
@@ -27,19 +25,24 @@ abstract final class IdePalette {
   static const red = Color(0xFFFF7A7A);
 }
 
+/// Toolbar button for the IDE title bar.
+///
+/// [onPressed] is required and passed straight through: a button that does
+/// nothing must be spelled `onPressed: null` so it renders disabled, instead
+/// of looking active while silently doing nothing.
 class IdeToolbarIcon extends StatelessWidget {
   const IdeToolbarIcon({
     super.key,
     required this.icon,
     required this.tooltip,
+    required this.onPressed,
     this.color,
-    this.onPressed,
   });
 
   final IconData icon;
   final String tooltip;
-  final Color? color;
   final VoidCallback? onPressed;
+  final Color? color;
 
   @override
   Widget build(BuildContext context) {
@@ -49,7 +52,7 @@ class IdeToolbarIcon extends StatelessWidget {
         visualDensity: VisualDensity.compact,
         iconSize: 19,
         color: color ?? IdePalette.softText,
-        onPressed: onPressed ?? () {},
+        onPressed: onPressed,
         icon: Icon(icon),
       ),
     );

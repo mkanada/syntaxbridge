@@ -95,6 +95,10 @@ tende a crescer a cada painel novo. Sugestão de corte natural: chrome do IDE
 (title bar, activity rail, status bar) em um arquivo, workspace/docking em
 outro, e a página apenas orquestrando estado.
 
+> Parcialmente resolvido (2026-08-07): a remoção do chrome decorativo (ver
+> achado 5) deixou o arquivo em ~650 linhas. A separação entre docking e
+> estado da página continua pendente.
+
 ### Média prioridade
 
 #### 5. UI decorativa se apresenta como funcional
@@ -111,6 +115,14 @@ outro, e a página apenas orquestrando estado.
 Placeholders visuais são legítimos em protótipo, mas botões devem refletir seu
 estado real, e testes não deveriam ancorar em texto decorativo que será
 substituído.
+
+> Resolvido (2026-08-07): todo o chrome herdado do "clone do VS Code" foi
+> removido — activity rail, menus File/Edit/Search/Run/Window, caixa de busca,
+> botões "Run pipeline"/"Settings", status bar e o snippet YAML fixo
+> (`_WorkspaceCodePreview`). `IdeToolbarIcon.onPressed` passou a ser obrigatório
+> (`null` renderiza desabilitado), e o teste
+> `omits IDE chrome that syntax-bridge does not implement` agora impede a
+> reintrodução desses elementos.
 
 #### 6. Falha na criação de projeto deixa diretório órfão e quebra retry
 
