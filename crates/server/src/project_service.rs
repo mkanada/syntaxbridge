@@ -189,11 +189,60 @@ impl From<PersistenceError> for OpenProjectError {
     }
 }
 
+/// A recent project as offered on the entry screen.
+///
+/// `available` is resolved when listing rather than stored, because the user
+/// can delete a project directory at any time without the app knowing: the
+/// registry alone cannot say whether a project can still be opened.
+#[derive(Debug, Serialize)]
+pub struct RecentProject {
+    pub name: String,
+    pub project_dir: PathBuf,
+    pub source_language: String,
+    pub target_language: String,
+    pub last_ingest_status: String,
+    pub available: bool,
+}
+
+impl RecentProject {
+    fn from_record(record: ProjectRecord) -> Self {
+        Self {
+            available: is_openable_project(&record.project_dir),
+            name: record.name,
+            project_dir: record.project_dir,
+            source_language: record.source_language,
+            target_language: record.target_language,
+            last_ingest_status: record.last_ingest_status,
+        }
+    }
+}
+
+/// A project can be reopened when its own database is still on disk. This is
+/// exactly what `open_project` checks, so the entry screen never presents a
+/// project that opening would then reject.
+fn is_openable_project(project_dir: &Path) -> bool {
+    project_dir.join("project.db").is_file()
+}
+
 /// Lists the last 5 projects the app was used with, most recently opened
-/// first, for the entry screen shown on startup.
-pub fn list_recent_projects(global_db_path: &Path) -> Result<Vec<ProjectRecord>, PersistenceError> {
+/// first, for the entry screen shown on startup. Each one is checked against
+/// the filesystem so the screen can tell which are still openable.
+pub fn list_recent_projects(global_db_path: &Path) -> Result<Vec<RecentProject>, PersistenceError> {
     let global_store = GlobalStore::open(global_db_path)?;
-    global_store.recent_projects(5)
+    let records = global_store.recent_projects(5)?;
+
+    Ok(records
+        .into_iter()
+        .map(RecentProject::from_record)
+        .collect())
+}
+
+/// Removes a project from the recent-projects registry. Nothing on disk is
+/// touched: this only makes the app stop offering the project, which is what
+/// a user wants after deleting (or moving) the project directory themselves.
+pub fn forget_project(project_dir: &Path, global_db_path: &Path) -> Result<bool, PersistenceError> {
+    let global_store = GlobalStore::open(global_db_path)?;
+    global_store.forget_project(project_dir)
 }
 
 /// Reloads a project directly from its own `project.db`, without running
@@ -204,11 +253,11 @@ pub fn open_project(
     project_dir: &Path,
     global_db_path: &Path,
 ) -> Result<LoadedProject, OpenProjectError> {
-    let project_db_path = project_dir.join("project.db");
-    if !project_db_path.is_file() {
+    if !is_openable_project(project_dir) {
         return Err(OpenProjectError::NotFound(project_dir.to_path_buf()));
     }
 
+    let project_db_path = project_dir.join("project.db");
     let project_store = ProjectStore::open(&project_db_path)?;
     let compilation_units = project_store.list_compilation_units()?;
     let source_files = project_store.list_source_files()?;

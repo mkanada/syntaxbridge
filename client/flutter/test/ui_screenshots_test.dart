@@ -125,6 +125,9 @@ class _FakeServerClient implements ServerClient {
   Future<List<RecentProject>> listRecentProjects() async => const [];
 
   @override
+  Future<void> forgetProject(String projectDir) async {}
+
+  @override
   Future<CreatedProject> openProject(String projectDir) async {
     return project ??
         const CreatedProject(

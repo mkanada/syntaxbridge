@@ -15,6 +15,16 @@ Este documento registra exatamente o que ja esta funcionando no repositorio.
 - O endpoint `GET /health` responde JSON com:
   - `service: "syntax-bridge-server"`;
   - `status: "ok"`.
+- O endpoint `GET /projects` lista os 5 projetos mais recentes. Cada projeto
+  traz `available`, resolvido contra o disco no momento da listagem: o usuario
+  pode apagar ou mover a pasta de um projeto a qualquer momento sem o app
+  saber, entao o registro sozinho nao diz se o projeto ainda abre. O criterio e
+  o mesmo do `open_project` (existe `project.db` na pasta), para a tela inicial
+  nunca oferecer um projeto que abrir depois recusaria.
+- O endpoint `DELETE /projects` recebe `{"project_dir": ...}` e remove o
+  projeto do registro de recentes, sem tocar em nada no disco. Responde
+  `{"forgotten": true|false}`; esquecer um projeto desconhecido e sucesso com
+  `false`, nao erro.
 
 ## Cliente Flutter Desktop
 

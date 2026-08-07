@@ -70,6 +70,34 @@ class _ProjectLandingPageState extends State<ProjectLandingPage> {
     }
   }
 
+  /// Drops a project the server reported as gone from the list. The directory
+  /// itself is left alone: the user already deleted or moved it, and this only
+  /// stops the app from offering something it cannot open.
+  Future<void> _forget(RecentProject project) async {
+    setState(() {
+      _openError = null;
+    });
+
+    try {
+      await widget.serverClient.forgetProject(project.projectDir);
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _recentProjects = widget.serverClient.listRecentProjects();
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _openError = error;
+      });
+    }
+  }
+
   Future<void> _import() async {
     final project = await showDialog<CreatedProject>(
       context: context,
@@ -161,9 +189,13 @@ class _ProjectLandingPageState extends State<ProjectLandingPage> {
                           _RecentProjectTile(
                             project: project,
                             opening: _openingProjectDir == project.projectDir,
-                            onTap: _openingProjectDir == null
+                            onTap:
+                                project.available && _openingProjectDir == null
                                 ? () => _openRecent(project)
                                 : null,
+                            onForget: project.available
+                                ? null
+                                : () => _forget(project),
                           ),
                       ],
                     );
@@ -210,14 +242,21 @@ class _RecentProjectTile extends StatelessWidget {
     required this.project,
     required this.opening,
     required this.onTap,
+    required this.onForget,
   });
 
   final RecentProject project;
   final bool opening;
   final VoidCallback? onTap;
 
+  /// Set only for projects whose directory is gone: offers to drop the entry
+  /// instead of leaving a row that fails whenever it is clicked.
+  final VoidCallback? onForget;
+
   @override
   Widget build(BuildContext context) {
+    final missing = onForget != null;
+
     return Padding(
       padding: const EdgeInsets.only(bottom: 8),
       child: Material(
@@ -234,9 +273,9 @@ class _RecentProjectTile extends StatelessWidget {
             ),
             child: Row(
               children: [
-                const Icon(
-                  Icons.folder_rounded,
-                  color: IdePalette.teal,
+                Icon(
+                  missing ? Icons.folder_off_rounded : Icons.folder_rounded,
+                  color: missing ? IdePalette.muted : IdePalette.teal,
                   size: 20,
                 ),
                 const SizedBox(width: 12),
@@ -246,8 +285,8 @@ class _RecentProjectTile extends StatelessWidget {
                     children: [
                       Text(
                         project.name,
-                        style: const TextStyle(
-                          color: IdePalette.text,
+                        style: TextStyle(
+                          color: missing ? IdePalette.muted : IdePalette.text,
                           fontWeight: FontWeight.w600,
                         ),
                       ),
@@ -259,6 +298,14 @@ class _RecentProjectTile extends StatelessWidget {
                           fontSize: 12,
                         ),
                       ),
+                      if (missing)
+                        const Text(
+                          'Folder no longer exists',
+                          style: TextStyle(
+                            color: IdePalette.amber,
+                            fontSize: 12,
+                          ),
+                        ),
                     ],
                   ),
                 ),
@@ -266,6 +313,15 @@ class _RecentProjectTile extends StatelessWidget {
                   const SizedBox.square(
                     dimension: 16,
                     child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                else if (missing)
+                  IconButton(
+                    tooltip: 'Remove ${project.name} from the list',
+                    onPressed: onForget,
+                    icon: const Icon(
+                      Icons.delete_outline_rounded,
+                      color: IdePalette.muted,
+                    ),
                   )
                 else
                   const Icon(

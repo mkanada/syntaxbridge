@@ -190,8 +190,7 @@ fn open_project_reloads_persisted_data_without_reingesting() {
 
 #[test]
 fn open_project_rejects_a_directory_without_a_project_database() {
-    let workspace =
-        TempWorkspace::new("open-project-missing").expect("create temporary workspace");
+    let workspace = TempWorkspace::new("open-project-missing").expect("create temporary workspace");
     let bogus_dir = workspace.path().join("not-a-project");
     fs::create_dir_all(&bogus_dir).expect("create bogus directory");
     let global_db_path = workspace.path().join("global.db");
@@ -368,8 +367,188 @@ fn recent_projects_endpoint_lists_the_last_created_project() {
         .and_then(Value::as_array)
         .expect("response includes projects array");
 
-    assert_eq!(projects.len(), 1, "unexpected response body: {response_body}");
+    assert_eq!(
+        projects.len(),
+        1,
+        "unexpected response body: {response_body}"
+    );
     assert_eq!(projects[0]["name"], "counter");
+}
+
+#[test]
+fn recent_projects_endpoint_flags_a_project_whose_directory_is_gone() {
+    let workspace = TempWorkspace::new("recent-missing").expect("create temporary workspace");
+    let archive_path = workspace.path().join("fixture.tar.gz");
+    write_cmake_fixture_tarball(workspace.path(), &archive_path).expect("create fixture archive");
+    let global_db_path = workspace.path().join("global.db");
+
+    let created = project_service::create_project(
+        CreateProjectRequest {
+            name: "counter".to_owned(),
+            workspace_dir: workspace.path().join("projects"),
+            archive_path,
+        },
+        &global_db_path,
+    )
+    .expect("ingest and persist project");
+
+    // The user deleted the project directory outside the app: the registry
+    // still knows about it, but there is nothing left to open.
+    fs::remove_dir_all(&created.project_dir).expect("delete the project directory");
+
+    let server = SyntaxBridgeServer::bind("127.0.0.1:0")
+        .expect("bind test server")
+        .with_global_db_path(global_db_path);
+    let addr = server.local_addr().expect("read server address");
+    let handle = server.spawn().expect("spawn test server");
+
+    let mut stream = TcpStream::connect(addr).expect("connect to test server");
+    write!(
+        stream,
+        "GET /projects HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write request");
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read response");
+    handle.shutdown().expect("stop test server");
+
+    let response_body = response
+        .split("\r\n\r\n")
+        .nth(1)
+        .expect("response has HTTP body");
+    let json: Value = serde_json::from_str(response_body).expect("parse response body");
+    let projects = json
+        .get("projects")
+        .and_then(Value::as_array)
+        .expect("response includes projects array");
+
+    assert_eq!(
+        projects.len(),
+        1,
+        "unexpected response body: {response_body}"
+    );
+    assert_eq!(projects[0]["name"], "counter");
+    assert_eq!(
+        projects[0]["available"], false,
+        "a project whose directory is gone must be reported as unavailable: {response_body}"
+    );
+}
+
+#[test]
+fn recent_projects_endpoint_reports_an_existing_project_as_available() {
+    let workspace = TempWorkspace::new("recent-available").expect("create temporary workspace");
+    let archive_path = workspace.path().join("fixture.tar.gz");
+    write_cmake_fixture_tarball(workspace.path(), &archive_path).expect("create fixture archive");
+    let global_db_path = workspace.path().join("global.db");
+
+    project_service::create_project(
+        CreateProjectRequest {
+            name: "counter".to_owned(),
+            workspace_dir: workspace.path().join("projects"),
+            archive_path,
+        },
+        &global_db_path,
+    )
+    .expect("ingest and persist project");
+
+    let server = SyntaxBridgeServer::bind("127.0.0.1:0")
+        .expect("bind test server")
+        .with_global_db_path(global_db_path);
+    let addr = server.local_addr().expect("read server address");
+    let handle = server.spawn().expect("spawn test server");
+
+    let mut stream = TcpStream::connect(addr).expect("connect to test server");
+    write!(
+        stream,
+        "GET /projects HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write request");
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read response");
+    handle.shutdown().expect("stop test server");
+
+    let response_body = response
+        .split("\r\n\r\n")
+        .nth(1)
+        .expect("response has HTTP body");
+    let json: Value = serde_json::from_str(response_body).expect("parse response body");
+    let projects = json
+        .get("projects")
+        .and_then(Value::as_array)
+        .expect("response includes projects array");
+
+    assert_eq!(projects[0]["available"], true, "body: {response_body}");
+}
+
+#[test]
+fn forget_project_endpoint_drops_it_from_the_recent_projects_list() {
+    let workspace = TempWorkspace::new("forget-http").expect("create temporary workspace");
+    let archive_path = workspace.path().join("fixture.tar.gz");
+    write_cmake_fixture_tarball(workspace.path(), &archive_path).expect("create fixture archive");
+    let global_db_path = workspace.path().join("global.db");
+
+    let created = project_service::create_project(
+        CreateProjectRequest {
+            name: "counter".to_owned(),
+            workspace_dir: workspace.path().join("projects"),
+            archive_path,
+        },
+        &global_db_path,
+    )
+    .expect("ingest and persist project");
+    fs::remove_dir_all(&created.project_dir).expect("delete the project directory");
+
+    let server = SyntaxBridgeServer::bind("127.0.0.1:0")
+        .expect("bind test server")
+        .with_global_db_path(global_db_path);
+    let addr = server.local_addr().expect("read server address");
+    let handle = server.spawn().expect("spawn test server");
+
+    let body = serde_json::json!({ "project_dir": created.project_dir }).to_string();
+    let mut stream = TcpStream::connect(addr).expect("connect to test server");
+    write!(
+        stream,
+        "DELETE /projects HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .expect("write request");
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read response");
+
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK\r\n"),
+        "unexpected response: {response}"
+    );
+
+    let mut stream = TcpStream::connect(addr).expect("reconnect to test server");
+    write!(
+        stream,
+        "GET /projects HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write request");
+
+    let mut listing = String::new();
+    stream.read_to_string(&mut listing).expect("read response");
+    handle.shutdown().expect("stop test server");
+
+    let listing_body = listing
+        .split("\r\n\r\n")
+        .nth(1)
+        .expect("response has HTTP body");
+    let json: Value = serde_json::from_str(listing_body).expect("parse response body");
+    let projects = json
+        .get("projects")
+        .and_then(Value::as_array)
+        .expect("response includes projects array");
+
+    assert!(
+        projects.is_empty(),
+        "forgotten project must not be listed again: {listing_body}"
+    );
 }
 
 #[test]
@@ -436,8 +615,8 @@ fn open_project_endpoint_returns_not_found_for_a_bogus_directory() {
     let addr = server.local_addr().expect("read server address");
     let handle = server.spawn().expect("spawn test server");
 
-    let body = serde_json::json!({ "project_dir": workspace.path().join("does-not-exist") })
-        .to_string();
+    let body =
+        serde_json::json!({ "project_dir": workspace.path().join("does-not-exist") }).to_string();
     let mut stream = TcpStream::connect(addr).expect("connect to test server");
     write!(
         stream,

@@ -143,7 +143,9 @@ fn app(global_db_path: PathBuf) -> Router {
         .route("/health", get(health))
         .route(
             "/projects",
-            get(list_recent_projects_from_http).post(create_project_from_http),
+            get(list_recent_projects_from_http)
+                .post(create_project_from_http)
+                .delete(forget_project_from_http),
         )
         .route("/projects/open", post(open_project_from_http))
         .route("/projects/source-file", get(read_source_file_from_http))
@@ -225,8 +227,10 @@ async fn list_recent_projects_from_http(State(state): State<AppState>) -> Respon
     log_server("handling list recent projects request");
 
     let global_db_path = (*state.global_db_path).clone();
-    match tokio::task::spawn_blocking(move || project_service::list_recent_projects(&global_db_path))
-        .await
+    match tokio::task::spawn_blocking(move || {
+        project_service::list_recent_projects(&global_db_path)
+    })
+    .await
     {
         Ok(Ok(projects)) => json_response(StatusCode::OK, json!({ "projects": projects })),
         Ok(Err(error)) => {
@@ -291,6 +295,57 @@ async fn open_project_from_http(
             json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!({"error":"open_project_failed","message":error.to_string()}),
+            )
+        }
+    }
+}
+
+/// Drops a project from the recent-projects registry. Deleting a registry
+/// entry is idempotent from the caller's point of view, so forgetting an
+/// unknown project is reported as success with `forgotten: false` rather than
+/// as an error.
+async fn forget_project_from_http(
+    State(state): State<AppState>,
+    payload: Result<Json<OpenProjectRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(request) => request,
+        Err(error) => {
+            log_server(format_args!("invalid forget project JSON: {error}"));
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error":"invalid_json","message":error.body_text()}),
+            );
+        }
+    };
+
+    log_server(format_args!(
+        "forgetting project: project_dir={}",
+        request.project_dir.display()
+    ));
+
+    let global_db_path = (*state.global_db_path).clone();
+    match tokio::task::spawn_blocking(move || {
+        project_service::forget_project(&request.project_dir, &global_db_path)
+    })
+    .await
+    {
+        Ok(Ok(forgotten)) => {
+            log_server(format_args!("project forgotten: removed={forgotten}"));
+            json_response(StatusCode::OK, json!({ "forgotten": forgotten }))
+        }
+        Ok(Err(error)) => {
+            log_server(format_args!("forget project failed: {error}"));
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":"forget_project_failed","message":error.to_string()}),
+            )
+        }
+        Err(error) => {
+            log_server(format_args!("forget project task failed: {error}"));
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":"forget_project_failed","message":error.to_string()}),
             )
         }
     }

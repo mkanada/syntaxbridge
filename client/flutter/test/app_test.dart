@@ -394,6 +394,50 @@ void main() {
     expect(find.text('input-source/fixture/main.cpp'), findsOneWidget);
   });
 
+  testWidgets('offers to drop a recent project whose folder is gone', (
+    tester,
+  ) async {
+    final fakeClient = _FakeServerClient(
+      const ServerStatus(service: 'syntax-bridge-server', status: 'ok'),
+      recentProjects: const [
+        RecentProject(
+          name: 'gone',
+          projectDir: '/tmp/projects/gone',
+          sourceLanguage: 'cpp',
+          targetLanguage: 'dart',
+          lastIngestStatus: 'success',
+          available: false,
+        ),
+        RecentProject(
+          name: 'kept',
+          projectDir: '/tmp/projects/kept',
+          sourceLanguage: 'cpp',
+          targetLanguage: 'dart',
+          lastIngestStatus: 'success',
+        ),
+      ],
+    );
+
+    await tester.pumpWidget(SyntaxBridgeApp(serverClient: fakeClient));
+    await tester.pumpAndSettle();
+
+    expect(find.text('gone'), findsOneWidget);
+    expect(find.text('Folder no longer exists'), findsOneWidget);
+
+    // A project that cannot be opened must not pretend it can: tapping it
+    // does nothing instead of failing with a server error.
+    await tester.tap(find.text('gone'));
+    await tester.pumpAndSettle();
+    expect(fakeClient.openedProjectDir, isNull);
+
+    await tester.tap(find.byTooltip('Remove gone from the list'));
+    await tester.pumpAndSettle();
+
+    expect(fakeClient.forgottenProjectDir, '/tmp/projects/gone');
+    expect(find.text('gone'), findsNothing);
+    expect(find.text('kept'), findsOneWidget);
+  });
+
   testWidgets('imports an existing project through the modal dialog', (
     tester,
   ) async {
@@ -402,7 +446,8 @@ void main() {
       openProjectResult: const CreatedProject(
         name: 'verovio',
         projectDir: '/home/user/syntax-bridge-projects/verovio',
-        inputSourceDir: '/home/user/syntax-bridge-projects/verovio/input-source',
+        inputSourceDir:
+            '/home/user/syntax-bridge-projects/verovio/input-source',
         compilationUnits: [],
         sourceFiles: [],
       ),
@@ -580,9 +625,19 @@ class _FakeServerClient implements ServerClient {
   String? createdProjectName;
   String? readSourceFilePath;
   String? openedProjectDir;
+  String? forgottenProjectDir;
+  late List<RecentProject> _remainingProjects = recentProjects;
 
   @override
   Future<ServerStatus> health() async => status;
+
+  @override
+  Future<void> forgetProject(String projectDir) async {
+    forgottenProjectDir = projectDir;
+    _remainingProjects = _remainingProjects
+        .where((project) => project.projectDir != projectDir)
+        .toList();
+  }
 
   @override
   Future<CreatedProject> createProject(CreateProjectInput input) async {
@@ -602,7 +657,7 @@ class _FakeServerClient implements ServerClient {
   }
 
   @override
-  Future<List<RecentProject>> listRecentProjects() async => recentProjects;
+  Future<List<RecentProject>> listRecentProjects() async => _remainingProjects;
 
   @override
   Future<CreatedProject> openProject(String projectDir) async {

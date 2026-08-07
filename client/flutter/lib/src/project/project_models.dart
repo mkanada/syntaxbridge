@@ -19,6 +19,7 @@ class RecentProject {
     required this.sourceLanguage,
     required this.targetLanguage,
     required this.lastIngestStatus,
+    this.available = true,
   });
 
   factory RecentProject.fromJson(Map<String, Object?> json) {
@@ -28,6 +29,7 @@ class RecentProject {
       sourceLanguage: json['source_language'] as String? ?? '',
       targetLanguage: json['target_language'] as String? ?? '',
       lastIngestStatus: json['last_ingest_status'] as String? ?? '',
+      available: json['available'] as bool? ?? true,
     );
   }
 
@@ -36,6 +38,11 @@ class RecentProject {
   final String sourceLanguage;
   final String targetLanguage;
   final String lastIngestStatus;
+
+  /// Whether the project directory is still on disk. The server resolves this
+  /// when listing, since the user can delete a project folder at any time
+  /// without the app knowing.
+  final bool available;
 }
 
 class CreateProjectInput {

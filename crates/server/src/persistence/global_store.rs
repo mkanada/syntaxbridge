@@ -85,6 +85,19 @@ impl GlobalStore {
         Ok(())
     }
 
+    /// Drops a project from the registry, without touching anything on disk.
+    /// Returns whether a row was actually removed, so a caller can tell
+    /// "forgotten now" from "was never registered".
+    pub fn forget_project(&self, project_dir: &Path) -> Result<bool, PersistenceError> {
+        let project_dir = project_dir.to_string_lossy();
+        let removed = self.connection.execute(
+            "DELETE FROM projects WHERE project_dir = ?1",
+            params![project_dir],
+        )?;
+
+        Ok(removed > 0)
+    }
+
     pub fn list_projects(&self) -> Result<Vec<ProjectRecord>, PersistenceError> {
         let mut statement = self.connection.prepare(
             "SELECT name, project_dir, source_language, target_language, last_ingest_status
@@ -242,6 +255,51 @@ mod tests {
     }
 
     #[test]
+    fn forgetting_a_project_removes_it_from_the_registry() {
+        let db_path = temp_db_path("global-forget");
+        let store = GlobalStore::open(&db_path).expect("open global store");
+        let kept = Path::new("/tmp/syntax-bridge-projects/kept");
+        let removed = Path::new("/tmp/syntax-bridge-projects/removed");
+
+        store
+            .register_project("kept", kept, "cpp", "dart", "success")
+            .expect("register kept project");
+        store
+            .register_project("removed", removed, "cpp", "dart", "success")
+            .expect("register removed project");
+
+        assert!(
+            store.forget_project(removed).expect("forget project"),
+            "expected the registered project to be removed"
+        );
+
+        let names: Vec<_> = store
+            .list_projects()
+            .expect("list projects")
+            .into_iter()
+            .map(|project| project.name)
+            .collect();
+        assert_eq!(names, vec!["kept"]);
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn forgetting_an_unknown_project_reports_that_nothing_was_removed() {
+        let db_path = temp_db_path("global-forget-unknown");
+        let store = GlobalStore::open(&db_path).expect("open global store");
+
+        assert!(
+            !store
+                .forget_project(Path::new("/tmp/syntax-bridge-projects/never-registered"))
+                .expect("forget project"),
+            "expected no row to be removed"
+        );
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
     fn recent_projects_limits_to_the_most_recently_opened() {
         let db_path = temp_db_path("global-recent-limit");
         let store = GlobalStore::open(&db_path).expect("open global store");
@@ -263,7 +321,13 @@ mod tests {
         let names: Vec<_> = recent.iter().map(|project| project.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["project-6", "project-5", "project-4", "project-3", "project-2"]
+            vec![
+                "project-6",
+                "project-5",
+                "project-4",
+                "project-3",
+                "project-2"
+            ]
         );
 
         let _ = fs::remove_file(&db_path);

@@ -72,11 +72,30 @@ class HttpServerClient implements ServerClient {
     }
 
     final json = jsonDecode(body) as Map<String, Object?>;
-    final projectsJson = json['projects'] as List<Object?>? ?? const <Object?>[];
+    final projectsJson =
+        json['projects'] as List<Object?>? ?? const <Object?>[];
     return projectsJson
         .whereType<Map<String, Object?>>()
         .map(RecentProject.fromJson)
         .toList();
+  }
+
+  @override
+  Future<void> forgetProject(String projectDir) async {
+    final url = baseUrl.resolve('/projects');
+    final payload = jsonEncode({'project_dir': projectDir});
+    cliLog('HTTP DELETE $url payload=$payload');
+    final request = await _httpClient.deleteUrl(url);
+    request.headers.contentType = ContentType.json;
+    request.write(payload);
+
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP DELETE $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException(_errorMessageFromBody(body));
+    }
   }
 
   @override
