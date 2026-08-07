@@ -72,6 +72,23 @@ Ele:
 - instala o runner de testes em `/app/bin/syntax-bridge-toolchain-tests`;
 - instala desktop file, icone e metainfo do app.
 
+O manifesto esta dividido em tres modulos, do mais estavel para o mais volatil,
+porque o cache do flatpak-builder e uma cadeia: um miss em um modulo invalida
+todos os seguintes.
+
+- `dart-sdk` — baixa e instala o Dart SDK;
+- `syntax-bridge-server` — compila o servidor e os binarios de teste;
+- `syntax-bridge-app` — instala o bundle Flutter e os wrappers.
+
+As fontes do modulo Rust vem de `rust-src.tar`, um arquivo gerado por
+`scripts/test-flatpak-package.sh`. Isso e proposital: o flatpak-builder nao
+consegue cachear um modulo que use fonte `type: dir`
+(`builder_source_dir_checksum` alimenta o cache com um valor aleatorio, com o
+comentario "We can't realistically checksum a directory, so always rebuild"),
+mas ele faz checksum do **conteudo** de uma fonte `type: file`. Empacotar as
+entradas Rust em um tar deterministico transforma "arvore inalterada" em cache
+hit em vez de recompilacao completa.
+
 O comando principal do Flatpak executa `build-aux/flatpak/syntax-bridge`, que:
 
 - sobe o servidor Rust em `127.0.0.1:37651`;
@@ -88,12 +105,18 @@ Existem dois scripts de verificacao:
     ativados;
 - `scripts/test-flatpak-package.sh`
   - constroi o bundle Flutter Linux;
+  - empacota as entradas Rust em `build-aux/flatpak/rust-src.tar`;
   - constroi o Flatpak;
   - instala o app localmente;
   - executa os testes pelo app instalado com
     `flatpak run --command=syntax-bridge-toolchain-tests dev.syntax_bridge.SyntaxBridge`;
   - executa o teste HTTP pelo app instalado com
     `flatpak run --command=syntax-bridge-server-health-tests dev.syntax_bridge.SyntaxBridge`.
+
+O cache do flatpak-builder fica em `~/.cache/syntax-bridge` (ajustavel por
+`FLATPAK_CACHE_ROOT`, `FLATPAK_BUILD_DIR` e `FLATPAK_STATE_DIR`). Antes ele
+ficava em `/tmp`, que o systemd-tmpfiles esvazia a cada boot — o que forcava
+rebaixar os 222 MB do Dart SDK e recompilar tudo depois de reiniciar a maquina.
 
 ## Validacoes ja executadas com sucesso
 

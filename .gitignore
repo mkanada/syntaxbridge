@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target/
 
+# Fonte Rust empacotada para o build Flatpak (gerada por scripts/test-flatpak-package.sh)
+/build-aux/flatpak/rust-src.tar
+
 # CMake build artifacts dos recursos de teste
 /test-resources/*/build/
 
