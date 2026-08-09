@@ -182,7 +182,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Point'), findsOneWidget);
-    expect(find.text('struct'), findsOneWidget);
+    expect(find.widgetWithText(ListTile, 'struct'), findsOneWidget);
   });
 
   testWidgets("opens a type's source file with its body highlighted on click", (

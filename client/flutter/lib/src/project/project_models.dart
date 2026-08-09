@@ -162,7 +162,10 @@ enum TypeDeclarationKind {
   enum_,
   typedef,
   typeAlias,
-  macro;
+  constantMacro,
+  functionMacro,
+  headerGuard,
+  annotationMacro;
 
   static TypeDeclarationKind fromJson(String? value) {
     return switch (value) {
@@ -172,7 +175,10 @@ enum TypeDeclarationKind {
       'enum' => TypeDeclarationKind.enum_,
       'typedef' => TypeDeclarationKind.typedef,
       'type_alias' => TypeDeclarationKind.typeAlias,
-      'macro' => TypeDeclarationKind.macro,
+      'constant_macro' => TypeDeclarationKind.constantMacro,
+      'function_macro' => TypeDeclarationKind.functionMacro,
+      'header_guard' => TypeDeclarationKind.headerGuard,
+      'annotation_macro' => TypeDeclarationKind.annotationMacro,
       _ => TypeDeclarationKind.struct,
     };
   }
@@ -186,9 +192,27 @@ enum TypeDeclarationKind {
       TypeDeclarationKind.enum_ => 'enum',
       TypeDeclarationKind.typedef => 'typedef',
       TypeDeclarationKind.typeAlias => 'type alias',
-      TypeDeclarationKind.macro => 'macro',
+      TypeDeclarationKind.constantMacro => 'constant',
+      TypeDeclarationKind.functionMacro => 'function macro',
+      TypeDeclarationKind.headerGuard => 'header guard',
+      TypeDeclarationKind.annotationMacro => 'macro',
     };
   }
+
+  /// Whether this kind is ever worth showing in the type catalog UI. Header
+  /// guards and other valueless annotation macros are pure preprocessor
+  /// plumbing (`#ifndef FOO_H` / `#define FOO_H`, `#define MYLIB_API`) with
+  /// nothing to show a user.
+  bool get isUserVisible =>
+      this != TypeDeclarationKind.headerGuard &&
+      this != TypeDeclarationKind.annotationMacro;
+
+  /// Whether this kind belongs in the "Constants & macros" section rather
+  /// than alongside struct/class/union/enum/typedef/type alias — a macro
+  /// isn't a type, even when it carries a value.
+  bool get isMacro =>
+      this == TypeDeclarationKind.constantMacro ||
+      this == TypeDeclarationKind.functionMacro;
 }
 
 /// One named type declared in the project (US-3): a struct, class, union,

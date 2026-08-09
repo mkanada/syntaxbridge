@@ -322,10 +322,20 @@ Tabelas `type_declarations` e `type_dependencies` no `project.db`.
   vez de representados) e *inline* (hoje tratados como namespace comum,
   aparecendo no nome qualificado quando não deveriam), *forward declaration*
   vs. definição, tipos aninhados e membros, enums com escopo.
-- **Macros são um caso à parte:** não têm tipo, não têm escopo e muitas não são
-  conversíveis. Vale marcar desde já a subdivisão entre macro-constante,
-  macro-função e macro de compilação condicional, porque o destino em Dart de
-  cada uma é diferente.
+- **Resolvido (parcial):** macros não têm tipo nem escopo, e boa parte não é
+  conversível — `TypeDeclarationKind` ganhou `ConstantMacro`, `FunctionMacro`,
+  `HeaderGuard` e `AnnotationMacro` no lugar do antigo `Macro` genérico
+  (`classify_macro` em `type_catalog.rs`, via `clang_Cursor_isMacroFunctionLike`/
+  `isMacroBuiltin` e tokenização do corpo do macro). `HeaderGuard` (o `#define`
+  de uma guarda `#ifndef`/`#define`, detectado por heurística de nome+posição)
+  e `AnnotationMacro` (outras macros sem valor, ex. `#define MYLIB_API`) são
+  filtrados na UI (`TypesView.isUserVisible`) por não terem nada a mostrar ao
+  usuário; `ConstantMacro`/`FunctionMacro` aparecem numa seção "Constants &
+  macros" à parte dos tipos nomeados. Builtins do compilador (`__STDC__` etc.)
+  são descartados no catálogo. **Ainda falta:** macro de compilação
+  condicional (`#ifdef`/`#if` fora de guardas de header) não tem representação
+  própria — hoje cai em `AnnotationMacro` — e o destino de cada subtipo em
+  Dart (US-7) ainda não foi definido.
 - O grafo de dependências (`TypeDependency`) já implementado não estava
   previsto no plano original e é mais valioso do que a lista: é ele que dá
   ordem topológica de geração em US-8 e fecho transitivo em US-6.

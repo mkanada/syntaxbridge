@@ -1,6 +1,9 @@
 //! Extracts the catalog of named types (structs, classes, unions, enums,
-//! typedefs, type aliases and macro `#define`s) declared across a project's
-//! compilation units, using `libclang`.
+//! typedefs, type aliases) and `#define` macros declared across a project's
+//! compilation units, using `libclang`. Macros are further classified into
+//! constants, function-like macros, include guards and other annotations
+//! (see `TypeDeclarationKind`) since most of them aren't types and some
+//! (include guards) aren't meaningful to a user at all.
 //!
 //! `libclang` is loaded dynamically at runtime (see the `clang-sys`
 //! `runtime` feature) and is only ever expected to be found inside the
@@ -29,7 +32,20 @@ pub enum TypeDeclarationKind {
     Enum,
     Typedef,
     TypeAlias,
-    Macro,
+    /// An object-like macro with a value, e.g. `#define MAX_SIZE 100` — the
+    /// closest thing C's preprocessor has to a named constant.
+    ConstantMacro,
+    /// A function-like macro, e.g. `#define SQUARE(x) ((x) * (x))`.
+    FunctionMacro,
+    /// The valueless `#define` half of an `#ifndef`/`#define` include guard
+    /// (e.g. `#define FOO_H`). Pure build plumbing with nothing to show a
+    /// user, so callers are expected to filter this kind out rather than
+    /// display it.
+    HeaderGuard,
+    /// Any other valueless object-like macro (feature flags, export/import
+    /// annotations like `#define MYLIB_API`). Not a type either, but kept
+    /// distinct from `HeaderGuard` in case it becomes useful later.
+    AnnotationMacro,
 }
 
 impl TypeDeclarationKind {
@@ -41,7 +57,10 @@ impl TypeDeclarationKind {
             Self::Enum => "enum",
             Self::Typedef => "typedef",
             Self::TypeAlias => "type_alias",
-            Self::Macro => "macro",
+            Self::ConstantMacro => "constant_macro",
+            Self::FunctionMacro => "function_macro",
+            Self::HeaderGuard => "header_guard",
+            Self::AnnotationMacro => "annotation_macro",
         }
     }
 
@@ -53,7 +72,10 @@ impl TypeDeclarationKind {
             "enum" => Some(Self::Enum),
             "typedef" => Some(Self::Typedef),
             "type_alias" => Some(Self::TypeAlias),
-            "macro" => Some(Self::Macro),
+            "constant_macro" => Some(Self::ConstantMacro),
+            "function_macro" => Some(Self::FunctionMacro),
+            "header_guard" => Some(Self::HeaderGuard),
+            "annotation_macro" => Some(Self::AnnotationMacro),
             _ => None,
         }
     }
@@ -389,10 +411,12 @@ extern "C" fn visit_cursor(
     let state = unsafe { &mut *(data as *mut VisitorState<'_>) };
 
     let kind = unsafe { clang_sys::clang_getCursorKind(cursor) };
-    let is_relevant = declaration_kind_for(kind).filter(|declaration_kind| {
-        *declaration_kind == TypeDeclarationKind::Macro
-            || unsafe { clang_sys::clang_isCursorDefinition(cursor) } != 0
-    });
+    let is_relevant = if kind == clang_sys::CXCursor_MacroDefinition {
+        unsafe { classify_macro(cursor) }
+    } else {
+        declaration_kind_for(kind)
+            .filter(|_| unsafe { clang_sys::clang_isCursorDefinition(cursor) } != 0)
+    };
 
     if let Some(declaration_kind) = is_relevant
         && let Some(declaration) = describe_cursor(cursor, declaration_kind, state.project_root)
@@ -531,9 +555,95 @@ fn declaration_kind_for(kind: clang_sys::CXCursorKind) -> Option<TypeDeclaration
         clang_sys::CXCursor_EnumDecl => Some(TypeDeclarationKind::Enum),
         clang_sys::CXCursor_TypedefDecl => Some(TypeDeclarationKind::Typedef),
         clang_sys::CXCursor_TypeAliasDecl => Some(TypeDeclarationKind::TypeAlias),
-        clang_sys::CXCursor_MacroDefinition => Some(TypeDeclarationKind::Macro),
         _ => None,
     }
+}
+
+/// Classifies a `CXCursor_MacroDefinition` cursor into the macro kind that
+/// best describes it, or `None` for compiler-builtin macros (`__STDC__` and
+/// the like), which carry no project information worth cataloging.
+///
+/// Function-like macros (`#define SQUARE(x) ...`) are unambiguous via
+/// `clang_Cursor_isMacroFunctionLike`. Object-like macros are split by
+/// whether they expand to anything: a macro with no replacement tokens is
+/// either an include guard's `#define` half or some other valueless
+/// annotation/flag, distinguished with `looks_like_header_guard`; a macro
+/// with replacement tokens is treated as a constant.
+unsafe fn classify_macro(cursor: clang_sys::CXCursor) -> Option<TypeDeclarationKind> {
+    if unsafe { clang_sys::clang_Cursor_isMacroBuiltin(cursor) } != 0 {
+        return None;
+    }
+
+    if unsafe { clang_sys::clang_Cursor_isMacroFunctionLike(cursor) } != 0 {
+        return Some(TypeDeclarationKind::FunctionMacro);
+    }
+
+    if unsafe { macro_has_value_tokens(cursor) } {
+        return Some(TypeDeclarationKind::ConstantMacro);
+    }
+
+    let name = unsafe { cxstring_to_string(clang_sys::clang_getCursorSpelling(cursor)) };
+    let location = unsafe { clang_sys::clang_getCursorLocation(cursor) };
+    let mut line: c_uint = 0;
+    unsafe {
+        clang_sys::clang_getSpellingLocation(
+            location,
+            std::ptr::null_mut(),
+            &mut line,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+    }
+
+    Some(if looks_like_header_guard(&name, line) {
+        TypeDeclarationKind::HeaderGuard
+    } else {
+        TypeDeclarationKind::AnnotationMacro
+    })
+}
+
+/// Tokenizes an object-like macro's definition and reports whether it
+/// expands to anything beyond its own name (e.g. `MAX_SIZE` in `#define
+/// MAX_SIZE 100` has one extra token; a valueless `#define MYLIB_API` has
+/// none).
+unsafe fn macro_has_value_tokens(cursor: clang_sys::CXCursor) -> bool {
+    let translation_unit = unsafe { clang_sys::clang_Cursor_getTranslationUnit(cursor) };
+    let extent = unsafe { clang_sys::clang_getCursorExtent(cursor) };
+
+    let mut tokens: *mut clang_sys::CXToken = std::ptr::null_mut();
+    let mut token_count: c_uint = 0;
+    unsafe {
+        clang_sys::clang_tokenize(translation_unit, extent, &mut tokens, &mut token_count);
+    }
+
+    let has_value = token_count > 1;
+
+    if !tokens.is_null() {
+        unsafe {
+            clang_sys::clang_disposeTokens(translation_unit, tokens, token_count);
+        }
+    }
+
+    has_value
+}
+
+/// Heuristic for whether a valueless object-like macro is the `#define`
+/// half of an `#ifndef`/`#define` include guard, rather than some other
+/// flag/annotation macro (e.g. `#define MYLIB_API`): `libclang` doesn't
+/// expose `#ifndef`/`#endif` structure directly, but guards are
+/// conventionally the first thing defined in a header and named after the
+/// file they protect, so both the position and the name are checked.
+fn looks_like_header_guard(name: &str, line: u32) -> bool {
+    const NEAR_TOP_OF_FILE: u32 = 5;
+
+    line <= NEAR_TOP_OF_FILE && guard_name_pattern(name)
+}
+
+fn guard_name_pattern(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    const SUFFIXES: &[&str] = &["_H", "_H_", "_HPP", "_HPP_", "_HXX", "_HXX_", "_INCLUDED"];
+
+    SUFFIXES.iter().any(|suffix| upper.ends_with(suffix))
 }
 
 fn describe_cursor(

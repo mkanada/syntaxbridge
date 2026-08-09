@@ -31,7 +31,7 @@ fn sample_declarations() -> Vec<TypeDeclaration> {
         },
         TypeDeclaration {
             name: "ANSWER".to_owned(),
-            kind: TypeDeclarationKind::Macro,
+            kind: TypeDeclarationKind::ConstantMacro,
             namespace: String::new(),
             file: "/workspace/src/types.h".to_owned(),
             line: 1,

@@ -90,8 +90,8 @@ fn create_project_catalogs_project_types_with_libclang() {
             .find(|declaration| declaration.name == name && declaration.kind == kind)
     };
 
-    let macro_decl = find("ANSWER", TypeDeclarationKind::Macro)
-        .unwrap_or_else(|| panic!("expected ANSWER macro in catalog: {catalog:#?}"));
+    let macro_decl = find("ANSWER", TypeDeclarationKind::ConstantMacro)
+        .unwrap_or_else(|| panic!("expected ANSWER constant macro in catalog: {catalog:#?}"));
     assert!(macro_decl.file.ends_with("types.h"));
 
     let typedef_decl = find("MyInt", TypeDeclarationKind::Typedef)
@@ -382,6 +382,106 @@ fn create_project_catalogs_namespace_and_extent_with_libclang() {
         nested_point.end_line > nested_point.line,
         "expected geometry::Point's extent to cover its multi-line body: {nested_point:#?}"
     );
+}
+
+const MACROS_MAIN_CPP: &str = r#"
+#include "macros.h"
+
+int main() {
+    int limit = MAX_SIZE;
+    int squared = SQUARE(limit);
+    (void)limit;
+    (void)squared;
+    return 0;
+}
+"#;
+
+const MACROS_H: &str = r#"
+#ifndef MACROS_H
+#define MACROS_H
+
+#define MAX_SIZE 100
+#define SQUARE(x) ((x) * (x))
+#define MYLIB_API
+
+MYLIB_API int compute();
+
+#endif
+"#;
+
+/// The type catalog should be selective about what counts as a "type":
+/// header guards and valueless annotation macros are pure preprocessor
+/// noise with nothing to show a user, so they get their own kinds instead
+/// of being lumped into a generic `Macro` alongside real constants and
+/// function-like macros.
+#[test]
+fn create_project_classifies_macro_kinds_with_libclang() {
+    let workspace = TempWorkspace::new("type-catalog-macros").expect("create temporary workspace");
+    let archive_path = workspace.path().join("fixture.tar.gz");
+    write_macros_fixture_tarball(workspace.path(), &archive_path).expect("create fixture archive");
+    let global_db_path = workspace.path().join("global.db");
+
+    let project = project_service::create_project(
+        CreateProjectRequest {
+            name: "type_catalog_macros_fixture".to_owned(),
+            workspace_dir: workspace.path().join("projects"),
+            archive_path,
+        },
+        &global_db_path,
+        None,
+    )
+    .expect("ingest project and extract type catalog");
+
+    let catalog = &project.type_catalog;
+
+    let find = |name: &str, kind: TypeDeclarationKind| {
+        catalog
+            .iter()
+            .find(|declaration| declaration.name == name && declaration.kind == kind)
+    };
+
+    find("MAX_SIZE", TypeDeclarationKind::ConstantMacro).unwrap_or_else(|| {
+        panic!("expected MAX_SIZE classified as a constant macro: {catalog:#?}")
+    });
+
+    find("SQUARE", TypeDeclarationKind::FunctionMacro).unwrap_or_else(|| {
+        panic!("expected SQUARE classified as a function-like macro: {catalog:#?}")
+    });
+
+    find("MACROS_H", TypeDeclarationKind::HeaderGuard)
+        .unwrap_or_else(|| panic!("expected MACROS_H classified as a header guard: {catalog:#?}"));
+
+    find("MYLIB_API", TypeDeclarationKind::AnnotationMacro).unwrap_or_else(|| {
+        panic!("expected MYLIB_API classified as a valueless annotation macro: {catalog:#?}")
+    });
+}
+
+fn write_macros_fixture_tarball(workspace: &Path, archive_path: &Path) -> io::Result<()> {
+    let source_dir = workspace.join("fixture");
+    fs::create_dir_all(&source_dir)?;
+    fs::write(source_dir.join("main.cpp"), MACROS_MAIN_CPP)?;
+    fs::write(source_dir.join("macros.h"), MACROS_H)?;
+    fs::write(
+        source_dir.join("CMakeLists.txt"),
+        r#"
+cmake_minimum_required(VERSION 3.16)
+project(syntax_bridge_type_catalog_macros_fixture LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_executable(syntax_bridge_type_catalog_macros_fixture main.cpp)
+"#,
+    )?;
+
+    let output = Command::new("tar")
+        .arg("-czf")
+        .arg(archive_path)
+        .arg("-C")
+        .arg(workspace)
+        .arg("fixture")
+        .output()?;
+    assert_success(output);
+
+    Ok(())
 }
 
 fn write_namespaces_fixture_tarball(workspace: &Path, archive_path: &Path) -> io::Result<()> {
