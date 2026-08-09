@@ -214,12 +214,28 @@ escritos à mão em linguagens diferentes.
 
 ## Ordem sugerida
 
-1. Inverter a posse da rolagem em `DockablePanel`.
-2. Registro de painéis e lado esquerdo tabulado.
-3. `GET /projects/types` e painel navegador de tipos — fecha o critério 7 de
-   US-3 e é o menor incremento de valor visível disponível hoje.
-4. Modelo de abas no centro e rolar-até-a-linha — pré-requisito do critério 5
-   de US-4.
+1. ✅ Inverter a posse da rolagem em `DockablePanel` —
+   `client/flutter/lib/src/ui/dockable_panel.dart`,
+   `source_files_view.dart`, `execution_log_view.dart`; teste em
+   `test/dockable_panel_test.dart`.
+2. ✅ Registro de painéis e lado esquerdo tabulado —
+   `panel_descriptor.dart`, `panel_group.dart` (`TabbedPanelGroup`),
+   integrados em `server_status_page.dart`; teste em
+   `test/panel_group_test.dart`. A persistência do layout no `project.db`
+   (critério 3 do bloqueio 2) **não** foi feita — fica para quando um passo
+   futuro justificar o custo de schema.
+3. ✅ `GET /projects/types` e painel navegador de tipos — fecha o critério 7 de
+   US-3. `types_view.dart`, rota em `crates/server/src/server.rs`.
+4. 🟡 Rolar-até-a-linha e realce, sem o modelo de abas ainda —
+   `source_file_viewer.dart` (`SourceFileViewer` virou `StatefulWidget`, ganhou
+   `ScrollController`, `highlightStartLine`/`highlightEndLine`); teste em
+   `test/source_file_viewer_test.dart`. Disparado hoje só pelo clique em um
+   tipo do navegador Types (`server_status_page.dart`), que abre o arquivo de
+   origem com o corpo do tipo destacado — não pelo modelo `WorkspaceDocument`
+   descrito abaixo, que continua sem existir: ainda há só um documento aberto
+   por vez no centro (`_selectedSourceFile` continua sendo um campo único, não
+   uma lista de abas). Falta o próprio modelo de abas para o critério 5 de
+   US-4 (clicar em um *uso*, não numa declaração).
 5. Painel inspetor ligado à seleção — o hospedeiro de US-4 e US-5.
 
 Os passos 1, 2 e 4 são refatorações com teste próprio e nenhuma mudança de

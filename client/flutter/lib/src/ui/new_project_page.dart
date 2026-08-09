@@ -1,26 +1,30 @@
 import 'package:flutter/material.dart';
 
 import '../io/path_picker.dart';
-import '../project/project_error_message.dart';
 import '../project/project_models.dart';
-import '../server/server_client.dart';
 import 'ide_theme.dart';
 import 'project_creation_pane.dart';
 
 /// Full-screen "create a new project" step shown before the IDE loads, so
 /// there is nothing else to interact with until a project exists.
+///
+/// This page only collects and validates the form's parameters — submitting
+/// hands the input off via [onSubmit] rather than calling the server itself,
+/// so the caller can move to a progress screen immediately (`assim que os
+/// parâmetros... estão válidos, ir para a próxima tela`) instead of leaving
+/// the user staring at a blocked button while the server ingests the
+/// archive and runs `libclang` extraction, which can take minutes for a
+/// real project.
 class NewProjectPage extends StatefulWidget {
   const NewProjectPage({
     super.key,
-    required this.serverClient,
     required this.pathPicker,
-    required this.onProjectCreated,
+    required this.onSubmit,
     required this.onCancel,
   });
 
-  final ServerClient serverClient;
   final PathPicker pathPicker;
-  final ValueChanged<CreatedProject> onProjectCreated;
+  final ValueChanged<CreateProjectInput> onSubmit;
   final VoidCallback onCancel;
 
   @override
@@ -31,8 +35,6 @@ class _NewProjectPageState extends State<NewProjectPage> {
   final _nameController = TextEditingController();
   final _workspaceDirController = TextEditingController();
   final _archivePathController = TextEditingController();
-  bool _creating = false;
-  Object? _createError;
 
   @override
   void dispose() {
@@ -43,8 +45,7 @@ class _NewProjectPageState extends State<NewProjectPage> {
   }
 
   bool get _canCreateProject {
-    return !_creating &&
-        _nameController.text.trim().isNotEmpty &&
+    return _nameController.text.trim().isNotEmpty &&
         _workspaceDirController.text.trim().isNotEmpty &&
         _archivePathController.text.trim().isNotEmpty;
   }
@@ -75,40 +76,14 @@ class _NewProjectPageState extends State<NewProjectPage> {
     setState(() {});
   }
 
-  Future<void> _createProject() async {
-    final input = CreateProjectInput(
-      name: _nameController.text.trim(),
-      workspaceDir: _workspaceDirController.text.trim(),
-      archivePath: _archivePathController.text.trim(),
+  void _submit() {
+    widget.onSubmit(
+      CreateProjectInput(
+        name: _nameController.text.trim(),
+        workspaceDir: _workspaceDirController.text.trim(),
+        archivePath: _archivePathController.text.trim(),
+      ),
     );
-
-    setState(() {
-      _creating = true;
-      _createError = null;
-    });
-
-    try {
-      final project = await widget.serverClient.createProject(input);
-      if (!mounted) {
-        return;
-      }
-
-      widget.onProjectCreated(project);
-    } catch (error) {
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
-        _createError = error;
-      });
-    } finally {
-      if (mounted) {
-        setState(() {
-          _creating = false;
-        });
-      }
-    }
   }
 
   @override
@@ -148,14 +123,11 @@ class _NewProjectPageState extends State<NewProjectPage> {
                   nameController: _nameController,
                   workspaceDirController: _workspaceDirController,
                   archivePathController: _archivePathController,
-                  creating: _creating,
-                  createError: _createError,
                   canCreateProject: _canCreateProject,
                   onChanged: () => setState(() {}),
                   onChooseWorkspaceDirectory: _chooseWorkspaceDirectory,
                   onChooseSourceArchive: _chooseSourceArchive,
-                  onCreateProject: _createProject,
-                  errorMessage: projectErrorMessage,
+                  onCreateProject: _submit,
                 ),
               ],
             ),

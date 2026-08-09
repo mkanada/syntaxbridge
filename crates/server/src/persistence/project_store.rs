@@ -34,22 +34,31 @@ impl ProjectStore {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 kind TEXT NOT NULL,
+                namespace TEXT NOT NULL,
                 file TEXT NOT NULL,
                 line INTEGER NOT NULL,
-                column INTEGER NOT NULL
+                column INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                end_column INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS type_dependencies (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 caller_name TEXT NOT NULL,
                 caller_kind TEXT NOT NULL,
+                caller_namespace TEXT NOT NULL,
                 caller_file TEXT NOT NULL,
                 caller_line INTEGER NOT NULL,
                 caller_column INTEGER NOT NULL,
+                caller_end_line INTEGER NOT NULL,
+                caller_end_column INTEGER NOT NULL,
                 callee_name TEXT NOT NULL,
                 callee_kind TEXT NOT NULL,
+                callee_namespace TEXT NOT NULL,
                 callee_file TEXT NOT NULL,
                 callee_line INTEGER NOT NULL,
-                callee_column INTEGER NOT NULL
+                callee_column INTEGER NOT NULL,
+                callee_end_line INTEGER NOT NULL,
+                callee_end_column INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS source_files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,6 +66,8 @@ impl ProjectStore {
                 kind TEXT NOT NULL
             );",
         )?;
+
+        migrate_type_columns(&connection)?;
 
         Ok(Self { connection })
     }
@@ -125,14 +136,17 @@ impl ProjectStore {
 
         for declaration in declarations {
             transaction.execute(
-                "INSERT INTO type_declarations (name, kind, file, line, column)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO type_declarations (name, kind, namespace, file, line, column, end_line, end_column)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     declaration.name,
                     declaration.kind.as_str(),
+                    declaration.namespace,
                     declaration.file,
                     declaration.line,
-                    declaration.column
+                    declaration.column,
+                    declaration.end_line,
+                    declaration.end_column
                 ],
             )?;
         }
@@ -142,23 +156,27 @@ impl ProjectStore {
     }
 
     pub fn list_type_declarations(&self) -> Result<Vec<TypeDeclaration>, PersistenceError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT name, kind, file, line, column FROM type_declarations ORDER BY id")?;
+        let mut statement = self.connection.prepare(
+            "SELECT name, kind, namespace, file, line, column, end_line, end_column
+             FROM type_declarations ORDER BY id",
+        )?;
 
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, u32>(3)?,
+                row.get::<_, String>(3)?,
                 row.get::<_, u32>(4)?,
+                row.get::<_, u32>(5)?,
+                row.get::<_, u32>(6)?,
+                row.get::<_, u32>(7)?,
             ))
         })?;
 
         let mut declarations = Vec::new();
         for row in rows {
-            let (name, kind, file, line, column) = row?;
+            let (name, kind, namespace, file, line, column, end_line, end_column) = row?;
             let Some(kind) = TypeDeclarationKind::parse(&kind) else {
                 continue;
             };
@@ -166,9 +184,12 @@ impl ProjectStore {
             declarations.push(TypeDeclaration {
                 name,
                 kind,
+                namespace,
                 file,
                 line,
                 column,
+                end_line,
+                end_column,
             });
         }
 
@@ -193,20 +214,26 @@ impl ProjectStore {
         for dependency in dependencies {
             transaction.execute(
                 "INSERT INTO type_dependencies (
-                    caller_name, caller_kind, caller_file, caller_line, caller_column,
-                    callee_name, callee_kind, callee_file, callee_line, callee_column
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    caller_name, caller_kind, caller_namespace, caller_file, caller_line, caller_column, caller_end_line, caller_end_column,
+                    callee_name, callee_kind, callee_namespace, callee_file, callee_line, callee_column, callee_end_line, callee_end_column
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     dependency.caller.name,
                     dependency.caller.kind.as_str(),
+                    dependency.caller.namespace,
                     dependency.caller.file,
                     dependency.caller.line,
                     dependency.caller.column,
+                    dependency.caller.end_line,
+                    dependency.caller.end_column,
                     dependency.callee.name,
                     dependency.callee.kind.as_str(),
+                    dependency.callee.namespace,
                     dependency.callee.file,
                     dependency.callee.line,
                     dependency.callee.column,
+                    dependency.callee.end_line,
+                    dependency.callee.end_column,
                 ],
             )?;
         }
@@ -217,8 +244,8 @@ impl ProjectStore {
 
     pub fn list_type_dependencies(&self) -> Result<Vec<TypeDependency>, PersistenceError> {
         let mut statement = self.connection.prepare(
-            "SELECT caller_name, caller_kind, caller_file, caller_line, caller_column,
-                    callee_name, callee_kind, callee_file, callee_line, callee_column
+            "SELECT caller_name, caller_kind, caller_namespace, caller_file, caller_line, caller_column, caller_end_line, caller_end_column,
+                    callee_name, callee_kind, callee_namespace, callee_file, callee_line, callee_column, callee_end_line, callee_end_column
              FROM type_dependencies ORDER BY id",
         )?;
 
@@ -227,13 +254,19 @@ impl ProjectStore {
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, u32>(3)?,
+                row.get::<_, String>(3)?,
                 row.get::<_, u32>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, u32>(8)?,
-                row.get::<_, u32>(9)?,
+                row.get::<_, u32>(5)?,
+                row.get::<_, u32>(6)?,
+                row.get::<_, u32>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, u32>(12)?,
+                row.get::<_, u32>(13)?,
+                row.get::<_, u32>(14)?,
+                row.get::<_, u32>(15)?,
             ))
         })?;
 
@@ -242,14 +275,20 @@ impl ProjectStore {
             let (
                 caller_name,
                 caller_kind,
+                caller_namespace,
                 caller_file,
                 caller_line,
                 caller_column,
+                caller_end_line,
+                caller_end_column,
                 callee_name,
                 callee_kind,
+                callee_namespace,
                 callee_file,
                 callee_line,
                 callee_column,
+                callee_end_line,
+                callee_end_column,
             ) = row?;
 
             let (Some(caller_kind), Some(callee_kind)) = (
@@ -263,16 +302,22 @@ impl ProjectStore {
                 caller: TypeDeclaration {
                     name: caller_name,
                     kind: caller_kind,
+                    namespace: caller_namespace,
                     file: caller_file,
                     line: caller_line,
                     column: caller_column,
+                    end_line: caller_end_line,
+                    end_column: caller_end_column,
                 },
                 callee: TypeDeclaration {
                     name: callee_name,
                     kind: callee_kind,
+                    namespace: callee_namespace,
                     file: callee_file,
                     line: callee_line,
                     column: callee_column,
+                    end_line: callee_end_line,
+                    end_column: callee_end_column,
                 },
             });
         }
@@ -319,6 +364,92 @@ impl ProjectStore {
 
         Ok(files)
     }
+}
+
+/// Adds the `namespace`/`end_line`/`end_column` columns to `type_declarations`
+/// and their `caller_`/`callee_` counterparts to `type_dependencies` when
+/// opening a `project.db` written before those columns existed.
+///
+/// `CREATE TABLE IF NOT EXISTS` above leaves an already-created table
+/// untouched, so without this, reopening an older project fails with
+/// "no such column" the first time a type is listed. This is a narrow,
+/// additive migration rather than a general schema-versioning mechanism (see
+/// `docs/plans/User Steps.md`'s open item on that).
+fn migrate_type_columns(connection: &Connection) -> Result<(), PersistenceError> {
+    ensure_column(
+        connection,
+        "type_declarations",
+        "namespace",
+        "namespace TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "type_declarations",
+        "end_line",
+        "end_line INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        connection,
+        "type_declarations",
+        "end_column",
+        "end_column INTEGER NOT NULL DEFAULT 0",
+    )?;
+
+    for side in ["caller", "callee"] {
+        ensure_column(
+            connection,
+            "type_dependencies",
+            &format!("{side}_namespace"),
+            &format!("{side}_namespace TEXT NOT NULL DEFAULT ''"),
+        )?;
+        ensure_column(
+            connection,
+            "type_dependencies",
+            &format!("{side}_end_line"),
+            &format!("{side}_end_line INTEGER NOT NULL DEFAULT 0"),
+        )?;
+        ensure_column(
+            connection,
+            "type_dependencies",
+            &format!("{side}_end_column"),
+            &format!("{side}_end_column INTEGER NOT NULL DEFAULT 0"),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    column_definition: &str,
+) -> Result<(), PersistenceError> {
+    if !table_has_column(connection, table, column)? {
+        connection.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column_definition}"
+        ))?;
+    }
+
+    Ok(())
+}
+
+fn table_has_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, PersistenceError> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = statement.query([])?;
+
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -385,18 +516,89 @@ mod tests {
             TypeDeclaration {
                 name: "Point".to_owned(),
                 kind: TypeDeclarationKind::Struct,
+                namespace: "geometry".to_owned(),
                 file: "/workspace/src/types.h".to_owned(),
                 line: 3,
                 column: 8,
+                end_line: 6,
+                end_column: 1,
             },
             TypeDeclaration {
                 name: "ANSWER".to_owned(),
                 kind: TypeDeclarationKind::Macro,
+                namespace: String::new(),
                 file: "/workspace/src/types.h".to_owned(),
                 line: 1,
                 column: 9,
+                end_line: 1,
+                end_column: 20,
             },
         ]
+    }
+
+    /// Reproduces reopening a `project.db` written before `namespace` and
+    /// the extent columns existed: `CREATE TABLE IF NOT EXISTS` leaves an
+    /// already-created table untouched, so `ProjectStore::open` must migrate
+    /// it explicitly instead of relying on that statement.
+    #[test]
+    fn opening_a_pre_namespace_database_adds_the_missing_columns() {
+        let db_path = temp_db_path("project-types-pre-namespace-migration");
+        {
+            let connection = Connection::open(&db_path).expect("create legacy database");
+            connection
+                .execute_batch(
+                    "CREATE TABLE type_declarations (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        file TEXT NOT NULL,
+                        line INTEGER NOT NULL,
+                        column INTEGER NOT NULL
+                    );
+                    CREATE TABLE type_dependencies (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        caller_name TEXT NOT NULL,
+                        caller_kind TEXT NOT NULL,
+                        caller_file TEXT NOT NULL,
+                        caller_line INTEGER NOT NULL,
+                        caller_column INTEGER NOT NULL,
+                        callee_name TEXT NOT NULL,
+                        callee_kind TEXT NOT NULL,
+                        callee_file TEXT NOT NULL,
+                        callee_line INTEGER NOT NULL,
+                        callee_column INTEGER NOT NULL
+                    );",
+                )
+                .expect("create legacy tables");
+            connection
+                .execute(
+                    "INSERT INTO type_declarations (name, kind, file, line, column)
+                     VALUES ('Point', 'struct', '/workspace/src/types.h', 3, 8)",
+                    [],
+                )
+                .expect("insert legacy row");
+        }
+
+        let store = ProjectStore::open(&db_path).expect("open and migrate legacy database");
+        let declarations = store
+            .list_type_declarations()
+            .expect("list type declarations after migration");
+
+        assert_eq!(
+            declarations,
+            vec![TypeDeclaration {
+                name: "Point".to_owned(),
+                kind: TypeDeclarationKind::Struct,
+                namespace: String::new(),
+                file: "/workspace/src/types.h".to_owned(),
+                line: 3,
+                column: 8,
+                end_line: 0,
+                end_column: 0,
+            }]
+        );
+
+        let _ = fs::remove_file(&db_path);
     }
 
     #[test]
@@ -443,16 +645,22 @@ mod tests {
         let point = TypeDeclaration {
             name: "Point".to_owned(),
             kind: TypeDeclarationKind::Struct,
+            namespace: "geometry".to_owned(),
             file: "/workspace/src/types.h".to_owned(),
             line: 3,
             column: 8,
+            end_line: 6,
+            end_column: 1,
         };
         let rect = TypeDeclaration {
             name: "Rect".to_owned(),
             kind: TypeDeclarationKind::Struct,
+            namespace: "geometry".to_owned(),
             file: "/workspace/src/types.h".to_owned(),
             line: 8,
             column: 8,
+            end_line: 11,
+            end_column: 1,
         };
 
         vec![TypeDependency {

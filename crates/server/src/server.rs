@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Json, Query, State};
+use axum::extract::{Json, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -18,8 +18,9 @@ use tokio::runtime;
 use tokio::sync::oneshot;
 
 use crate::ingest::CreateProjectRequest;
+use crate::jobs::{JobPhase, JobRegistry};
 use crate::persistence;
-use crate::project_service::{self, OpenProjectError, ProjectCreationError, ReadSourceFileError};
+use crate::project_service::{self, ListTypesError, OpenProjectError, ReadSourceFileError};
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:37651";
 
@@ -132,11 +133,13 @@ async fn serve_with_axum(
 #[derive(Clone)]
 struct AppState {
     global_db_path: Arc<PathBuf>,
+    job_registry: JobRegistry,
 }
 
 fn app(global_db_path: PathBuf) -> Router {
     let state = AppState {
         global_db_path: Arc::new(global_db_path),
+        job_registry: JobRegistry::new(),
     };
 
     Router::new()
@@ -147,8 +150,13 @@ fn app(global_db_path: PathBuf) -> Router {
                 .post(create_project_from_http)
                 .delete(forget_project_from_http),
         )
+        .route(
+            "/projects/jobs/{job_id}",
+            get(poll_project_creation_job_from_http),
+        )
         .route("/projects/open", post(open_project_from_http))
         .route("/projects/source-file", get(read_source_file_from_http))
+        .route("/projects/types", get(list_types_from_http))
         .with_state(state)
 }
 
@@ -160,6 +168,12 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
+/// Starts project creation as a background job and returns immediately with
+/// a job id to poll (`poll_project_creation_job_from_http`), instead of
+/// blocking the request on the whole ingest + `libclang` extraction — which,
+/// for a real-world-sized project, takes minutes (see
+/// `crates/server/tests/verovio_5_7_0_import_diagnosis.rs`) and would
+/// otherwise leave the client with nothing to show but a frozen request.
 async fn create_project_from_http(
     State(state): State<AppState>,
     payload: Result<Json<CreateProjectRequest>, JsonRejection>,
@@ -183,44 +197,98 @@ async fn create_project_from_http(
     ));
 
     let global_db_path = (*state.global_db_path).clone();
-    match tokio::task::spawn_blocking(move || {
-        project_service::create_project(request, &global_db_path)
-    })
-    .await
-    {
-        Ok(Ok(project)) => {
-            log_server(format_args!(
-                "project created: name={} project_dir={} units={}",
+    let (job_id, job) = state.job_registry.start();
+    log_server(format_args!(
+        "project creation job started: job_id={job_id}"
+    ));
+
+    let log_job_id = job_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let outcome =
+            project_service::create_project(request, &global_db_path, Some(&job.progress));
+        match &outcome {
+            Ok(project) => log_server(format_args!(
+                "project creation job succeeded: job_id={log_job_id} name={} project_dir={} units={}",
                 project.name,
                 project.project_dir.display(),
                 project.compilation_units.len()
-            ));
-            json_response(StatusCode::CREATED, project)
+            )),
+            Err(error) => log_server(format_args!(
+                "project creation job failed: job_id={log_job_id} error={error:?}"
+            )),
         }
-        Ok(Err(error)) => project_creation_error_response(error),
-        Err(error) => {
-            log_server(format_args!("project ingest task failed: {error}"));
-            json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"error":"project_ingest_failed","message":error.to_string()}),
-            )
-        }
-    }
+        job.finish(outcome);
+    });
+
+    json_response(StatusCode::ACCEPTED, json!({"job_id": job_id}))
 }
 
-fn project_creation_error_response(error: ProjectCreationError) -> Response {
-    let status = if error.is_client_error() {
-        StatusCode::BAD_REQUEST
-    } else {
-        StatusCode::INTERNAL_SERVER_ERROR
+/// Reports a project-creation job's status: still `running` (with live
+/// progress for each `libclang` pass), `succeeded` (with the finished
+/// project), or `failed` (with the error) — always as a `200`, since the
+/// poll request itself succeeded even when the job it describes did not.
+async fn poll_project_creation_job_from_http(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Response {
+    let Some(job) = state.job_registry.get(&job_id) else {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            json!({"error":"job_not_found","message": format!("no project creation job with id {job_id}")}),
+        );
     };
-    log_server(format_args!(
-        "project creation failed: status={status} error={error:?}"
-    ));
-    json_response(
-        status,
-        json!({"error":"project_creation_failed","message":error.to_string()}),
-    )
+
+    job.with_outcome(|outcome| match outcome {
+        Some(Ok(project)) => json_response(
+            StatusCode::OK,
+            json!({"status": "succeeded", "project": project}),
+        ),
+        Some(Err(error)) => json_response(
+            StatusCode::OK,
+            json!({
+                "status": "failed",
+                "message": error.to_string(),
+                "is_client_error": error.is_client_error(),
+            }),
+        ),
+        None => {
+            let type_catalog_completed = job.progress.type_catalog.completed();
+            let type_catalog_total = job.progress.type_catalog.total();
+            let source_catalog_completed = job.progress.source_catalog.completed();
+            let source_catalog_total = job.progress.source_catalog.total();
+            let phase = crate::jobs::derive_phase(
+                type_catalog_completed,
+                type_catalog_total,
+                source_catalog_completed,
+                source_catalog_total,
+            );
+
+            json_response(
+                StatusCode::OK,
+                json!({
+                    "status": "running",
+                    "phase": phase_str(phase),
+                    "type_catalog": {
+                        "completed": type_catalog_completed,
+                        "total": type_catalog_total,
+                    },
+                    "source_catalog": {
+                        "completed": source_catalog_completed,
+                        "total": source_catalog_total,
+                    },
+                }),
+            )
+        }
+    })
+}
+
+fn phase_str(phase: JobPhase) -> &'static str {
+    match phase {
+        JobPhase::Ingesting => "ingesting",
+        JobPhase::CatalogingTypes => "cataloging_types",
+        JobPhase::DiscoveringSourceFiles => "discovering_source_files",
+        JobPhase::Persisting => "persisting",
+    }
 }
 
 async fn list_recent_projects_from_http(State(state): State<AppState>) -> Response {
@@ -410,6 +478,46 @@ fn read_source_file_error_response(error: ReadSourceFileError) -> Response {
     json_response(
         status,
         json!({"error":"read_source_file_failed","message":error.to_string()}),
+    )
+}
+
+#[derive(Deserialize)]
+struct ProjectDirQuery {
+    project_dir: PathBuf,
+}
+
+async fn list_types_from_http(Query(query): Query<ProjectDirQuery>) -> Response {
+    log_server(format_args!(
+        "listing types: project_dir={}",
+        query.project_dir.display()
+    ));
+
+    match tokio::task::spawn_blocking(move || project_service::list_types(&query.project_dir)).await
+    {
+        Ok(Ok(types)) => json_response(StatusCode::OK, json!({ "types": types })),
+        Ok(Err(error)) => list_types_error_response(error),
+        Err(error) => {
+            log_server(format_args!("list types task failed: {error}"));
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":"list_types_failed","message":error.to_string()}),
+            )
+        }
+    }
+}
+
+fn list_types_error_response(error: ListTypesError) -> Response {
+    let status = if error.is_client_error() {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    log_server(format_args!(
+        "list types failed: status={status} error={error:?}"
+    ));
+    json_response(
+        status,
+        json!({"error":"list_types_failed","message":error.to_string()}),
     )
 }
 

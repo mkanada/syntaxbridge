@@ -12,9 +12,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use syntax_bridge_server::ingest::CreateProjectRequest;
+use syntax_bridge_server::ingest::{CompilationUnit, CreateProjectRequest};
+use syntax_bridge_server::progress::ExtractionProgress;
 use syntax_bridge_server::project_service;
-use syntax_bridge_server::type_catalog::{TypeDeclaration, TypeDeclarationKind};
+use syntax_bridge_server::type_catalog::{self, TypeDeclaration, TypeDeclarationKind};
 
 const MAIN_CPP: &str = r#"
 #include "types.h"
@@ -77,6 +78,7 @@ fn create_project_catalogs_project_types_with_libclang() {
             archive_path,
         },
         &global_db_path,
+        None,
     )
     .expect("ingest project and extract type catalog");
 
@@ -202,6 +204,7 @@ fn create_project_extracts_type_dependencies_with_libclang() {
             archive_path,
         },
         &global_db_path,
+        None,
     )
     .expect("ingest project and extract type dependencies");
 
@@ -281,6 +284,181 @@ fn create_project_extracts_type_dependencies_with_libclang() {
             "expected persisted dependencies to contain {dependency:?}"
         );
     }
+}
+
+const NAMESPACES_MAIN_CPP: &str = r#"
+#include "types.h"
+
+int main() {
+    Point top_level{};
+    geometry::Point nested{};
+    geometry::detail::Helper helper{};
+    (void)top_level;
+    (void)nested;
+    (void)helper;
+    return 0;
+}
+"#;
+
+const NAMESPACES_TYPES_H: &str = r#"
+struct Point {
+    int x;
+};
+
+namespace geometry {
+
+struct Point {
+    int x;
+    int y;
+};
+
+namespace detail {
+
+class Helper {
+public:
+    int value;
+};
+
+}  // namespace detail
+
+}  // namespace geometry
+"#;
+
+#[test]
+fn create_project_catalogs_namespace_and_extent_with_libclang() {
+    let workspace =
+        TempWorkspace::new("type-catalog-namespaces").expect("create temporary workspace");
+    let archive_path = workspace.path().join("fixture.tar.gz");
+    write_namespaces_fixture_tarball(workspace.path(), &archive_path)
+        .expect("create fixture archive");
+    let global_db_path = workspace.path().join("global.db");
+
+    let project = project_service::create_project(
+        CreateProjectRequest {
+            name: "type_catalog_namespaces_fixture".to_owned(),
+            workspace_dir: workspace.path().join("projects"),
+            archive_path,
+        },
+        &global_db_path,
+        None,
+    )
+    .expect("ingest project and extract type catalog");
+
+    let catalog = &project.type_catalog;
+
+    let top_level_point = catalog
+        .iter()
+        .find(|declaration| {
+            declaration.name == "Point"
+                && declaration.kind == TypeDeclarationKind::Struct
+                && declaration.namespace.is_empty()
+        })
+        .unwrap_or_else(|| panic!("expected global-scope Point in catalog: {catalog:#?}"));
+
+    let nested_point = catalog
+        .iter()
+        .find(|declaration| {
+            declaration.name == "Point"
+                && declaration.kind == TypeDeclarationKind::Struct
+                && declaration.namespace == "geometry"
+        })
+        .unwrap_or_else(|| panic!("expected geometry::Point in catalog: {catalog:#?}"));
+
+    assert_ne!(
+        top_level_point, nested_point,
+        "global-scope Point and geometry::Point are distinct types and must not collapse into one entry"
+    );
+
+    let helper = catalog
+        .iter()
+        .find(|declaration| declaration.name == "Helper")
+        .unwrap_or_else(|| panic!("expected Helper in catalog: {catalog:#?}"));
+    assert_eq!(
+        helper.namespace, "geometry::detail",
+        "expected Helper's namespace to include both enclosing namespaces: {helper:#?}"
+    );
+
+    assert!(
+        nested_point.end_line > nested_point.line,
+        "expected geometry::Point's extent to cover its multi-line body: {nested_point:#?}"
+    );
+}
+
+fn write_namespaces_fixture_tarball(workspace: &Path, archive_path: &Path) -> io::Result<()> {
+    let source_dir = workspace.join("fixture");
+    fs::create_dir_all(&source_dir)?;
+    fs::write(source_dir.join("main.cpp"), NAMESPACES_MAIN_CPP)?;
+    fs::write(source_dir.join("types.h"), NAMESPACES_TYPES_H)?;
+    fs::write(
+        source_dir.join("CMakeLists.txt"),
+        r#"
+cmake_minimum_required(VERSION 3.16)
+project(syntax_bridge_type_catalog_namespaces_fixture LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_executable(syntax_bridge_type_catalog_namespaces_fixture main.cpp)
+"#,
+    )?;
+
+    let output = Command::new("tar")
+        .arg("-czf")
+        .arg(archive_path)
+        .arg("-C")
+        .arg(workspace)
+        .arg("fixture")
+        .output()?;
+    assert_success(output);
+
+    Ok(())
+}
+
+/// `GET /projects/jobs/{id}` needs to observe progress mid-extraction, not
+/// just the before/after totals — this proves `extract_type_catalog` reports
+/// through the tracker as it goes, using a plain two-file fixture (no
+/// tarball/CMake ingest needed to exercise this).
+#[test]
+fn extract_type_catalog_reports_progress_as_units_complete() {
+    let workspace =
+        TempWorkspace::new("type-catalog-progress").expect("create temporary workspace");
+    let project_root = workspace.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project dir");
+
+    let file_a = project_root.join("a.cpp");
+    let file_b = project_root.join("b.cpp");
+    fs::write(&file_a, "struct A { int x; };").expect("write a.cpp");
+    fs::write(&file_b, "struct B { int y; };").expect("write b.cpp");
+
+    let units = vec![
+        CompilationUnit {
+            directory: project_root.display().to_string(),
+            file: file_a.display().to_string(),
+            command: None,
+            arguments: vec!["clang++".to_owned(), "-std=c++17".to_owned()],
+        },
+        CompilationUnit {
+            directory: project_root.display().to_string(),
+            file: file_b.display().to_string(),
+            command: None,
+            arguments: vec!["clang++".to_owned(), "-std=c++17".to_owned()],
+        },
+    ];
+
+    let progress = ExtractionProgress::new();
+    assert_eq!(
+        progress.total(),
+        0,
+        "total should read as unset before extraction starts"
+    );
+
+    type_catalog::extract_type_catalog(&units, &project_root, Some(&progress))
+        .expect("extract type catalog");
+
+    assert_eq!(progress.total(), 2, "expected total set to the unit count");
+    assert_eq!(
+        progress.completed(),
+        2,
+        "expected both units marked done by the end"
+    );
 }
 
 fn write_dependencies_fixture_tarball(workspace: &Path, archive_path: &Path) -> io::Result<()> {

@@ -7,7 +7,10 @@ import 'package:flutter/widgets.dart';
 
 /// Captures a [RepaintBoundary]'s current content as PNG-encoded bytes.
 abstract class ScreenCapturer {
-  Future<Uint8List> capture(GlobalKey boundaryKey, {required double pixelRatio});
+  Future<Uint8List> capture(
+    GlobalKey boundaryKey, {
+    required double pixelRatio,
+  });
 }
 
 class RenderScreenCapturer implements ScreenCapturer {

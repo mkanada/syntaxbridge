@@ -24,6 +24,12 @@ extension DockSideLabel on DockSide {
   }
 }
 
+/// Moldura de painel do workspace.
+///
+/// O painel limita a altura do corpo e **nao rola**: quem rola e o filho. Sem
+/// isso, uma lista dentro do painel viveria em altura ilimitada e teria de
+/// construir todas as linhas em todo frame, o que nao se sustenta a partir do
+/// catalogo de tipos (US-3).
 class DockablePanel extends StatelessWidget {
   const DockablePanel({
     super.key,
@@ -42,14 +48,16 @@ class DockablePanel extends StatelessWidget {
   final ValueChanged<DockSide> onDockSide;
   final Widget child;
 
+  /// Altura do corpo quando o pai nao a limita — o caso do modo compacto, em
+  /// que os paineis ficam empilhados dentro de uma area rolavel.
+  static const double unboundedBodyHeight = 420;
+
   @override
   Widget build(BuildContext context) {
     return LayoutBuilder(
       builder: (context, constraints) {
-        final body = SingleChildScrollView(
-          padding: const EdgeInsets.all(14),
-          child: child,
-        );
+        final bounded = constraints.maxHeight.isFinite;
+        final body = Padding(padding: const EdgeInsets.all(14), child: child);
 
         return Material(
           color: IdePalette.sideBar,
@@ -59,9 +67,7 @@ class DockablePanel extends StatelessWidget {
             borderRadius: BorderRadius.circular(6),
           ),
           child: Column(
-            mainAxisSize: constraints.maxHeight.isFinite
-                ? MainAxisSize.max
-                : MainAxisSize.min,
+            mainAxisSize: bounded ? MainAxisSize.max : MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               _DockablePanelHeader(
@@ -72,10 +78,10 @@ class DockablePanel extends StatelessWidget {
                 onDockSide: onDockSide,
               ),
               const Divider(height: 1, color: IdePalette.border),
-              if (constraints.maxHeight.isFinite)
+              if (bounded)
                 Expanded(child: body)
               else
-                body,
+                SizedBox(height: unboundedBodyHeight, child: body),
             ],
           ),
         );

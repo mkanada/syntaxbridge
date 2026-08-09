@@ -1,5 +1,7 @@
 pub mod ingest;
+pub mod jobs;
 pub mod persistence;
+pub mod progress;
 pub mod project_service;
 pub mod server;
 pub mod source_catalog;

@@ -72,7 +72,8 @@ class _ImportProjectDialogState extends State<ImportProjectDialog> {
     }
   }
 
-  bool get _canImport => !_importing && _directoryController.text.trim().isNotEmpty;
+  bool get _canImport =>
+      !_importing && _directoryController.text.trim().isNotEmpty;
 
   @override
   Widget build(BuildContext context) {

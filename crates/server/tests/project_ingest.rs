@@ -1,9 +1,9 @@
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use syntax_bridge_server::ingest::{CreateProjectRequest, create_project};
@@ -131,6 +131,7 @@ fn create_project_persists_compilation_units_and_registers_project_globally() {
             archive_path,
         },
         &global_db_path,
+        None,
     )
     .expect("ingest and persist project");
 
@@ -167,6 +168,7 @@ fn open_project_reloads_persisted_data_without_reingesting() {
             archive_path,
         },
         &global_db_path,
+        None,
     )
     .expect("ingest and persist project");
 
@@ -204,6 +206,11 @@ fn open_project_rejects_a_directory_without_a_project_database() {
     );
 }
 
+/// `POST /projects` starts a background job and returns immediately
+/// (`202 Accepted` + `job_id`) rather than blocking on the whole ingest —
+/// see `crates/server/src/server.rs`'s `create_project_from_http` doc
+/// comment for why. This polls `GET /projects/jobs/{id}` for the fixture's
+/// small, effectively-instant creation.
 #[test]
 fn project_endpoint_returns_created_project_and_compilation_units() {
     let workspace = TempWorkspace::new("ingest-http").expect("create temporary workspace");
@@ -234,10 +241,9 @@ fn project_endpoint_returns_created_project_and_compilation_units() {
 
     let mut response = String::new();
     stream.read_to_string(&mut response).expect("read response");
-    handle.shutdown().expect("stop test server");
 
     assert!(
-        response.starts_with("HTTP/1.1 201 Created\r\n"),
+        response.starts_with("HTTP/1.1 202 Accepted\r\n"),
         "unexpected response: {response}"
     );
 
@@ -245,19 +251,28 @@ fn project_endpoint_returns_created_project_and_compilation_units() {
         .split("\r\n\r\n")
         .nth(1)
         .expect("response has HTTP body");
-    let json: Value = serde_json::from_str(response_body).expect("parse response body");
-    let units = json
+    let start_json: Value = serde_json::from_str(response_body).expect("parse response body");
+    let job_id = start_json["job_id"]
+        .as_str()
+        .expect("response includes job_id");
+
+    let json = poll_job_until_done(addr, job_id);
+    handle.shutdown().expect("stop test server");
+
+    assert_eq!(json["status"], "succeeded", "unexpected job status: {json}");
+    let project = &json["project"];
+    let units = project
         .get("compilation_units")
         .and_then(Value::as_array)
         .expect("response includes compilation_units array");
 
-    assert_eq!(json["name"], "counter");
-    assert_eq!(units.len(), 1, "unexpected response body: {response_body}");
+    assert_eq!(project["name"], "counter");
+    assert_eq!(units.len(), 1, "unexpected project body: {project}");
     assert!(
         units[0]["file"]
             .as_str()
             .is_some_and(|file| file.ends_with("main.cpp")),
-        "response should include main.cpp unit: {response_body}"
+        "response should include main.cpp unit: {project}"
     );
 
     let global_store =
@@ -272,6 +287,93 @@ fn project_endpoint_returns_created_project_and_compilation_units() {
     assert_eq!(
         projects[0].project_dir,
         workspace.path().join("projects").join("counter")
+    );
+}
+
+#[test]
+fn project_creation_job_reports_failure_for_a_client_error() {
+    let workspace =
+        TempWorkspace::new("ingest-http-job-failure").expect("create temporary workspace");
+    let archive_path = workspace.path().join("fixture.tar.gz");
+    write_cmake_fixture_tarball(workspace.path(), &archive_path).expect("create fixture archive");
+
+    let server = SyntaxBridgeServer::bind("127.0.0.1:0")
+        .expect("bind test server")
+        .with_global_db_path(workspace.path().join("global.db"));
+    let addr = server.local_addr().expect("read server address");
+    let handle = server.spawn().expect("spawn test server");
+
+    let body = serde_json::json!({
+        "name": "../escape",
+        "workspace_dir": workspace.path().join("projects"),
+        "archive_path": archive_path,
+    })
+    .to_string();
+
+    let mut stream = TcpStream::connect(addr).expect("connect to test server");
+    write!(
+        stream,
+        "POST /projects HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .expect("write request");
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read response");
+    assert!(
+        response.starts_with("HTTP/1.1 202 Accepted\r\n"),
+        "starting the job itself should still succeed: {response}"
+    );
+
+    let response_body = response
+        .split("\r\n\r\n")
+        .nth(1)
+        .expect("response has HTTP body");
+    let start_json: Value = serde_json::from_str(response_body).expect("parse response body");
+    let job_id = start_json["job_id"]
+        .as_str()
+        .expect("response includes job_id");
+
+    let json = poll_job_until_done(addr, job_id);
+    handle.shutdown().expect("stop test server");
+
+    assert_eq!(json["status"], "failed", "unexpected job status: {json}");
+    assert_eq!(
+        json["is_client_error"], true,
+        "an invalid project name should be a client error: {json}"
+    );
+    assert!(
+        json["message"].as_str().is_some_and(|m| !m.is_empty()),
+        "expected a non-empty error message: {json}"
+    );
+}
+
+#[test]
+fn project_creation_job_endpoint_returns_not_found_for_an_unknown_job() {
+    let workspace =
+        TempWorkspace::new("ingest-http-job-missing").expect("create temporary workspace");
+
+    let server = SyntaxBridgeServer::bind("127.0.0.1:0")
+        .expect("bind test server")
+        .with_global_db_path(workspace.path().join("global.db"));
+    let addr = server.local_addr().expect("read server address");
+    let handle = server.spawn().expect("spawn test server");
+
+    let mut stream = TcpStream::connect(addr).expect("connect to test server");
+    write!(
+        stream,
+        "GET /projects/jobs/does-not-exist HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write request");
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read response");
+    handle.shutdown().expect("stop test server");
+
+    assert!(
+        response.starts_with("HTTP/1.1 404 Not Found\r\n"),
+        "unexpected response: {response}"
     );
 }
 
@@ -310,12 +412,56 @@ fn project_endpoint_accepts_chunked_json_requests() {
 
     let mut response = String::new();
     stream.read_to_string(&mut response).expect("read response");
-    handle.shutdown().expect("stop test server");
 
     assert!(
-        response.starts_with("HTTP/1.1 201 Created\r\n"),
+        response.starts_with("HTTP/1.1 202 Accepted\r\n"),
         "unexpected response: {response}"
     );
+
+    let response_body = response
+        .split("\r\n\r\n")
+        .nth(1)
+        .expect("response has HTTP body");
+    let start_json: Value = serde_json::from_str(response_body).expect("parse response body");
+    let job_id = start_json["job_id"]
+        .as_str()
+        .expect("response includes job_id");
+
+    let json = poll_job_until_done(addr, job_id);
+    handle.shutdown().expect("stop test server");
+
+    assert_eq!(json["status"], "succeeded", "unexpected job status: {json}");
+}
+
+/// Polls `GET /projects/jobs/{job_id}` until the job leaves the `running`
+/// state, for tests exercising the fixture's small, effectively-instant
+/// creation. Bounded so a real regression fails the test instead of hanging
+/// the suite.
+fn poll_job_until_done(addr: SocketAddr, job_id: &str) -> Value {
+    for _ in 0..200 {
+        let mut stream = TcpStream::connect(addr).expect("connect to test server");
+        write!(
+            stream,
+            "GET /projects/jobs/{job_id} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write poll request");
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        let response_body = response
+            .split("\r\n\r\n")
+            .nth(1)
+            .expect("response has HTTP body");
+        let json: Value = serde_json::from_str(response_body).expect("parse response body");
+
+        if json["status"] != "running" {
+            return json;
+        }
+
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    panic!("job {job_id} did not finish within the polling budget");
 }
 
 #[test]
@@ -332,6 +478,7 @@ fn recent_projects_endpoint_lists_the_last_created_project() {
             archive_path,
         },
         &global_db_path,
+        None,
     )
     .expect("ingest and persist project");
 
@@ -389,6 +536,7 @@ fn recent_projects_endpoint_flags_a_project_whose_directory_is_gone() {
             archive_path,
         },
         &global_db_path,
+        None,
     )
     .expect("ingest and persist project");
 
@@ -449,6 +597,7 @@ fn recent_projects_endpoint_reports_an_existing_project_as_available() {
             archive_path,
         },
         &global_db_path,
+        None,
     )
     .expect("ingest and persist project");
 
@@ -496,6 +645,7 @@ fn forget_project_endpoint_drops_it_from_the_recent_projects_list() {
             archive_path,
         },
         &global_db_path,
+        None,
     )
     .expect("ingest and persist project");
     fs::remove_dir_all(&created.project_dir).expect("delete the project directory");
@@ -565,6 +715,7 @@ fn open_project_endpoint_reloads_a_previously_ingested_project() {
             archive_path,
         },
         &global_db_path,
+        None,
     )
     .expect("ingest and persist project");
 

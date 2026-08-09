@@ -44,7 +44,9 @@ class FilePickerPathPicker implements PathPicker {
     final path = await FilePicker.getDirectoryPath(
       dialogTitle: 'Choose an existing syntax-bridge project',
     );
-    cliLog('existing project directory picker returned: ${path ?? '<cancelled>'}');
+    cliLog(
+      'existing project directory picker returned: ${path ?? '<cancelled>'}',
+    );
     return path;
   }
 }

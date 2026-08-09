@@ -25,7 +25,7 @@ verificáveis, e não como intenções.
 | --- | --- | --- | --- |
 | US-1 | Criação de projeto e ingestão do input | pronto | — |
 | US-2 | Lista de arquivos fonte e leitura de conteúdo | pronto | US-1 |
-| US-3 | Catálogo de tipos do projeto | parcial (sem UI) | US-2 |
+| US-3 | Catálogo de tipos do projeto | parcial (falta identidade estável de tipo) | US-2 |
 | US-4 | Usos de cada tipo e navegação | planejado | US-3 |
 | US-5 | Funções, métodos e macros, e seus usos | planejado | US-3 |
 | US-6 | Isolamento e caracterização comportamental | planejado | US-5 |
@@ -50,13 +50,23 @@ aparece na UI e o que a interface atual precisa mudar para sustentá-la.
 
 **Status:** pronto · **Depende de:** — ·
 **Implementação:** `crates/server/src/ingest.rs`,
-`crates/server/src/project_service.rs`, `client/flutter/lib/src/ui/new_project_page.dart` ·
-**Testes:** `crates/server/tests/project_ingest.rs`
+`crates/server/src/project_service.rs`, `crates/server/src/jobs.rs`,
+`crates/server/src/progress.rs`,
+`client/flutter/lib/src/ui/new_project_page.dart`,
+`client/flutter/lib/src/ui/creating_project_page.dart` ·
+**Testes:** `crates/server/tests/project_ingest.rs`,
+`crates/server/tests/verovio_5_7_0_import_diagnosis.rs`,
+`client/flutter/test/creating_project_page_test.dart`,
+`client/flutter/test/app_test.dart`
 
 ### Objetivo do usuário
 
 Partir de um arquivo compactado com código C/C++ e chegar a um projeto do
-Syntax Bridge aberto, com a lista de unidades de compilação visível.
+Syntax Bridge aberto, com a lista de unidades de compilação visível. Assim que
+os parâmetros do formulário são válidos, a tela muda imediatamente para uma
+tela de progresso com log e barra de progresso — a criação em si roda em
+segundo plano no servidor e pode levar minutos num projeto real (ver a
+observação "Custo" abaixo).
 
 ### Fluxo
 
@@ -65,21 +75,55 @@ Syntax Bridge aberto, com a lista de unidades de compilação visível.
   projeto, dentro do subdiretório `input-source`.
 - O sistema identifica os arquivos do projeto CMake, roda-o com
   `CMAKE_EXPORT_COMPILE_COMMANDS` habilitado e obtém a lista de *compilation
-  units* a partir de `compile_commands.json`. Essa lista é apresentada ao
-  usuário.
+  units* a partir de `compile_commands.json`.
+- O cliente muda de tela assim que os três campos são válidos (não espera o
+  servidor) e passa a consultar o progresso periodicamente até a criação
+  terminar, com sucesso ou falha.
 
 ### Contrato de API
 
-- `POST /projects` → `CreatedProject`
+- `POST /projects` → `202 Accepted` com `{"job_id": "…"}`. Não bloqueia mais na
+  ingestão nem na extração `libclang` (ver "Custo" abaixo) — inicia um job em
+  segundo plano e devolve na hora.
+- `GET /projects/jobs/{job_id}` → o estado do job:
+  - em andamento: `{"status":"running","phase":"ingesting"|"cataloging_types"|
+    "discovering_source_files"|"persisting","type_catalog":{"completed":N,
+    "total":M},"source_catalog":{"completed":N,"total":M}}` (a fase é derivada
+    dos contadores, não guardada à parte);
+  - sucesso: `{"status":"succeeded","project": CreatedProject}`;
+  - falha: `{"status":"failed","message":"…","is_client_error":bool}`;
+  - id desconhecido: `404`.
 - `GET /projects` → últimos 5 projetos (`ProjectRecord`)
 - `POST /projects/open` → `LoadedProject` (recarrega sem re-ingerir)
 
 ### Persistência
 
-`projects` no banco global; `compilation_units` no `project.db` de cada projeto.
+`projects` no banco global; `compilation_units` no `project.db` de cada
+projeto. Os jobs de criação **não** são persistidos — vivem só em memória no
+processo do servidor (`crates/server/src/jobs.rs`), então reiniciar o servidor
+com uma criação em andamento perde o job (o cliente veria `404` ao consultar).
 
 ### Observações e decisões em aberto
 
+- **Resolvido: custo da extração `libclang` deixou de bloquear a requisição.**
+  Um relato real de "trava no meio da importação" com o Verovio 5.7.0 (não o
+  fixture de 6.2.0 já versionado; reproduzido em
+  `crates/server/tests/verovio_5_7_0_import_diagnosis.rs`, que não roda por
+  padrão) revelou que `project_service::create_project` fazia duas passadas
+  completas de `libclang` sobre as 291 unidades de compilação — uma em
+  `type_catalog`, outra, independente, em `source_catalog` — cada uma levando
+  minutos num único núcleo, dentro de uma única requisição HTTP síncrona, sem
+  nenhum log de progresso. A resposta em duas partes: (1) as duas passadas
+  agora paralelizam entre os núcleos disponíveis (um `CXIndex` por thread de
+  trabalho — a forma documentada de paralelizar `libclang` com segurança,
+  já que compartilhar um índice entre threads não é seguro), cortando o tempo
+  total de ~11min para ~3min neste ambiente de 4 núcleos; (2) `POST /projects`
+  agora inicia um job em segundo plano e devolve na hora, com
+  `GET /projects/jobs/{id}` reportando progresso real (via os mesmos contadores
+  atômicos que as passadas paralelas já atualizam) para o cliente exibir. Isso
+  é a primeira instância concreta do item transversal "Trabalho longo:
+  progresso, cancelamento, incrementalidade" — os demais passos (US-4, US-6)
+  ainda precisam do próprio mecanismo de job, este é só o primeiro caso.
 - **Só CMake.** Projetos com Makefile, autotools ou *header-only* não têm
   caminho. Decidir se o produto exige CMake na v1 e falha explicitamente, ou se
   aceita um `compile_commands.json` fornecido pelo próprio usuário como
@@ -98,6 +142,10 @@ Syntax Bridge aberto, com a lista de unidades de compilação visível.
   entradas inseguras), não escala.
 - **Reabertura já existe e é mais barata que a re-ingestão**, mas
   `LoadedProject` devolve menos dados que `CreatedProject` — ver US-3.
+- **Jobs de criação nunca são removidos do registro em memória.** Aceitável por
+  ora (mesma decisão já tomada para o registro de jobs em geral); revisitar se
+  um servidor de longa duração acumulando um job por projeto criado alguma vez
+  importar na prática.
 
 ### Critérios de aceitação (testáveis)
 
@@ -106,22 +154,33 @@ Syntax Bridge aberto, com a lista de unidades de compilação visível.
 2. O conteúdo é extraído sob `<projeto>/input-source` e nenhuma entrada do
    archive escapa desse diretório.
 3. Um nome de projeto com `..` ou separador de caminho é rejeitado com erro de
-   cliente (4xx), não de servidor.
+   cliente (`is_client_error: true` no job), não de servidor.
 4. Após a criação, `compilation_units` no `project.db` contém exatamente as
    entradas devolvidas na resposta.
 5. Reabrir o projeto devolve as mesmas unidades de compilação sem executar
    CMake novamente.
 6. Um diretório sem `project.db` devolve 404, não 500.
+7. Consultar um `job_id` desconhecido devolve 404.
+8. Enquanto um job está em andamento, `GET /projects/jobs/{id}` reflete
+   progresso real (contadores crescentes), não um valor estático.
+9. Na UI, submeter o formulário com parâmetros válidos troca de tela
+   imediatamente, antes de qualquer resposta do servidor.
 
 ### Condições de testabilidade
 
 - Fixture pequeno e versionado: `test-resources/sample-cmake-project.tar.gz`.
-- Um fixture grande e real (Verovio) para provar escala — já exercitado.
+- Um fixture grande e real (Verovio) para provar escala — já exercitado, tanto
+  a 6.2.0 (`crates/server/tests/fixtures/verovio/`, usada por padrão) quanto a
+  5.7.0 real do usuário (`test-resources/verovio-version-5.7.0.tar.gz`, só no
+  teste `#[ignore]`d de diagnóstico).
 - Os testes precisam de `cmake` e `clang++` no PATH; dentro do Flatpak isso vem
   das extensões do SDK. Fora dele, o resultado depende da máquina e deve ser
   registrado como tal.
 - Diretórios de trabalho temporários e descartáveis por teste: nenhum teste
   pode depender de estado deixado por outro.
+- Testes de widget que dependem do polling usam um `ServerClient` falso
+  roteirizado (uma lista de respostas, uma por chamada) em vez de temporizador
+  real, para não depender de tempo de parede.
 
 ---
 
@@ -193,21 +252,38 @@ Tabela `source_files` no `project.db`.
 
 ## US-3 — Catálogo de tipos do projeto
 
-**Status:** parcial — backend pronto, sem rota dedicada e sem UI ·
+**Status:** parcial — rota dedicada, UI e desambiguação por namespace existem;
+falta identidade estável de tipo (USR do libclang, ver decisão abaixo) ·
 **Depende de:** US-2 ·
-**Implementação:** `crates/server/src/type_catalog.rs` ·
-**Testes:** `crates/server/tests/type_catalog.rs`
+**Implementação:** `crates/server/src/type_catalog.rs`,
+`crates/server/src/persistence/project_store.rs`,
+`crates/server/src/project_service.rs` (`list_types`),
+`crates/server/src/server.rs` (`GET /projects/types`),
+`client/flutter/lib/src/ui/types_view.dart`,
+`client/flutter/lib/src/ui/source_file_viewer.dart`,
+`client/flutter/lib/src/ui/server_status_page.dart` ·
+**Testes:** `crates/server/tests/type_catalog.rs`,
+`crates/server/tests/type_catalog_route.rs`,
+`crates/server/src/persistence/project_store.rs` (testes inline),
+`client/flutter/test/types_view_test.dart`,
+`client/flutter/test/source_file_viewer_test.dart`,
+`client/flutter/test/app_test.dart`
 
 ### Objetivo do usuário
 
-Ver, em forma de tabela, todos os tipos definidos no projeto, com nome e
-espécie (struct, class, union, enum, typedef, type alias, macro). Tipos
-primitivos e tipos de headers padrão fora do projeto são ignorados.
+Ver, em forma de tabela, todos os tipos definidos no projeto, com nome,
+namespace e espécie (struct, class, union, enum, typedef, type alias, macro).
+Tipos primitivos e tipos de headers padrão fora do projeto são ignorados.
+Clicar em um tipo abre o arquivo onde ele é definido, com seu corpo
+destacado.
 
 ### Contrato de API
 
-Hoje o catálogo viaja apenas dentro de `CreatedProject.type_catalog` e
-`CreatedProject.type_dependencies`, ou seja, **só na criação**.
+- `POST /projects` e `POST /projects/open` continuam sem devolver o catálogo:
+  `CreatedProject`/`LoadedProject` não carregam `type_catalog`.
+- `GET /projects/types?project_dir=…` → `{ "types": [TypeDeclaration] }`, lido
+  direto do `project.db`, sem reparsear. Resolve a lacuna que existia entre
+  criação e reabertura (ver decisão abaixo).
 
 ### Persistência
 
@@ -215,13 +291,25 @@ Tabelas `type_declarations` e `type_dependencies` no `project.db`.
 
 ### Observações e decisões em aberto
 
-- **Lacuna concreta e imediata:** `LoadedProject` não devolve `type_catalog`
-  nem `type_dependencies`. O dado é extraído, gravado e depois some ao reabrir
-  o projeto. Ou `LoadedProject` passa a incluí-los, ou existe uma rota própria
-  (`GET /projects/types`) — a segunda opção escala melhor para US-4, que vai
-  precisar de paginação e ordenação no servidor.
-- **Não há UI.** Nenhum arquivo Dart menciona tipos; este é o menor incremento
-  de valor visível disponível hoje.
+- **Resolvido:** a rota `GET /projects/types` foi adicionada — a opção
+  recomendada de escalar melhor para US-4, em vez de inchar `LoadedProject`.
+  O painel navegador "Types" já existe no cliente, ao lado do Explorer (mesmo
+  lado esquerdo, com abas — ver `docs/plans/ui-lists.md`).
+- **Resolvido:** `TypeDeclaration` ganhou `namespace` (cadeia de namespaces
+  envolventes, unida por `::`, extraída via `clang_getCursorSemanticParent`) e
+  `end_line`/`end_column` (extensão da declaração, via `clang_getCursorExtent`),
+  persistidos em `type_declarations`/`type_dependencies`. A tabela de tipos
+  agora mostra o nome qualificado (`geometry::Shape`), o que resolve a
+  ambiguidade visual entre homônimos — critério 3 abaixo. Clicar em um tipo
+  abre seu arquivo de origem, rola até a declaração e destaca o corpo inteiro
+  (`SourceFileViewer` ganhou `highlightStartLine`/`highlightEndLine`), usando
+  `IdePalette.selection`, até então declarada e não utilizada.
+- **Segue em aberto:** o nome qualificado por namespace resolve a
+  desambiguação *visual*, mas não é uma identidade estável — dois tipos podem
+  ter o mesmo nome qualificado depois de uma edição textual não relacionada
+  (ver item de identidade abaixo), e a chave de deduplicação/seleção ainda é
+  posicional. O USR do libclang continua sendo a solução completa, adiada
+  porque US-4 em diante é quem de fato depende dela para sobreviver a edições.
 - **O texto original mistura tipos e funções.** Funções e métodos pertencem a
   US-5; manter os dois na mesma lista confunde a modelagem e a UI.
 - **Identidade de tipo é frágil.** A chave atual é
@@ -230,8 +318,10 @@ Tabelas `type_declarations` e `type_dependencies` no `project.db`.
   libclang é a identidade estável e essa decisão precisa ser tomada *aqui*,
   porque US-4 até US-8 vão referenciar tipos por ela.
 - **Faltam decisões sobre:** templates e suas instanciações/especializações,
-  nome qualificado e namespaces (incluindo anônimos e inline), *forward
-  declaration* vs. definição, tipos aninhados e membros, enums com escopo.
+  namespaces anônimos (hoje silenciosamente omitidos do nome qualificado, em
+  vez de representados) e *inline* (hoje tratados como namespace comum,
+  aparecendo no nome qualificado quando não deveriam), *forward declaration*
+  vs. definição, tipos aninhados e membros, enums com escopo.
 - **Macros são um caso à parte:** não têm tipo, não têm escopo e muitas não são
   conversíveis. Vale marcar desde já a subdivisão entre macro-constante,
   macro-função e macro de compilação condicional, porque o destino em Dart de
@@ -246,20 +336,26 @@ Tabelas `type_declarations` e `type_dependencies` no `project.db`.
    com espécie correta para cada um.
 2. Nenhum tipo declarado em header de sistema aparece no catálogo.
 3. Tipos com o mesmo nome em namespaces diferentes aparecem como entradas
-   distintas e distinguíveis.
+   distintas e distinguíveis. **Satisfeito** por
+   `create_project_catalogs_namespace_and_extent_with_libclang` (fixture
+   próprio, não o fixture combinado abaixo) e pelo nome qualificado exibido em
+   `TypesView`.
 4. Uma TU que o libclang não consegue parsear é ignorada sem derrubar a
    extração das demais.
 5. O grafo de dependências contém uma aresta para cada campo, classe base e
    tipo subjacente de typedef/alias, sem duplicatas e sem autorreferência.
 6. Reabrir um projeto devolve o mesmo catálogo gravado, sem reparsear.
-7. Na UI, a tabela exibe nome e espécie de cada tipo.
+7. Na UI, a tabela exibe nome (qualificado por namespace) e espécie de cada
+   tipo; clicar em uma linha abre o arquivo de origem com o corpo do tipo
+   destacado.
 
 ### Condições de testabilidade
 
 - O fixture precisa conter, deliberadamente, ao menos: um struct, uma classe
   com herança, uma union, um enum, um typedef, um `using` alias, uma macro, um
-  namespace, e dois tipos homônimos em namespaces distintos. Sem isso os
-  critérios 1 e 3 não são exercitáveis.
+  namespace, e dois tipos homônimos em namespaces distintos. Sem isso o
+  critério 1 não é exercitável em um único fixture representativo — o critério
+  3 já tem cobertura própria (ver acima) com um fixture menor e dedicado.
 - `libclang` precisa estar carregável no ambiente de teste; o teste deve falhar
   com mensagem clara quando não estiver, em vez de passar vazio.
 - Ordenação determinística do catálogo antes de qualquer comparação.
@@ -743,22 +839,72 @@ ter fonte única em vez de dois modelos escritos à mão em linguagens diferente
 
 ### Trabalho longo: progresso, cancelamento, incrementalidade
 
-As rotas atuais são síncronas. A partir de US-4 isso deixa de funcionar. É
-necessário decidir o modelo (job com identificador, consulta de progresso,
-cancelamento) e o comportamento transacional: um cancelamento não pode deixar o
-`project.db` pela metade.
+As rotas em geral ainda são síncronas. A partir de US-4 isso deixa de
+funcionar.
+
+**Primeira instância resolvida:** `POST /projects` (US-1) — job em memória
+(`crates/server/src/jobs.rs`), sem identificador persistido, com
+`GET /projects/jobs/{id}` para consulta de progresso. Cancelamento **não**
+foi resolvido por essa instância (não há como cancelar um job de criação em
+andamento) nem o comportamento transacional correspondente — só a parte de
+progresso. O modelo (um registro de jobs em memória, progresso derivado de
+contadores atômicos em vez de estado explícito) fica como precedente para
+US-4 e US-6 decidirem se reaproveitam ou não; nenhum dos dois foi resolvido
+ainda, e nenhum dos dois precisa de cancelamento com o mesmo formato (uma
+indexação de tipos/funções não tem a mesma noção de "meio caminho seguro para
+persistir" que uma caracterização comportamental tem).
 
 ### Versionamento do esquema de persistência
 
-Não há versão de esquema nem migração. Os passos seguintes vão alterar tabelas
-existentes, e projetos criados por versões anteriores precisam de um caminho —
-nem que seja detectar e recusar com mensagem clara.
+Não há versão de esquema nem migração genérica. Os passos seguintes vão
+alterar tabelas existentes, e projetos criados por versões anteriores
+precisam de um caminho — nem que seja detectar e recusar com mensagem clara.
+
+A adição de `namespace`/`end_line`/`end_column` a `type_declarations` e
+`type_dependencies` (US-3) quebrou reabertura de projetos existentes em teste
+manual (`no such column: namespace`) antes de `ProjectStore::open` ganhar uma
+migração pontual (`migrate_type_columns`, via `PRAGMA table_info` +
+`ALTER TABLE ADD COLUMN`, testada em
+`opening_a_pre_namespace_database_adds_the_missing_columns`). Isso resolve
+*esse* caso, mas não é o mecanismo geral que este item pede — a próxima coluna
+nova exige o mesmo trabalho manual de novo.
 
 ### Escala
 
 Falta um alvo declarado de tamanho de projeto suportado (número de TUs, linhas,
 tipos). O fixture Verovio já é uma boa referência; sem um alvo escrito, decisões
 de arquitetura em US-4 e US-6 ficam sem critério.
+
+Um relato de "trava no meio da importação" ao importar o Verovio 5.7.0 real
+(não o fixture de 6.2.0 já versionado) confirmou esse risco na prática, não só
+em teoria: `project_service::create_project` faz **duas** passadas completas de
+`libclang` sobre as 291 unidades de compilação — uma em
+`type_catalog::extract_type_catalog`, outra, independente, em
+`source_catalog::extract_source_files` (`libclang` não expõe como reaproveitar
+a AST já parseada entre as duas) — cada `parse` frio levando ~1.3s por arquivo,
+sem nenhum log de progresso em nenhuma das duas. Resultado: 6+ minutos de
+silêncio total por passada, dentro de uma requisição HTTP síncrona, o que é
+indistinguível de travamento do ponto de vista do usuário.
+
+Reproduzido por um teste dedicado, não executado por padrão —
+`crates/server/tests/verovio_5_7_0_import_diagnosis.rs`
+(`cargo test -p syntax-bridge-server --test verovio_5_7_0_import_diagnosis --
+--ignored --nocapture`), contra o arquivo real
+`test-resources/verovio-version-5.7.0.tar.gz`.
+
+Mitigado, não resolvido: as duas passadas agora logam progresso por unidade
+(`log_type_catalog`/`[type_catalog]` no log do servidor) e paralelizam entre
+si — um `CXIndex` por thread de trabalho (um índice por thread é o único jeito
+documentado de paralelizar `libclang` com segurança; cada thread precisa
+carregar a biblioteca dinamicamente de novo, já que o carregamento do
+`clang-sys` com a feature `runtime` é por thread). Isso cortou o tempo total de
+importação do Verovio 5.7.0 de mais de 300s (o teste chegou a estourar esse
+timeout duas vezes antes da paralelização) para ~203s neste ambiente de 4
+núcleos — proporcional ao número de núcleos disponíveis, não uma correção
+estrutural. Um projeto ainda maior, ou uma máquina com menos núcleos (o
+sandbox Flatpak, por exemplo), volta a bater no mesmo problema. A correção de
+verdade é a já registrada acima em "Trabalho longo": tirar a ingestão da
+requisição HTTP síncrona e dar progresso real ao usuário.
 
 ### Erros e diagnósticos
 
@@ -782,7 +928,13 @@ importante do roadmap e não aparecia em nenhum plano.
 
 ### Higiene do repositório
 
-`test-resources/Test-package/` é saída de execução (contém `build/` e
-`project.db`), não fixture, e está fora do controle de versão sem estar no
-`.gitignore`. Fixtures de teste e artefatos de execução precisam de separação
-explícita, porque US-4 em diante vão depender de fixtures estáveis e versionados.
+Resolvido: `test-resources/Test-package/` (saída de execução, com `build/` e
+`project.db`) foi removido do repositório, e `test-resources/*/build/` entrou
+no `.gitignore`. O único fixture leve em `test-resources/` hoje é
+`sample-cmake-project.tar.gz`, versionado. O fixture *combinado* do critério
+de testabilidade de US-3 (struct, herança, union, enum, typedef, alias, macro,
+namespace e homônimos, todos no mesmo projeto) ainda não existe — é o que
+falta para o critério 1 de US-3 ser exercitável em um único teste. O critério
+3 (homônimos em namespaces distintos) já tem um fixture próprio, menor, em
+`crates/server/tests/type_catalog.rs`
+(`create_project_catalogs_namespace_and_extent_with_libclang`).

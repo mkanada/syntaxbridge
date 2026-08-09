@@ -7,8 +7,18 @@ use serde::Serialize;
 
 use crate::ingest::{self, CompilationUnit, CreateProjectRequest, CreatedProject, IngestError};
 use crate::persistence::{GlobalStore, PersistenceError, ProjectRecord, ProjectStore};
+use crate::progress::ExtractionProgress;
 use crate::source_catalog::{self, SourceCatalogError, SourceFile};
-use crate::type_catalog::{self, TypeCatalogError};
+use crate::type_catalog::{self, TypeCatalogError, TypeDeclaration};
+
+/// Live progress trackers for `create_project`'s two `libclang` passes, so a
+/// caller running it in the background (`jobs.rs`) can report real progress
+/// to a poller instead of the caller having to wait for the whole thing.
+#[derive(Default)]
+pub struct CreationProgress {
+    pub type_catalog: ExtractionProgress,
+    pub source_catalog: ExtractionProgress,
+}
 
 pub const DEFAULT_SOURCE_LANGUAGE: &str = "cpp";
 pub const DEFAULT_TARGET_LANGUAGE: &str = "dart";
@@ -76,17 +86,22 @@ impl From<SourceCatalogError> for ProjectCreationError {
 pub fn create_project(
     request: CreateProjectRequest,
     global_db_path: &Path,
+    progress: Option<&CreationProgress>,
 ) -> Result<CreatedProject, ProjectCreationError> {
     let mut project = ingest::create_project(request)?;
 
-    let catalog =
-        type_catalog::extract_type_catalog(&project.compilation_units, &project.input_source_dir)?;
+    let catalog = type_catalog::extract_type_catalog(
+        &project.compilation_units,
+        &project.input_source_dir,
+        progress.map(|progress| &progress.type_catalog),
+    )?;
     project.type_catalog = catalog.declarations;
     project.type_dependencies = catalog.dependencies;
 
     project.source_files = source_catalog::extract_source_files(
         &project.compilation_units,
         &project.input_source_dir,
+        progress.map(|progress| &progress.source_catalog),
     )?;
 
     let project_db_path = project.project_dir.join("project.db");
@@ -285,6 +300,59 @@ pub fn open_project(
         compilation_units,
         source_files,
     })
+}
+
+#[derive(Debug)]
+pub enum ListTypesError {
+    NotFound(PathBuf),
+    Persistence(PersistenceError),
+}
+
+impl ListTypesError {
+    pub fn is_client_error(&self) -> bool {
+        match self {
+            Self::NotFound(_) => true,
+            Self::Persistence(_) => false,
+        }
+    }
+}
+
+impl fmt::Display for ListTypesError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound(path) => {
+                write!(
+                    formatter,
+                    "no syntax-bridge project found at {}",
+                    path.display()
+                )
+            }
+            Self::Persistence(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for ListTypesError {}
+
+impl From<PersistenceError> for ListTypesError {
+    fn from(error: PersistenceError) -> Self {
+        Self::Persistence(error)
+    }
+}
+
+/// Serves the type catalog already persisted for a project (US-3), without
+/// reparsing it — the gap `docs/plans/User Steps.md` calls out for
+/// `LoadedProject`, closed here with a dedicated route instead of growing
+/// that struct, since US-4's navigator will need server-side sort and
+/// pagination this route is the natural place to add.
+pub fn list_types(project_dir: &Path) -> Result<Vec<TypeDeclaration>, ListTypesError> {
+    if !is_openable_project(project_dir) {
+        return Err(ListTypesError::NotFound(project_dir.to_path_buf()));
+    }
+
+    let project_db_path = project_dir.join("project.db");
+    let project_store = ProjectStore::open(&project_db_path)?;
+    Ok(project_store.list_type_declarations()?)
 }
 
 /// Reads a single source file's content for display, refusing to read

@@ -11,7 +11,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use syntax_bridge_server::ingest::CreateProjectRequest;
@@ -142,6 +142,7 @@ fn create_project_lists_translation_units_and_headers_as_source_files() {
             archive_path,
         },
         &global_db_path,
+        None,
     )
     .expect("ingest project and extract source files");
 
@@ -215,11 +216,15 @@ fn source_file_endpoint_returns_content_and_rejects_paths_outside_project() {
     .to_string();
     let (status, body) = http_post(addr, "/projects", &create_body);
     assert!(
-        status.starts_with("HTTP/1.1 201"),
+        status.starts_with("HTTP/1.1 202"),
         "unexpected project creation response: {status}"
     );
 
-    let created: Value = serde_json::from_str(&body).expect("parse creation response body");
+    let start: Value = serde_json::from_str(&body).expect("parse job-start response body");
+    let job_id = start["job_id"].as_str().expect("response includes job_id");
+    let job = poll_job_until_done(addr, job_id);
+    assert_eq!(job["status"], "succeeded", "unexpected job status: {job}");
+    let created = &job["project"];
     let project_dir = created["project_dir"]
         .as_str()
         .expect("response includes project_dir");
@@ -348,6 +353,24 @@ fn read_http_response(mut stream: TcpStream) -> (String, String) {
         .to_owned();
 
     (format!("{status_line}\r\n"), body)
+}
+
+/// Polls `GET /projects/jobs/{job_id}` until the job leaves the `running`
+/// state, for the fixture's small, effectively-instant creation. Bounded so
+/// a real regression fails the test instead of hanging the suite.
+fn poll_job_until_done(addr: SocketAddr, job_id: &str) -> Value {
+    for _ in 0..200 {
+        let (_, body) = http_get(addr, &format!("/projects/jobs/{job_id}"));
+        let json: Value = serde_json::from_str(&body).expect("parse job status response body");
+
+        if json["status"] != "running" {
+            return json;
+        }
+
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    panic!("job {job_id} did not finish within the polling budget");
 }
 
 fn assert_success(output: Output) {

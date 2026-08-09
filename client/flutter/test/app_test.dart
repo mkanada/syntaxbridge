@@ -159,6 +159,100 @@ void main() {
     expect(find.text('clang++ -c main.cpp'), findsNothing);
   });
 
+  testWidgets('shows the type catalog for the project', (tester) async {
+    final fakeClient = _FakeServerClient(
+      const ServerStatus(service: 'syntax-bridge-server', status: 'ok'),
+      types: const [
+        TypeDeclaration(
+          name: 'Point',
+          kind: TypeDeclarationKind.struct,
+          file: '/tmp/projects/counter/input-source/fixture/types.h',
+          line: 3,
+          column: 8,
+        ),
+      ],
+    );
+
+    await tester.pumpWidget(SyntaxBridgeApp(serverClient: fakeClient));
+    await tester.pumpAndSettle();
+    await _skipToIde(tester);
+
+    expect(find.text('Types'), findsOneWidget);
+    await tester.tap(find.text('Types'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Point'), findsOneWidget);
+    expect(find.text('struct'), findsOneWidget);
+  });
+
+  testWidgets("opens a type's source file with its body highlighted on click", (
+    tester,
+  ) async {
+    final fakeClient = _FakeServerClient(
+      const ServerStatus(service: 'syntax-bridge-server', status: 'ok'),
+      project: const CreatedProject(
+        name: 'counter',
+        projectDir: '/tmp/projects/counter',
+        inputSourceDir: '/tmp/projects/counter/input-source',
+        compilationUnits: [],
+        sourceFiles: [
+          SourceFile(
+            path: '/tmp/projects/counter/input-source/fixture/types.h',
+            kind: SourceFileKind.header,
+          ),
+        ],
+      ),
+      types: const [
+        TypeDeclaration(
+          name: 'Point',
+          kind: TypeDeclarationKind.struct,
+          namespace: 'geometry',
+          file: '/tmp/projects/counter/input-source/fixture/types.h',
+          line: 3,
+          column: 8,
+          endLine: 6,
+          endColumn: 1,
+        ),
+      ],
+      sourceFileContent:
+          'namespace geometry {\n\nstruct Point {\n  int x;\n  int y;\n};\n\n}',
+    );
+
+    await tester.pumpWidget(SyntaxBridgeApp(serverClient: fakeClient));
+    await tester.pumpAndSettle();
+    await _skipToIde(tester);
+
+    await tester.tap(find.text('Types'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('geometry::Point'));
+    await tester.pumpAndSettle();
+
+    expect(
+      fakeClient.readSourceFilePath,
+      '/tmp/projects/counter/input-source/fixture/types.h',
+    );
+    expect(find.text('types.h'), findsWidgets);
+    expect(find.text('struct Point {'), findsOneWidget);
+
+    final highlighted = tester.widget<ColoredBox>(
+      find
+          .ancestor(
+            of: find.text('struct Point {'),
+            matching: find.byType(ColoredBox),
+          )
+          .first,
+    );
+    final unhighlighted = tester.widget<ColoredBox>(
+      find
+          .ancestor(
+            of: find.text('namespace geometry {'),
+            matching: find.byType(ColoredBox),
+          )
+          .first,
+    );
+    expect(highlighted.color, isNot(unhighlighted.color));
+  });
+
   testWidgets('opens a source file and displays its content on click', (
     tester,
   ) async {
@@ -613,6 +707,7 @@ class _FakeServerClient implements ServerClient {
     this.recentProjects = const <RecentProject>[],
     this.openProjectResult,
     this.openProjectError,
+    this.types = const <TypeDeclaration>[],
   });
 
   final ServerStatus status;
@@ -622,6 +717,7 @@ class _FakeServerClient implements ServerClient {
   final List<RecentProject> recentProjects;
   final CreatedProject? openProjectResult;
   final Object? openProjectError;
+  final List<TypeDeclaration> types;
   String? createdProjectName;
   String? readSourceFilePath;
   String? openedProjectDir;
@@ -640,20 +736,36 @@ class _FakeServerClient implements ServerClient {
   }
 
   @override
-  Future<CreatedProject> createProject(CreateProjectInput input) async {
+  Future<String> startCreateProject(CreateProjectInput input) async {
     createdProjectName = input.name;
+    return 'job-1';
+  }
+
+  @override
+  Future<ProjectCreationJobStatus> pollCreateProjectJob(String jobId) async {
     final error = createError;
     if (error != null) {
-      throw error;
+      final message = error is ProjectCreationException
+          ? error.message
+          : error.toString();
+      return ProjectCreationJobStatus(
+        state: ProjectCreationJobState.failed,
+        errorMessage: message,
+        isClientError: true,
+      );
     }
 
-    return project ??
-        const CreatedProject(
-          name: 'empty',
-          projectDir: '',
-          inputSourceDir: '',
-          compilationUnits: [],
-        );
+    return ProjectCreationJobStatus(
+      state: ProjectCreationJobState.succeeded,
+      project:
+          project ??
+          const CreatedProject(
+            name: 'empty',
+            projectDir: '',
+            inputSourceDir: '',
+            compilationUnits: [],
+          ),
+    );
   }
 
   @override
@@ -684,6 +796,9 @@ class _FakeServerClient implements ServerClient {
     readSourceFilePath = path;
     return sourceFileContent;
   }
+
+  @override
+  Future<List<TypeDeclaration>> listTypes(String projectDir) async => types;
 }
 
 class _FakePathPicker implements PathPicker {

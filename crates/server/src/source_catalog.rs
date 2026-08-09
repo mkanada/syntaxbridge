@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::ingest::CompilationUnit;
+use crate::progress::ExtractionProgress;
 use crate::type_catalog;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -69,9 +70,16 @@ impl std::error::Error for SourceCatalogError {}
 ///
 /// Compilation units that `libclang` fails to parse are skipped rather than
 /// failing the whole extraction, mirroring `type_catalog::extract_type_catalog`.
+///
+/// This is a second full `libclang` parse of every compilation unit,
+/// independent of `type_catalog::extract_type_catalog`'s own parse — `libclang`
+/// doesn't expose a way to share the already-parsed AST between the two, so
+/// it re-pays that cost. Parallelized the same way and for the same reason
+/// (see that function's doc comment).
 pub fn extract_source_files(
     compilation_units: &[CompilationUnit],
     project_root: &Path,
+    progress: Option<&ExtractionProgress>,
 ) -> Result<Vec<SourceFile>, SourceCatalogError> {
     type_catalog::load_libclang().map_err(SourceCatalogError::LibclangUnavailable)?;
 
@@ -79,21 +87,41 @@ pub fn extract_source_files(
         .canonicalize()
         .unwrap_or_else(|_| project_root.to_path_buf());
 
+    if let Some(progress) = progress {
+        progress.set_total(compilation_units.len());
+    }
+
     let mut translation_units = BTreeSet::new();
     let mut headers = BTreeSet::new();
 
-    unsafe {
-        let index = clang_sys::clang_createIndex(0, 0);
+    if !compilation_units.is_empty() {
+        let worker_count = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+            .min(compilation_units.len());
+        let chunk_size = compilation_units.len().div_ceil(worker_count);
 
-        for unit in compilation_units {
-            if let Some(canonical) = canonicalize_within(&unit.file, &project_root) {
-                translation_units.insert(canonical);
-            }
+        let partials = std::thread::scope(|scope| {
+            compilation_units
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    let project_root = &project_root;
+                    scope.spawn(move || parse_chunk(chunk, project_root, progress))
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .expect("source catalog worker thread panicked")
+                })
+                .collect::<Vec<_>>()
+        });
 
-            collect_inclusions(index, unit, &project_root, &mut headers);
+        for (partial_translation_units, partial_headers) in partials {
+            translation_units.extend(partial_translation_units);
+            headers.extend(partial_headers);
         }
-
-        clang_sys::clang_disposeIndex(index);
     }
 
     for translation_unit in &translation_units {
@@ -114,6 +142,45 @@ pub fn extract_source_files(
     files.sort_by(|left, right| left.path.cmp(&right.path));
 
     Ok(files)
+}
+
+/// Parses `chunk`'s compilation units with a `CXIndex` private to this
+/// worker, returning its own local translation units and headers for the
+/// caller to merge (see `type_catalog::parse_chunk`, the same pattern).
+fn parse_chunk(
+    chunk: &[CompilationUnit],
+    project_root: &Path,
+    progress: Option<&ExtractionProgress>,
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    // Each worker thread needs its own load: see `type_catalog::parse_chunk`
+    // for why the calling thread's `load_libclang()` doesn't cover this one.
+    type_catalog::load_libclang().expect(
+        "libclang already loaded successfully on the calling thread; \
+         per-thread load is not expected to fail",
+    );
+
+    let mut translation_units = BTreeSet::new();
+    let mut headers = BTreeSet::new();
+
+    unsafe {
+        let index = clang_sys::clang_createIndex(0, 0);
+
+        for unit in chunk {
+            if let Some(canonical) = canonicalize_within(&unit.file, project_root) {
+                translation_units.insert(canonical);
+            }
+
+            collect_inclusions(index, unit, project_root, &mut headers);
+
+            if let Some(progress) = progress {
+                progress.mark_one_done();
+            }
+        }
+
+        clang_sys::clang_disposeIndex(index);
+    }
+
+    (translation_units, headers)
 }
 
 struct InclusionState<'a> {

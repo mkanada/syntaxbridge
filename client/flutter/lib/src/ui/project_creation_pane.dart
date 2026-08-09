@@ -7,28 +7,22 @@ class ProjectCreationPane extends StatelessWidget {
     required this.nameController,
     required this.workspaceDirController,
     required this.archivePathController,
-    required this.creating,
-    required this.createError,
     required this.canCreateProject,
     required this.onChanged,
     required this.onChooseWorkspaceDirectory,
     required this.onChooseSourceArchive,
     required this.onCreateProject,
-    required this.errorMessage,
   });
 
   final bool showTitle;
   final TextEditingController nameController;
   final TextEditingController workspaceDirController;
   final TextEditingController archivePathController;
-  final bool creating;
-  final Object? createError;
   final bool canCreateProject;
   final VoidCallback onChanged;
   final Future<void> Function() onChooseWorkspaceDirectory;
   final Future<void> Function() onChooseSourceArchive;
-  final Future<void> Function() onCreateProject;
-  final String Function(Object error) errorMessage;
+  final VoidCallback onCreateProject;
 
   @override
   Widget build(BuildContext context) {
@@ -87,30 +81,10 @@ class ProjectCreationPane extends StatelessWidget {
         ),
         const SizedBox(height: 16),
         FilledButton.icon(
-          onPressed: canCreateProject
-              ? () {
-                  onCreateProject();
-                }
-              : null,
-          icon: creating
-              ? const SizedBox.square(
-                  dimension: 18,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                )
-              : const Icon(Icons.create_new_folder),
-          label: Text(creating ? 'Creating' : 'Create project'),
+          onPressed: canCreateProject ? onCreateProject : null,
+          icon: const Icon(Icons.create_new_folder),
+          label: const Text('Create project'),
         ),
-        if (createError != null) ...[
-          const SizedBox(height: 16),
-          Text(
-            'Project creation failed',
-            style: Theme.of(
-              context,
-            ).textTheme.titleMedium?.copyWith(color: const Color(0xFFB3261E)),
-          ),
-          const SizedBox(height: 4),
-          Text(errorMessage(createError!)),
-        ],
       ],
     );
   }

@@ -24,14 +24,13 @@ class ExecutionLogView extends StatelessWidget {
           Text('Execution log', style: textTheme.headlineSmall),
           const SizedBox(height: 12),
         ],
-        DecoratedBox(
-          decoration: BoxDecoration(
-            color: IdePalette.editor,
-            border: Border.all(color: IdePalette.border),
-            borderRadius: BorderRadius.circular(6),
-          ),
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(minHeight: 160, maxHeight: 280),
+        Expanded(
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: IdePalette.editor,
+              border: Border.all(color: IdePalette.border),
+              borderRadius: BorderRadius.circular(6),
+            ),
             child: entries.isEmpty
                 ? const Padding(
                     padding: EdgeInsets.all(16),
@@ -40,17 +39,13 @@ class ExecutionLogView extends StatelessWidget {
                       style: TextStyle(color: IdePalette.muted),
                     ),
                   )
-                : SingleChildScrollView(
+                : ListView.separated(
                     padding: const EdgeInsets.symmetric(vertical: 8),
-                    child: Column(
-                      children: [
-                        for (final (index, entry) in entries.indexed) ...[
-                          if (index > 0)
-                            const Divider(height: 1, color: IdePalette.border),
-                          ExecutionLogRow(entry: entry),
-                        ],
-                      ],
-                    ),
+                    itemCount: entries.length,
+                    separatorBuilder: (context, index) =>
+                        const Divider(height: 1, color: IdePalette.border),
+                    itemBuilder: (context, index) =>
+                        ExecutionLogRow(entry: entries[index]),
                   ),
           ),
         ),

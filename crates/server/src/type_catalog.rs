@@ -13,10 +13,12 @@ use std::ffi::{CStr, CString};
 use std::fmt;
 use std::os::raw::{c_int, c_uint, c_void};
 use std::path::{Path, PathBuf};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
 use crate::ingest::CompilationUnit;
+use crate::progress::ExtractionProgress;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -61,9 +63,19 @@ impl TypeDeclarationKind {
 pub struct TypeDeclaration {
     pub name: String,
     pub kind: TypeDeclarationKind,
+    /// The chain of enclosing namespaces, innermost last, joined with `::`
+    /// (e.g. `"geometry::detail"`), or empty for a type declared at global
+    /// scope. Anonymous namespaces are skipped since they contribute no
+    /// name to disambiguate with.
+    pub namespace: String,
     pub file: String,
     pub line: u32,
     pub column: u32,
+    /// The line and column of the end of the declaration's extent (e.g. the
+    /// closing `}` of a struct/class/union/enum body), used to highlight the
+    /// whole declaration rather than just its starting point.
+    pub end_line: u32,
+    pub end_column: u32,
 }
 
 /// An edge in the type dependency graph: `caller` references `callee` in its
@@ -106,15 +118,122 @@ impl std::error::Error for TypeCatalogError {}
 /// Compilation units that `libclang` fails to parse are skipped rather than
 /// failing the whole extraction, since a single misconfigured translation
 /// unit shouldn't prevent cataloging the rest of the project.
+///
+/// Each `libclang` parse is a cold parse of the whole translation unit (no
+/// precompiled headers), which is inherently slow one at a time — on a real
+/// project like Verovio (~290 units) that's several minutes spent entirely
+/// on one core, indistinguishable from a hang from the outside (see
+/// `crates/server/tests/verovio_5_7_0_import_diagnosis.rs`). Units are
+/// independent, so they're split across a worker per CPU core, each with its
+/// own `CXIndex` — sharing one `CXIndex` across threads isn't safe, but one
+/// index per thread is the documented-safe way to parallelize `libclang`.
+/// Declarations and dependencies are deduplicated locally per worker, then
+/// again across workers when merging, since the same project header is
+/// commonly included — and therefore reparsed — by many translation units.
 pub fn extract_type_catalog(
     compilation_units: &[CompilationUnit],
     project_root: &Path,
+    progress: Option<&ExtractionProgress>,
 ) -> Result<TypeCatalog, TypeCatalogError> {
     ensure_libclang_loaded()?;
 
     let project_root = project_root
         .canonicalize()
         .unwrap_or_else(|_| project_root.to_path_buf());
+
+    let total = compilation_units.len();
+    if let Some(progress) = progress {
+        progress.set_total(total);
+    }
+    log_type_catalog(format_args!(
+        "extract_type_catalog: start, {total} compilation units"
+    ));
+    let extraction_started = Instant::now();
+
+    let partials = if compilation_units.is_empty() {
+        Vec::new()
+    } else {
+        let worker_count = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+            .min(total);
+        let chunk_size = total.div_ceil(worker_count);
+
+        std::thread::scope(|scope| {
+            compilation_units
+                .chunks(chunk_size)
+                .enumerate()
+                .map(|(worker_index, chunk)| {
+                    let project_root = &project_root;
+                    scope.spawn(move || parse_chunk(worker_index, chunk, project_root, progress))
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().expect("type catalog worker thread panicked"))
+                .collect::<Vec<_>>()
+        })
+    };
+
+    let mut seen = HashSet::new();
+    let mut declarations = Vec::new();
+    let mut dependency_seen = HashSet::new();
+    let mut dependencies = Vec::new();
+
+    for (partial_declarations, partial_dependencies) in partials {
+        for declaration in partial_declarations {
+            let key = (
+                declaration.kind,
+                declaration.name.clone(),
+                declaration.file.clone(),
+                declaration.line,
+                declaration.column,
+            );
+
+            if seen.insert(key) {
+                declarations.push(declaration);
+            }
+        }
+
+        for dependency in partial_dependencies {
+            push_dependency(
+                &mut dependencies,
+                &mut dependency_seen,
+                dependency.caller,
+                dependency.callee,
+            );
+        }
+    }
+
+    log_type_catalog(format_args!(
+        "extract_type_catalog: done in {:.2}s, {} declarations, {} dependencies",
+        extraction_started.elapsed().as_secs_f64(),
+        declarations.len(),
+        dependencies.len()
+    ));
+
+    Ok(TypeCatalog {
+        declarations,
+        dependencies,
+    })
+}
+
+/// Parses `chunk`'s compilation units with a `CXIndex` private to this
+/// worker, returning its own local (not yet cross-chunk deduplicated)
+/// declarations and dependencies for the caller to merge.
+fn parse_chunk(
+    worker_index: usize,
+    chunk: &[CompilationUnit],
+    project_root: &Path,
+    progress: Option<&ExtractionProgress>,
+) -> (Vec<TypeDeclaration>, Vec<TypeDependency>) {
+    // `clang-sys`'s `runtime` feature loads the shared library into
+    // thread-local storage, so the load done by `ensure_libclang_loaded` on
+    // the calling thread doesn't cover this worker thread — each one has to
+    // load it independently before making any `clang_sys` call.
+    load_libclang().expect(
+        "libclang already loaded successfully on the calling thread; \
+         per-thread load is not expected to fail",
+    );
 
     let mut seen = HashSet::new();
     let mut declarations = Vec::new();
@@ -124,25 +243,52 @@ pub fn extract_type_catalog(
     unsafe {
         let index = clang_sys::clang_createIndex(0, 0);
 
-        for unit in compilation_units {
+        for unit in chunk {
             let mut visitor_state = VisitorState {
-                project_root: &project_root,
+                project_root,
                 declarations: &mut declarations,
                 seen: &mut seen,
                 dependencies: &mut dependencies,
                 dependency_seen: &mut dependency_seen,
             };
 
+            log_type_catalog(format_args!(
+                "parsing (worker {worker_index}): {}",
+                unit.file
+            ));
+            let unit_started = Instant::now();
+
             visit_translation_unit(index, unit, &mut visitor_state);
+
+            if let Some(progress) = progress {
+                progress.mark_one_done();
+            }
+
+            log_type_catalog(format_args!(
+                "parsed in {:.2}s (worker {worker_index}): {}",
+                unit_started.elapsed().as_secs_f64(),
+                unit.file
+            ));
         }
 
         clang_sys::clang_disposeIndex(index);
     }
 
-    Ok(TypeCatalog {
-        declarations,
-        dependencies,
-    })
+    (declarations, dependencies)
+}
+
+fn log_type_catalog(args: fmt::Arguments<'_>) {
+    eprintln!(
+        "[syntax-bridge][type_catalog][{}] {args}",
+        timestamp_millis()
+    );
+}
+
+fn timestamp_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 struct VisitorState<'a> {
@@ -433,13 +579,70 @@ fn describe_cursor(
         return None;
     }
 
+    let namespace = unsafe { namespace_of(cursor) };
+    let (end_line, end_column) = unsafe { extent_end(cursor) };
+
     Some(TypeDeclaration {
         name,
         kind,
+        namespace,
         file: canonical_file_path.display().to_string(),
         line,
         column,
+        end_line,
+        end_column,
     })
+}
+
+/// Walks `cursor`'s semantic parents, collecting the spelling of every
+/// enclosing `namespace` (innermost last), and joins them with `::`.
+///
+/// Non-namespace parents (a struct nesting another struct, for instance) are
+/// skipped rather than stopping the walk, so a type nested inside a class
+/// still picks up that class's enclosing namespace.
+unsafe fn namespace_of(cursor: clang_sys::CXCursor) -> String {
+    let mut segments = Vec::new();
+    let mut parent = unsafe { clang_sys::clang_getCursorSemanticParent(cursor) };
+
+    while unsafe { clang_sys::clang_Cursor_isNull(parent) } == 0 {
+        let parent_kind = unsafe { clang_sys::clang_getCursorKind(parent) };
+        if parent_kind == clang_sys::CXCursor_TranslationUnit {
+            break;
+        }
+
+        if parent_kind == clang_sys::CXCursor_Namespace {
+            let name = unsafe { cxstring_to_string(clang_sys::clang_getCursorSpelling(parent)) };
+            if !name.is_empty() {
+                segments.push(name);
+            }
+        }
+
+        parent = unsafe { clang_sys::clang_getCursorSemanticParent(parent) };
+    }
+
+    segments.reverse();
+    segments.join("::")
+}
+
+/// The line/column of the end of `cursor`'s extent (e.g. the closing `}` of
+/// a struct/class/union/enum body), for highlighting the whole declaration.
+unsafe fn extent_end(cursor: clang_sys::CXCursor) -> (u32, u32) {
+    let extent = unsafe { clang_sys::clang_getCursorExtent(cursor) };
+    let end = unsafe { clang_sys::clang_getRangeEnd(extent) };
+
+    let mut line: c_uint = 0;
+    let mut column: c_uint = 0;
+    unsafe {
+        clang_sys::clang_getSpellingLocation(
+            end,
+            std::ptr::null_mut(),
+            &mut line,
+            &mut column,
+            std::ptr::null_mut(),
+        );
+    }
+
+    (line, column)
 }
 
 pub(crate) unsafe fn cxstring_to_string(string: clang_sys::CXString) -> String {

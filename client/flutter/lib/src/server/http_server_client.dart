@@ -39,7 +39,7 @@ class HttpServerClient implements ServerClient {
   }
 
   @override
-  Future<CreatedProject> createProject(CreateProjectInput input) async {
+  Future<String> startCreateProject(CreateProjectInput input) async {
     final url = baseUrl.resolve('/projects');
     final payload = jsonEncode(input.toJson());
     cliLog('HTTP POST $url payload=$payload');
@@ -51,11 +51,30 @@ class HttpServerClient implements ServerClient {
     final body = await utf8.decoder.bind(response).join();
     cliLog('HTTP POST $url -> ${response.statusCode} body=$body');
 
-    if (response.statusCode != HttpStatus.created) {
+    if (response.statusCode != HttpStatus.accepted) {
       throw ProjectCreationException(_errorMessageFromBody(body));
     }
 
-    return CreatedProject.fromJson(jsonDecode(body) as Map<String, Object?>);
+    final json = jsonDecode(body) as Map<String, Object?>;
+    return json['job_id'] as String? ?? '';
+  }
+
+  @override
+  Future<ProjectCreationJobStatus> pollCreateProjectJob(String jobId) async {
+    final url = baseUrl.resolve('/projects/jobs/$jobId');
+    cliLog('HTTP GET $url');
+    final request = await _httpClient.getUrl(url);
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP GET $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.ok) {
+      throw ProjectCreationException(_errorMessageFromBody(body));
+    }
+
+    return ProjectCreationJobStatus.fromJson(
+      jsonDecode(body) as Map<String, Object?>,
+    );
   }
 
   @override
@@ -138,6 +157,29 @@ class HttpServerClient implements ServerClient {
 
     final json = jsonDecode(body) as Map<String, Object?>;
     return json['content'] as String? ?? '';
+  }
+
+  @override
+  Future<List<TypeDeclaration>> listTypes(String projectDir) async {
+    final url = baseUrl
+        .resolve('/projects/types')
+        .replace(queryParameters: {'project_dir': projectDir});
+    cliLog('HTTP GET $url');
+    final request = await _httpClient.getUrl(url);
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP GET $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException(_errorMessageFromBody(body));
+    }
+
+    final json = jsonDecode(body) as Map<String, Object?>;
+    final typesJson = json['types'] as List<Object?>? ?? const <Object?>[];
+    return typesJson
+        .whereType<Map<String, Object?>>()
+        .map(TypeDeclaration.fromJson)
+        .toList();
   }
 
   String _errorMessageFromBody(String body) {

@@ -9,10 +9,13 @@ import 'dockable_panel.dart';
 import 'execution_log.dart';
 import 'execution_log_view.dart';
 import 'ide_theme.dart';
+import 'panel_descriptor.dart';
+import 'panel_group.dart';
 import 'screen_capturer.dart';
 import 'server_connection_status.dart';
 import 'source_file_viewer.dart';
 import 'source_files_view.dart';
+import 'types_view.dart';
 
 class ServerStatusPage extends StatefulWidget {
   const ServerStatusPage({
@@ -35,19 +38,25 @@ class ServerStatusPage extends StatefulWidget {
 class _ServerStatusPageState extends State<ServerStatusPage> {
   late Future<ServerStatus> _status;
   final List<ExecutionLogEntry> _logs = [];
-  final Set<_IdePanel> _openPanels = {_IdePanel.explorer, _IdePanel.log};
-  final Map<_IdePanel, DockSide> _panelSides = {
-    _IdePanel.explorer: DockSide.left,
-    _IdePanel.log: DockSide.right,
+  final Set<String> _openPanels = {'explorer', 'types', 'log'};
+  final Map<String, DockSide> _panelSides = {
+    'explorer': DockSide.left,
+    'types': DockSide.left,
+    'log': DockSide.right,
   };
   final _screenshotBoundaryKey = GlobalKey();
   SourceFile? _selectedSourceFile;
   Future<String>? _selectedSourceContent;
+  TypeDeclaration? _selectedType;
+  int? _highlightStartLine;
+  int? _highlightEndLine;
+  late Future<List<TypeDeclaration>> _types;
 
   @override
   void initState() {
     super.initState();
     _status = _loadServerStatus(notify: false);
+    _types = _loadTypes();
   }
 
   void _refresh() {
@@ -83,7 +92,12 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     }
   }
 
-  void _selectSourceFile(SourceFile file) {
+  void _selectSourceFile(
+    SourceFile file, {
+    TypeDeclaration? selectedType,
+    int? highlightStartLine,
+    int? highlightEndLine,
+  }) {
     _addLog('Opening ${file.path}');
     setState(() {
       _selectedSourceFile = file;
@@ -91,7 +105,27 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
         widget.project.projectDir,
         file,
       );
+      _selectedType = selectedType;
+      _highlightStartLine = highlightStartLine;
+      _highlightEndLine = highlightEndLine;
     });
+  }
+
+  /// Opens the file where [type] is declared and highlights its body, so
+  /// clicking a type in the Types navigator jumps straight to its
+  /// definition instead of just naming it.
+  void _selectType(TypeDeclaration type) {
+    final sourceFile = widget.project.sourceFiles.firstWhere(
+      (file) => file.path == type.file,
+      orElse: () => SourceFile(path: type.file, kind: SourceFileKind.header),
+    );
+
+    _selectSourceFile(
+      sourceFile,
+      selectedType: type,
+      highlightStartLine: type.line,
+      highlightEndLine: type.endLine > 0 ? type.endLine : type.line,
+    );
   }
 
   Future<String> _loadSourceFileContent(
@@ -111,6 +145,29 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
       _addLog(
         'Failed to load ${file.path}: ${projectErrorMessage(error)}',
         level: ExecutionLogLevel.error,
+      );
+      rethrow;
+    }
+  }
+
+  Future<List<TypeDeclaration>> _loadTypes() async {
+    try {
+      final types = await widget.serverClient.listTypes(
+        widget.project.projectDir,
+      );
+      _addLog(
+        'Loaded ${types.length} types',
+        level: ExecutionLogLevel.success,
+        notify: false,
+      );
+      return types;
+    } catch (error, stackTrace) {
+      cliLog('list types exception: $error');
+      cliLog('list types stack: $stackTrace');
+      _addLog(
+        'Failed to load types: ${projectErrorMessage(error)}',
+        level: ExecutionLogLevel.error,
+        notify: false,
       );
       rethrow;
     }
@@ -159,22 +216,22 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     });
   }
 
-  void _openPanel(_IdePanel panel) {
+  void _openPanel(String id) {
     setState(() {
-      _openPanels.add(panel);
+      _openPanels.add(id);
     });
   }
 
-  void _closePanel(_IdePanel panel) {
+  void _closePanel(String id) {
     setState(() {
-      _openPanels.remove(panel);
+      _openPanels.remove(id);
     });
   }
 
-  void _dockPanel(_IdePanel panel, DockSide side) {
+  void _dockPanel(String id, DockSide side) {
     setState(() {
-      _panelSides[panel] = side;
-      _openPanels.add(panel);
+      _panelSides[id] = side;
+      _openPanels.add(id);
     });
   }
 
@@ -189,38 +246,42 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
             Expanded(
               child: LayoutBuilder(
                 builder: (context, constraints) {
-                  final panels = _buildPanels();
+                  final descriptors = _panelDescriptors();
 
                   return ColoredBox(
                     color: IdePalette.background,
                     child: _DockedWorkspace(
                       compact: constraints.maxWidth < 980,
                       closedPanels: [
-                        for (final panel in _IdePanel.values)
-                          if (!_openPanels.contains(panel))
+                        for (final descriptor in descriptors)
+                          if (!_openPanels.contains(descriptor.id))
                             _ClosedPanelButton(
-                              title: panel.title,
-                              icon: panel.icon,
-                              onPressed: () => _openPanel(panel),
+                              title: descriptor.title,
+                              icon: descriptor.icon,
+                              onPressed: () => _openPanel(descriptor.id),
                             ),
                       ],
                       topPanels: _panelsFor(
-                        panels,
+                        context,
+                        descriptors,
                         DockSide.top,
                         constraints.maxWidth,
                       ),
                       leftPanels: _panelsFor(
-                        panels,
+                        context,
+                        descriptors,
                         DockSide.left,
                         constraints.maxWidth,
                       ),
                       rightPanels: _panelsFor(
-                        panels,
+                        context,
+                        descriptors,
                         DockSide.right,
                         constraints.maxWidth,
                       ),
                       bottomPanels: _panelsFor(
-                        panels,
+                        context,
+                        descriptors,
                         DockSide.bottom,
                         constraints.maxWidth,
                       ),
@@ -230,6 +291,8 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
                         onRefresh: _refresh,
                         selectedFile: _selectedSourceFile,
                         selectedFileContent: _selectedSourceContent,
+                        highlightStartLine: _highlightStartLine,
+                        highlightEndLine: _highlightEndLine,
                       ),
                     ),
                   );
@@ -242,64 +305,127 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     );
   }
 
-  Map<_IdePanel, Widget> _buildPanels() {
-    return {
-      _IdePanel.explorer: DockablePanel(
-        title: _IdePanel.explorer.title,
-        icon: _IdePanel.explorer.icon,
-        side: _panelSides[_IdePanel.explorer] ?? DockSide.left,
-        onClose: () => _closePanel(_IdePanel.explorer),
-        onDockSide: (side) => _dockPanel(_IdePanel.explorer, side),
-        child: SourceFilesView(
+  /// The registry of panels the workspace can show. Adding a panel means
+  /// adding one entry here — nothing else in this class or in
+  /// [_DockedWorkspace] names a specific panel.
+  List<PanelDescriptor> _panelDescriptors() {
+    return [
+      PanelDescriptor(
+        id: 'explorer',
+        title: 'Explorer',
+        icon: Icons.folder_open_outlined,
+        defaultSide: DockSide.left,
+        builder: (context) => SourceFilesView(
           project: widget.project,
           onFileSelected: _selectSourceFile,
           selectedPath: _selectedSourceFile?.path,
         ),
       ),
-      _IdePanel.log: DockablePanel(
-        title: _IdePanel.log.title,
-        icon: _IdePanel.log.icon,
-        side: _panelSides[_IdePanel.log] ?? DockSide.right,
-        onClose: () => _closePanel(_IdePanel.log),
-        onDockSide: (side) => _dockPanel(_IdePanel.log, side),
-        child: ExecutionLogView(entries: _logs, showTitle: false),
+      PanelDescriptor(
+        id: 'types',
+        title: 'Types',
+        icon: Icons.data_object,
+        defaultSide: DockSide.left,
+        builder: (context) => FutureBuilder<List<TypeDeclaration>>(
+          future: _types,
+          builder: (context, snapshot) {
+            if (snapshot.connectionState != ConnectionState.done) {
+              return const Center(
+                child: Padding(
+                  padding: EdgeInsets.all(16),
+                  child: CircularProgressIndicator(),
+                ),
+              );
+            }
+
+            final error = snapshot.error;
+            if (error != null) {
+              return Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(
+                  'Failed to load types: ${projectErrorMessage(error)}',
+                  style: const TextStyle(color: IdePalette.red),
+                ),
+              );
+            }
+
+            return TypesView(
+              types: snapshot.data ?? const [],
+              onTypeSelected: _selectType,
+              selectedType: _selectedType,
+            );
+          },
+        ),
       ),
-    };
+      PanelDescriptor(
+        id: 'log',
+        title: 'Execution log',
+        icon: Icons.receipt_long_outlined,
+        defaultSide: DockSide.right,
+        builder: (context) =>
+            ExecutionLogView(entries: _logs, showTitle: false),
+      ),
+    ];
   }
 
+  /// The open panels docked to [side]. A single one renders as a standalone
+  /// [DockablePanel]; two or more share a [TabbedPanelGroup] so each keeps
+  /// full height instead of splitting it.
   List<Widget> _panelsFor(
-    Map<_IdePanel, Widget> panels,
+    BuildContext context,
+    List<PanelDescriptor> descriptors,
     DockSide side,
     double screenWidth,
   ) {
-    final compact = screenWidth < 980;
-    return [
-      for (final panel in _IdePanel.values)
-        if (_openPanels.contains(panel) &&
-            (_panelSides[panel] ?? DockSide.left) == side)
-          _ConstrainedDockPanel(
-            side: compact ? DockSide.top : side,
-            child: panels[panel]!,
-          ),
+    final openOnSide = [
+      for (final descriptor in descriptors)
+        if (_openPanels.contains(descriptor.id) &&
+            (_panelSides[descriptor.id] ?? descriptor.defaultSide) == side)
+          descriptor,
     ];
-  }
-}
 
-enum _IdePanel { explorer, log }
+    if (openOnSide.isEmpty) {
+      return const [];
+    }
 
-extension _IdePanelMetadata on _IdePanel {
-  String get title {
-    return switch (this) {
-      _IdePanel.explorer => 'Explorer',
-      _IdePanel.log => 'Execution log',
-    };
-  }
+    final compact = screenWidth < 980;
+    final displaySide = compact ? DockSide.top : side;
 
-  IconData get icon {
-    return switch (this) {
-      _IdePanel.explorer => Icons.folder_open_outlined,
-      _IdePanel.log => Icons.receipt_long_outlined,
-    };
+    if (openOnSide.length == 1) {
+      final descriptor = openOnSide.single;
+      return [
+        _ConstrainedDockPanel(
+          side: displaySide,
+          child: DockablePanel(
+            title: descriptor.title,
+            icon: descriptor.icon,
+            side: _panelSides[descriptor.id] ?? descriptor.defaultSide,
+            onClose: () => _closePanel(descriptor.id),
+            onDockSide: (newSide) => _dockPanel(descriptor.id, newSide),
+            child: descriptor.builder(context),
+          ),
+        ),
+      ];
+    }
+
+    return [
+      _ConstrainedDockPanel(
+        side: displaySide,
+        child: TabbedPanelGroup(
+          tabs: [
+            for (final descriptor in openOnSide)
+              PanelTab(
+                title: descriptor.title,
+                icon: descriptor.icon,
+                side: _panelSides[descriptor.id] ?? descriptor.defaultSide,
+                onClose: () => _closePanel(descriptor.id),
+                onDockSide: (newSide) => _dockPanel(descriptor.id, newSide),
+                child: descriptor.builder(context),
+              ),
+          ],
+        ),
+      ),
+    ];
   }
 }
 
@@ -476,6 +602,8 @@ class _WorkspaceCenter extends StatelessWidget {
     required this.onRefresh,
     this.selectedFile,
     this.selectedFileContent,
+    this.highlightStartLine,
+    this.highlightEndLine,
   });
 
   final Future<ServerStatus> status;
@@ -483,6 +611,8 @@ class _WorkspaceCenter extends StatelessWidget {
   final VoidCallback onRefresh;
   final SourceFile? selectedFile;
   final Future<String>? selectedFileContent;
+  final int? highlightStartLine;
+  final int? highlightEndLine;
 
   @override
   Widget build(BuildContext context) {
@@ -496,6 +626,8 @@ class _WorkspaceCenter extends StatelessWidget {
             ? SourceFileViewer(
                 path: selectedFile.path,
                 content: selectedFileContent,
+                highlightStartLine: highlightStartLine,
+                highlightEndLine: highlightEndLine,
               )
             : SingleChildScrollView(
                 padding: const EdgeInsets.all(18),

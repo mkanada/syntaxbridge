@@ -111,14 +111,27 @@ class _FakeServerClient implements ServerClient {
   Future<ServerStatus> health() async => status;
 
   @override
-  Future<CreatedProject> createProject(CreateProjectInput input) async {
-    return project ??
-        CreatedProject(
-          name: input.name,
-          projectDir: '${input.workspaceDir}/${input.name}',
-          inputSourceDir: '${input.workspaceDir}/${input.name}/input-source',
-          compilationUnits: const [],
-        );
+  Future<String> startCreateProject(CreateProjectInput input) async {
+    _pendingInput = input;
+    return 'job-1';
+  }
+
+  CreateProjectInput? _pendingInput;
+
+  @override
+  Future<ProjectCreationJobStatus> pollCreateProjectJob(String jobId) async {
+    final input = _pendingInput!;
+    return ProjectCreationJobStatus(
+      state: ProjectCreationJobState.succeeded,
+      project:
+          project ??
+          CreatedProject(
+            name: input.name,
+            projectDir: '${input.workspaceDir}/${input.name}',
+            inputSourceDir: '${input.workspaceDir}/${input.name}/input-source',
+            compilationUnits: const [],
+          ),
+    );
   }
 
   @override
@@ -143,6 +156,9 @@ class _FakeServerClient implements ServerClient {
     required String projectDir,
     required String path,
   }) async => '';
+
+  @override
+  Future<List<TypeDeclaration>> listTypes(String projectDir) async => const [];
 }
 
 const _projectWithCompilationUnits = CreatedProject(

@@ -8,6 +8,7 @@ import 'src/logging/cli_log.dart';
 import 'src/project/project_models.dart';
 import 'src/server/http_server_client.dart';
 import 'src/server/server_client.dart';
+import 'src/ui/creating_project_page.dart';
 import 'src/ui/ide_theme.dart';
 import 'src/ui/new_project_page.dart';
 import 'src/ui/project_landing_page.dart';
@@ -20,6 +21,7 @@ export 'src/project/project_creation_exception.dart';
 export 'src/project/project_models.dart';
 export 'src/server/http_server_client.dart';
 export 'src/server/server_client.dart';
+export 'src/ui/creating_project_page.dart';
 export 'src/ui/new_project_page.dart';
 export 'src/ui/project_landing_page.dart';
 export 'src/ui/screen_capturer.dart';
@@ -140,21 +142,32 @@ class _AppRoot extends StatefulWidget {
   State<_AppRoot> createState() => _AppRootState();
 }
 
-enum _AppStage { landing, creatingProject, ide }
+enum _AppStage { landing, newProjectForm, creatingProject, ide }
 
 class _AppRootState extends State<_AppRoot> {
   _AppStage _stage = _AppStage.landing;
   CreatedProject? _project;
+  CreateProjectInput? _pendingInput;
 
   void _startNewProject() {
     setState(() {
-      _stage = _AppStage.creatingProject;
+      _stage = _AppStage.newProjectForm;
     });
   }
 
   void _cancelNewProject() {
     setState(() {
       _stage = _AppStage.landing;
+    });
+  }
+
+  /// The form's parameters are valid the moment this is called (it's only
+  /// reachable by tapping the button `NewProjectPage` gates on that), so the
+  /// screen switches immediately rather than waiting on the server.
+  void _submitNewProject(CreateProjectInput input) {
+    setState(() {
+      _pendingInput = input;
+      _stage = _AppStage.creatingProject;
     });
   }
 
@@ -175,10 +188,16 @@ class _AppRootState extends State<_AppRoot> {
           onProjectReady: _handleProjectReady,
           onNewProject: _startNewProject,
         );
-      case _AppStage.creatingProject:
+      case _AppStage.newProjectForm:
         return NewProjectPage(
-          serverClient: widget.serverClient,
           pathPicker: widget.pathPicker,
+          onSubmit: _submitNewProject,
+          onCancel: _cancelNewProject,
+        );
+      case _AppStage.creatingProject:
+        return CreatingProjectPage(
+          serverClient: widget.serverClient,
+          input: _pendingInput!,
           onProjectCreated: _handleProjectReady,
           onCancel: _cancelNewProject,
         );

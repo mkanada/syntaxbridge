@@ -3,7 +3,15 @@ import '../project/project_models.dart';
 abstract class ServerClient {
   Future<ServerStatus> health();
 
-  Future<CreatedProject> createProject(CreateProjectInput input);
+  /// Starts project creation as a background job on the server (ingest plus
+  /// `libclang` extraction, which can take minutes for a real project) and
+  /// returns its job id immediately, to be polled with
+  /// [pollCreateProjectJob] rather than waiting on the whole thing inline.
+  Future<String> startCreateProject(CreateProjectInput input);
+
+  /// A snapshot of a job started by [startCreateProject]: still running
+  /// (with progress), or its terminal outcome.
+  Future<ProjectCreationJobStatus> pollCreateProjectJob(String jobId);
 
   /// The last 5 projects the app was used with, most recently opened first.
   Future<List<RecentProject>> listRecentProjects();
@@ -22,4 +30,8 @@ abstract class ServerClient {
     required String projectDir,
     required String path,
   });
+
+  /// The type catalog already persisted for a project (US-3), without
+  /// reparsing it.
+  Future<List<TypeDeclaration>> listTypes(String projectDir);
 }

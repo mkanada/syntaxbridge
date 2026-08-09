@@ -25,27 +25,27 @@ class SourceFilesView extends StatelessWidget {
         const SizedBox(height: 4),
         Text(project.projectDir, style: Theme.of(context).textTheme.bodyMedium),
         const SizedBox(height: 16),
-        ListView.separated(
-          shrinkWrap: true,
-          physics: const NeverScrollableScrollPhysics(),
-          itemCount: files.length,
-          separatorBuilder: (context, index) => const Divider(height: 1),
-          itemBuilder: (context, index) {
-            final file = files[index];
-            final relativePath = _projectRelativeFile(file.path);
+        Expanded(
+          child: ListView.separated(
+            itemCount: files.length,
+            separatorBuilder: (context, index) => const Divider(height: 1),
+            itemBuilder: (context, index) {
+              final file = files[index];
+              final relativePath = _projectRelativeFile(file.path);
 
-            return ListTile(
-              contentPadding: EdgeInsets.zero,
-              selected: file.path == selectedPath,
-              leading: Icon(
-                file.kind == SourceFileKind.translationUnit
-                    ? Icons.description
-                    : Icons.article_outlined,
-              ),
-              title: Text(relativePath),
-              onTap: () => onFileSelected(file),
-            );
-          },
+              return ListTile(
+                contentPadding: EdgeInsets.zero,
+                selected: file.path == selectedPath,
+                leading: Icon(
+                  file.kind == SourceFileKind.translationUnit
+                      ? Icons.description
+                      : Icons.article_outlined,
+                ),
+                title: Text(relativePath),
+                onTap: () => onFileSelected(file),
+              );
+            },
+          ),
         ),
       ],
     );
