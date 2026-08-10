@@ -39,11 +39,14 @@ class ServerStatusPage extends StatefulWidget {
 class _ServerStatusPageState extends State<ServerStatusPage> {
   late Future<ServerStatus> _status;
   final List<ExecutionLogEntry> _logs = [];
-  final Set<String> _openPanels = {'explorer', 'types', 'usages', 'log'};
+  // 'usages' starts closed: it opens itself, docked to the center split,
+  // only once a type is actually selected (see _selectType) — "entering"
+  // the split rather than reserving half the workspace from the outset.
+  final Set<String> _openPanels = {'explorer', 'types', 'log'};
   final Map<String, DockSide> _panelSides = {
     'explorer': DockSide.left,
     'types': DockSide.left,
-    'usages': DockSide.bottom,
+    'usages': DockSide.center,
     'log': DockSide.right,
   };
   final _screenshotBoundaryKey = GlobalKey();
@@ -116,9 +119,10 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
 
   /// Opens the file where [type] is declared and highlights its body, so
   /// clicking a type in the Types navigator jumps straight to its
-  /// definition instead of just naming it. Also populates the Usages panel
-  /// (US-4) for this type, keyed by its stable `usr` (US-3) rather than by
-  /// position.
+  /// definition instead of just naming it. Also opens the Usages panel
+  /// (US-4), docked to the center split so it appears side by side with the
+  /// source viewer, and populates it for this type, keyed by its stable
+  /// `usr` (US-3) rather than by position.
   void _selectType(TypeDeclaration type) {
     final sourceFile = widget.project.sourceFiles.firstWhere(
       (file) => file.path == type.file,
@@ -133,6 +137,8 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     );
 
     setState(() {
+      _openPanels.add('usages');
+      _panelSides['usages'] = DockSide.center;
       _selectedTypeUsages = type.usr.isEmpty
           ? Future.value(const <TypeUsage>[])
           : _loadUsages(type.usr);
@@ -269,15 +275,20 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     });
   }
 
-  void _openPanel(String id) {
-    setState(() {
-      _openPanels.add(id);
-    });
-  }
-
   void _closePanel(String id) {
     setState(() {
       _openPanels.remove(id);
+    });
+  }
+
+  /// Flips [id] between open and closed — what the Panels menu (in the title
+  /// bar) uses both to reopen a closed panel and to close an open one from
+  /// a single checklist, instead of the old per-panel "closed" button.
+  void _togglePanel(String id) {
+    setState(() {
+      if (!_openPanels.remove(id)) {
+        _openPanels.add(id);
+      }
     });
   }
 
@@ -290,30 +301,27 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
 
   @override
   Widget build(BuildContext context) {
+    final descriptors = _panelDescriptors();
+
     return RepaintBoundary(
       key: _screenshotBoundaryKey,
       child: Scaffold(
         body: Column(
           children: [
-            _TitleBar(onRefresh: _refresh, onCaptureScreen: _captureScreen),
+            _TitleBar(
+              onRefresh: _refresh,
+              onCaptureScreen: _captureScreen,
+              panels: descriptors,
+              openPanelIds: _openPanels,
+              onTogglePanel: _togglePanel,
+            ),
             Expanded(
               child: LayoutBuilder(
                 builder: (context, constraints) {
-                  final descriptors = _panelDescriptors();
-
                   return ColoredBox(
                     color: IdePalette.background,
                     child: _DockedWorkspace(
                       compact: constraints.maxWidth < 980,
-                      closedPanels: [
-                        for (final descriptor in descriptors)
-                          if (!_openPanels.contains(descriptor.id))
-                            _ClosedPanelButton(
-                              title: descriptor.title,
-                              icon: descriptor.icon,
-                              onPressed: () => _openPanel(descriptor.id),
-                            ),
-                      ],
                       topPanels: _panelsFor(
                         context,
                         descriptors,
@@ -337,6 +345,13 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
                         descriptors,
                         DockSide.bottom,
                         constraints.maxWidth,
+                      ),
+                      centerPanels: _panelsFor(
+                        context,
+                        descriptors,
+                        DockSide.center,
+                        constraints.maxWidth,
+                        groupAsTabs: false,
                       ),
                       child: _WorkspaceCenter(
                         status: _status,
@@ -416,7 +431,9 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
         id: 'usages',
         title: 'Usages',
         icon: Icons.travel_explore_outlined,
-        defaultSide: DockSide.bottom,
+        // Splits side by side with the source viewer by default, via the
+        // center split, so a type's usages sit right next to its code.
+        defaultSide: DockSide.center,
         builder: (context) {
           final usagesFuture = _selectedTypeUsages;
           if (usagesFuture == null) {
@@ -470,15 +487,19 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     ];
   }
 
-  /// The open panels docked to [side]. A single one renders as a standalone
-  /// [DockablePanel]; two or more share a [TabbedPanelGroup] so each keeps
-  /// full height instead of splitting it.
+  /// The open panels docked to [side]. With [groupAsTabs] (the default), a
+  /// single panel renders as a standalone [DockablePanel] and two or more
+  /// share a [TabbedPanelGroup] so each keeps full height instead of
+  /// splitting it. The center side passes `groupAsTabs: false` instead: its
+  /// panels split side by side (the center split), so each one always gets
+  /// its own standalone frame rather than being hidden behind a tab.
   List<Widget> _panelsFor(
     BuildContext context,
     List<PanelDescriptor> descriptors,
     DockSide side,
-    double screenWidth,
-  ) {
+    double screenWidth, {
+    bool groupAsTabs = true,
+  }) {
     final openOnSide = [
       for (final descriptor in descriptors)
         if (_openPanels.contains(descriptor.id) &&
@@ -493,20 +514,20 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     final compact = screenWidth < 980;
     final displaySide = compact ? DockSide.top : side;
 
-    if (openOnSide.length == 1) {
-      final descriptor = openOnSide.single;
+    if (!groupAsTabs || openOnSide.length == 1) {
       return [
-        _ConstrainedDockPanel(
-          side: displaySide,
-          child: DockablePanel(
-            title: descriptor.title,
-            icon: descriptor.icon,
-            side: _panelSides[descriptor.id] ?? descriptor.defaultSide,
-            onClose: () => _closePanel(descriptor.id),
-            onDockSide: (newSide) => _dockPanel(descriptor.id, newSide),
-            child: descriptor.builder(context),
+        for (final descriptor in openOnSide)
+          _ConstrainedDockPanel(
+            side: displaySide,
+            child: DockablePanel(
+              title: descriptor.title,
+              icon: descriptor.icon,
+              side: _panelSides[descriptor.id] ?? descriptor.defaultSide,
+              onClose: () => _closePanel(descriptor.id),
+              onDockSide: (newSide) => _dockPanel(descriptor.id, newSide),
+              child: descriptor.builder(context),
+            ),
           ),
-        ),
       ];
     }
 
@@ -534,20 +555,24 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
 class _DockedWorkspace extends StatelessWidget {
   const _DockedWorkspace({
     required this.compact,
-    required this.closedPanels,
     required this.topPanels,
     required this.leftPanels,
     required this.rightPanels,
     required this.bottomPanels,
+    required this.centerPanels,
     required this.child,
   });
 
   final bool compact;
-  final List<Widget> closedPanels;
   final List<Widget> topPanels;
   final List<Widget> leftPanels;
   final List<Widget> rightPanels;
   final List<Widget> bottomPanels;
+
+  /// Panels docked to the center (any panel can be, via its own dock menu):
+  /// they split side by side with [child] instead of stacking above/below
+  /// or beside it like the other sides do.
+  final List<Widget> centerPanels;
   final Widget child;
 
   @override
@@ -558,10 +583,6 @@ class _DockedWorkspace extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            if (closedPanels.isNotEmpty) ...[
-              _ClosedPanelsBar(children: closedPanels),
-              const SizedBox(height: 12),
-            ],
             if (topPanels.isNotEmpty) ...[
               _PanelColumn(stretch: true, children: topPanels),
               const SizedBox(height: 12),
@@ -575,6 +596,12 @@ class _DockedWorkspace extends StatelessWidget {
               const SizedBox(height: 12),
             ],
             child,
+            // No side-by-side room in compact width, so center panels just
+            // stack under the main content like any other group.
+            if (centerPanels.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              _PanelColumn(stretch: true, children: centerPanels),
+            ],
             if (bottomPanels.isNotEmpty) ...[
               const SizedBox(height: 12),
               _PanelColumn(stretch: true, children: bottomPanels),
@@ -589,10 +616,6 @@ class _DockedWorkspace extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          if (closedPanels.isNotEmpty) ...[
-            _ClosedPanelsBar(children: closedPanels),
-            const SizedBox(height: 8),
-          ],
           if (topPanels.isNotEmpty) ...[
             SizedBox(
               height: 180,
@@ -611,7 +634,9 @@ class _DockedWorkspace extends StatelessWidget {
                   ),
                   const SizedBox(width: 8),
                 ],
-                Expanded(child: child),
+                Expanded(
+                  child: _CenterSplit(main: child, panels: centerPanels),
+                ),
                 if (rightPanels.isNotEmpty) ...[
                   const SizedBox(width: 8),
                   SizedBox(
@@ -635,30 +660,51 @@ class _DockedWorkspace extends StatelessWidget {
   }
 }
 
-class _ClosedPanelsBar extends StatelessWidget {
-  const _ClosedPanelsBar({required this.children});
+/// The center of the workspace: [main] (the source viewer/welcome screen)
+/// side by side with every center-docked panel, each getting an equal share
+/// of the width. With no center-docked panels, this is just [main] — the
+/// split only exists once something else asks to live there.
+class _CenterSplit extends StatelessWidget {
+  const _CenterSplit({required this.main, required this.panels});
 
-  final List<Widget> children;
+  final Widget main;
+  final List<Widget> panels;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(8),
-      decoration: BoxDecoration(
-        color: IdePalette.tabBar,
-        border: Border.all(color: IdePalette.border),
-        borderRadius: BorderRadius.circular(6),
-      ),
-      child: Wrap(spacing: 8, runSpacing: 8, children: children),
+    if (panels.isEmpty) {
+      return main;
+    }
+
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Expanded(child: main),
+        for (final panel in panels) ...[
+          const SizedBox(width: 8),
+          Expanded(child: panel),
+        ],
+      ],
     );
   }
 }
 
 class _TitleBar extends StatelessWidget {
-  const _TitleBar({required this.onRefresh, required this.onCaptureScreen});
+  const _TitleBar({
+    required this.onRefresh,
+    required this.onCaptureScreen,
+    required this.panels,
+    required this.openPanelIds,
+    required this.onTogglePanel,
+  });
 
   final VoidCallback onRefresh;
   final VoidCallback onCaptureScreen;
+
+  /// Every registered panel, open or closed — what the Panels menu lists.
+  final List<PanelDescriptor> panels;
+  final Set<String> openPanelIds;
+  final ValueChanged<String> onTogglePanel;
 
   @override
   Widget build(BuildContext context) {
@@ -679,6 +725,23 @@ class _TitleBar extends StatelessWidget {
               overflow: TextOverflow.ellipsis,
               style: TextStyle(fontWeight: FontWeight.w700),
             ),
+          ),
+          PopupMenuButton<String>(
+            tooltip: 'Panels',
+            color: IdePalette.panel,
+            icon: const Icon(
+              Icons.view_quilt_outlined,
+              color: IdePalette.muted,
+            ),
+            onSelected: onTogglePanel,
+            itemBuilder: (context) => [
+              for (final panel in panels)
+                CheckedPopupMenuItem<String>(
+                  value: panel.id,
+                  checked: openPanelIds.contains(panel.id),
+                  child: Text(panel.title),
+                ),
+            ],
           ),
           IdeToolbarIcon(
             icon: Icons.refresh_rounded,
@@ -853,30 +916,9 @@ class _ConstrainedDockPanel extends StatelessWidget {
     return SizedBox(
       width: switch (side) {
         DockSide.left || DockSide.right => 360,
-        DockSide.top || DockSide.bottom => null,
+        DockSide.top || DockSide.bottom || DockSide.center => null,
       },
       child: child,
-    );
-  }
-}
-
-class _ClosedPanelButton extends StatelessWidget {
-  const _ClosedPanelButton({
-    required this.title,
-    required this.icon,
-    required this.onPressed,
-  });
-
-  final String title;
-  final IconData icon;
-  final VoidCallback onPressed;
-
-  @override
-  Widget build(BuildContext context) {
-    return OutlinedButton.icon(
-      onPressed: onPressed,
-      icon: Icon(icon),
-      label: Text(title),
     );
   }
 }

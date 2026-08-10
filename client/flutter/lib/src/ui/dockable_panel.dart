@@ -2,7 +2,11 @@ import 'package:flutter/material.dart';
 
 import 'ide_theme.dart';
 
-enum DockSide { left, right, top, bottom }
+/// Where a dockable panel can be placed. [center] docks it into the main
+/// workspace split, side by side with whatever else lives there (the source
+/// viewer, and any other center-docked panel) — see [ServerStatusPage]'s
+/// center split.
+enum DockSide { left, right, top, bottom, center }
 
 extension DockSideLabel on DockSide {
   String get label {
@@ -11,6 +15,7 @@ extension DockSideLabel on DockSide {
       DockSide.right => 'right',
       DockSide.top => 'top',
       DockSide.bottom => 'bottom',
+      DockSide.center => 'center',
     };
   }
 
@@ -20,6 +25,7 @@ extension DockSideLabel on DockSide {
       DockSide.right => Icons.vertical_align_center,
       DockSide.top => Icons.horizontal_rule,
       DockSide.bottom => Icons.horizontal_rule,
+      DockSide.center => Icons.view_column_outlined,
     };
   }
 }

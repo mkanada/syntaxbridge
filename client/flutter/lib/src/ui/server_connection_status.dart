@@ -47,15 +47,18 @@ class ServerConnectionStatus extends StatelessWidget {
                       : IdePalette.amber,
                 ),
                 const SizedBox(width: 10),
-                Text(
-                  connected
-                      ? 'Connected'
-                      : failed
-                      ? 'Disconnected'
-                      : 'Connecting',
-                  style: Theme.of(
-                    context,
-                  ).textTheme.titleMedium?.copyWith(color: IdePalette.softText),
+                Flexible(
+                  child: Text(
+                    connected
+                        ? 'Connected'
+                        : failed
+                        ? 'Disconnected'
+                        : 'Connecting',
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                      color: IdePalette.softText,
+                    ),
+                  ),
                 ),
                 const Spacer(),
                 IconButton(

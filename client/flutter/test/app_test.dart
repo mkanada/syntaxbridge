@@ -310,14 +310,16 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.text('1 use'), findsOneWidget);
-      expect(
-        find.text('Select a type to see where it is used'),
-        findsOneWidget,
-      );
+      // The Usages panel only enters (docked to the center split, side by
+      // side with the source viewer) once a type is actually selected.
+      expect(find.text('Usages'), findsNothing);
 
       await tester.tap(find.text('geometry::Point'));
       await tester.pumpAndSettle();
 
+      // Both the panel frame's title and the panel content's own heading
+      // say "Usages".
+      expect(find.text('Usages'), findsWidgets);
       expect(find.text('1 use of geometry::Point'), findsOneWidget);
       expect(find.text('main.cpp:4'), findsOneWidget);
       expect(find.text('variable'), findsOneWidget);
@@ -443,12 +445,13 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.byTooltip('Close Execution log panel'), findsNothing);
-    expect(
-      find.widgetWithText(OutlinedButton, 'Execution log'),
-      findsOneWidget,
-    );
+    expect(find.text('Execution log'), findsNothing);
 
-    await tester.tap(find.widgetWithText(OutlinedButton, 'Execution log'));
+    // Reopening a closed panel goes through the Panels menu now, not a
+    // per-panel button cluttering the workspace.
+    await tester.tap(find.byTooltip('Panels'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Execution log'));
     await tester.pumpAndSettle();
 
     expect(find.byTooltip('Close Execution log panel'), findsOneWidget);
@@ -473,6 +476,55 @@ void main() {
       greaterThan(tester.getTopLeft(find.text('Syntax Bridge workspace')).dx),
     );
   });
+
+  testWidgets(
+    'docks panels to the center split, side by side rather than tabbed',
+    (tester) async {
+      tester.view
+        ..devicePixelRatio = 1
+        ..physicalSize = const Size(1280, 900);
+      addTearDown(tester.view.reset);
+
+      await tester.pumpWidget(
+        SyntaxBridgeApp(
+          serverClient: _FakeServerClient(
+            const ServerStatus(service: 'syntax-bridge-server', status: 'ok'),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await _skipToIde(tester);
+
+      await tester.tap(find.byTooltip('Dock Explorer panel'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Dock center').last);
+      await tester.pumpAndSettle();
+
+      // Center-docked, split side by side with the main workspace content —
+      // not overlaid or replaced.
+      expect(find.text('Explorer'), findsOneWidget);
+      expect(find.text('Syntax Bridge workspace'), findsOneWidget);
+      expect(
+        tester.getTopLeft(find.text('Explorer')).dx,
+        greaterThan(tester.getTopLeft(find.text('Syntax Bridge workspace')).dx),
+      );
+
+      await tester.tap(find.byTooltip('Dock Execution log panel'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Dock center').last);
+      await tester.pumpAndSettle();
+
+      // Two panels sharing the center dock still both show at once: it's a
+      // split, not a tab group hiding one behind the other.
+      expect(find.text('Explorer'), findsOneWidget);
+      expect(find.text('Execution log'), findsOneWidget);
+      expect(find.text('Syntax Bridge workspace'), findsOneWidget);
+      expect(
+        tester.getTopLeft(find.text('Execution log')).dx,
+        greaterThan(tester.getTopLeft(find.text('Explorer')).dx),
+      );
+    },
+  );
 
   testWidgets('shows project creation failures with server details', (
     tester,
