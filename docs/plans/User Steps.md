@@ -25,8 +25,8 @@ verificáveis, e não como intenções.
 | --- | --- | --- | --- |
 | US-1 | Criação de projeto e ingestão do input | pronto | — |
 | US-2 | Lista de arquivos fonte e leitura de conteúdo | pronto | US-1 |
-| US-3 | Catálogo de tipos do projeto | parcial (falta identidade estável de tipo) | US-2 |
-| US-4 | Usos de cada tipo e navegação | planejado | US-3 |
+| US-3 | Catálogo de tipos do projeto | pronto | US-2 |
+| US-4 | Usos de cada tipo e navegação | parcial (falta taxonomia de nível de expressão e cancelamento) | US-3 |
 | US-5 | Funções, métodos e macros, e seus usos | planejado | US-3 |
 | US-6 | Isolamento e caracterização comportamental | planejado | US-5 |
 | US-7 | Mapeamento de tipos C++ → Dart | planejado | US-4, US-5 |
@@ -252,9 +252,7 @@ Tabela `source_files` no `project.db`.
 
 ## US-3 — Catálogo de tipos do projeto
 
-**Status:** parcial — rota dedicada, UI e desambiguação por namespace existem;
-falta identidade estável de tipo (USR do libclang, ver decisão abaixo) ·
-**Depende de:** US-2 ·
+**Status:** pronto · **Depende de:** US-2 ·
 **Implementação:** `crates/server/src/type_catalog.rs`,
 `crates/server/src/persistence/project_store.rs`,
 `crates/server/src/project_service.rs` (`list_types`),
@@ -304,19 +302,26 @@ Tabelas `type_declarations` e `type_dependencies` no `project.db`.
   abre seu arquivo de origem, rola até a declaração e destaca o corpo inteiro
   (`SourceFileViewer` ganhou `highlightStartLine`/`highlightEndLine`), usando
   `IdePalette.selection`, até então declarada e não utilizada.
-- **Segue em aberto:** o nome qualificado por namespace resolve a
-  desambiguação *visual*, mas não é uma identidade estável — dois tipos podem
-  ter o mesmo nome qualificado depois de uma edição textual não relacionada
-  (ver item de identidade abaixo), e a chave de deduplicação/seleção ainda é
-  posicional. O USR do libclang continua sendo a solução completa, adiada
-  porque US-4 em diante é quem de fato depende dela para sobreviver a edições.
+- **Resolvido: identidade estável de tipo via USR do libclang.**
+  `TypeDeclaration` ganhou `usr` (`clang_getCursorUSR` em `describe_cursor`,
+  `type_catalog.rs`), persistido como coluna `usr` em `type_declarations` e
+  `caller_usr`/`callee_usr` em `type_dependencies` (com migração em
+  `migrate_type_columns`, mesmo padrão da migração de `namespace`/extensão). A
+  deduplicação entre unidades de compilação — antes posicional
+  (`kind, name, file, line, column`) — agora usa o USR como chave
+  (`declaration_identity` em `type_catalog.rs`), com o fallback posicional
+  reservado ao caso (raro) de um `libclang` que não forneça USR para um dado
+  cursor. Provado por
+  `type_declaration_usr_is_stable_across_incidental_line_shifts` (o USR de um
+  tipo não muda quando um edit insere linhas em branco antes dele, embora sua
+  `line` mude) e por
+  `type_declaration_usr_distinguishes_namespaced_homonyms_with_libclang` (dois
+  `Point` em namespaces diferentes têm USRs distintos), ambos em
+  `crates/server/tests/type_catalog.rs`. Isso fecha o item que mantinha este
+  passo como `parcial`: US-4 em diante já podem referenciar tipos pelo USR em
+  vez de posição.
 - **O texto original mistura tipos e funções.** Funções e métodos pertencem a
   US-5; manter os dois na mesma lista confunde a modelagem e a UI.
-- **Identidade de tipo é frágil.** A chave atual é
-  `(kind, name, file, line, column)`: nome simples colide entre namespaces, e a
-  identidade quebra assim que alguém insere uma linha no arquivo. O USR do
-  libclang é a identidade estável e essa decisão precisa ser tomada *aqui*,
-  porque US-4 até US-8 vão referenciar tipos por ela.
 - **Faltam decisões sobre:** templates e suas instanciações/especializações,
   namespaces anônimos (hoje silenciosamente omitidos do nome qualificado, em
   vez de representados) e *inline* (hoje tratados como namespace comum,
@@ -374,7 +379,29 @@ Tabelas `type_declarations` e `type_dependencies` no `project.db`.
 
 ## US-4 — Usos de cada tipo e navegação
 
-**Status:** planejado · **Depende de:** US-3
+**Status:** parcial — extração, persistência, rotas e navegação na UI existem
+para a taxonomia de nível de assinatura (ver decisão de taxonomia abaixo);
+faltam usos de nível de expressão (*cast*, `sizeof`, `new`, argumento de
+template) e cancelamento de indexação em projetos grandes (critério 7,
+parcial) · **Depende de:** US-3 ·
+**Implementação:** `crates/server/src/type_catalog.rs` (`TypeUsageKind`,
+`TypeUsage`, `push_usage`, extensão de `visit_cursor`/
+`record_member_dependency`), `crates/server/src/persistence/project_store.rs`
+(tabela `type_usages`, `replace_type_usages`, `list_type_usages_for`,
+`type_usage_counts`), `crates/server/src/project_service.rs`
+(`TypeCatalogListing`, `list_type_usages`), `crates/server/src/server.rs`
+(`GET /projects/types/usages`, `usage_counts` em `GET /projects/types`),
+`client/flutter/lib/src/project/project_models.dart` (`TypeUsage`,
+`TypeUsageKind`, `TypeCatalogListing`),
+`client/flutter/lib/src/ui/types_view.dart` (coluna e ordenação por número de
+usos), `client/flutter/lib/src/ui/usages_view.dart` (painel de usos),
+`client/flutter/lib/src/ui/server_status_page.dart` (fiação entre os dois) ·
+**Testes:** `crates/server/tests/type_catalog.rs`
+(`extract_type_catalog_records_usages_across_the_defined_taxonomy`),
+`crates/server/tests/type_catalog_route.rs`, testes inline em
+`persistence/project_store.rs`,
+`client/flutter/test/types_view_test.dart`,
+`client/flutter/test/usages_view_test.dart`, `client/flutter/test/app_test.dart`
 
 ### Objetivo do usuário
 
@@ -387,51 +414,98 @@ O *scan* é feito antes, de modo que a navegação seja imediata.
 
 ### Observações e decisões em aberto
 
-- **"Uso" precisa de taxonomia.** Declaração de variável, instanciação, herança,
-  parâmetro, tipo de retorno, campo, *cast*, `sizeof`, argumento de template e
-  menção em `typedef` não são a mesma coisa e não deveriam pesar igual no
-  ranking. Definir a lista fechada de espécies de uso é pré-requisito para o
-  critério de ordenação fazer sentido.
-- **Fonte da informação:** `clang_indexTranslationUnit` (semântico, caro,
-  correto) ou tree-sitter (sintático, barato, aproximado). A escolha vale para
-  US-5 também. Recomendação: libclang para o índice persistido, tree-sitter
-  reservado para realce e navegação dentro do editor.
-- **Custo.** Reparsear todas as TUs de um projeto do porte do Verovio não cabe
-  em uma requisição HTTP síncrona. Este é o passo que força a introdução de
-  trabalho assíncrono com progresso e cancelamento — ver eixos transversais.
-- **Incrementalidade:** decidir desde já se o índice é recalculado por completo
-  ou por TU alterada, porque a segunda opção condiciona o esquema do banco.
-- **Macros não têm uso semântico rastreável** por cursor; dependem do
-  *preprocessing record* e de correlação textual. Provavelmente têm precisão
-  menor que os demais tipos e isso deve ser visível ao usuário.
-- **Usos dentro de código não compilado** (`#ifdef` desligado) não existem para
-  o libclang. O usuário precisa saber que a contagem é relativa à configuração
-  de build escolhida em US-1.
+- **Resolvido (parcial): taxonomia de "uso".** Em vez da lista completa
+  originalmente cogitada (declaração de variável, instanciação, herança,
+  parâmetro, tipo de retorno, campo, *cast*, `sizeof`, argumento de template,
+  menção em `typedef`), `TypeUsageKind` cobre as espécies *de nível de
+  assinatura* — `VariableDeclaration` (escopo de arquivo/namespace/membro
+  estático), `Parameter`, `Field`, `ReturnType`, `Inheritance` e
+  `TypedefMention` — e deixa de fora as de *nível de expressão* (`cast`,
+  `sizeof`, `new`, argumento de template). O motivo é arquitetural, não
+  preguiça de escopo: `extract_type_catalog` faz o parse com
+  `CXTranslationUnit_SkipFunctionBodies` desde a correção de escala do
+  Verovio 5.7.0 (ver "Escala" nas observações transversais), e ligar os corpos
+  de função de volta só para este passo reintroduziria exatamente o custo que
+  aquela correção eliminou. Essas espécies vivem dentro de corpos de função,
+  então ficam de fora enquanto essa trade-off não for revisitada.
+- **Resolvido: fonte da informação e custo.** `libclang`, reaproveitando a
+  *mesma* varredura de AST que já constrói o catálogo de tipos (US-3) — nenhum
+  segundo `clang_parseTranslationUnit` por projeto. `push_usage` roda dentro de
+  `visit_cursor`/`record_member_dependency`, populando um terceiro vetor
+  (`TypeCatalog.usages`) ao lado de `declarations`/`dependencies`. Isso também
+  responde "o *scan* é feito antes": como é a mesma passada de US-3, os usos já
+  estão persistidos no fim da criação do projeto, sem custo adicional
+  perceptível.
+- **Local do uso, não do tipo referenciado.** Cada `TypeUsage` aponta para a
+  posição do *cursor que faz a referência* (o nome do campo, do parâmetro, da
+  variável, da função, ou o especificador de base), não para o token do tipo
+  em si — por exemplo, o uso de `Point` como tipo de campo em
+  `Point origin;` fica na linha/coluna de `origin`, não de `Point`. Decisão
+  deliberada: leva o usuário à declaração que usa o tipo (mais útil para
+  navegação) em vez de só ao nome do tipo.
+- **Segue em aberto: incrementalidade.** Como esta passada é a mesma de US-3, o
+  índice de usos é recalculado por completo a cada criação de projeto, do
+  mesmo jeito que o catálogo de tipos — reindexação por TU alterada continua
+  sem solução, para os dois casos.
+- **Segue em aberto: macros não geram uso.** Diferente do texto original ("têm
+  precisão menor"), a decisão tomada aqui foi mais estrita: macros não entram
+  na extração de usos (`TypeUsageKind` não tem variante para elas), porque
+  correlacioná-las depende do *preprocessing record*, que este passe não
+  consulta. Ficam de fora até esse trabalho ser feito, não apenas com menos
+  precisão.
+- **Segue em aberto: usos dentro de código não compilado.** Continua
+  verdadeiro e sem solução — `#ifdef` desligado é invisível ao `libclang`.
+- **Segue em aberto: cancelamento (critério 7, parcial).** Progresso é
+  relatado de graça, porque a indexação de usos anda junto da passada de tipos
+  de US-3 e reaproveita os mesmos contadores atômicos que ela já expõe via
+  `GET /projects/jobs/{id}`. Cancelamento não foi resolvido — mesmo precedente
+  deixado em aberto por US-1.
 
 ### Critérios de aceitação (testáveis)
 
-1. Para um tipo do fixture com N usos conhecidos, o índice registra exatamente
-   esses N locais, com arquivo, linha e coluna corretos.
-2. Cada uso é classificado segundo a taxonomia definida.
-3. A contagem exibida na lista é igual ao número de locais navegáveis.
-4. A lista ordena por nome e por contagem, nos dois sentidos, de forma estável
-   para empates.
-5. Clicar em um uso abre o arquivo correspondente na linha correta.
-6. A consulta de usos de um tipo é respondida a partir do dado persistido, sem
-   reparsear.
-7. Um projeto grande é indexado com progresso reportado e pode ser cancelado
-   sem deixar o banco em estado inconsistente.
+1. **Satisfeito** (para a taxonomia coberta): para um tipo do fixture com N
+   usos conhecidos, o índice registra exatamente esses N locais, com arquivo,
+   linha e coluna corretos. Provado por
+   `extract_type_catalog_records_usages_across_the_defined_taxonomy`, que fixa
+   um `Point`/`Widget` com um uso de cada uma das seis espécies e calcula a
+   posição esperada a partir do próprio texto do fixture (não contada à mão).
+2. **Satisfeito** (para a taxonomia coberta): cada uso é classificado segundo
+   `TypeUsageKind`.
+3. **Satisfeito:** a contagem exibida na lista (`usage_counts` em
+   `GET /projects/types`, coluna "N uses"/"N use" em `TypesView`) é igual ao
+   número de locais navegáveis persistidos.
+4. **Satisfeito:** `TypesView` ordena por nome, por espécie e por número de
+   usos, nos dois sentidos, com empate desfeito por nome em todos os casos.
+5. **Satisfeito:** clicar em um uso no painel "Usages" abre o arquivo
+   correspondente na linha correta (`UsagesView` → `_selectUsage` →
+   `SourceFileViewer`).
+6. **Satisfeito:** `GET /projects/types/usages?usr=…` responde a partir de
+   `type_usages` já persistido, sem reparsear —
+   `usages_route_returns_the_persisted_usages_for_a_type` popula o banco
+   diretamente, sem `libclang`.
+7. **Parcial:** projetos grandes (Verovio, ~290 TUs) são indexados com
+   progresso real reportado (reaproveitando o contador de US-3), mas
+   cancelamento não existe — o mesmo estado em que US-1 deixou o próprio
+   mecanismo de job.
 
 ### Condições de testabilidade
 
 - O fixture precisa ter contagens de uso *conhecidas e escritas no teste*, o
   que exige um fixture propositalmente pequeno e estável — mudanças nele
   quebram os testes, e isso é aceitável desde que ele seja versionado.
+  **Satisfeito:** `USAGE_TAXONOMY_CPP` em `type_catalog.rs`, com localização
+  calculada por busca textual (`locate_in`) em vez de contada à mão, para
+  sobreviver a edições do fixture.
 - Precisa existir um segundo fixture, maior, para testar progresso,
   cancelamento e tempo — com asserção sobre ordem de grandeza, não sobre
-  duração exata, que não é reprodutível.
+  duração exata, que não é reprodutível. **Não satisfeito:** nenhum teste
+  dedicado de progresso/tempo em escala existe para usos especificamente
+  (o fixture Verovio de US-1/US-3 já prova que a extração não regride em
+  escala, mas não testa cancelamento, que continua inexistente).
 - Consultas de leitura precisam ser testáveis sem executar a indexação:
-  popular o banco diretamente e consultar.
+  popular o banco diretamente e consultar. **Satisfeito:**
+  `usages_route_returns_the_persisted_usages_for_a_type` e os testes de
+  round-trip em `project_store.rs` populam `type_usages` diretamente.
 
 ---
 
@@ -859,10 +933,17 @@ foi resolvido por essa instância (não há como cancelar um job de criação em
 andamento) nem o comportamento transacional correspondente — só a parte de
 progresso. O modelo (um registro de jobs em memória, progresso derivado de
 contadores atômicos em vez de estado explícito) fica como precedente para
-US-4 e US-6 decidirem se reaproveitam ou não; nenhum dos dois foi resolvido
-ainda, e nenhum dos dois precisa de cancelamento com o mesmo formato (uma
-indexação de tipos/funções não tem a mesma noção de "meio caminho seguro para
-persistir" que uma caracterização comportamental tem).
+US-4 e US-6 decidirem se reaproveitam ou não.
+
+**US-4 reaproveitou em vez de decidir de novo:** em vez de um job próprio, a
+indexação de usos roda dentro da *mesma* passada `libclang` de US-3 (mesma
+varredura de AST, populando um terceiro vetor), então herda de graça o
+progresso já relatado por `GET /projects/jobs/{id}` para `type_catalog` — sem
+rota nem contador novos. Cancelamento continua **não resolvido**, no mesmo
+estado em que US-1 deixou. US-6 segue em aberto quanto a reaproveitar esse
+modelo ou não; ao contrário de US-4, uma caracterização comportamental *tem*
+uma noção de "meio caminho seguro para persistir" que uma indexação de tipos
+não tem, então pode não fazer sentido herdar a mesma solução sem adaptação.
 
 ### Versionamento do esquema de persistência
 

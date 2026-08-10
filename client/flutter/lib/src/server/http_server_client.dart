@@ -160,7 +160,7 @@ class HttpServerClient implements ServerClient {
   }
 
   @override
-  Future<List<TypeDeclaration>> listTypes(String projectDir) async {
+  Future<TypeCatalogListing> listTypes(String projectDir) async {
     final url = baseUrl
         .resolve('/projects/types')
         .replace(queryParameters: {'project_dir': projectDir});
@@ -174,11 +174,34 @@ class HttpServerClient implements ServerClient {
       throw HttpException(_errorMessageFromBody(body));
     }
 
+    return TypeCatalogListing.fromJson(
+      jsonDecode(body) as Map<String, Object?>,
+    );
+  }
+
+  @override
+  Future<List<TypeUsage>> listTypeUsages({
+    required String projectDir,
+    required String typeUsr,
+  }) async {
+    final url = baseUrl
+        .resolve('/projects/types/usages')
+        .replace(queryParameters: {'project_dir': projectDir, 'usr': typeUsr});
+    cliLog('HTTP GET $url');
+    final request = await _httpClient.getUrl(url);
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP GET $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException(_errorMessageFromBody(body));
+    }
+
     final json = jsonDecode(body) as Map<String, Object?>;
-    final typesJson = json['types'] as List<Object?>? ?? const <Object?>[];
-    return typesJson
+    final usagesJson = json['usages'] as List<Object?>? ?? const <Object?>[];
+    return usagesJson
         .whereType<Map<String, Object?>>()
-        .map(TypeDeclaration.fromJson)
+        .map(TypeUsage.fromJson)
         .toList();
   }
 

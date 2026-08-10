@@ -158,7 +158,14 @@ class _FakeServerClient implements ServerClient {
   }) async => '';
 
   @override
-  Future<List<TypeDeclaration>> listTypes(String projectDir) async => const [];
+  Future<TypeCatalogListing> listTypes(String projectDir) async =>
+      const TypeCatalogListing(types: [], usageCounts: {});
+
+  @override
+  Future<List<TypeUsage>> listTypeUsages({
+    required String projectDir,
+    required String typeUsr,
+  }) async => const [];
 }
 
 const _projectWithCompilationUnits = CreatedProject(

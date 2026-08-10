@@ -200,6 +200,12 @@ class _ScriptedServerClient implements ServerClient {
   }) => throw UnimplementedError('not used by this screen');
 
   @override
-  Future<List<TypeDeclaration>> listTypes(String projectDir) =>
+  Future<TypeCatalogListing> listTypes(String projectDir) =>
       throw UnimplementedError('not used by this screen');
+
+  @override
+  Future<List<TypeUsage>> listTypeUsages({
+    required String projectDir,
+    required String typeUsr,
+  }) => throw UnimplementedError('not used by this screen');
 }

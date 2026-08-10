@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -9,7 +10,7 @@ use crate::ingest::{self, CompilationUnit, CreateProjectRequest, CreatedProject,
 use crate::persistence::{GlobalStore, PersistenceError, ProjectRecord, ProjectStore};
 use crate::progress::ExtractionProgress;
 use crate::source_catalog::{self, SourceCatalogError, SourceFile};
-use crate::type_catalog::{self, TypeCatalogError, TypeDeclaration};
+use crate::type_catalog::{self, TypeCatalogError, TypeDeclaration, TypeUsage};
 
 /// Live progress trackers for `create_project`'s two `libclang` passes, so a
 /// caller running it in the background (`jobs.rs`) can report real progress
@@ -97,6 +98,7 @@ pub fn create_project(
     )?;
     project.type_catalog = catalog.declarations;
     project.type_dependencies = catalog.dependencies;
+    let type_usages = catalog.usages;
 
     project.source_files = source_catalog::extract_source_files(
         &project.compilation_units,
@@ -109,6 +111,7 @@ pub fn create_project(
     project_store.replace_compilation_units(&project.compilation_units)?;
     project_store.replace_type_declarations(&project.type_catalog)?;
     project_store.replace_type_dependencies(&project.type_dependencies)?;
+    project_store.replace_type_usages(&type_usages)?;
     project_store.replace_source_files(&project.source_files)?;
 
     let global_store = GlobalStore::open(global_db_path)?;
@@ -343,16 +346,45 @@ impl From<PersistenceError> for ListTypesError {
 /// Serves the type catalog already persisted for a project (US-3), without
 /// reparsing it — the gap `docs/plans/User Steps.md` calls out for
 /// `LoadedProject`, closed here with a dedicated route instead of growing
-/// that struct, since US-4's navigator will need server-side sort and
-/// pagination this route is the natural place to add.
-pub fn list_types(project_dir: &Path) -> Result<Vec<TypeDeclaration>, ListTypesError> {
+/// that struct.
+///
+/// `usage_counts` (US-4) rides along keyed by `usr` rather than being
+/// embedded per-`TypeDeclaration`, so the type-catalog model itself stays
+/// free of usage-index concerns — the type list renders the count by looking
+/// up each row's own `usr`.
+#[derive(Debug, Serialize)]
+pub struct TypeCatalogListing {
+    pub types: Vec<TypeDeclaration>,
+    pub usage_counts: HashMap<String, usize>,
+}
+
+pub fn list_types(project_dir: &Path) -> Result<TypeCatalogListing, ListTypesError> {
     if !is_openable_project(project_dir) {
         return Err(ListTypesError::NotFound(project_dir.to_path_buf()));
     }
 
     let project_db_path = project_dir.join("project.db");
     let project_store = ProjectStore::open(&project_db_path)?;
-    Ok(project_store.list_type_declarations()?)
+    Ok(TypeCatalogListing {
+        types: project_store.list_type_declarations()?,
+        usage_counts: project_store.type_usage_counts()?,
+    })
+}
+
+/// Serves every recorded usage of one type (identified by its stable `usr`,
+/// US-3), from the persisted index (US-4) without reparsing — what backs
+/// "click a type, see every place it's used".
+pub fn list_type_usages(
+    project_dir: &Path,
+    type_usr: &str,
+) -> Result<Vec<TypeUsage>, ListTypesError> {
+    if !is_openable_project(project_dir) {
+        return Err(ListTypesError::NotFound(project_dir.to_path_buf()));
+    }
+
+    let project_db_path = project_dir.join("project.db");
+    let project_store = ProjectStore::open(&project_db_path)?;
+    Ok(project_store.list_type_usages_for(type_usr)?)
 }
 
 /// Reads a single source file's content for display, refusing to read

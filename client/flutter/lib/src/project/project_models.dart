@@ -227,6 +227,7 @@ class TypeDeclaration {
     required this.column,
     this.endLine = 0,
     this.endColumn = 0,
+    this.usr = '',
   });
 
   factory TypeDeclaration.fromJson(Map<String, Object?> json) {
@@ -239,6 +240,7 @@ class TypeDeclaration {
       column: json['column'] as int? ?? 0,
       endLine: json['end_line'] as int? ?? 0,
       endColumn: json['end_column'] as int? ?? 0,
+      usr: json['usr'] as String? ?? '',
     );
   }
 
@@ -258,6 +260,109 @@ class TypeDeclaration {
   /// whole declaration when opening its source file.
   final int endLine;
   final int endColumn;
+
+  /// `libclang`'s Unified Symbol Resolution for this declaration — a
+  /// semantic identity independent of source position, unlike
+  /// `(kind, name, file, line, column)`, which breaks the instant an
+  /// unrelated edit shifts line numbers. Mirrors `TypeDeclaration::usr` in
+  /// `crates/server/src/type_catalog.rs`.
+  final String usr;
+}
+
+/// Mirrors `TypeUsageKind` in `crates/server/src/type_catalog.rs`: the
+/// closed taxonomy of "use" US-4 tracks. Only signature-level kinds are
+/// covered — see the doc comment on the Rust enum for why (function bodies
+/// aren't parsed, for the same performance reason `SkipFunctionBodies` was
+/// introduced for US-1's Verovio-import fix).
+enum TypeUsageKind {
+  variableDeclaration,
+  parameter,
+  field,
+  returnType,
+  inheritance,
+  typedefMention;
+
+  static TypeUsageKind fromJson(String? value) {
+    return switch (value) {
+      'variable_declaration' => TypeUsageKind.variableDeclaration,
+      'parameter' => TypeUsageKind.parameter,
+      'field' => TypeUsageKind.field,
+      'return_type' => TypeUsageKind.returnType,
+      'inheritance' => TypeUsageKind.inheritance,
+      'typedef_mention' => TypeUsageKind.typedefMention,
+      _ => TypeUsageKind.variableDeclaration,
+    };
+  }
+
+  /// Short label shown next to a usage's location in the usages panel.
+  String get label {
+    return switch (this) {
+      TypeUsageKind.variableDeclaration => 'variable',
+      TypeUsageKind.parameter => 'parameter',
+      TypeUsageKind.field => 'field',
+      TypeUsageKind.returnType => 'return type',
+      TypeUsageKind.inheritance => 'base class',
+      TypeUsageKind.typedefMention => 'typedef',
+    };
+  }
+}
+
+/// One occurrence of a project type being used at a specific source
+/// location (US-4). Mirrors `TypeUsage` in
+/// `crates/server/src/type_catalog.rs`.
+class TypeUsage {
+  const TypeUsage({
+    required this.typeUsr,
+    required this.kind,
+    required this.file,
+    required this.line,
+    required this.column,
+  });
+
+  factory TypeUsage.fromJson(Map<String, Object?> json) {
+    return TypeUsage(
+      typeUsr: json['type_usr'] as String? ?? '',
+      kind: TypeUsageKind.fromJson(json['kind'] as String?),
+      file: json['file'] as String? ?? '',
+      line: json['line'] as int? ?? 0,
+      column: json['column'] as int? ?? 0,
+    );
+  }
+
+  final String typeUsr;
+  final TypeUsageKind kind;
+  final String file;
+  final int line;
+  final int column;
+}
+
+/// The response of `GET /projects/types` (US-3/US-4): the type catalog plus
+/// how many times each type is used, keyed by `usr`. Kept separate from
+/// [TypeDeclaration] itself so the type-catalog model stays free of
+/// usage-index concerns; the type list looks up each row's own [usr] to
+/// render its count.
+class TypeCatalogListing {
+  const TypeCatalogListing({required this.types, required this.usageCounts});
+
+  factory TypeCatalogListing.fromJson(Map<String, Object?> json) {
+    final typesJson = json['types'] as List<Object?>? ?? const <Object?>[];
+    final usageCountsJson =
+        json['usage_counts'] as Map<String, Object?>? ??
+        const <String, Object?>{};
+
+    return TypeCatalogListing(
+      types: typesJson
+          .whereType<Map<String, Object?>>()
+          .map(TypeDeclaration.fromJson)
+          .toList(),
+      usageCounts: usageCountsJson.map(
+        (usr, count) => MapEntry(usr, count as int? ?? 0),
+      ),
+    );
+  }
+
+  final List<TypeDeclaration> types;
+  final Map<String, int> usageCounts;
 }
 
 /// How far a single `libclang` extraction pass (type cataloging or source

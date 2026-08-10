@@ -157,6 +157,7 @@ fn app(global_db_path: PathBuf) -> Router {
         .route("/projects/open", post(open_project_from_http))
         .route("/projects/source-file", get(read_source_file_from_http))
         .route("/projects/types", get(list_types_from_http))
+        .route("/projects/types/usages", get(list_type_usages_from_http))
         .with_state(state)
 }
 
@@ -494,13 +495,46 @@ async fn list_types_from_http(Query(query): Query<ProjectDirQuery>) -> Response 
 
     match tokio::task::spawn_blocking(move || project_service::list_types(&query.project_dir)).await
     {
-        Ok(Ok(types)) => json_response(StatusCode::OK, json!({ "types": types })),
+        Ok(Ok(listing)) => json_response(StatusCode::OK, listing),
         Ok(Err(error)) => list_types_error_response(error),
         Err(error) => {
             log_server(format_args!("list types task failed: {error}"));
             json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!({"error":"list_types_failed","message":error.to_string()}),
+            )
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct TypeUsagesQuery {
+    project_dir: PathBuf,
+    usr: String,
+}
+
+/// Serves every usage of one type (US-4), identified by its stable `usr`
+/// (US-3) rather than by position, from the persisted index — the request a
+/// click on a type-list row makes to populate its "used at" panel.
+async fn list_type_usages_from_http(Query(query): Query<TypeUsagesQuery>) -> Response {
+    log_server(format_args!(
+        "listing usages: project_dir={} usr={}",
+        query.project_dir.display(),
+        query.usr
+    ));
+
+    match tokio::task::spawn_blocking(move || {
+        project_service::list_type_usages(&query.project_dir, &query.usr)
+    })
+    .await
+    {
+        Ok(Ok(usages)) => json_response(StatusCode::OK, json!({ "usages": usages })),
+        Ok(Err(error)) => list_types_error_response(error),
+        Err(error) => {
+            log_server(format_args!("list usages task failed: {error}"));
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":"list_usages_failed","message":error.to_string()}),
             )
         }
     }

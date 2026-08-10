@@ -219,15 +219,76 @@ void main() {
 
     expect(selected, widget);
   });
+
+  const pointWithUsr = TypeDeclaration(
+    name: 'Point',
+    kind: TypeDeclarationKind.struct,
+    file: '/workspace/src/types.h',
+    line: 3,
+    column: 8,
+    usr: 'c:@S@Point',
+  );
+  const widgetWithUsr = TypeDeclaration(
+    name: 'Widget',
+    kind: TypeDeclarationKind.class_,
+    file: '/workspace/src/widget.h',
+    line: 5,
+    column: 1,
+    usr: 'c:@S@Widget',
+  );
+
+  testWidgets('shows each type\'s usage count', (tester) async {
+    await tester.pumpWidget(
+      _host(
+        const [pointWithUsr, widgetWithUsr],
+        usageCounts: const {'c:@S@Point': 3, 'c:@S@Widget': 0},
+      ),
+    );
+
+    expect(_rowLabel('3 uses'), findsOneWidget);
+    expect(_rowLabel('0 uses'), findsOneWidget);
+  });
+
+  testWidgets('sorts by usage count, breaking ties by name', (tester) async {
+    await tester.pumpWidget(
+      _host(
+        const [pointWithUsr, widgetWithUsr],
+        usageCounts: const {'c:@S@Point': 5, 'c:@S@Widget': 1},
+      ),
+    );
+
+    await tester.tap(find.text('Uses'));
+    await tester.pump();
+
+    final widgetY = tester.getTopLeft(find.text('Widget')).dy;
+    final pointY = tester.getTopLeft(find.text('Point')).dy;
+    expect(widgetY, lessThan(pointY), reason: '1 use sorts before 5 uses');
+
+    await tester.tap(find.text('Uses'));
+    await tester.pump();
+
+    final widgetYDescending = tester.getTopLeft(find.text('Widget')).dy;
+    final pointYDescending = tester.getTopLeft(find.text('Point')).dy;
+    expect(
+      pointYDescending,
+      lessThan(widgetYDescending),
+      reason: 'reversed: 5 uses sorts before 1 use',
+    );
+  });
 }
 
 Widget _host(
   List<TypeDeclaration> types, {
   ValueChanged<TypeDeclaration>? onTypeSelected,
+  Map<String, int> usageCounts = const {},
 }) {
   return MaterialApp(
     home: Scaffold(
-      body: TypesView(types: types, onTypeSelected: onTypeSelected ?? (_) {}),
+      body: TypesView(
+        types: types,
+        onTypeSelected: onTypeSelected ?? (_) {},
+        usageCounts: usageCounts,
+      ),
     ),
   );
 }

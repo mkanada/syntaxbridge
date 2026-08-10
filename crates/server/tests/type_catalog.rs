@@ -15,7 +15,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use syntax_bridge_server::ingest::{CompilationUnit, CreateProjectRequest};
 use syntax_bridge_server::progress::ExtractionProgress;
 use syntax_bridge_server::project_service;
-use syntax_bridge_server::type_catalog::{self, TypeDeclaration, TypeDeclarationKind};
+use syntax_bridge_server::type_catalog::{
+    self, TypeDeclaration, TypeDeclarationKind, TypeUsage, TypeUsageKind,
+};
 
 const MAIN_CPP: &str = r#"
 #include "types.h"
@@ -559,6 +561,268 @@ fn extract_type_catalog_reports_progress_as_units_complete() {
         2,
         "expected both units marked done by the end"
     );
+}
+
+/// The "identidade de tipo é frágil" open item in `docs/plans/User Steps.md`
+/// (US-3): the previous `(kind, name, file, line, column)` key breaks the
+/// instant an unrelated edit shifts line numbers. `clang_getCursorUSR` gives
+/// libclang's own semantic identity for a cursor, independent of position,
+/// so it survives exactly that kind of edit.
+#[test]
+fn type_declaration_usr_is_stable_across_incidental_line_shifts() {
+    let workspace = TempWorkspace::new("type-catalog-usr").expect("create temporary workspace");
+    let project_root = workspace.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project dir");
+
+    let file_path = project_root.join("shapes.cpp");
+    let before = "struct Shape {\n    int sides;\n};\n";
+    fs::write(&file_path, before).expect("write shapes.cpp (before)");
+
+    let unit = CompilationUnit {
+        directory: project_root.display().to_string(),
+        file: file_path.display().to_string(),
+        command: None,
+        arguments: vec!["clang++".to_owned(), "-std=c++17".to_owned()],
+    };
+
+    let before_catalog =
+        type_catalog::extract_type_catalog(std::slice::from_ref(&unit), &project_root, None)
+            .expect("extract catalog before edit");
+    let before_shape = before_catalog
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "Shape")
+        .unwrap_or_else(|| panic!("expected Shape in catalog before edit: {before_catalog:#?}"));
+    assert!(
+        !before_shape.usr.is_empty(),
+        "expected a non-empty USR: {before_shape:#?}"
+    );
+
+    // An incidental edit — two blank lines inserted above the struct — shifts
+    // every following line number without changing what Shape *is*.
+    let after = format!("\n\n{before}");
+    fs::write(&file_path, &after).expect("write shapes.cpp (after)");
+
+    let after_catalog = type_catalog::extract_type_catalog(&[unit], &project_root, None)
+        .expect("extract catalog after edit");
+    let after_shape = after_catalog
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "Shape")
+        .unwrap_or_else(|| panic!("expected Shape in catalog after edit: {after_catalog:#?}"));
+
+    assert_ne!(
+        before_shape.line, after_shape.line,
+        "the edit should have shifted Shape's line number"
+    );
+    assert_eq!(
+        before_shape.usr, after_shape.usr,
+        "Shape's USR should stay stable across a line-shifting edit that doesn't change its identity"
+    );
+}
+
+/// Complements the line-shift test above: two homonym types in different
+/// namespaces are a distinct pair of identities, not just a distinct pair of
+/// qualified display names, so their USRs must differ too.
+#[test]
+fn type_declaration_usr_distinguishes_namespaced_homonyms_with_libclang() {
+    let workspace =
+        TempWorkspace::new("type-catalog-usr-namespaces").expect("create temporary workspace");
+    let archive_path = workspace.path().join("fixture.tar.gz");
+    write_namespaces_fixture_tarball(workspace.path(), &archive_path)
+        .expect("create fixture archive");
+    let global_db_path = workspace.path().join("global.db");
+
+    let project = project_service::create_project(
+        CreateProjectRequest {
+            name: "type_catalog_usr_namespaces_fixture".to_owned(),
+            workspace_dir: workspace.path().join("projects"),
+            archive_path,
+        },
+        &global_db_path,
+        None,
+    )
+    .expect("ingest project and extract type catalog");
+
+    let catalog = &project.type_catalog;
+
+    let top_level_point = catalog
+        .iter()
+        .find(|declaration| declaration.name == "Point" && declaration.namespace.is_empty())
+        .unwrap_or_else(|| panic!("expected global-scope Point in catalog: {catalog:#?}"));
+
+    let nested_point = catalog
+        .iter()
+        .find(|declaration| declaration.name == "Point" && declaration.namespace == "geometry")
+        .unwrap_or_else(|| panic!("expected geometry::Point in catalog: {catalog:#?}"));
+
+    assert!(
+        !top_level_point.usr.is_empty() && !nested_point.usr.is_empty(),
+        "expected both Points to carry a non-empty USR: {top_level_point:#?} {nested_point:#?}"
+    );
+    assert_ne!(
+        top_level_point.usr, nested_point.usr,
+        "global-scope Point and geometry::Point are distinct types and must have distinct USRs"
+    );
+}
+
+const USAGE_TAXONOMY_CPP: &str = r#"
+struct Point {
+    int x;
+    int y;
+};
+
+struct Widget {
+    int id;
+};
+
+struct Panel : public Widget {
+    Point origin;
+};
+
+typedef Point PointAlias;
+
+Point global_point;
+
+Point make_point(Point seed) {
+    return seed;
+}
+"#;
+
+/// US-4's taxonomy of "uso": every signature-level mention of a project type
+/// (field, parameter, return type, base class, file-scope variable, typedef
+/// underlying type) is recorded as a `TypeUsage`, keyed by the used type's
+/// USR (US-3) rather than position. Expression-level kinds that only appear
+/// inside function bodies (casts, `sizeof`, `new`, template arguments) are
+/// deliberately out of scope here — `type_catalog.rs` parses with
+/// `CXTranslationUnit_SkipFunctionBodies` for performance (see the "Escala"
+/// note in `docs/plans/User Steps.md`), and this pass reuses that same AST
+/// walk instead of reparsing, so anything only visible inside a body isn't
+/// visited at all.
+#[test]
+fn extract_type_catalog_records_usages_across_the_defined_taxonomy() {
+    let workspace = TempWorkspace::new("type-catalog-usages").expect("create temporary workspace");
+    let project_root = workspace.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project dir");
+
+    let file_path = project_root.join("usages.cpp");
+    fs::write(&file_path, USAGE_TAXONOMY_CPP).expect("write usages.cpp");
+
+    let unit = CompilationUnit {
+        directory: project_root.display().to_string(),
+        file: file_path.display().to_string(),
+        command: None,
+        arguments: vec!["clang++".to_owned(), "-std=c++17".to_owned()],
+    };
+
+    let catalog =
+        type_catalog::extract_type_catalog(std::slice::from_ref(&unit), &project_root, None)
+            .expect("extract type catalog");
+
+    let point = catalog
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "Point")
+        .unwrap_or_else(|| panic!("expected Point in catalog: {catalog:#?}"));
+    let widget = catalog
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "Widget")
+        .unwrap_or_else(|| panic!("expected Widget in catalog: {catalog:#?}"));
+
+    let point_usages: Vec<&TypeUsage> = catalog
+        .usages
+        .iter()
+        .filter(|usage| usage.type_usr == point.usr)
+        .collect();
+    let widget_usages: Vec<&TypeUsage> = catalog
+        .usages
+        .iter()
+        .filter(|usage| usage.type_usr == widget.usr)
+        .collect();
+
+    let find_usage = |usages: &[&TypeUsage], kind: TypeUsageKind| -> TypeUsage {
+        usages
+            .iter()
+            .find(|usage| usage.kind == kind)
+            .unwrap_or_else(|| panic!("expected a {kind:?} usage among {usages:#?}"))
+            .to_owned()
+            .clone()
+    };
+
+    let field = find_usage(&point_usages, TypeUsageKind::Field);
+    let (field_line, field_column) = locate_in(USAGE_TAXONOMY_CPP, "Point origin;", "origin");
+    assert_eq!(field.line, field_line, "field usage line: {field:#?}");
+    assert_eq!(field.column, field_column, "field usage column: {field:#?}");
+    assert!(field.file.ends_with("usages.cpp"));
+
+    let typedef_mention = find_usage(&point_usages, TypeUsageKind::TypedefMention);
+    let (typedef_line, typedef_column) = locate_in(
+        USAGE_TAXONOMY_CPP,
+        "typedef Point PointAlias;",
+        "PointAlias",
+    );
+    assert_eq!(typedef_mention.line, typedef_line);
+    assert_eq!(typedef_mention.column, typedef_column);
+
+    let variable_declaration = find_usage(&point_usages, TypeUsageKind::VariableDeclaration);
+    let (var_line, var_column) =
+        locate_in(USAGE_TAXONOMY_CPP, "Point global_point;", "global_point");
+    assert_eq!(variable_declaration.line, var_line);
+    assert_eq!(variable_declaration.column, var_column);
+
+    let return_type = find_usage(&point_usages, TypeUsageKind::ReturnType);
+    let (return_line, return_column) = locate_in(
+        USAGE_TAXONOMY_CPP,
+        "Point make_point(Point seed) {",
+        "make_point",
+    );
+    assert_eq!(return_type.line, return_line);
+    assert_eq!(return_type.column, return_column);
+
+    let parameter = find_usage(&point_usages, TypeUsageKind::Parameter);
+    let (param_line, param_column) =
+        locate_in(USAGE_TAXONOMY_CPP, "Point make_point(Point seed) {", "seed");
+    assert_eq!(parameter.line, param_line);
+    assert_eq!(parameter.column, param_column);
+
+    let inheritance = find_usage(&widget_usages, TypeUsageKind::Inheritance);
+    let (base_line, base_column) = locate_in(
+        USAGE_TAXONOMY_CPP,
+        "struct Panel : public Widget {",
+        "Widget",
+    );
+    assert_eq!(inheritance.line, base_line);
+    assert_eq!(inheritance.column, base_column);
+
+    assert_eq!(
+        point_usages.len(),
+        5,
+        "expected exactly 5 usages of Point (field, typedef mention, variable declaration, \
+         return type, parameter): {point_usages:#?}"
+    );
+    assert_eq!(
+        widget_usages.len(),
+        1,
+        "expected exactly 1 usage of Widget (inheritance): {widget_usages:#?}"
+    );
+}
+
+/// Finds the 1-indexed `(line, column)` of `sub_needle` on the line
+/// containing `line_marker`, so expected usage locations are computed from
+/// the fixture text instead of hand-counted (and kept correct if the fixture
+/// is edited later).
+fn locate_in(content: &str, line_marker: &str, sub_needle: &str) -> (u32, u32) {
+    for (line_index, line) in content.lines().enumerate() {
+        if line.contains(line_marker) {
+            let byte_offset = line.find(sub_needle).unwrap_or_else(|| {
+                panic!("expected to find {sub_needle:?} on line containing {line_marker:?}")
+            });
+            let column = line[..byte_offset].chars().count() + 1;
+            return (line_index as u32 + 1, column as u32);
+        }
+    }
+    panic!("expected to find a line containing {line_marker:?}");
 }
 
 fn write_dependencies_fixture_tarball(workspace: &Path, archive_path: &Path) -> io::Result<()> {

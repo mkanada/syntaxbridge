@@ -253,6 +253,88 @@ void main() {
     expect(highlighted.color, isNot(unhighlighted.color));
   });
 
+  testWidgets(
+    'shows usage counts and navigates from the type list to a usage site '
+    '(US-4)',
+    (tester) async {
+      const pointUsr = 'c:@N@geometry@S@Point';
+      final fakeClient = _FakeServerClient(
+        const ServerStatus(service: 'syntax-bridge-server', status: 'ok'),
+        project: const CreatedProject(
+          name: 'counter',
+          projectDir: '/tmp/projects/counter',
+          inputSourceDir: '/tmp/projects/counter/input-source',
+          compilationUnits: [],
+          sourceFiles: [
+            SourceFile(
+              path: '/tmp/projects/counter/input-source/fixture/types.h',
+              kind: SourceFileKind.header,
+            ),
+            SourceFile(
+              path: '/tmp/projects/counter/input-source/fixture/main.cpp',
+              kind: SourceFileKind.translationUnit,
+            ),
+          ],
+        ),
+        types: const [
+          TypeDeclaration(
+            name: 'Point',
+            kind: TypeDeclarationKind.struct,
+            namespace: 'geometry',
+            file: '/tmp/projects/counter/input-source/fixture/types.h',
+            line: 3,
+            column: 8,
+            usr: pointUsr,
+          ),
+        ],
+        usageCounts: const {pointUsr: 1},
+        usagesByType: const {
+          pointUsr: [
+            TypeUsage(
+              typeUsr: pointUsr,
+              kind: TypeUsageKind.variableDeclaration,
+              file: '/tmp/projects/counter/input-source/fixture/main.cpp',
+              line: 4,
+              column: 1,
+            ),
+          ],
+        },
+        sourceFileContent: 'Point origin;\n',
+      );
+
+      await tester.pumpWidget(SyntaxBridgeApp(serverClient: fakeClient));
+      await tester.pumpAndSettle();
+      await _skipToIde(tester);
+
+      await tester.tap(find.text('Types'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('1 use'), findsOneWidget);
+      expect(
+        find.text('Select a type to see where it is used'),
+        findsOneWidget,
+      );
+
+      await tester.tap(find.text('geometry::Point'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('1 use of geometry::Point'), findsOneWidget);
+      expect(find.text('main.cpp:4'), findsOneWidget);
+      expect(find.text('variable'), findsOneWidget);
+
+      await tester.ensureVisible(find.text('main.cpp:4'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('main.cpp:4'));
+      await tester.pumpAndSettle();
+
+      expect(
+        fakeClient.readSourceFilePath,
+        '/tmp/projects/counter/input-source/fixture/main.cpp',
+      );
+      expect(find.text('main.cpp'), findsWidgets);
+    },
+  );
+
   testWidgets('opens a source file and displays its content on click', (
     tester,
   ) async {
@@ -708,6 +790,8 @@ class _FakeServerClient implements ServerClient {
     this.openProjectResult,
     this.openProjectError,
     this.types = const <TypeDeclaration>[],
+    this.usageCounts = const <String, int>{},
+    this.usagesByType = const <String, List<TypeUsage>>{},
   });
 
   final ServerStatus status;
@@ -718,6 +802,8 @@ class _FakeServerClient implements ServerClient {
   final CreatedProject? openProjectResult;
   final Object? openProjectError;
   final List<TypeDeclaration> types;
+  final Map<String, int> usageCounts;
+  final Map<String, List<TypeUsage>> usagesByType;
   String? createdProjectName;
   String? readSourceFilePath;
   String? openedProjectDir;
@@ -798,7 +884,14 @@ class _FakeServerClient implements ServerClient {
   }
 
   @override
-  Future<List<TypeDeclaration>> listTypes(String projectDir) async => types;
+  Future<TypeCatalogListing> listTypes(String projectDir) async =>
+      TypeCatalogListing(types: types, usageCounts: usageCounts);
+
+  @override
+  Future<List<TypeUsage>> listTypeUsages({
+    required String projectDir,
+    required String typeUsr,
+  }) async => usagesByType[typeUsr] ?? const <TypeUsage>[];
 }
 
 class _FakePathPicker implements PathPicker {

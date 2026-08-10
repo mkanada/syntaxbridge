@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -5,7 +6,9 @@ use rusqlite::{Connection, params};
 
 use crate::ingest::CompilationUnit;
 use crate::source_catalog::{SourceFile, SourceFileKind};
-use crate::type_catalog::{TypeDeclaration, TypeDeclarationKind, TypeDependency};
+use crate::type_catalog::{
+    TypeDeclaration, TypeDeclarationKind, TypeDependency, TypeUsage, TypeUsageKind,
+};
 
 use super::PersistenceError;
 
@@ -39,7 +42,8 @@ impl ProjectStore {
                 line INTEGER NOT NULL,
                 column INTEGER NOT NULL,
                 end_line INTEGER NOT NULL,
-                end_column INTEGER NOT NULL
+                end_column INTEGER NOT NULL,
+                usr TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS type_dependencies (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,6 +55,7 @@ impl ProjectStore {
                 caller_column INTEGER NOT NULL,
                 caller_end_line INTEGER NOT NULL,
                 caller_end_column INTEGER NOT NULL,
+                caller_usr TEXT NOT NULL DEFAULT '',
                 callee_name TEXT NOT NULL,
                 callee_kind TEXT NOT NULL,
                 callee_namespace TEXT NOT NULL,
@@ -58,13 +63,23 @@ impl ProjectStore {
                 callee_line INTEGER NOT NULL,
                 callee_column INTEGER NOT NULL,
                 callee_end_line INTEGER NOT NULL,
-                callee_end_column INTEGER NOT NULL
+                callee_end_column INTEGER NOT NULL,
+                callee_usr TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS source_files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 path TEXT NOT NULL,
                 kind TEXT NOT NULL
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS type_usages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type_usr TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                file TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                column INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_type_usages_type_usr ON type_usages(type_usr);",
         )?;
 
         migrate_type_columns(&connection)?;
@@ -136,8 +151,8 @@ impl ProjectStore {
 
         for declaration in declarations {
             transaction.execute(
-                "INSERT INTO type_declarations (name, kind, namespace, file, line, column, end_line, end_column)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO type_declarations (name, kind, namespace, file, line, column, end_line, end_column, usr)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     declaration.name,
                     declaration.kind.as_str(),
@@ -146,7 +161,8 @@ impl ProjectStore {
                     declaration.line,
                     declaration.column,
                     declaration.end_line,
-                    declaration.end_column
+                    declaration.end_column,
+                    declaration.usr
                 ],
             )?;
         }
@@ -157,7 +173,7 @@ impl ProjectStore {
 
     pub fn list_type_declarations(&self) -> Result<Vec<TypeDeclaration>, PersistenceError> {
         let mut statement = self.connection.prepare(
-            "SELECT name, kind, namespace, file, line, column, end_line, end_column
+            "SELECT name, kind, namespace, file, line, column, end_line, end_column, usr
              FROM type_declarations ORDER BY id",
         )?;
 
@@ -171,12 +187,13 @@ impl ProjectStore {
                 row.get::<_, u32>(5)?,
                 row.get::<_, u32>(6)?,
                 row.get::<_, u32>(7)?,
+                row.get::<_, String>(8)?,
             ))
         })?;
 
         let mut declarations = Vec::new();
         for row in rows {
-            let (name, kind, namespace, file, line, column, end_line, end_column) = row?;
+            let (name, kind, namespace, file, line, column, end_line, end_column, usr) = row?;
             let Some(kind) = TypeDeclarationKind::parse(&kind) else {
                 continue;
             };
@@ -190,6 +207,7 @@ impl ProjectStore {
                 column,
                 end_line,
                 end_column,
+                usr,
             });
         }
 
@@ -214,9 +232,9 @@ impl ProjectStore {
         for dependency in dependencies {
             transaction.execute(
                 "INSERT INTO type_dependencies (
-                    caller_name, caller_kind, caller_namespace, caller_file, caller_line, caller_column, caller_end_line, caller_end_column,
-                    callee_name, callee_kind, callee_namespace, callee_file, callee_line, callee_column, callee_end_line, callee_end_column
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                    caller_name, caller_kind, caller_namespace, caller_file, caller_line, caller_column, caller_end_line, caller_end_column, caller_usr,
+                    callee_name, callee_kind, callee_namespace, callee_file, callee_line, callee_column, callee_end_line, callee_end_column, callee_usr
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
                 params![
                     dependency.caller.name,
                     dependency.caller.kind.as_str(),
@@ -226,6 +244,7 @@ impl ProjectStore {
                     dependency.caller.column,
                     dependency.caller.end_line,
                     dependency.caller.end_column,
+                    dependency.caller.usr,
                     dependency.callee.name,
                     dependency.callee.kind.as_str(),
                     dependency.callee.namespace,
@@ -234,6 +253,7 @@ impl ProjectStore {
                     dependency.callee.column,
                     dependency.callee.end_line,
                     dependency.callee.end_column,
+                    dependency.callee.usr,
                 ],
             )?;
         }
@@ -244,8 +264,8 @@ impl ProjectStore {
 
     pub fn list_type_dependencies(&self) -> Result<Vec<TypeDependency>, PersistenceError> {
         let mut statement = self.connection.prepare(
-            "SELECT caller_name, caller_kind, caller_namespace, caller_file, caller_line, caller_column, caller_end_line, caller_end_column,
-                    callee_name, callee_kind, callee_namespace, callee_file, callee_line, callee_column, callee_end_line, callee_end_column
+            "SELECT caller_name, caller_kind, caller_namespace, caller_file, caller_line, caller_column, caller_end_line, caller_end_column, caller_usr,
+                    callee_name, callee_kind, callee_namespace, callee_file, callee_line, callee_column, callee_end_line, callee_end_column, callee_usr
              FROM type_dependencies ORDER BY id",
         )?;
 
@@ -263,10 +283,12 @@ impl ProjectStore {
                 row.get::<_, String>(9)?,
                 row.get::<_, String>(10)?,
                 row.get::<_, String>(11)?,
-                row.get::<_, u32>(12)?,
+                row.get::<_, String>(12)?,
                 row.get::<_, u32>(13)?,
                 row.get::<_, u32>(14)?,
                 row.get::<_, u32>(15)?,
+                row.get::<_, u32>(16)?,
+                row.get::<_, String>(17)?,
             ))
         })?;
 
@@ -281,6 +303,7 @@ impl ProjectStore {
                 caller_column,
                 caller_end_line,
                 caller_end_column,
+                caller_usr,
                 callee_name,
                 callee_kind,
                 callee_namespace,
@@ -289,6 +312,7 @@ impl ProjectStore {
                 callee_column,
                 callee_end_line,
                 callee_end_column,
+                callee_usr,
             ) = row?;
 
             let (Some(caller_kind), Some(callee_kind)) = (
@@ -308,6 +332,7 @@ impl ProjectStore {
                     column: caller_column,
                     end_line: caller_end_line,
                     end_column: caller_end_column,
+                    usr: caller_usr,
                 },
                 callee: TypeDeclaration {
                     name: callee_name,
@@ -318,6 +343,7 @@ impl ProjectStore {
                     column: callee_column,
                     end_line: callee_end_line,
                     end_column: callee_end_column,
+                    usr: callee_usr,
                 },
             });
         }
@@ -364,6 +390,90 @@ impl ProjectStore {
 
         Ok(files)
     }
+
+    /// Replaces the full set of type usage occurrences (US-4) with the ones
+    /// from the latest `libclang` extraction, since they describe the
+    /// current state of the source tree rather than an append-only history.
+    pub fn replace_type_usages(&mut self, usages: &[TypeUsage]) -> Result<(), PersistenceError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM type_usages", [])?;
+
+        for usage in usages {
+            transaction.execute(
+                "INSERT INTO type_usages (type_usr, kind, file, line, column)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    usage.type_usr,
+                    usage.kind.as_str(),
+                    usage.file,
+                    usage.line,
+                    usage.column
+                ],
+            )?;
+        }
+
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Every recorded usage of the type identified by `type_usr`, for the
+    /// "click a type, see every place it's used" navigation US-4 asks for —
+    /// answered straight from the persisted index, no reparsing.
+    pub fn list_type_usages_for(&self, type_usr: &str) -> Result<Vec<TypeUsage>, PersistenceError> {
+        let mut statement = self.connection.prepare(
+            "SELECT type_usr, kind, file, line, column
+             FROM type_usages WHERE type_usr = ?1 ORDER BY file, line, column",
+        )?;
+
+        let rows = statement.query_map(params![type_usr], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, u32>(3)?,
+                row.get::<_, u32>(4)?,
+            ))
+        })?;
+
+        let mut usages = Vec::new();
+        for row in rows {
+            let (type_usr, kind, file, line, column) = row?;
+            let Some(kind) = TypeUsageKind::parse(&kind) else {
+                continue;
+            };
+
+            usages.push(TypeUsage {
+                type_usr,
+                kind,
+                file,
+                line,
+                column,
+            });
+        }
+
+        Ok(usages)
+    }
+
+    /// The number of recorded usages per type, keyed by `usr` — what the
+    /// type list shows as its "N usages" column (US-4) without a per-row
+    /// query.
+    pub fn type_usage_counts(&self) -> Result<HashMap<String, usize>, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT type_usr, COUNT(*) FROM type_usages GROUP BY type_usr")?;
+
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+
+        let mut counts = HashMap::new();
+        for row in rows {
+            let (type_usr, count) = row?;
+            counts.insert(type_usr, count as usize);
+        }
+
+        Ok(counts)
+    }
 }
 
 /// Adds the `namespace`/`end_line`/`end_column` columns to `type_declarations`
@@ -394,6 +504,12 @@ fn migrate_type_columns(connection: &Connection) -> Result<(), PersistenceError>
         "end_column",
         "end_column INTEGER NOT NULL DEFAULT 0",
     )?;
+    ensure_column(
+        connection,
+        "type_declarations",
+        "usr",
+        "usr TEXT NOT NULL DEFAULT ''",
+    )?;
 
     for side in ["caller", "callee"] {
         ensure_column(
@@ -413,6 +529,12 @@ fn migrate_type_columns(connection: &Connection) -> Result<(), PersistenceError>
             "type_dependencies",
             &format!("{side}_end_column"),
             &format!("{side}_end_column INTEGER NOT NULL DEFAULT 0"),
+        )?;
+        ensure_column(
+            connection,
+            "type_dependencies",
+            &format!("{side}_usr"),
+            &format!("{side}_usr TEXT NOT NULL DEFAULT ''"),
         )?;
     }
 
@@ -522,6 +644,7 @@ mod tests {
                 column: 8,
                 end_line: 6,
                 end_column: 1,
+                usr: "c:@N@geometry@S@Point".to_owned(),
             },
             TypeDeclaration {
                 name: "ANSWER".to_owned(),
@@ -532,6 +655,7 @@ mod tests {
                 column: 9,
                 end_line: 1,
                 end_column: 20,
+                usr: "c:@macro@ANSWER".to_owned(),
             },
         ]
     }
@@ -595,6 +719,7 @@ mod tests {
                 column: 8,
                 end_line: 0,
                 end_column: 0,
+                usr: String::new(),
             }]
         );
 
@@ -651,6 +776,7 @@ mod tests {
             column: 8,
             end_line: 6,
             end_column: 1,
+            usr: "c:@N@geometry@S@Point".to_owned(),
         };
         let rect = TypeDeclaration {
             name: "Rect".to_owned(),
@@ -661,6 +787,7 @@ mod tests {
             column: 8,
             end_line: 11,
             end_column: 1,
+            usr: "c:@N@geometry@S@Rect".to_owned(),
         };
 
         vec![TypeDependency {
@@ -749,6 +876,102 @@ mod tests {
 
         let files = store.list_source_files().expect("list source files");
         assert!(files.is_empty(), "expected no source files: {files:?}");
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    fn sample_type_usages() -> Vec<TypeUsage> {
+        vec![
+            TypeUsage {
+                type_usr: "c:@N@geometry@S@Point".to_owned(),
+                kind: TypeUsageKind::Field,
+                file: "/workspace/src/types.h".to_owned(),
+                line: 9,
+                column: 11,
+            },
+            TypeUsage {
+                type_usr: "c:@N@geometry@S@Point".to_owned(),
+                kind: TypeUsageKind::Parameter,
+                file: "/workspace/src/main.cpp".to_owned(),
+                line: 4,
+                column: 22,
+            },
+            TypeUsage {
+                type_usr: "c:@N@geometry@S@Widget".to_owned(),
+                kind: TypeUsageKind::Inheritance,
+                file: "/workspace/src/types.h".to_owned(),
+                line: 8,
+                column: 20,
+            },
+        ]
+    }
+
+    #[test]
+    fn round_trips_type_usages() {
+        let db_path = temp_db_path("project-type-usages");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+        store
+            .replace_type_usages(&sample_type_usages())
+            .expect("persist type usages");
+
+        let point_usages = store
+            .list_type_usages_for("c:@N@geometry@S@Point")
+            .expect("list usages for Point");
+        assert_eq!(
+            point_usages,
+            vec![
+                TypeUsage {
+                    type_usr: "c:@N@geometry@S@Point".to_owned(),
+                    kind: TypeUsageKind::Parameter,
+                    file: "/workspace/src/main.cpp".to_owned(),
+                    line: 4,
+                    column: 22,
+                },
+                TypeUsage {
+                    type_usr: "c:@N@geometry@S@Point".to_owned(),
+                    kind: TypeUsageKind::Field,
+                    file: "/workspace/src/types.h".to_owned(),
+                    line: 9,
+                    column: 11,
+                },
+            ]
+        );
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn replacing_type_usages_clears_previous_entries() {
+        let db_path = temp_db_path("project-type-usages-replace");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+        store
+            .replace_type_usages(&sample_type_usages())
+            .expect("persist type usages");
+        store.replace_type_usages(&[]).expect("clear type usages");
+
+        let usages = store
+            .list_type_usages_for("c:@N@geometry@S@Point")
+            .expect("list usages for Point");
+        assert!(usages.is_empty(), "expected no usages: {usages:?}");
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn counts_usages_per_type() {
+        let db_path = temp_db_path("project-type-usage-counts");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+        store
+            .replace_type_usages(&sample_type_usages())
+            .expect("persist type usages");
+
+        let counts = store.type_usage_counts().expect("compute usage counts");
+        assert_eq!(counts.get("c:@N@geometry@S@Point"), Some(&2));
+        assert_eq!(counts.get("c:@N@geometry@S@Widget"), Some(&1));
+        assert_eq!(counts.len(), 2);
 
         let _ = fs::remove_file(&db_path);
     }

@@ -31,7 +31,14 @@ abstract class ServerClient {
     required String path,
   });
 
-  /// The type catalog already persisted for a project (US-3), without
-  /// reparsing it.
-  Future<List<TypeDeclaration>> listTypes(String projectDir);
+  /// The type catalog already persisted for a project (US-3), together with
+  /// each type's usage count (US-4), without reparsing.
+  Future<TypeCatalogListing> listTypes(String projectDir);
+
+  /// Every recorded usage of the type identified by [typeUsr] (US-3's stable
+  /// identity), from the persisted index (US-4), without reparsing.
+  Future<List<TypeUsage>> listTypeUsages({
+    required String projectDir,
+    required String typeUsr,
+  });
 }

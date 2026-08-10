@@ -1,5 +1,6 @@
-//! Exercises `GET /projects/types`, which serves the type catalog already
-//! persisted in `project.db` without reparsing.
+//! Exercises `GET /projects/types` and `GET /projects/types/usages`, which
+//! serve the type catalog and its usage index (US-4) already persisted in
+//! `project.db`, without reparsing.
 //!
 //! Unlike `type_catalog.rs`, this doesn't need a real `libclang`: the store
 //! is populated directly, the way `docs/plans/User Steps.md` (US-4's
@@ -15,7 +16,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 use syntax_bridge_server::persistence::ProjectStore;
 use syntax_bridge_server::server::SyntaxBridgeServer;
-use syntax_bridge_server::type_catalog::{TypeDeclaration, TypeDeclarationKind};
+use syntax_bridge_server::type_catalog::{
+    TypeDeclaration, TypeDeclarationKind, TypeUsage, TypeUsageKind,
+};
 
 fn sample_declarations() -> Vec<TypeDeclaration> {
     vec![
@@ -28,6 +31,7 @@ fn sample_declarations() -> Vec<TypeDeclaration> {
             column: 8,
             end_line: 6,
             end_column: 1,
+            usr: "c:@N@geometry@S@Point".to_owned(),
         },
         TypeDeclaration {
             name: "ANSWER".to_owned(),
@@ -38,6 +42,26 @@ fn sample_declarations() -> Vec<TypeDeclaration> {
             column: 9,
             end_line: 1,
             end_column: 20,
+            usr: "c:@macro@ANSWER".to_owned(),
+        },
+    ]
+}
+
+fn sample_usages() -> Vec<TypeUsage> {
+    vec![
+        TypeUsage {
+            type_usr: "c:@N@geometry@S@Point".to_owned(),
+            kind: TypeUsageKind::Field,
+            file: "/workspace/src/types.h".to_owned(),
+            line: 9,
+            column: 11,
+        },
+        TypeUsage {
+            type_usr: "c:@N@geometry@S@Point".to_owned(),
+            kind: TypeUsageKind::ReturnType,
+            file: "/workspace/src/main.cpp".to_owned(),
+            line: 4,
+            column: 1,
         },
     ]
 }
@@ -53,6 +77,9 @@ fn returns_the_persisted_catalog_without_reparsing() {
     store
         .replace_type_declarations(&sample_declarations())
         .expect("persist type declarations");
+    store
+        .replace_type_usages(&sample_usages())
+        .expect("persist type usages");
 
     let server = SyntaxBridgeServer::bind("127.0.0.1:0")
         .expect("bind test server")
@@ -91,6 +118,93 @@ fn returns_the_persisted_catalog_without_reparsing() {
         .find(|entry| entry["name"] == "Point")
         .expect("Point entry");
     assert_eq!(point["kind"], "struct");
+
+    let usage_counts = json
+        .get("usage_counts")
+        .and_then(Value::as_object)
+        .expect("response includes usage_counts object");
+    assert_eq!(
+        usage_counts.get("c:@N@geometry@S@Point"),
+        Some(&Value::from(2)),
+        "unexpected usage_counts: {usage_counts:?}"
+    );
+}
+
+#[test]
+fn usages_route_returns_the_persisted_usages_for_a_type() {
+    let workspace = TempWorkspace::new("types-usages-route").expect("create temporary workspace");
+    let project_dir = workspace.path().join("projects/counter");
+    fs::create_dir_all(&project_dir).expect("create project dir");
+
+    let mut store =
+        ProjectStore::open(&project_dir.join("project.db")).expect("open project store");
+    store
+        .replace_type_usages(&sample_usages())
+        .expect("persist type usages");
+
+    let server = SyntaxBridgeServer::bind("127.0.0.1:0")
+        .expect("bind test server")
+        .with_global_db_path(workspace.path().join("global.db"));
+    let addr = server.local_addr().expect("read server address");
+    let handle = server.spawn().expect("spawn test server");
+
+    let query = format!(
+        "/projects/types/usages?project_dir={}&usr={}",
+        percent_encode(&project_dir.display().to_string()),
+        percent_encode("c:@N@geometry@S@Point"),
+    );
+    let (status, body) = http_get(addr, &query);
+    handle.shutdown().expect("stop test server");
+
+    assert!(
+        status.starts_with("HTTP/1.1 200"),
+        "unexpected response: {status} body={body}"
+    );
+
+    let json: Value = serde_json::from_str(&body).expect("parse response body");
+    let usages = json
+        .get("usages")
+        .and_then(Value::as_array)
+        .expect("response includes usages array");
+    assert_eq!(usages.len(), 2, "unexpected response body: {body}");
+    assert!(
+        usages
+            .iter()
+            .any(|entry| entry["kind"] == "field" && entry["line"] == 9),
+        "missing field usage: {body}"
+    );
+    assert!(
+        usages
+            .iter()
+            .any(|entry| entry["kind"] == "return_type" && entry["line"] == 4),
+        "missing return_type usage: {body}"
+    );
+}
+
+#[test]
+fn usages_route_returns_not_found_for_a_project_without_a_database() {
+    let workspace =
+        TempWorkspace::new("types-usages-route-missing").expect("create temporary workspace");
+    let project_dir = workspace.path().join("projects/missing");
+
+    let server = SyntaxBridgeServer::bind("127.0.0.1:0")
+        .expect("bind test server")
+        .with_global_db_path(workspace.path().join("global.db"));
+    let addr = server.local_addr().expect("read server address");
+    let handle = server.spawn().expect("spawn test server");
+
+    let query = format!(
+        "/projects/types/usages?project_dir={}&usr={}",
+        percent_encode(&project_dir.display().to_string()),
+        percent_encode("c:@N@geometry@S@Point"),
+    );
+    let (status, body) = http_get(addr, &query);
+    handle.shutdown().expect("stop test server");
+
+    assert!(
+        status.starts_with("HTTP/1.1 404"),
+        "unexpected response: {status} body={body}"
+    );
 }
 
 #[test]

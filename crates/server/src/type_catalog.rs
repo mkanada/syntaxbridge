@@ -98,6 +98,13 @@ pub struct TypeDeclaration {
     /// whole declaration rather than just its starting point.
     pub end_line: u32,
     pub end_column: u32,
+    /// `libclang`'s Unified Symbol Resolution for this cursor
+    /// (`clang_getCursorUSR`) — a semantic identity independent of source
+    /// position, unlike `(kind, name, file, line, column)`, which breaks the
+    /// instant an unrelated edit shifts line numbers. This is the stable
+    /// identity US-4 onward reference types by (see `docs/plans/User
+    /// Steps.md`, US-3).
+    pub usr: String,
 }
 
 /// An edge in the type dependency graph: `caller` references `callee` in its
@@ -109,12 +116,80 @@ pub struct TypeDependency {
     pub callee: TypeDeclaration,
 }
 
-/// The catalog of named types declared across a project, together with the
-/// dependency edges between them.
+/// The closed taxonomy of "use" this catalog tracks (US-4). Each kind is a
+/// *signature-level* mention of a named type — visible without parsing
+/// function bodies, since `extract_type_catalog` parses with
+/// `CXTranslationUnit_SkipFunctionBodies` for performance (see the "Escala"
+/// note in `docs/plans/User Steps.md`) and reuses that same AST walk rather
+/// than reparsing with bodies enabled just for this. Expression-level kinds
+/// that only occur inside a body — casts, `sizeof`, `new`, template
+/// arguments — are deliberately out of scope for this pass; the doc's open
+/// item on completing the taxonomy stays open for those.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeUsageKind {
+    /// A file/namespace/static-member-scope variable declaration. Local
+    /// variables inside function bodies aren't visible to this pass (see
+    /// above) and so aren't counted.
+    VariableDeclaration,
+    /// A function or method parameter.
+    Parameter,
+    /// A struct/class/union field.
+    Field,
+    /// A function or method's return type.
+    ReturnType,
+    /// A base class in a `class Derived : Base` specifier.
+    Inheritance,
+    /// The underlying type of a `typedef`/`using` alias.
+    TypedefMention,
+}
+
+impl TypeUsageKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::VariableDeclaration => "variable_declaration",
+            Self::Parameter => "parameter",
+            Self::Field => "field",
+            Self::ReturnType => "return_type",
+            Self::Inheritance => "inheritance",
+            Self::TypedefMention => "typedef_mention",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "variable_declaration" => Some(Self::VariableDeclaration),
+            "parameter" => Some(Self::Parameter),
+            "field" => Some(Self::Field),
+            "return_type" => Some(Self::ReturnType),
+            "inheritance" => Some(Self::Inheritance),
+            "typedef_mention" => Some(Self::TypedefMention),
+            _ => None,
+        }
+    }
+}
+
+/// One occurrence of a project type being used at a specific source
+/// location, keyed by the used type's `usr` (US-3's stable identity) rather
+/// than by embedding the whole `TypeDeclaration` — usages are looked up by
+/// type identity, and a `TypeDeclaration` copy per occurrence would just be
+/// redundant, position-derived data.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct TypeUsage {
+    pub type_usr: String,
+    pub kind: TypeUsageKind,
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+}
+
+/// The catalog of named types declared across a project, the dependency
+/// edges between them, and every place a type is used (US-4).
 #[derive(Debug, Clone, Default)]
 pub struct TypeCatalog {
     pub declarations: Vec<TypeDeclaration>,
     pub dependencies: Vec<TypeDependency>,
+    pub usages: Vec<TypeUsage>,
 }
 
 #[derive(Debug)]
@@ -200,18 +275,12 @@ pub fn extract_type_catalog(
     let mut declarations = Vec::new();
     let mut dependency_seen = HashSet::new();
     let mut dependencies = Vec::new();
+    let mut usage_seen = HashSet::new();
+    let mut usages = Vec::new();
 
-    for (partial_declarations, partial_dependencies) in partials {
+    for (partial_declarations, partial_dependencies, partial_usages) in partials {
         for declaration in partial_declarations {
-            let key = (
-                declaration.kind,
-                declaration.name.clone(),
-                declaration.file.clone(),
-                declaration.line,
-                declaration.column,
-            );
-
-            if seen.insert(key) {
+            if seen.insert(declaration_identity(&declaration)) {
                 declarations.push(declaration);
             }
         }
@@ -224,18 +293,26 @@ pub fn extract_type_catalog(
                 dependency.callee,
             );
         }
+
+        for usage in partial_usages {
+            if usage_seen.insert(usage_identity(&usage)) {
+                usages.push(usage);
+            }
+        }
     }
 
     log_type_catalog(format_args!(
-        "extract_type_catalog: done in {:.2}s, {} declarations, {} dependencies",
+        "extract_type_catalog: done in {:.2}s, {} declarations, {} dependencies, {} usages",
         extraction_started.elapsed().as_secs_f64(),
         declarations.len(),
-        dependencies.len()
+        dependencies.len(),
+        usages.len()
     ));
 
     Ok(TypeCatalog {
         declarations,
         dependencies,
+        usages,
     })
 }
 
@@ -247,7 +324,7 @@ fn parse_chunk(
     chunk: &[CompilationUnit],
     project_root: &Path,
     progress: Option<&ExtractionProgress>,
-) -> (Vec<TypeDeclaration>, Vec<TypeDependency>) {
+) -> (Vec<TypeDeclaration>, Vec<TypeDependency>, Vec<TypeUsage>) {
     // `clang-sys`'s `runtime` feature loads the shared library into
     // thread-local storage, so the load done by `ensure_libclang_loaded` on
     // the calling thread doesn't cover this worker thread — each one has to
@@ -261,6 +338,8 @@ fn parse_chunk(
     let mut declarations = Vec::new();
     let mut dependency_seen = HashSet::new();
     let mut dependencies = Vec::new();
+    let mut usage_seen = HashSet::new();
+    let mut usages = Vec::new();
 
     unsafe {
         let index = clang_sys::clang_createIndex(0, 0);
@@ -272,6 +351,8 @@ fn parse_chunk(
                 seen: &mut seen,
                 dependencies: &mut dependencies,
                 dependency_seen: &mut dependency_seen,
+                usages: &mut usages,
+                usage_seen: &mut usage_seen,
             };
 
             log_type_catalog(format_args!(
@@ -296,7 +377,7 @@ fn parse_chunk(
         clang_sys::clang_disposeIndex(index);
     }
 
-    (declarations, dependencies)
+    (declarations, dependencies, usages)
 }
 
 fn log_type_catalog(args: fmt::Arguments<'_>) {
@@ -316,9 +397,40 @@ fn timestamp_millis() -> u128 {
 struct VisitorState<'a> {
     project_root: &'a Path,
     declarations: &'a mut Vec<TypeDeclaration>,
-    seen: &'a mut HashSet<(TypeDeclarationKind, String, String, u32, u32)>,
+    seen: &'a mut HashSet<String>,
     dependencies: &'a mut Vec<TypeDependency>,
     dependency_seen: &'a mut HashSet<(TypeDeclaration, TypeDeclaration)>,
+    usages: &'a mut Vec<TypeUsage>,
+    usage_seen: &'a mut HashSet<(String, TypeUsageKind, String, u32, u32)>,
+}
+
+/// The key used to deduplicate a `TypeUsage` across translation units (the
+/// same project header commonly gets reparsed by every TU that includes it):
+/// the used type's `usr` plus the usage's own kind and site, since the same
+/// type can legitimately be used more than once at different sites.
+fn usage_identity(usage: &TypeUsage) -> (String, TypeUsageKind, String, u32, u32) {
+    (
+        usage.type_usr.clone(),
+        usage.kind,
+        usage.file.clone(),
+        usage.line,
+        usage.column,
+    )
+}
+
+/// The key used to deduplicate a `TypeDeclaration` across translation units:
+/// its `usr` when `libclang` provided one (the stable, position-independent
+/// identity), falling back to the old positional key on the rare cursor kind
+/// where it doesn't (e.g. some very old `libclang` versions for macros).
+fn declaration_identity(declaration: &TypeDeclaration) -> String {
+    if !declaration.usr.is_empty() {
+        return declaration.usr.clone();
+    }
+
+    format!(
+        "pos:{:?}:{}:{}:{}:{}",
+        declaration.kind, declaration.name, declaration.file, declaration.line, declaration.column
+    )
 }
 
 unsafe fn visit_translation_unit(
@@ -421,15 +533,7 @@ extern "C" fn visit_cursor(
     if let Some(declaration_kind) = is_relevant
         && let Some(declaration) = describe_cursor(cursor, declaration_kind, state.project_root)
     {
-        let key = (
-            declaration.kind,
-            declaration.name.clone(),
-            declaration.file.clone(),
-            declaration.line,
-            declaration.column,
-        );
-
-        if state.seen.insert(key) {
+        if state.seen.insert(declaration_identity(&declaration)) {
             state.declarations.push(declaration.clone());
         }
 
@@ -439,6 +543,7 @@ extern "C" fn visit_cursor(
         ) && let underlying = unsafe { clang_sys::clang_getTypedefDeclUnderlyingType(cursor) }
             && let Some(callee) = resolve_named_declaration(underlying, state.project_root)
         {
+            push_usage(state, TypeUsageKind::TypedefMention, cursor, &callee);
             push_dependency(
                 state.dependencies,
                 state.dependency_seen,
@@ -455,13 +560,37 @@ extern "C" fn visit_cursor(
         record_member_dependency(cursor, parent, state);
     }
 
+    match kind {
+        clang_sys::CXCursor_ParmDecl => {
+            let parameter_type = unsafe { clang_sys::clang_getCursorType(cursor) };
+            if let Some(target) = resolve_named_declaration(parameter_type, state.project_root) {
+                push_usage(state, TypeUsageKind::Parameter, cursor, &target);
+            }
+        }
+        clang_sys::CXCursor_VarDecl => {
+            let variable_type = unsafe { clang_sys::clang_getCursorType(cursor) };
+            if let Some(target) = resolve_named_declaration(variable_type, state.project_root) {
+                push_usage(state, TypeUsageKind::VariableDeclaration, cursor, &target);
+            }
+        }
+        clang_sys::CXCursor_FunctionDecl | clang_sys::CXCursor_CXXMethod => {
+            let result_type = unsafe { clang_sys::clang_getCursorResultType(cursor) };
+            if let Some(target) = resolve_named_declaration(result_type, state.project_root) {
+                push_usage(state, TypeUsageKind::ReturnType, cursor, &target);
+            }
+        }
+        _ => {}
+    }
+
     clang_sys::CXChildVisit_Recurse
 }
 
 /// Records a dependency edge from the struct/class/union `parent` cursor to
 /// the named type declared by a field or base-class-specifier `cursor`,
 /// skipping silently when either side isn't a type this catalog tracks
-/// (builtins, or types outside `project_root`).
+/// (builtins, or types outside `project_root`). Also records the matching
+/// `TypeUsage` (`Field` or `Inheritance`) at `cursor`'s own location, which
+/// is the field's or base-specifier's site — not `parent`'s.
 fn record_member_dependency(
     cursor: clang_sys::CXCursor,
     parent: clang_sys::CXCursor,
@@ -480,7 +609,45 @@ fn record_member_dependency(
         return;
     };
 
+    let kind = unsafe { clang_sys::clang_getCursorKind(cursor) };
+    let usage_kind = if kind == clang_sys::CXCursor_CXXBaseSpecifier {
+        TypeUsageKind::Inheritance
+    } else {
+        TypeUsageKind::Field
+    };
+    push_usage(state, usage_kind, cursor, &callee);
+
     push_dependency(state.dependencies, state.dependency_seen, caller, callee);
+}
+
+/// Records that `target` is used with kind `kind` at `site_cursor`'s own
+/// location, deduplicating repeat occurrences (the same project header is
+/// commonly reparsed by many translation units). Silently skips sites
+/// outside `project_root` or in a system header, the same filter
+/// `describe_cursor` applies to declarations.
+fn push_usage(
+    state: &mut VisitorState<'_>,
+    kind: TypeUsageKind,
+    site_cursor: clang_sys::CXCursor,
+    target: &TypeDeclaration,
+) {
+    if target.usr.is_empty() {
+        return;
+    }
+    let Some((file, line, column)) = cursor_site(site_cursor, state.project_root) else {
+        return;
+    };
+
+    let usage = TypeUsage {
+        type_usr: target.usr.clone(),
+        kind,
+        file,
+        line,
+        column,
+    };
+    if state.usage_seen.insert(usage_identity(&usage)) {
+        state.usages.push(usage);
+    }
 }
 
 /// Strips pointers, references and array indirections off `cxtype`, then
@@ -656,6 +823,30 @@ fn describe_cursor(
         return None;
     }
 
+    let (file, line, column) = cursor_site(cursor, project_root)?;
+
+    let namespace = unsafe { namespace_of(cursor) };
+    let (end_line, end_column) = unsafe { extent_end(cursor) };
+    let usr = unsafe { cxstring_to_string(clang_sys::clang_getCursorUSR(cursor)) };
+
+    Some(TypeDeclaration {
+        name,
+        kind,
+        namespace,
+        file,
+        line,
+        column,
+        end_line,
+        end_column,
+        usr,
+    })
+}
+
+/// Resolves `cursor`'s own spelling location to `(file, line, column)`,
+/// filtering out system headers and anything outside `project_root` — the
+/// same rule `describe_cursor` applies to declarations, shared here since
+/// `push_usage` needs an identical filter for usage sites.
+fn cursor_site(cursor: clang_sys::CXCursor, project_root: &Path) -> Option<(String, u32, u32)> {
     let location = unsafe { clang_sys::clang_getCursorLocation(cursor) };
     if unsafe { clang_sys::clang_Location_isInSystemHeader(location) } != 0 {
         return None;
@@ -689,19 +880,7 @@ fn describe_cursor(
         return None;
     }
 
-    let namespace = unsafe { namespace_of(cursor) };
-    let (end_line, end_column) = unsafe { extent_end(cursor) };
-
-    Some(TypeDeclaration {
-        name,
-        kind,
-        namespace,
-        file: canonical_file_path.display().to_string(),
-        line,
-        column,
-        end_line,
-        end_column,
-    })
+    Some((canonical_file_path.display().to_string(), line, column))
 }
 
 /// Walks `cursor`'s semantic parents, collecting the spelling of every

@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 import '../project/project_models.dart';
 import 'ide_theme.dart';
 
-enum _SortField { name, kind }
+enum _SortField { name, kind, usageCount }
 
 /// The type catalog navigator (US-3): every struct, class, union, enum,
 /// typedef, type alias, and macro declared in the project, with its kind.
@@ -20,11 +20,16 @@ class TypesView extends StatefulWidget {
     required this.types,
     required this.onTypeSelected,
     this.selectedType,
+    this.usageCounts = const <String, int>{},
   });
 
   final List<TypeDeclaration> types;
   final ValueChanged<TypeDeclaration> onTypeSelected;
   final TypeDeclaration? selectedType;
+
+  /// Each type's usage count (US-4), keyed by its `usr`. A type with no
+  /// entry (or an empty `usr`) shows as 0 uses.
+  final Map<String, int> usageCounts;
 
   @override
   State<TypesView> createState() => _TypesViewState();
@@ -64,7 +69,8 @@ class _TypesViewState extends State<TypesView> {
           style: Theme.of(context).textTheme.bodyMedium,
         ),
         const SizedBox(height: 8),
-        Row(
+        Wrap(
+          crossAxisAlignment: WrapCrossAlignment.center,
           children: [
             Text(
               'Sort by ',
@@ -74,6 +80,7 @@ class _TypesViewState extends State<TypesView> {
             ),
             _sortButton(context, _SortField.name, 'Name'),
             _sortButton(context, _SortField.kind, 'Kind'),
+            _sortButton(context, _SortField.usageCount, 'Uses'),
           ],
         ),
         if (presentKinds.isNotEmpty) ...[
@@ -164,9 +171,19 @@ class _TypesViewState extends State<TypesView> {
       final int comparison = switch (_sortField) {
         _SortField.name => _compareByName(a, b),
         _SortField.kind => _compareByKindThenName(a, b),
+        _SortField.usageCount => _compareByUsageCount(a, b),
       };
       return _ascending ? comparison : -comparison;
     });
+  }
+
+  int _usageCount(TypeDeclaration type) => widget.usageCounts[type.usr] ?? 0;
+
+  /// Ties break by name so sorting stays stable for equal counts, matching
+  /// name/kind sort's own tie-breaking (US-4 criterion 4).
+  int _compareByUsageCount(TypeDeclaration a, TypeDeclaration b) {
+    final int countComparison = _usageCount(a).compareTo(_usageCount(b));
+    return countComparison != 0 ? countComparison : _compareByName(a, b);
   }
 
   /// One row per declaration, each divided from the next.
@@ -177,10 +194,24 @@ class _TypesViewState extends State<TypesView> {
           contentPadding: EdgeInsets.zero,
           selected: type == widget.selectedType,
           leading: const Icon(Icons.data_object),
-          title: Text(_qualifiedName(type)),
-          trailing: Text(
-            type.kind.label,
-            style: const TextStyle(color: IdePalette.muted),
+          title: Text(_qualifiedName(type), overflow: TextOverflow.ellipsis),
+          trailing: SizedBox(
+            width: 96,
+            child: Wrap(
+              alignment: WrapAlignment.end,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 8,
+              children: [
+                Text(
+                  '${_usageCount(type)} ${_usageCount(type) == 1 ? 'use' : 'uses'}',
+                  style: const TextStyle(color: IdePalette.muted, fontSize: 12),
+                ),
+                Text(
+                  type.kind.label,
+                  style: const TextStyle(color: IdePalette.muted, fontSize: 12),
+                ),
+              ],
+            ),
           ),
           onTap: () => widget.onTypeSelected(type),
         ),

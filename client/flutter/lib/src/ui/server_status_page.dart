@@ -16,6 +16,7 @@ import 'server_connection_status.dart';
 import 'source_file_viewer.dart';
 import 'source_files_view.dart';
 import 'types_view.dart';
+import 'usages_view.dart';
 
 class ServerStatusPage extends StatefulWidget {
   const ServerStatusPage({
@@ -38,10 +39,11 @@ class ServerStatusPage extends StatefulWidget {
 class _ServerStatusPageState extends State<ServerStatusPage> {
   late Future<ServerStatus> _status;
   final List<ExecutionLogEntry> _logs = [];
-  final Set<String> _openPanels = {'explorer', 'types', 'log'};
+  final Set<String> _openPanels = {'explorer', 'types', 'usages', 'log'};
   final Map<String, DockSide> _panelSides = {
     'explorer': DockSide.left,
     'types': DockSide.left,
+    'usages': DockSide.bottom,
     'log': DockSide.right,
   };
   final _screenshotBoundaryKey = GlobalKey();
@@ -50,7 +52,8 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
   TypeDeclaration? _selectedType;
   int? _highlightStartLine;
   int? _highlightEndLine;
-  late Future<List<TypeDeclaration>> _types;
+  late Future<TypeCatalogListing> _types;
+  Future<List<TypeUsage>>? _selectedTypeUsages;
 
   @override
   void initState() {
@@ -113,7 +116,9 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
 
   /// Opens the file where [type] is declared and highlights its body, so
   /// clicking a type in the Types navigator jumps straight to its
-  /// definition instead of just naming it.
+  /// definition instead of just naming it. Also populates the Usages panel
+  /// (US-4) for this type, keyed by its stable `usr` (US-3) rather than by
+  /// position.
   void _selectType(TypeDeclaration type) {
     final sourceFile = widget.project.sourceFiles.firstWhere(
       (file) => file.path == type.file,
@@ -126,6 +131,54 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
       highlightStartLine: type.line,
       highlightEndLine: type.endLine > 0 ? type.endLine : type.line,
     );
+
+    setState(() {
+      _selectedTypeUsages = type.usr.isEmpty
+          ? Future.value(const <TypeUsage>[])
+          : _loadUsages(type.usr);
+    });
+  }
+
+  /// Opens the file at the exact location [usage] occurs, for the Usages
+  /// panel's "click a usage, jump to it" navigation (US-4 criterion 5). The
+  /// selected type (and therefore the usages panel's contents) stays
+  /// unchanged — only the source viewer moves.
+  void _selectUsage(TypeUsage usage) {
+    final sourceFile = widget.project.sourceFiles.firstWhere(
+      (file) => file.path == usage.file,
+      orElse: () => SourceFile(path: usage.file, kind: SourceFileKind.header),
+    );
+
+    _selectSourceFile(
+      sourceFile,
+      selectedType: _selectedType,
+      highlightStartLine: usage.line,
+      highlightEndLine: usage.line,
+    );
+  }
+
+  Future<List<TypeUsage>> _loadUsages(String typeUsr) async {
+    try {
+      final usages = await widget.serverClient.listTypeUsages(
+        projectDir: widget.project.projectDir,
+        typeUsr: typeUsr,
+      );
+      _addLog(
+        'Loaded ${usages.length} usages',
+        level: ExecutionLogLevel.success,
+        notify: false,
+      );
+      return usages;
+    } catch (error, stackTrace) {
+      cliLog('list usages exception: $error');
+      cliLog('list usages stack: $stackTrace');
+      _addLog(
+        'Failed to load usages: ${projectErrorMessage(error)}',
+        level: ExecutionLogLevel.error,
+        notify: false,
+      );
+      rethrow;
+    }
   }
 
   Future<String> _loadSourceFileContent(
@@ -150,17 +203,17 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     }
   }
 
-  Future<List<TypeDeclaration>> _loadTypes() async {
+  Future<TypeCatalogListing> _loadTypes() async {
     try {
-      final types = await widget.serverClient.listTypes(
+      final listing = await widget.serverClient.listTypes(
         widget.project.projectDir,
       );
       _addLog(
-        'Loaded ${types.length} types',
+        'Loaded ${listing.types.length} types',
         level: ExecutionLogLevel.success,
         notify: false,
       );
-      return types;
+      return listing;
     } catch (error, stackTrace) {
       cliLog('list types exception: $error');
       cliLog('list types stack: $stackTrace');
@@ -326,7 +379,7 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
         title: 'Types',
         icon: Icons.data_object,
         defaultSide: DockSide.left,
-        builder: (context) => FutureBuilder<List<TypeDeclaration>>(
+        builder: (context) => FutureBuilder<TypeCatalogListing>(
           future: _types,
           builder: (context, snapshot) {
             if (snapshot.connectionState != ConnectionState.done) {
@@ -349,13 +402,62 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
               );
             }
 
+            final listing = snapshot.data;
             return TypesView(
-              types: snapshot.data ?? const [],
+              types: listing?.types ?? const [],
+              usageCounts: listing?.usageCounts ?? const {},
               onTypeSelected: _selectType,
               selectedType: _selectedType,
             );
           },
         ),
+      ),
+      PanelDescriptor(
+        id: 'usages',
+        title: 'Usages',
+        icon: Icons.travel_explore_outlined,
+        defaultSide: DockSide.bottom,
+        builder: (context) {
+          final usagesFuture = _selectedTypeUsages;
+          if (usagesFuture == null) {
+            return UsagesView(
+              selectedType: null,
+              usages: const [],
+              onUsageSelected: _selectUsage,
+            );
+          }
+
+          return FutureBuilder<List<TypeUsage>>(
+            future: usagesFuture,
+            builder: (context, snapshot) {
+              if (snapshot.connectionState != ConnectionState.done) {
+                return const Center(
+                  child: Padding(
+                    padding: EdgeInsets.all(16),
+                    child: CircularProgressIndicator(),
+                  ),
+                );
+              }
+
+              final error = snapshot.error;
+              if (error != null) {
+                return Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Text(
+                    'Failed to load usages: ${projectErrorMessage(error)}',
+                    style: const TextStyle(color: IdePalette.red),
+                  ),
+                );
+              }
+
+              return UsagesView(
+                selectedType: _selectedType,
+                usages: snapshot.data ?? const [],
+                onUsageSelected: _selectUsage,
+              );
+            },
+          );
+        },
       ),
       PanelDescriptor(
         id: 'log',
