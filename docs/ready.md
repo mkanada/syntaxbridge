@@ -91,7 +91,7 @@ todos os seguintes.
 - `syntax-bridge-app` — instala o bundle Flutter e os wrappers.
 
 As fontes do modulo Rust vem de `rust-src.tar`, um arquivo gerado por
-`scripts/test-flatpak-package.sh`. Isso e proposital: o flatpak-builder nao
+`scripts/build-flatpak-package.sh`. Isso e proposital: o flatpak-builder nao
 consegue cachear um modulo que use fonte `type: dir`
 (`builder_source_dir_checksum` alimenta o cache com um valor aleatorio, com o
 comentario "We can't realistically checksum a directory, so always rebuild"),
@@ -108,20 +108,29 @@ O comando principal do Flatpak executa `build-aux/flatpak/syntax-bridge`, que:
 
 ## Scripts de verificacao
 
-Existem dois scripts de verificacao:
+Existem tres scripts de verificacao:
 
 - `scripts/test-in-flatpak.sh`
   - executa `cargo --offline test` dentro do SDK Flatpak com Rust e LLVM
     ativados;
-- `scripts/test-flatpak-package.sh`
+- `scripts/build-flatpak-package.sh`
   - constroi o bundle Flutter Linux;
   - empacota as entradas Rust em `build-aux/flatpak/rust-src.tar`;
   - constroi o Flatpak;
-  - instala o app localmente;
+  - instala o app localmente.
+  - Nao roda nenhum teste — e o que `just run` usa (via `just package-build`)
+    para reempacotar rapido antes de abrir o app.
+- `scripts/test-flatpak-package.sh`
+  - chama `scripts/build-flatpak-package.sh`;
   - executa os testes pelo app instalado com
     `flatpak run --command=syntax-bridge-toolchain-tests dev.syntax_bridge.SyntaxBridge`;
   - executa o teste HTTP pelo app instalado com
-    `flatpak run --command=syntax-bridge-server-health-tests dev.syntax_bridge.SyntaxBridge`.
+    `flatpak run --command=syntax-bridge-server-health-tests dev.syntax_bridge.SyntaxBridge`;
+  - executa os testes de ingestao pelo app instalado com
+    `flatpak run --command=syntax-bridge-project-ingest-tests dev.syntax_bridge.SyntaxBridge`.
+  - E o que `just package-test` usa, para verificacao explicita do pacote
+    instalado (`just ci` nao chama este script — usa `just test`, que roda os
+    testes Rust dentro do SDK Flatpak sem empacotar).
 
 O cache do flatpak-builder fica em `~/.cache/syntax-bridge` (ajustavel por
 `FLATPAK_CACHE_ROOT`, `FLATPAK_BUILD_DIR` e `FLATPAK_STATE_DIR`). Antes ele

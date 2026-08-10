@@ -46,7 +46,11 @@ test-host: rust-test flutter-test
 # Run a fuller local verification pass.
 ci: fmt-check lint test
 
-# Build and test the installed Flatpak package.
+# Build and install the Flatpak package, without running its in-sandbox tests.
+package-build:
+    scripts/build-flatpak-package.sh
+
+# Build, install, and test the Flatpak package.
 package-test:
     scripts/test-flatpak-package.sh
 
@@ -103,8 +107,8 @@ screenshots *args:
     just flutter-screenshots {{args}}
     @dir="client/flutter/build/test-screenshots"; html="$dir/index.html"; { printf '%s\n' '<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Syntax Bridge screenshots</title><style>body{font:16px sans-serif;margin:24px;background:#f6f7f8;color:#1d1b20}main{display:grid;gap:24px}figure{margin:0;padding:16px;background:white;border:1px solid #d7dadd;border-radius:8px}img{display:block;max-width:100%;height:auto;border:1px solid #d7dadd}figcaption{margin-bottom:12px;font-weight:600}</style></head><body><main><h1>Syntax Bridge screenshots</h1>'; for image in "$dir"/*.bmp "$dir"/*.png; do [ -e "$image" ] || continue; name="$(basename "$image")"; printf '<figure><figcaption>%s</figcaption><img src="%s" alt="%s"></figure>\n' "$name" "$name" "$name"; done; printf '%s\n' '</main></body></html>'; } > "$html"; printf 'Screenshot gallery: %s\n' "$html"
 
-# Verify, rebuild, repackage, reinstall, and then run the Flatpak app.
-run *args: check flutter-test package-test
+# Check, rebuild, repackage, reinstall, and run the Flatpak app (no tests; see `just ci`).
+run *args: check package-build
     flatpak run dev.syntax_bridge.SyntaxBridge {{args}}
 
 # Run the already installed Flatpak app, skipping the rebuild.
