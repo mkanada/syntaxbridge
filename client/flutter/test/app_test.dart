@@ -324,9 +324,14 @@ void main() {
       expect(find.text('main.cpp:4'), findsOneWidget);
       expect(find.text('variable'), findsOneWidget);
 
-      await tester.ensureVisible(find.text('main.cpp:4'));
+      final openInEditor = find.byKey(
+        const Key(
+          'usage-open-/tmp/projects/counter/input-source/fixture/main.cpp:4',
+        ),
+      );
+      await tester.ensureVisible(openInEditor);
       await tester.pumpAndSettle();
-      await tester.tap(find.text('main.cpp:4'));
+      await tester.tap(openInEditor);
       await tester.pumpAndSettle();
 
       expect(
@@ -878,6 +883,9 @@ class _FakeServerClient implements ServerClient {
     createdProjectName = input.name;
     return 'job-1';
   }
+
+  @override
+  Future<void> cancelCreateProject(String jobId) async {}
 
   @override
   Future<ProjectCreationJobStatus> pollCreateProjectJob(String jobId) async {

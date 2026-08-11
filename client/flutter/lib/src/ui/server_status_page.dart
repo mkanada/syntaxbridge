@@ -209,6 +209,18 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     }
   }
 
+  /// Fetches the file a usage occurs in, for the Usages panel's accordion
+  /// (US-4) to show the surrounding code inline. Deliberately silent on
+  /// success — unlike [_loadSourceFileContent], this runs once per usage
+  /// expanded rather than once per navigation, and would otherwise flood the
+  /// execution log.
+  Future<String> _loadUsageSource(TypeUsage usage) {
+    return widget.serverClient.readSourceFile(
+      projectDir: widget.project.projectDir,
+      path: usage.file,
+    );
+  }
+
   Future<TypeCatalogListing> _loadTypes() async {
     try {
       final listing = await widget.serverClient.listTypes(
@@ -441,6 +453,7 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
               selectedType: null,
               usages: const [],
               onUsageSelected: _selectUsage,
+              loadUsageSource: _loadUsageSource,
             );
           }
 
@@ -471,6 +484,7 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
                 selectedType: _selectedType,
                 usages: snapshot.data ?? const [],
                 onUsageSelected: _selectUsage,
+                loadUsageSource: _loadUsageSource,
               );
             },
           );

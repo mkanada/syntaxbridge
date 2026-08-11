@@ -8,17 +8,21 @@ use serde::Serialize;
 
 use crate::ingest::{self, CompilationUnit, CreateProjectRequest, CreatedProject, IngestError};
 use crate::persistence::{GlobalStore, PersistenceError, ProjectRecord, ProjectStore};
-use crate::progress::ExtractionProgress;
+use crate::progress::{Cancellation, ExtractionProgress};
 use crate::source_catalog::{self, SourceCatalogError, SourceFile};
 use crate::type_catalog::{self, TypeCatalogError, TypeDeclaration, TypeUsage};
 
 /// Live progress trackers for `create_project`'s two `libclang` passes, so a
 /// caller running it in the background (`jobs.rs`) can report real progress
 /// to a poller instead of the caller having to wait for the whole thing.
+/// `cancellation` is shared between both passes (US-4 criterion 7): stopping
+/// a job stops indexing regardless of which pass is currently running,
+/// rather than requiring a separate flag per pass.
 #[derive(Default)]
 pub struct CreationProgress {
     pub type_catalog: ExtractionProgress,
     pub source_catalog: ExtractionProgress,
+    pub cancellation: Cancellation,
 }
 
 pub const DEFAULT_SOURCE_LANGUAGE: &str = "cpp";
@@ -40,6 +44,18 @@ impl ProjectCreationError {
             Self::TypeCatalog(_) => false,
             Self::SourceCatalog(_) => false,
         }
+    }
+
+    /// Distinguishes a user-requested cancellation (US-4 criterion 7) from a
+    /// real failure, so `jobs.rs`/the HTTP layer can report `"cancelled"`
+    /// instead of `"failed"` — cancelling isn't an error the user needs a
+    /// message about.
+    pub fn is_cancelled(&self) -> bool {
+        matches!(
+            self,
+            Self::TypeCatalog(TypeCatalogError::Cancelled)
+                | Self::SourceCatalog(SourceCatalogError::Cancelled)
+        )
     }
 }
 
@@ -91,19 +107,21 @@ pub fn create_project(
 ) -> Result<CreatedProject, ProjectCreationError> {
     let mut project = ingest::create_project(request)?;
 
-    let catalog = type_catalog::extract_type_catalog(
+    let catalog = type_catalog::extract_type_catalog_cancellable(
         &project.compilation_units,
         &project.input_source_dir,
         progress.map(|progress| &progress.type_catalog),
+        progress.map(|progress| &progress.cancellation),
     )?;
     project.type_catalog = catalog.declarations;
     project.type_dependencies = catalog.dependencies;
     let type_usages = catalog.usages;
 
-    project.source_files = source_catalog::extract_source_files(
+    project.source_files = source_catalog::extract_source_files_cancellable(
         &project.compilation_units,
         &project.input_source_dir,
         progress.map(|progress| &progress.source_catalog),
+        progress.map(|progress| &progress.cancellation),
     )?;
 
     let project_db_path = project.project_dir.join("project.db");

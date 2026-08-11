@@ -3,12 +3,12 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use syntax_bridge_server::ingest::{CreateProjectRequest, create_project};
 use syntax_bridge_server::persistence::GlobalStore;
-use syntax_bridge_server::project_service;
+use syntax_bridge_server::project_service::{self, CreationProgress};
 use syntax_bridge_server::server::SyntaxBridgeServer;
 
 const CPP_SOURCE: &str = r#"
@@ -152,6 +152,109 @@ fn create_project_persists_compilation_units_and_registers_project_globally() {
     assert_eq!(projects[0].source_language, "cpp");
     assert_eq!(projects[0].target_language, "dart");
     assert_eq!(projects[0].last_ingest_status, "success");
+}
+
+/// US-4 criterion 7: cancelling before `create_project` even starts is the
+/// deterministic edge of "cancellation works end to end" — the extraction
+/// layers already prove they stop early (`type_catalog`'s and
+/// `source_catalog`'s own tests); this proves `create_project` itself
+/// surfaces that as a distinct, non-persisting outcome instead of the
+/// generic `TypeCatalog`/`SourceCatalog` failure path.
+#[test]
+fn create_project_reports_cancellation_and_persists_nothing() {
+    let workspace = TempWorkspace::new("ingest-cancel").expect("create temporary workspace");
+    let archive_path = workspace.path().join("fixture.tar.gz");
+    write_cmake_fixture_tarball(workspace.path(), &archive_path).expect("create fixture archive");
+    let global_db_path = workspace.path().join("global.db");
+
+    let progress = CreationProgress::default();
+    progress.cancellation.cancel();
+
+    let result = project_service::create_project(
+        CreateProjectRequest {
+            name: "counter".to_owned(),
+            workspace_dir: workspace.path().join("projects"),
+            archive_path,
+        },
+        &global_db_path,
+        Some(&progress),
+    );
+
+    let error = result.expect_err("a pre-cancelled run should not succeed");
+    assert!(
+        error.is_cancelled(),
+        "expected a cancellation error, got {error:?}"
+    );
+
+    assert!(
+        !workspace
+            .path()
+            .join("projects")
+            .join("counter")
+            .join("project.db")
+            .exists(),
+        "a cancelled run should not persist a project database"
+    );
+    assert!(
+        !global_db_path.exists()
+            || GlobalStore::open(&global_db_path)
+                .expect("open global store")
+                .list_projects()
+                .expect("list projects")
+                .is_empty(),
+        "a cancelled run should not register the project globally"
+    );
+}
+
+/// US-4 criterion 7 at real scale, mirroring
+/// `verovio_5_7_0_import_diagnosis.rs`'s precedent for large-fixture tests:
+/// not run by default (`--ignored`) because a full `libclang` pass over the
+/// Verovio fixture's ~290 translation units takes minutes even
+/// uninterrupted (see "Escala" in `docs/plans/User Steps.md`). The other
+/// cancellation tests all pre-cancel before starting, which is deterministic
+/// but only proves the flag is *checked*, not that cancelling a run already
+/// in flight actually cuts it short before finishing on its own — on the
+/// small fixture used elsewhere, a genuine mid-flight cancel would race
+/// against a run fast enough to complete before the cancel is even sent.
+/// This fixture is slow enough that the 500ms head start before cancelling
+/// can't plausibly overlap with completion.
+#[test]
+#[ignore = "slow: runs a real libclang extraction over the Verovio 6.2.0 fixture (~290 TUs) to prove cancellation actually interrupts a run in flight"]
+fn create_project_stops_within_seconds_of_cancellation_on_a_real_project() {
+    let workspace =
+        TempWorkspace::new("ingest-cancel-verovio").expect("create temporary workspace");
+    let archive_path = workspace.path().join("verovio-version-6.2.0.tar.gz");
+    fs::write(&archive_path, VEROVIO_ARCHIVE).expect("write Verovio fixture archive");
+    let global_db_path = workspace.path().join("global.db");
+    let request = CreateProjectRequest {
+        name: "verovio".to_owned(),
+        workspace_dir: workspace.path().join("projects"),
+        archive_path,
+    };
+
+    let progress = CreationProgress::default();
+    let started = Instant::now();
+
+    let result = std::thread::scope(|scope| {
+        let handle = scope
+            .spawn(|| project_service::create_project(request, &global_db_path, Some(&progress)));
+
+        std::thread::sleep(Duration::from_millis(500));
+        progress.cancellation.cancel();
+
+        handle.join().expect("creation thread panicked")
+    });
+
+    let elapsed = started.elapsed();
+    let error = result.expect_err("a cancelled run should not succeed");
+    assert!(
+        error.is_cancelled(),
+        "expected a cancellation error, got {error:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "cancellation should cut a multi-minute extraction short, took {elapsed:?}"
+    );
 }
 
 #[test]
@@ -375,6 +478,115 @@ fn project_creation_job_endpoint_returns_not_found_for_an_unknown_job() {
         response.starts_with("HTTP/1.1 404 Not Found\r\n"),
         "unexpected response: {response}"
     );
+}
+
+/// US-4 criterion 7's HTTP surface: `DELETE /projects/jobs/{id}` on an id
+/// nobody registered behaves like the poll route's own unknown-id case.
+#[test]
+fn cancel_job_endpoint_returns_not_found_for_an_unknown_job() {
+    let workspace =
+        TempWorkspace::new("ingest-http-cancel-missing").expect("create temporary workspace");
+
+    let server = SyntaxBridgeServer::bind("127.0.0.1:0")
+        .expect("bind test server")
+        .with_global_db_path(workspace.path().join("global.db"));
+    let addr = server.local_addr().expect("read server address");
+    let handle = server.spawn().expect("spawn test server");
+
+    let mut stream = TcpStream::connect(addr).expect("connect to test server");
+    write!(
+        stream,
+        "DELETE /projects/jobs/does-not-exist HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write request");
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read response");
+    handle.shutdown().expect("stop test server");
+
+    assert!(
+        response.starts_with("HTTP/1.1 404 Not Found\r\n"),
+        "unexpected response: {response}"
+    );
+}
+
+/// Cancelling a job that has already finished must not retroactively change
+/// its outcome — a real result the client may already be showing shouldn't
+/// flip to "cancelled" because of a request that arrived too late to matter.
+/// This is the deterministic slice of "cancel is best-effort": timing a
+/// cancel to land *before* a job as small as this fixture finishes would be
+/// racy (see `poll_job_until_done`'s own doc comment), so this test instead
+/// proves the safe, always-true half of the contract.
+#[test]
+fn cancel_job_endpoint_does_not_alter_an_already_finished_job() {
+    let workspace =
+        TempWorkspace::new("ingest-http-cancel-finished").expect("create temporary workspace");
+    let archive_path = workspace.path().join("fixture.tar.gz");
+    write_cmake_fixture_tarball(workspace.path(), &archive_path).expect("create fixture archive");
+
+    let server = SyntaxBridgeServer::bind("127.0.0.1:0")
+        .expect("bind test server")
+        .with_global_db_path(workspace.path().join("global.db"));
+    let addr = server.local_addr().expect("read server address");
+    let handle = server.spawn().expect("spawn test server");
+
+    let body = serde_json::json!({
+        "name": "counter",
+        "workspace_dir": workspace.path().join("projects"),
+        "archive_path": archive_path,
+    })
+    .to_string();
+
+    let mut start_stream = TcpStream::connect(addr).expect("connect to test server");
+    write!(
+        start_stream,
+        "POST /projects HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .expect("write request");
+    let mut start_response = String::new();
+    start_stream
+        .read_to_string(&mut start_response)
+        .expect("read response");
+    let start_response_body = start_response
+        .split("\r\n\r\n")
+        .nth(1)
+        .expect("response has HTTP body");
+    let start_json: Value = serde_json::from_str(start_response_body).expect("parse response body");
+    let job_id = start_json["job_id"]
+        .as_str()
+        .expect("response includes job_id");
+
+    let finished = poll_job_until_done(addr, job_id);
+    assert_eq!(
+        finished["status"], "succeeded",
+        "unexpected job status: {finished}"
+    );
+
+    let mut stream = TcpStream::connect(addr).expect("connect to test server");
+    write!(
+        stream,
+        "DELETE /projects/jobs/{job_id} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write request");
+    let mut cancel_response = String::new();
+    stream
+        .read_to_string(&mut cancel_response)
+        .expect("read response");
+    assert!(
+        cancel_response.starts_with("HTTP/1.1 202 Accepted\r\n"),
+        "cancelling should still be accepted, even though the job is already done: {cancel_response}"
+    );
+
+    let after_cancel = poll_job_until_done(addr, job_id);
+    handle.shutdown().expect("stop test server");
+
+    assert_eq!(
+        after_cancel["status"], "succeeded",
+        "a late cancel must not overwrite a real outcome: {after_cancel}"
+    );
+    assert_eq!(after_cancel["project"]["name"], "counter");
 }
 
 #[test]

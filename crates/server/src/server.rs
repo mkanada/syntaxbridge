@@ -152,7 +152,7 @@ fn app(global_db_path: PathBuf) -> Router {
         )
         .route(
             "/projects/jobs/{job_id}",
-            get(poll_project_creation_job_from_http),
+            get(poll_project_creation_job_from_http).delete(cancel_project_creation_job_from_http),
         )
         .route("/projects/open", post(open_project_from_http))
         .route("/projects/source-file", get(read_source_file_from_http))
@@ -244,6 +244,9 @@ async fn poll_project_creation_job_from_http(
             StatusCode::OK,
             json!({"status": "succeeded", "project": project}),
         ),
+        Some(Err(error)) if error.is_cancelled() => {
+            json_response(StatusCode::OK, json!({"status": "cancelled"}))
+        }
         Some(Err(error)) => json_response(
             StatusCode::OK,
             json!({
@@ -263,11 +266,21 @@ async fn poll_project_creation_job_from_http(
                 source_catalog_completed,
                 source_catalog_total,
             );
+            // Cancellation was requested but the background thread hasn't
+            // reported a terminal outcome yet — distinct from `"cancelled"`
+            // (`finish`'s outcome was a cancellation) so a poller never sees
+            // a stale `"running"` after asking to cancel, without lying
+            // about the job having actually stopped.
+            let status = if job.cancel_requested() {
+                "cancelling"
+            } else {
+                "running"
+            };
 
             json_response(
                 StatusCode::OK,
                 json!({
-                    "status": "running",
+                    "status": status,
                     "phase": phase_str(phase),
                     "type_catalog": {
                         "completed": type_catalog_completed,
@@ -281,6 +294,30 @@ async fn poll_project_creation_job_from_http(
             )
         }
     })
+}
+
+/// Requests cancellation of an in-flight project-creation job (US-4
+/// criterion 7). Best-effort: the background thread stops on its own next
+/// check between compilation units (see `progress::Cancellation`), so this
+/// returns immediately with `202` rather than waiting for that to happen —
+/// callers poll `GET /projects/jobs/{job_id}` to observe the eventual
+/// `"cancelling"` → `"cancelled"` transition. Idempotent, and harmless to
+/// call on a job that has already finished.
+async fn cancel_project_creation_job_from_http(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Response {
+    let Some(job) = state.job_registry.get(&job_id) else {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            json!({"error":"job_not_found","message": format!("no project creation job with id {job_id}")}),
+        );
+    };
+
+    job.cancel();
+    log_server(format_args!("cancellation requested: job_id={job_id}"));
+
+    json_response(StatusCode::ACCEPTED, json!({"status": "cancel_requested"}))
 }
 
 fn phase_str(phase: JobPhase) -> &'static str {

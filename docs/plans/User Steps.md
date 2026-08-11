@@ -26,7 +26,7 @@ verificáveis, e não como intenções.
 | US-1 | Criação de projeto e ingestão do input | pronto | — |
 | US-2 | Lista de arquivos fonte e leitura de conteúdo | pronto | US-1 |
 | US-3 | Catálogo de tipos do projeto | pronto | US-2 |
-| US-4 | Usos de cada tipo e navegação | parcial (falta taxonomia de nível de expressão e cancelamento) | US-3 |
+| US-4 | Usos de cada tipo e navegação | pronto | US-3 |
 | US-5 | Funções, métodos e macros, e seus usos | planejado | US-3 |
 | US-6 | Isolamento e caracterização comportamental | planejado | US-5 |
 | US-7 | Mapeamento de tipos C++ → Dart | planejado | US-4, US-5 |
@@ -379,29 +379,52 @@ Tabelas `type_declarations` e `type_dependencies` no `project.db`.
 
 ## US-4 — Usos de cada tipo e navegação
 
-**Status:** parcial — extração, persistência, rotas e navegação na UI existem
-para a taxonomia de nível de assinatura (ver decisão de taxonomia abaixo);
-faltam usos de nível de expressão (*cast*, `sizeof`, `new`, argumento de
-template) e cancelamento de indexação em projetos grandes (critério 7,
-parcial) · **Depende de:** US-3 ·
+**Status:** pronto — extração, persistência, rotas e navegação na UI existem
+para a taxonomia de nível de assinatura (ver decisão de taxonomia abaixo, que
+deixa usos de nível de expressão — *cast*, `sizeof`, `new`, argumento de
+template — deliberadamente fora de escopo em vez de pendentes); cancelamento
+de indexação em projetos grandes (critério 7) está implementado e testado ·
+**Depende de:** US-3 ·
 **Implementação:** `crates/server/src/type_catalog.rs` (`TypeUsageKind`,
 `TypeUsage`, `push_usage`, extensão de `visit_cursor`/
-`record_member_dependency`), `crates/server/src/persistence/project_store.rs`
+`record_member_dependency`, `extract_type_catalog_cancellable`),
+`crates/server/src/source_catalog.rs` (`extract_source_files_cancellable`),
+`crates/server/src/progress.rs` (`Cancellation`),
+`crates/server/src/persistence/project_store.rs`
 (tabela `type_usages`, `replace_type_usages`, `list_type_usages_for`,
 `type_usage_counts`), `crates/server/src/project_service.rs`
-(`TypeCatalogListing`, `list_type_usages`), `crates/server/src/server.rs`
-(`GET /projects/types/usages`, `usage_counts` em `GET /projects/types`),
+(`TypeCatalogListing`, `list_type_usages`, `CreationProgress::cancellation`,
+`ProjectCreationError::is_cancelled`), `crates/server/src/jobs.rs`
+(`ProjectCreationJob::cancel`/`cancel_requested`), `crates/server/src/server.rs`
+(`GET /projects/types/usages`, `usage_counts` em `GET /projects/types`,
+`DELETE /projects/jobs/{job_id}`, estados `cancelling`/`cancelled` em
+`GET /projects/jobs/{job_id}`),
 `client/flutter/lib/src/project/project_models.dart` (`TypeUsage`,
-`TypeUsageKind`, `TypeCatalogListing`),
+`TypeUsageKind`, `TypeCatalogListing`, estados `cancelling`/`cancelled` de
+`ProjectCreationJobStatus`),
+`client/flutter/lib/src/server/server_client.dart`/`http_server_client.dart`
+(`cancelCreateProject`),
 `client/flutter/lib/src/ui/types_view.dart` (coluna e ordenação por número de
 usos), `client/flutter/lib/src/ui/usages_view.dart` (painel de usos),
-`client/flutter/lib/src/ui/server_status_page.dart` (fiação entre os dois) ·
+`client/flutter/lib/src/ui/server_status_page.dart` (fiação entre os dois),
+`client/flutter/lib/src/ui/creating_project_page.dart` (botão "Cancel") ·
 **Testes:** `crates/server/tests/type_catalog.rs`
-(`extract_type_catalog_records_usages_across_the_defined_taxonomy`),
+(`extract_type_catalog_records_usages_across_the_defined_taxonomy`,
+`extract_type_catalog_stops_early_when_cancelled`),
+`crates/server/tests/source_files.rs`
+(`extract_source_files_stops_early_when_cancelled`),
 `crates/server/tests/type_catalog_route.rs`, testes inline em
-`persistence/project_store.rs`,
+`persistence/project_store.rs`, `jobs.rs`, `progress.rs`,
+`crates/server/tests/project_ingest.rs`
+(`create_project_reports_cancellation_and_persists_nothing`,
+`cancel_job_endpoint_returns_not_found_for_an_unknown_job`,
+`cancel_job_endpoint_does_not_alter_an_already_finished_job`,
+`create_project_stops_within_seconds_of_cancellation_on_a_real_project`,
+`#[ignore]`d — ver "Condições de testabilidade"),
 `client/flutter/test/types_view_test.dart`,
-`client/flutter/test/usages_view_test.dart`, `client/flutter/test/app_test.dart`
+`client/flutter/test/usages_view_test.dart`,
+`client/flutter/test/creating_project_page_test.dart`,
+`client/flutter/test/app_test.dart`
 
 ### Objetivo do usuário
 
@@ -455,11 +478,35 @@ O *scan* é feito antes, de modo que a navegação seja imediata.
   precisão.
 - **Segue em aberto: usos dentro de código não compilado.** Continua
   verdadeiro e sem solução — `#ifdef` desligado é invisível ao `libclang`.
-- **Segue em aberto: cancelamento (critério 7, parcial).** Progresso é
-  relatado de graça, porque a indexação de usos anda junto da passada de tipos
-  de US-3 e reaproveita os mesmos contadores atômicos que ela já expõe via
-  `GET /projects/jobs/{id}`. Cancelamento não foi resolvido — mesmo precedente
-  deixado em aberto por US-1.
+- **Resolvido: cancelamento (critério 7).** Progresso já era relatado de
+  graça, porque a indexação de usos anda junto da passada de tipos de US-3 e
+  reaproveita os mesmos contadores atômicos que ela já expõe via
+  `GET /projects/jobs/{id}`. Cancelamento reaproveita o mesmo job: um sinal
+  compartilhado (`progress::Cancellation`, um `AtomicBool`) é checado uma vez
+  por unidade de compilação dentro de `type_catalog::parse_chunk` e
+  `source_catalog::parse_chunk` — best-effort, não preemptivo, então uma
+  unidade já em processamento sempre termina antes do sinal ser observado.
+  `DELETE /projects/jobs/{job_id}` pede o cancelamento e devolve `202` na
+  hora, sem esperar o worker parar; `GET /projects/jobs/{job_id}` ganhou dois
+  estados novos para refletir a diferença entre "pedido, ainda rodando"
+  (`"cancelling"`) e "efetivamente parado" (`"cancelled"`) — sem essa
+  distinção um poller veria `"running"` ficar preso depois de pedir o
+  cancelamento, ou teria que inferir sucesso a partir da ausência de erro. O
+  cliente Flutter ganhou um botão "Cancel" na tela de progresso
+  (`creating_project_page.dart`) que chama a nova rota e mostra o resultado.
+  Provado em três níveis: extração (`extract_type_catalog_stops_early_when_cancelled`,
+  `extract_source_files_stops_early_when_cancelled` — um token
+  pré-cancelado, determinístico, prova que o sinal é checado e para a
+  pipeline, não só aceito como parâmetro), `create_project`
+  (`create_project_reports_cancellation_and_persists_nothing` — cancelar
+  antes de começar não persiste nada), e rota HTTP (dois testes
+  determinísticos: id desconhecido devolve `404`; cancelar um job já
+  terminado não sobrescreve um resultado real). Um quarto teste,
+  `create_project_stops_within_seconds_of_cancellation_on_a_real_project`
+  (`#[ignore]`d, ver "Condições de testabilidade"), prova cancelamento
+  genuíno em pleno voo sobre o fixture Verovio real (298 unidades de
+  compilação): cancelar ~500ms após iniciar interrompeu a extração em
+  ~0.3s, contra os minutos que uma passada completa levaria.
 
 ### Critérios de aceitação (testáveis)
 
@@ -483,10 +530,12 @@ O *scan* é feito antes, de modo que a navegação seja imediata.
    `type_usages` já persistido, sem reparsear —
    `usages_route_returns_the_persisted_usages_for_a_type` popula o banco
    diretamente, sem `libclang`.
-7. **Parcial:** projetos grandes (Verovio, ~290 TUs) são indexados com
-   progresso real reportado (reaproveitando o contador de US-3), mas
-   cancelamento não existe — o mesmo estado em que US-1 deixou o próprio
-   mecanismo de job.
+7. **Satisfeito:** projetos grandes (Verovio, ~290 TUs) são indexados com
+   progresso real reportado (reaproveitando o contador de US-3), e
+   cancelamento (`DELETE /projects/jobs/{job_id}`) interrompe a indexação em
+   andamento — provado em pleno voo sobre o próprio fixture Verovio por
+   `create_project_stops_within_seconds_of_cancellation_on_a_real_project`
+   (`#[ignore]`d).
 
 ### Condições de testabilidade
 
@@ -498,10 +547,18 @@ O *scan* é feito antes, de modo que a navegação seja imediata.
   sobreviver a edições do fixture.
 - Precisa existir um segundo fixture, maior, para testar progresso,
   cancelamento e tempo — com asserção sobre ordem de grandeza, não sobre
-  duração exata, que não é reprodutível. **Não satisfeito:** nenhum teste
-  dedicado de progresso/tempo em escala existe para usos especificamente
-  (o fixture Verovio de US-1/US-3 já prova que a extração não regride em
-  escala, mas não testa cancelamento, que continua inexistente).
+  duração exata, que não é reprodutível. **Parcialmente satisfeito:**
+  `create_project_stops_within_seconds_of_cancellation_on_a_real_project`
+  reaproveita o fixture Verovio 6.2.0 já versionado (298 unidades de
+  compilação) para provar cancelamento em pleno voo, com asserção de ordem de
+  grandeza (`elapsed < 60s` contra os minutos de uma passada completa) em vez
+  de duração exata — mas, como a extração completa de um projeto desse
+  tamanho leva minutos, o teste é `#[ignore]`d por padrão, mesmo precedente de
+  `verovio_5_7_0_import_diagnosis.rs`. Ainda não há teste dedicado de
+  *progresso* em escala especificamente para usos (o fixture Verovio de
+  US-1/US-3 já prova que a extração não regride em escala, e o teste de
+  cancelamento acima cobre esse ângulo, mas não há asserção sobre a forma dos
+  contadores de progresso nesse fixture maior).
 - Consultas de leitura precisam ser testáveis sem executar a indexação:
   popular o banco diretamente e consultar. **Satisfeito:**
   `usages_route_returns_the_persisted_usages_for_a_type` e os testes de
@@ -939,11 +996,22 @@ US-4 e US-6 decidirem se reaproveitam ou não.
 indexação de usos roda dentro da *mesma* passada `libclang` de US-3 (mesma
 varredura de AST, populando um terceiro vetor), então herda de graça o
 progresso já relatado por `GET /projects/jobs/{id}` para `type_catalog` — sem
-rota nem contador novos. Cancelamento continua **não resolvido**, no mesmo
-estado em que US-1 deixou. US-6 segue em aberto quanto a reaproveitar esse
-modelo ou não; ao contrário de US-4, uma caracterização comportamental *tem*
-uma noção de "meio caminho seguro para persistir" que uma indexação de tipos
-não tem, então pode não fazer sentido herdar a mesma solução sem adaptação.
+rota nem contador novos.
+
+**Cancelamento resolvido, por US-4, para o mecanismo de job em geral.**
+US-1 tinha deixado cancelamento em aberto (só progresso estava resolvido);
+US-4 fechou essa lacuna para o próprio mecanismo compartilhado, não só para
+usos: `progress::Cancellation` (um `AtomicBool` checado uma vez por unidade de
+compilação, em `type_catalog::parse_chunk` e `source_catalog::parse_chunk`) e
+`DELETE /projects/jobs/{job_id}` cancelam a criação de projeto inteira — a
+extração de tipos (US-3), a indexação de usos (US-4) e a descoberta de
+arquivos fonte (US-2) param juntas, já que todas vivem dentro do mesmo job.
+Como consequência, US-1 também ganhou cancelamento de fato, embora a decisão
+tenha sido tomada e documentada aqui. Ver US-4 para os detalhes de
+implementação e teste. US-6 segue em aberto quanto a reaproveitar esse modelo
+ou não; ao contrário de US-4, uma caracterização comportamental *tem* uma
+noção de "meio caminho seguro para persistir" que uma indexação de tipos não
+tem, então pode não fazer sentido herdar a mesma solução sem adaptação.
 
 ### Versionamento do esquema de persistência
 

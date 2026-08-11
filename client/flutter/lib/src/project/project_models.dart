@@ -414,7 +414,19 @@ enum ProjectCreationJobPhase {
   }
 }
 
-enum ProjectCreationJobState { running, succeeded, failed }
+/// `cancelling` and `cancelled` are US-4 criterion 7: a `DELETE
+/// /projects/jobs/{id}` request was made, but stopping the background
+/// `libclang` pass is best-effort, so there's a window where the job is
+/// still `running` from the pipeline's own point of view while already
+/// `cancelling` from the user's — distinct from `cancelled`, the terminal
+/// outcome once the pipeline actually noticed and stopped.
+enum ProjectCreationJobState {
+  running,
+  cancelling,
+  succeeded,
+  failed,
+  cancelled,
+}
 
 /// A snapshot of `GET /projects/jobs/{id}`: whether the background project
 /// creation job (started by `startCreateProject`) is still running, and if
@@ -432,10 +444,18 @@ class ProjectCreationJobStatus {
 
   factory ProjectCreationJobStatus.fromJson(Map<String, Object?> json) {
     final state = switch (json['status'] as String?) {
+      'cancelling' => ProjectCreationJobState.cancelling,
       'succeeded' => ProjectCreationJobState.succeeded,
       'failed' => ProjectCreationJobState.failed,
+      'cancelled' => ProjectCreationJobState.cancelled,
       _ => ProjectCreationJobState.running,
     };
+    // The server includes `phase`/progress alongside both `"running"` and
+    // `"cancelling"` — they're the same not-yet-finished response, differing
+    // only in whether a cancel was requested.
+    final stillRunning =
+        state == ProjectCreationJobState.running ||
+        state == ProjectCreationJobState.cancelling;
 
     final typeCatalogJson = json['type_catalog'] as Map<String, Object?>?;
     final sourceCatalogJson = json['source_catalog'] as Map<String, Object?>?;
@@ -443,7 +463,7 @@ class ProjectCreationJobStatus {
 
     return ProjectCreationJobStatus(
       state: state,
-      phase: state == ProjectCreationJobState.running
+      phase: stillRunning
           ? ProjectCreationJobPhase.fromJson(json['phase'] as String?)
           : null,
       typeCatalogProgress: typeCatalogJson != null

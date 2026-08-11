@@ -14,10 +14,11 @@ use std::process::{Command, Output};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
-use syntax_bridge_server::ingest::CreateProjectRequest;
+use syntax_bridge_server::ingest::{CompilationUnit, CreateProjectRequest};
+use syntax_bridge_server::progress::{Cancellation, ExtractionProgress};
 use syntax_bridge_server::project_service;
 use syntax_bridge_server::server::SyntaxBridgeServer;
-use syntax_bridge_server::source_catalog::SourceFileKind;
+use syntax_bridge_server::source_catalog::{self, SourceCatalogError, SourceFileKind};
 
 const POINT_H: &str = r#"
 #pragma once
@@ -194,6 +195,48 @@ fn create_project_lists_translation_units_and_headers_as_source_files() {
             "expected persisted source files to contain {file:?}"
         );
     }
+}
+
+/// US-4 criterion 7, mirroring `type_catalog`'s
+/// `extract_type_catalog_stops_early_when_cancelled`: a pre-cancelled token
+/// is the deterministic way to prove this pass actually stops instead of
+/// merely accepting the parameter.
+#[test]
+fn extract_source_files_stops_early_when_cancelled() {
+    let workspace = TempWorkspace::new("source-files-cancel").expect("create temporary workspace");
+    let project_root = workspace.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project dir");
+
+    let file_a = project_root.join("a.cpp");
+    fs::write(&file_a, "int a;").expect("write a.cpp");
+
+    let units = vec![CompilationUnit {
+        directory: project_root.display().to_string(),
+        file: file_a.display().to_string(),
+        command: None,
+        arguments: vec!["clang++".to_owned(), "-std=c++17".to_owned()],
+    }];
+
+    let progress = ExtractionProgress::new();
+    let cancellation = Cancellation::new();
+    cancellation.cancel();
+
+    let result = source_catalog::extract_source_files_cancellable(
+        &units,
+        &project_root,
+        Some(&progress),
+        Some(&cancellation),
+    );
+
+    assert!(
+        matches!(result, Err(SourceCatalogError::Cancelled)),
+        "expected a cancelled result, got {result:?}"
+    );
+    assert_eq!(
+        progress.completed(),
+        0,
+        "no unit should have been marked done once cancellation was already requested"
+    );
 }
 
 #[test]

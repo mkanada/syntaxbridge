@@ -21,7 +21,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use crate::ingest::CompilationUnit;
-use crate::progress::ExtractionProgress;
+use crate::progress::{Cancellation, ExtractionProgress};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -195,6 +195,11 @@ pub struct TypeCatalog {
 #[derive(Debug)]
 pub enum TypeCatalogError {
     LibclangUnavailable(String),
+    /// Extraction stopped early because `Cancellation::cancel` was called
+    /// (US-4 criterion 7) — not a real failure, so `create_project` treats it
+    /// distinctly from the other variants (see `ProjectCreationError::
+    /// is_cancelled`) rather than persisting a partial catalog.
+    Cancelled,
 }
 
 impl fmt::Display for TypeCatalogError {
@@ -203,6 +208,7 @@ impl fmt::Display for TypeCatalogError {
             Self::LibclangUnavailable(message) => {
                 write!(formatter, "libclang is unavailable: {message}")
             }
+            Self::Cancelled => write!(formatter, "type catalog extraction was cancelled"),
         }
     }
 }
@@ -231,6 +237,20 @@ pub fn extract_type_catalog(
     compilation_units: &[CompilationUnit],
     project_root: &Path,
     progress: Option<&ExtractionProgress>,
+) -> Result<TypeCatalog, TypeCatalogError> {
+    extract_type_catalog_cancellable(compilation_units, project_root, progress, None)
+}
+
+/// Same as [`extract_type_catalog`], but stops early once `cancellation` is
+/// signalled (US-4 criterion 7). Each worker checks it once per compilation
+/// unit — best-effort, not preemptive — and a cancelled run reports
+/// [`TypeCatalogError::Cancelled`] instead of a partial catalog, so callers
+/// never mistake an interrupted run for a complete one.
+pub fn extract_type_catalog_cancellable(
+    compilation_units: &[CompilationUnit],
+    project_root: &Path,
+    progress: Option<&ExtractionProgress>,
+    cancellation: Option<&Cancellation>,
 ) -> Result<TypeCatalog, TypeCatalogError> {
     ensure_libclang_loaded()?;
 
@@ -262,7 +282,9 @@ pub fn extract_type_catalog(
                 .enumerate()
                 .map(|(worker_index, chunk)| {
                     let project_root = &project_root;
-                    scope.spawn(move || parse_chunk(worker_index, chunk, project_root, progress))
+                    scope.spawn(move || {
+                        parse_chunk(worker_index, chunk, project_root, progress, cancellation)
+                    })
                 })
                 .collect::<Vec<_>>()
                 .into_iter()
@@ -270,6 +292,14 @@ pub fn extract_type_catalog(
                 .collect::<Vec<_>>()
         })
     };
+
+    if cancellation.is_some_and(Cancellation::is_cancelled) {
+        log_type_catalog(format_args!(
+            "extract_type_catalog: cancelled after {:.2}s",
+            extraction_started.elapsed().as_secs_f64()
+        ));
+        return Err(TypeCatalogError::Cancelled);
+    }
 
     let mut seen = HashSet::new();
     let mut declarations = Vec::new();
@@ -324,6 +354,7 @@ fn parse_chunk(
     chunk: &[CompilationUnit],
     project_root: &Path,
     progress: Option<&ExtractionProgress>,
+    cancellation: Option<&Cancellation>,
 ) -> (Vec<TypeDeclaration>, Vec<TypeDependency>, Vec<TypeUsage>) {
     // `clang-sys`'s `runtime` feature loads the shared library into
     // thread-local storage, so the load done by `ensure_libclang_loaded` on
@@ -345,6 +376,13 @@ fn parse_chunk(
         let index = clang_sys::clang_createIndex(0, 0);
 
         for unit in chunk {
+            if cancellation.is_some_and(Cancellation::is_cancelled) {
+                log_type_catalog(format_args!(
+                    "worker {worker_index}: stopping early, cancellation requested"
+                ));
+                break;
+            }
+
             let mut visitor_state = VisitorState {
                 project_root,
                 declarations: &mut declarations,

@@ -13,10 +13,10 @@ use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use syntax_bridge_server::ingest::{CompilationUnit, CreateProjectRequest};
-use syntax_bridge_server::progress::ExtractionProgress;
+use syntax_bridge_server::progress::{Cancellation, ExtractionProgress};
 use syntax_bridge_server::project_service;
 use syntax_bridge_server::type_catalog::{
-    self, TypeDeclaration, TypeDeclarationKind, TypeUsage, TypeUsageKind,
+    self, TypeCatalogError, TypeDeclaration, TypeDeclarationKind, TypeUsage, TypeUsageKind,
 };
 
 const MAIN_CPP: &str = r#"
@@ -560,6 +560,49 @@ fn extract_type_catalog_reports_progress_as_units_complete() {
         progress.completed(),
         2,
         "expected both units marked done by the end"
+    );
+}
+
+/// US-4 criterion 7: cancellation of the (potentially minutes-long, on a
+/// real project) extraction pass. A pre-cancelled token is the deterministic
+/// way to prove the mechanism actually stops the pipeline instead of merely
+/// existing — waiting for a real mid-flight cancel would race against
+/// however fast this run's fixture happens to parse.
+#[test]
+fn extract_type_catalog_stops_early_when_cancelled() {
+    let workspace = TempWorkspace::new("type-catalog-cancel").expect("create temporary workspace");
+    let project_root = workspace.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project dir");
+
+    let file_a = project_root.join("a.cpp");
+    fs::write(&file_a, "struct A { int x; };").expect("write a.cpp");
+
+    let units = vec![CompilationUnit {
+        directory: project_root.display().to_string(),
+        file: file_a.display().to_string(),
+        command: None,
+        arguments: vec!["clang++".to_owned(), "-std=c++17".to_owned()],
+    }];
+
+    let progress = ExtractionProgress::new();
+    let cancellation = Cancellation::new();
+    cancellation.cancel();
+
+    let result = type_catalog::extract_type_catalog_cancellable(
+        &units,
+        &project_root,
+        Some(&progress),
+        Some(&cancellation),
+    );
+
+    assert!(
+        matches!(result, Err(TypeCatalogError::Cancelled)),
+        "expected a cancelled result, got {result:?}"
+    );
+    assert_eq!(
+        progress.completed(),
+        0,
+        "no unit should have been marked done once cancellation was already requested"
     );
 }
 

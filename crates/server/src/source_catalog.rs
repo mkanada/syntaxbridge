@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::ingest::CompilationUnit;
-use crate::progress::ExtractionProgress;
+use crate::progress::{Cancellation, ExtractionProgress};
 use crate::type_catalog;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -51,6 +51,9 @@ pub struct SourceFile {
 #[derive(Debug)]
 pub enum SourceCatalogError {
     LibclangUnavailable(String),
+    /// Mirrors `TypeCatalogError::Cancelled` (US-4 criterion 7): extraction
+    /// stopped early because `Cancellation::cancel` was called.
+    Cancelled,
 }
 
 impl fmt::Display for SourceCatalogError {
@@ -59,6 +62,7 @@ impl fmt::Display for SourceCatalogError {
             Self::LibclangUnavailable(message) => {
                 write!(formatter, "libclang is unavailable: {message}")
             }
+            Self::Cancelled => write!(formatter, "source catalog extraction was cancelled"),
         }
     }
 }
@@ -80,6 +84,18 @@ pub fn extract_source_files(
     compilation_units: &[CompilationUnit],
     project_root: &Path,
     progress: Option<&ExtractionProgress>,
+) -> Result<Vec<SourceFile>, SourceCatalogError> {
+    extract_source_files_cancellable(compilation_units, project_root, progress, None)
+}
+
+/// Same as [`extract_source_files`], but stops early once `cancellation` is
+/// signalled (US-4 criterion 7), mirroring
+/// `type_catalog::extract_type_catalog_cancellable`.
+pub fn extract_source_files_cancellable(
+    compilation_units: &[CompilationUnit],
+    project_root: &Path,
+    progress: Option<&ExtractionProgress>,
+    cancellation: Option<&Cancellation>,
 ) -> Result<Vec<SourceFile>, SourceCatalogError> {
     type_catalog::load_libclang().map_err(SourceCatalogError::LibclangUnavailable)?;
 
@@ -106,7 +122,7 @@ pub fn extract_source_files(
                 .chunks(chunk_size)
                 .map(|chunk| {
                     let project_root = &project_root;
-                    scope.spawn(move || parse_chunk(chunk, project_root, progress))
+                    scope.spawn(move || parse_chunk(chunk, project_root, progress, cancellation))
                 })
                 .collect::<Vec<_>>()
                 .into_iter()
@@ -122,6 +138,10 @@ pub fn extract_source_files(
             translation_units.extend(partial_translation_units);
             headers.extend(partial_headers);
         }
+    }
+
+    if cancellation.is_some_and(Cancellation::is_cancelled) {
+        return Err(SourceCatalogError::Cancelled);
     }
 
     for translation_unit in &translation_units {
@@ -151,6 +171,7 @@ fn parse_chunk(
     chunk: &[CompilationUnit],
     project_root: &Path,
     progress: Option<&ExtractionProgress>,
+    cancellation: Option<&Cancellation>,
 ) -> (BTreeSet<String>, BTreeSet<String>) {
     // Each worker thread needs its own load: see `type_catalog::parse_chunk`
     // for why the calling thread's `load_libclang()` doesn't cover this one.
@@ -166,6 +187,10 @@ fn parse_chunk(
         let index = clang_sys::clang_createIndex(0, 0);
 
         for unit in chunk {
+            if cancellation.is_some_and(Cancellation::is_cancelled) {
+                break;
+            }
+
             if let Some(canonical) = canonicalize_within(&unit.file, project_root) {
                 translation_units.insert(canonical);
             }

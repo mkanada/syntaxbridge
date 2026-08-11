@@ -78,6 +78,20 @@ class HttpServerClient implements ServerClient {
   }
 
   @override
+  Future<void> cancelCreateProject(String jobId) async {
+    final url = baseUrl.resolve('/projects/jobs/$jobId');
+    cliLog('HTTP DELETE $url');
+    final request = await _httpClient.deleteUrl(url);
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP DELETE $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.accepted) {
+      throw HttpException(_errorMessageFromBody(body));
+    }
+  }
+
+  @override
   Future<List<RecentProject>> listRecentProjects() async {
     final url = baseUrl.resolve('/projects');
     cliLog('HTTP GET $url');

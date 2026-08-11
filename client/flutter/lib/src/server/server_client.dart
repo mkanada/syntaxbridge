@@ -13,6 +13,13 @@ abstract class ServerClient {
   /// (with progress), or its terminal outcome.
   Future<ProjectCreationJobStatus> pollCreateProjectJob(String jobId);
 
+  /// Requests cancellation of a job started by [startCreateProject] (US-4
+  /// criterion 7). Best-effort and asynchronous: this returns once the
+  /// server has accepted the request, not once the job has actually
+  /// stopped — callers keep polling [pollCreateProjectJob] to observe the
+  /// `cancelling` → `cancelled` transition.
+  Future<void> cancelCreateProject(String jobId);
+
   /// The last 5 projects the app was used with, most recently opened first.
   Future<List<RecentProject>> listRecentProjects();
 

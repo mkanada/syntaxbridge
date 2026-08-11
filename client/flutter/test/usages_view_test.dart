@@ -58,19 +58,68 @@ void main() {
     expect(find.text('No usages found'), findsOneWidget);
   });
 
-  testWidgets('reports a click on a usage', (tester) async {
+  testWidgets('clicking the open-in-editor action jumps to the usage, without '
+      'expanding the accordion', (tester) async {
     TypeUsage? selected;
+    var loadCalled = false;
 
     await tester.pumpWidget(
       _host(
         selectedType: point,
         usages: const [fieldUsage, parameterUsage],
         onUsageSelected: (usage) => selected = usage,
+        loadUsageSource: (usage) async {
+          loadCalled = true;
+          return '';
+        },
       ),
     );
-    await tester.tap(find.text('main.cpp:4'));
+    await tester.tap(
+      find.byKey(
+        Key('usage-open-${parameterUsage.file}:${parameterUsage.line}'),
+      ),
+    );
+    await tester.pumpAndSettle();
 
     expect(selected, parameterUsage);
+    expect(loadCalled, isFalse);
+  });
+
+  testWidgets('usage items start collapsed, with no code visible', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      _host(
+        selectedType: point,
+        usages: const [fieldUsage],
+        loadUsageSource: (usage) async => 'Point origin; // field usage',
+      ),
+    );
+
+    expect(find.text('Point origin; // field usage'), findsNothing);
+  });
+
+  testWidgets('clicking a usage expands it to show the code where it is used, '
+      'without navigating the main viewer', (tester) async {
+    TypeUsage? selected;
+    final lines = List.generate(20, (i) => 'line ${i + 1}');
+    lines[8] = 'Point origin; // field usage';
+    final content = lines.join('\n');
+
+    await tester.pumpWidget(
+      _host(
+        selectedType: point,
+        usages: const [fieldUsage],
+        onUsageSelected: (usage) => selected = usage,
+        loadUsageSource: (usage) async => content,
+      ),
+    );
+
+    await tester.tap(find.text('panel.h:9'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Point origin; // field usage'), findsOneWidget);
+    expect(selected, isNull);
   });
 }
 
@@ -78,6 +127,7 @@ Widget _host({
   required TypeDeclaration? selectedType,
   required List<TypeUsage> usages,
   ValueChanged<TypeUsage>? onUsageSelected,
+  Future<String> Function(TypeUsage usage)? loadUsageSource,
 }) {
   return MaterialApp(
     home: Scaffold(
@@ -85,6 +135,7 @@ Widget _host({
         selectedType: selectedType,
         usages: usages,
         onUsageSelected: onUsageSelected ?? (_) {},
+        loadUsageSource: loadUsageSource ?? (_) async => '',
       ),
     ),
   );

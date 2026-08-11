@@ -69,6 +69,24 @@ impl ProjectCreationJob {
         *self.outcome.lock().unwrap() = Some(outcome);
     }
 
+    /// Requests cancellation (US-4 criterion 7): the background thread
+    /// notices the shared flag between compilation units and stops on its
+    /// own next check, best-effort rather than immediate. Safe to call after
+    /// the job has already finished — it just has no effect, since nothing
+    /// reads the flag anymore.
+    pub fn cancel(&self) {
+        self.progress.cancellation.cancel();
+    }
+
+    /// Whether cancellation was requested for this job, regardless of
+    /// whether the background thread has actually stopped yet — the
+    /// distinction a poller needs to report `"cancelling"` (requested, still
+    /// running) separately from `"cancelled"` (`finish`'s outcome was a
+    /// cancellation).
+    pub fn cancel_requested(&self) -> bool {
+        self.progress.cancellation.is_cancelled()
+    }
+
     /// Gives the caller access to the terminal outcome, if any, without
     /// requiring `CreatedProject`/`ProjectCreationError` to be `Clone` (the
     /// latter wraps non-`Clone` I/O and SQLite errors) — the caller builds
@@ -169,6 +187,43 @@ mod tests {
     fn job_reports_no_outcome_until_finished() {
         let job = ProjectCreationJob::new();
         job.with_outcome(|outcome| assert!(outcome.is_none()));
+    }
+
+    #[test]
+    fn job_starts_without_cancellation_requested() {
+        let job = ProjectCreationJob::new();
+        assert!(!job.cancel_requested());
+    }
+
+    #[test]
+    fn cancelling_a_job_is_observed_through_cancel_requested() {
+        let job = ProjectCreationJob::new();
+        job.cancel();
+        assert!(job.cancel_requested());
+    }
+
+    #[test]
+    fn cancelling_an_already_finished_job_is_harmless() {
+        let job = ProjectCreationJob::new();
+        job.finish(Ok(CreatedProject {
+            name: "counter".to_owned(),
+            project_dir: "/tmp/counter".into(),
+            input_source_dir: "/tmp/counter/input-source".into(),
+            cmake_source_dir: "/tmp/counter/input-source".into(),
+            build_dir: "/tmp/counter/build".into(),
+            compile_commands_path: "/tmp/counter/build/compile_commands.json".into(),
+            compilation_units: Vec::new(),
+            type_catalog: Vec::new(),
+            type_dependencies: Vec::new(),
+            source_files: Vec::new(),
+        }));
+
+        job.cancel();
+
+        job.with_outcome(|outcome| match outcome {
+            Some(Ok(project)) => assert_eq!(project.name, "counter"),
+            other => panic!("expected the original successful outcome, got {other:?}"),
+        });
     }
 
     #[test]

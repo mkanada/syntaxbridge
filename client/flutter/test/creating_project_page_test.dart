@@ -127,6 +127,90 @@ void main() {
     await tester.tap(find.byTooltip('Back'));
     expect(cancelled, isTrue);
   });
+
+  testWidgets('tapping Cancel requests cancellation and disables the button', (
+    tester,
+  ) async {
+    final client = _ScriptedServerClient(jobId: 'job-1', statuses: []);
+
+    await tester.pumpWidget(_host(client: client, input: input));
+    await tester.pump();
+
+    await tester.tap(find.text('Cancel'));
+    await tester.pump();
+
+    expect(client.cancelCallCount, 1);
+    expect(client.cancelledJobId, 'job-1');
+    expect(find.text('Cancelling...'), findsOneWidget);
+
+    final button = tester.widget<TextButton>(find.byType(TextButton));
+    expect(button.onPressed, isNull, reason: 'a second tap should be a no-op');
+  });
+
+  testWidgets('reports a cancelled job and offers a way back', (tester) async {
+    final client = _ScriptedServerClient(
+      jobId: 'job-1',
+      statuses: [
+        const ProjectCreationJobStatus(
+          state: ProjectCreationJobState.cancelling,
+          phase: ProjectCreationJobPhase.catalogingTypes,
+        ),
+        const ProjectCreationJobStatus(
+          state: ProjectCreationJobState.cancelled,
+        ),
+      ],
+    );
+
+    var backTapped = false;
+    await tester.pumpWidget(
+      _host(
+        client: client,
+        input: input,
+        pollInterval: const Duration(milliseconds: 10),
+        onCancel: () => backTapped = true,
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 10));
+    await tester.pump(const Duration(milliseconds: 10));
+
+    expect(find.text('Project creation cancelled'), findsOneWidget);
+    expect(find.text('Cancel'), findsNothing);
+
+    await tester.tap(find.byTooltip('Back'));
+    expect(backTapped, isTrue);
+  });
+
+  testWidgets('reports a failure to request cancellation without crashing', (
+    tester,
+  ) async {
+    final client = _ScriptedServerClient(
+      jobId: 'job-1',
+      statuses: [],
+      cancelError: Exception('network down'),
+    );
+
+    await tester.pumpWidget(_host(client: client, input: input));
+    await tester.pump();
+
+    await tester.tap(find.text('Cancel'));
+    await tester.pump();
+    await tester.pump();
+
+    // The log's `ListView` only builds items in (or near) its viewport;
+    // by this point there are enough entries that the error message —
+    // the newest, at the bottom — isn't built yet without scrolling to it.
+    await tester.scrollUntilVisible(
+      find.textContaining('Failed to request cancellation'),
+      200,
+      scrollable: find.byType(Scrollable),
+    );
+
+    expect(
+      find.textContaining('Failed to request cancellation'),
+      findsOneWidget,
+    );
+  });
 }
 
 Widget _host({
@@ -152,11 +236,18 @@ Widget _host({
 /// call), holding on the last entry once exhausted — good enough to script
 /// "N running snapshots then a terminal one" without needing real timers.
 class _ScriptedServerClient implements ServerClient {
-  _ScriptedServerClient({required this.jobId, required this.statuses});
+  _ScriptedServerClient({
+    required this.jobId,
+    required this.statuses,
+    this.cancelError,
+  });
 
   final String jobId;
   final List<ProjectCreationJobStatus> statuses;
+  final Object? cancelError;
   int _pollCount = 0;
+  int cancelCallCount = 0;
+  String? cancelledJobId;
 
   @override
   Future<String> startCreateProject(CreateProjectInput input) async => jobId;
@@ -175,6 +266,16 @@ class _ScriptedServerClient implements ServerClient {
         : statuses.length - 1;
     _pollCount++;
     return statuses[index];
+  }
+
+  @override
+  Future<void> cancelCreateProject(String jobId) async {
+    cancelCallCount++;
+    cancelledJobId = jobId;
+    final error = cancelError;
+    if (error != null) {
+      throw error;
+    }
   }
 
   @override

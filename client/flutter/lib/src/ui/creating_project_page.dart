@@ -41,6 +41,9 @@ class _CreatingProjectPageState extends State<CreatingProjectPage> {
   ProjectCreationJobPhase? _lastLoggedPhase;
   ProjectCreationJobStatus? _lastStatus;
   bool _failed = false;
+  bool _cancelled = false;
+  String? _jobId;
+  bool _cancelRequested = false;
 
   @override
   void initState() {
@@ -79,6 +82,7 @@ class _CreatingProjectPageState extends State<CreatingProjectPage> {
       }
 
       _addLog('Job started');
+      _jobId = jobId;
       // Assigned before the first poll runs, not after: `_poll` can resolve
       // (and cancel `_pollTimer`) within the same microtask flush as this
       // call, and if the timer were created afterwards that cancel would be
@@ -109,10 +113,16 @@ class _CreatingProjectPageState extends State<CreatingProjectPage> {
         _lastLoggedPhase = phase;
         _addLog(phase.label);
       }
+      if (status.state == ProjectCreationJobState.cancelling &&
+          _lastStatus?.state != ProjectCreationJobState.cancelling) {
+        _addLog('Cancellation requested, stopping...');
+      }
       setState(() => _lastStatus = status);
 
       switch (status.state) {
         case ProjectCreationJobState.running:
+          return;
+        case ProjectCreationJobState.cancelling:
           return;
         case ProjectCreationJobState.succeeded:
           _pollTimer?.cancel();
@@ -121,6 +131,10 @@ class _CreatingProjectPageState extends State<CreatingProjectPage> {
         case ProjectCreationJobState.failed:
           _pollTimer?.cancel();
           _reportFailure(status.errorMessage ?? 'Project creation failed');
+        case ProjectCreationJobState.cancelled:
+          _pollTimer?.cancel();
+          setState(() => _cancelled = true);
+          _addLog('Project creation cancelled', level: ExecutionLogLevel.info);
       }
     } catch (error) {
       if (!mounted) {
@@ -137,6 +151,31 @@ class _CreatingProjectPageState extends State<CreatingProjectPage> {
   void _reportFailure(String message) {
     setState(() => _failed = true);
     _addLog(message, level: ExecutionLogLevel.error);
+  }
+
+  /// Requests cancellation (US-4 criterion 7). Sets [_cancelRequested]
+  /// immediately, ahead of the next poll's own `cancelling` state, so the
+  /// button disables right away instead of staying tappable for another
+  /// `pollInterval` while a duplicate request could still go out.
+  Future<void> _cancel() async {
+    final jobId = _jobId;
+    if (jobId == null || _cancelRequested) {
+      return;
+    }
+
+    setState(() => _cancelRequested = true);
+    _addLog('Cancelling...');
+    try {
+      await widget.serverClient.cancelCreateProject(jobId);
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      _addLog(
+        'Failed to request cancellation: ${projectErrorMessage(error)}',
+        level: ExecutionLogLevel.error,
+      );
+    }
   }
 
   /// A combined fraction across both `libclang` passes, or `null` while the
@@ -178,7 +217,7 @@ class _CreatingProjectPageState extends State<CreatingProjectPage> {
               children: [
                 Row(
                   children: [
-                    if (_failed)
+                    if (_failed || _cancelled)
                       IconButton(
                         onPressed: widget.onCancel,
                         tooltip: 'Back',
@@ -187,12 +226,19 @@ class _CreatingProjectPageState extends State<CreatingProjectPage> {
                     else
                       const SizedBox(width: 48),
                     const SizedBox(width: 4),
-                    Text(
-                      'Creating project',
-                      style: textTheme.headlineMedium?.copyWith(
-                        fontWeight: FontWeight.w700,
+                    Expanded(
+                      child: Text(
+                        'Creating project',
+                        style: textTheme.headlineMedium?.copyWith(
+                          fontWeight: FontWeight.w700,
+                        ),
                       ),
                     ),
+                    if (!_failed && !_cancelled)
+                      TextButton(
+                        onPressed: _cancelRequested ? null : _cancel,
+                        child: const Text('Cancel'),
+                      ),
                   ],
                 ),
                 if (_failed) ...[
@@ -204,18 +250,27 @@ class _CreatingProjectPageState extends State<CreatingProjectPage> {
                     ),
                   ),
                 ],
+                if (_cancelled) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    'Project creation cancelled',
+                    style: textTheme.titleMedium?.copyWith(
+                      color: IdePalette.muted,
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 24),
                 ClipRRect(
                   borderRadius: BorderRadius.circular(4),
                   child: LinearProgressIndicator(
                     // A `null` value drives an indeterminate, endlessly
                     // animating bar — appropriate while work is genuinely in
-                    // progress, but once failed nothing is progressing
-                    // anymore, and the page stays mounted so the user can
-                    // read the error, so a frozen bar (never animating) is
-                    // both the honest state and the only one a widget test's
-                    // `pumpAndSettle` can converge on.
-                    value: _failed
+                    // progress, but once failed or cancelled nothing is
+                    // progressing anymore, and the page stays mounted so the
+                    // user can read the outcome, so a frozen bar (never
+                    // animating) is both the honest state and the only one a
+                    // widget test's `pumpAndSettle` can converge on.
+                    value: (_failed || _cancelled)
                         ? (_progressFraction ?? 0.0)
                         : _progressFraction,
                     minHeight: 6,
