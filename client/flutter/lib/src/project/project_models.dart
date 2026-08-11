@@ -365,6 +365,199 @@ class TypeCatalogListing {
   final Map<String, int> usageCounts;
 }
 
+/// Mirrors `FunctionDeclarationKind` in
+/// `crates/server/src/function_catalog.rs`.
+enum FunctionDeclarationKind {
+  freeFunction,
+  method,
+  constructor,
+  destructor,
+  functionMacro;
+
+  static FunctionDeclarationKind fromJson(String? value) {
+    return switch (value) {
+      'free_function' => FunctionDeclarationKind.freeFunction,
+      'method' => FunctionDeclarationKind.method,
+      'constructor' => FunctionDeclarationKind.constructor,
+      'destructor' => FunctionDeclarationKind.destructor,
+      'function_macro' => FunctionDeclarationKind.functionMacro,
+      _ => FunctionDeclarationKind.freeFunction,
+    };
+  }
+
+  /// Short label shown next to a callable's name in the catalog.
+  String get label {
+    return switch (this) {
+      FunctionDeclarationKind.freeFunction => 'function',
+      FunctionDeclarationKind.method => 'method',
+      FunctionDeclarationKind.constructor => 'constructor',
+      FunctionDeclarationKind.destructor => 'destructor',
+      FunctionDeclarationKind.functionMacro => 'function macro',
+    };
+  }
+}
+
+/// One callable declared in the project (US-5): a free function, method,
+/// constructor, destructor, or function-like macro. Mirrors
+/// `FunctionDeclaration` in `crates/server/src/function_catalog.rs`.
+class FunctionDeclaration {
+  const FunctionDeclaration({
+    required this.name,
+    required this.kind,
+    this.namespace = '',
+    this.owningClassUsr,
+    required this.signature,
+    required this.file,
+    required this.line,
+    required this.column,
+    this.endLine = 0,
+    this.endColumn = 0,
+    this.usr = '',
+    this.isVirtual = false,
+    this.overridesUsr,
+  });
+
+  factory FunctionDeclaration.fromJson(Map<String, Object?> json) {
+    return FunctionDeclaration(
+      name: json['name'] as String? ?? '',
+      kind: FunctionDeclarationKind.fromJson(json['kind'] as String?),
+      namespace: json['namespace'] as String? ?? '',
+      owningClassUsr: json['owning_class_usr'] as String?,
+      signature: json['signature'] as String? ?? '',
+      file: json['file'] as String? ?? '',
+      line: json['line'] as int? ?? 0,
+      column: json['column'] as int? ?? 0,
+      endLine: json['end_line'] as int? ?? 0,
+      endColumn: json['end_column'] as int? ?? 0,
+      usr: json['usr'] as String? ?? '',
+      isVirtual: json['is_virtual'] as bool? ?? false,
+      overridesUsr: json['overrides_usr'] as String?,
+    );
+  }
+
+  final String name;
+  final FunctionDeclarationKind kind;
+  final String namespace;
+
+  /// `usr` of the owning struct/class/union, for a method/constructor/
+  /// destructor — `null` for a free function or macro.
+  final String? owningClassUsr;
+  final String signature;
+  final String file;
+  final int line;
+  final int column;
+  final int endLine;
+  final int endColumn;
+  final String usr;
+  final bool isVirtual;
+
+  /// `usr` of the immediate virtual method this one overrides, if any.
+  final String? overridesUsr;
+
+  /// The function's name, qualified with its enclosing namespace when it has
+  /// one, so overloads and homonyms in different scopes read as distinct
+  /// (US-5 criterion 2) — full disambiguation comes from [signature]. Shared
+  /// by every UI surface that lists functions (`FunctionsView`,
+  /// `CallersView`) rather than duplicated per file.
+  String get qualifiedName => namespace.isEmpty ? name : '$namespace::$name';
+}
+
+/// Mirrors `CallResolution` in `crates/server/src/function_catalog.rs`:
+/// whether a call site's target could be determined statically (US-5
+/// criterion 6), and if so, whether that's only the statically-known target
+/// of a virtual dispatch (criterion 3).
+class CallResolution {
+  const CallResolution.resolved({
+    required this.calleeUsr,
+    required this.isDynamicDispatch,
+  }) : unresolvedReason = null;
+
+  const CallResolution.unresolved({required this.unresolvedReason})
+    : calleeUsr = null,
+      isDynamicDispatch = false;
+
+  factory CallResolution.fromJson(Map<String, Object?> json) {
+    if (json['status'] == 'resolved') {
+      return CallResolution.resolved(
+        calleeUsr: json['callee_usr'] as String? ?? '',
+        isDynamicDispatch: json['is_dynamic_dispatch'] as bool? ?? false,
+      );
+    }
+
+    return CallResolution.unresolved(
+      unresolvedReason: json['reason'] as String? ?? '',
+    );
+  }
+
+  final String? calleeUsr;
+  final bool isDynamicDispatch;
+  final String? unresolvedReason;
+
+  bool get isResolved => calleeUsr != null;
+}
+
+/// One call site in the static call graph (US-5). Mirrors `CallEdge` in
+/// `crates/server/src/function_catalog.rs`.
+class CallEdge {
+  const CallEdge({
+    required this.callerUsr,
+    required this.resolution,
+    required this.file,
+    required this.line,
+    required this.column,
+  });
+
+  factory CallEdge.fromJson(Map<String, Object?> json) {
+    return CallEdge(
+      callerUsr: json['caller_usr'] as String? ?? '',
+      resolution: CallResolution.fromJson(
+        json['resolution'] as Map<String, Object?>? ?? const {},
+      ),
+      file: json['file'] as String? ?? '',
+      line: json['line'] as int? ?? 0,
+      column: json['column'] as int? ?? 0,
+    );
+  }
+
+  final String callerUsr;
+  final CallResolution resolution;
+  final String file;
+  final int line;
+  final int column;
+}
+
+/// The response of `GET /projects/functions` (US-5): the function catalog
+/// plus how many recorded callers each one has, keyed by `usr`. Mirrors
+/// `TypeCatalogListing`'s split between declarations and a usage/caller
+/// index.
+class FunctionCatalogListing {
+  const FunctionCatalogListing({
+    required this.functions,
+    required this.callerCounts,
+  });
+
+  factory FunctionCatalogListing.fromJson(Map<String, Object?> json) {
+    final functionsJson =
+        json['functions'] as List<Object?>? ?? const <Object?>[];
+    final callerCountsJson =
+        json['caller_counts'] as Map<String, Object?>? ??
+        const <String, Object?>{};
+
+    return FunctionCatalogListing(
+      functions: functionsJson
+          .whereType<Map<String, Object?>>()
+          .map(FunctionDeclaration.fromJson)
+          .toList(),
+      callerCounts: callerCountsJson.map(
+        (usr, count) => MapEntry(usr, count as int? ?? 0),
+      ),
+    );
+  }
+
+  final List<FunctionDeclaration> functions;
+  final Map<String, int> callerCounts;
+}
+
 /// How far a single `libclang` extraction pass (type cataloging or source
 /// file discovery) has gotten. Mirrors `ExtractionProgress` in
 /// `crates/server/src/progress.rs`; `total == 0` means that pass hasn't
@@ -389,6 +582,7 @@ enum ProjectCreationJobPhase {
   ingesting,
   catalogingTypes,
   discoveringSourceFiles,
+  catalogingFunctions,
   persisting;
 
   static ProjectCreationJobPhase fromJson(String? value) {
@@ -397,6 +591,7 @@ enum ProjectCreationJobPhase {
       'cataloging_types' => ProjectCreationJobPhase.catalogingTypes,
       'discovering_source_files' =>
         ProjectCreationJobPhase.discoveringSourceFiles,
+      'cataloging_functions' => ProjectCreationJobPhase.catalogingFunctions,
       'persisting' => ProjectCreationJobPhase.persisting,
       _ => ProjectCreationJobPhase.ingesting,
     };
@@ -409,6 +604,8 @@ enum ProjectCreationJobPhase {
       ProjectCreationJobPhase.catalogingTypes => 'Cataloging types',
       ProjectCreationJobPhase.discoveringSourceFiles =>
         'Discovering source files',
+      ProjectCreationJobPhase.catalogingFunctions =>
+        'Cataloging functions and calls',
       ProjectCreationJobPhase.persisting => 'Saving project',
     };
   }
@@ -437,6 +634,7 @@ class ProjectCreationJobStatus {
     this.phase,
     this.typeCatalogProgress,
     this.sourceCatalogProgress,
+    this.functionCatalogProgress,
     this.project,
     this.errorMessage,
     this.isClientError = false,
@@ -459,6 +657,8 @@ class ProjectCreationJobStatus {
 
     final typeCatalogJson = json['type_catalog'] as Map<String, Object?>?;
     final sourceCatalogJson = json['source_catalog'] as Map<String, Object?>?;
+    final functionCatalogJson =
+        json['function_catalog'] as Map<String, Object?>?;
     final projectJson = json['project'] as Map<String, Object?>?;
 
     return ProjectCreationJobStatus(
@@ -472,6 +672,9 @@ class ProjectCreationJobStatus {
       sourceCatalogProgress: sourceCatalogJson != null
           ? ExtractionProgress.fromJson(sourceCatalogJson)
           : null,
+      functionCatalogProgress: functionCatalogJson != null
+          ? ExtractionProgress.fromJson(functionCatalogJson)
+          : null,
       project: projectJson != null
           ? CreatedProject.fromJson(projectJson)
           : null,
@@ -484,6 +687,7 @@ class ProjectCreationJobStatus {
   final ProjectCreationJobPhase? phase;
   final ExtractionProgress? typeCatalogProgress;
   final ExtractionProgress? sourceCatalogProgress;
+  final ExtractionProgress? functionCatalogProgress;
   final CreatedProject? project;
   final String? errorMessage;
   final bool isClientError;

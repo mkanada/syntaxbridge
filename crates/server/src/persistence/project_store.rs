@@ -4,6 +4,9 @@ use std::path::Path;
 
 use rusqlite::{Connection, params};
 
+use crate::function_catalog::{
+    CallEdge, CallResolution, FunctionDeclaration, FunctionDeclarationKind,
+};
 use crate::ingest::CompilationUnit;
 use crate::source_catalog::{SourceFile, SourceFileKind};
 use crate::type_catalog::{
@@ -79,7 +82,35 @@ impl ProjectStore {
                 line INTEGER NOT NULL,
                 column INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_type_usages_type_usr ON type_usages(type_usr);",
+            CREATE INDEX IF NOT EXISTS idx_type_usages_type_usr ON type_usages(type_usr);
+            CREATE TABLE IF NOT EXISTS function_declarations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                namespace TEXT NOT NULL,
+                owning_class_usr TEXT,
+                signature TEXT NOT NULL,
+                file TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                column INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                end_column INTEGER NOT NULL,
+                usr TEXT NOT NULL DEFAULT '',
+                is_virtual INTEGER NOT NULL,
+                overrides_usr TEXT
+            );
+            CREATE TABLE IF NOT EXISTS call_edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                caller_usr TEXT NOT NULL,
+                callee_usr TEXT,
+                is_dynamic_dispatch INTEGER,
+                unresolved_reason TEXT,
+                file TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                column INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_call_edges_caller_usr ON call_edges(caller_usr);
+            CREATE INDEX IF NOT EXISTS idx_call_edges_callee_usr ON call_edges(callee_usr);",
         )?;
 
         migrate_type_columns(&connection)?;
@@ -474,6 +505,215 @@ impl ProjectStore {
 
         Ok(counts)
     }
+
+    /// Replaces the full set of cataloged function/method/macro declarations
+    /// (US-5) with the ones from the latest `libclang` extraction, mirroring
+    /// `replace_type_declarations`.
+    pub fn replace_function_declarations(
+        &mut self,
+        declarations: &[FunctionDeclaration],
+    ) -> Result<(), PersistenceError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM function_declarations", [])?;
+
+        for declaration in declarations {
+            transaction.execute(
+                "INSERT INTO function_declarations (
+                    name, kind, namespace, owning_class_usr, signature, file, line, column,
+                    end_line, end_column, usr, is_virtual, overrides_usr
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    declaration.name,
+                    declaration.kind.as_str(),
+                    declaration.namespace,
+                    declaration.owning_class_usr,
+                    declaration.signature,
+                    declaration.file,
+                    declaration.line,
+                    declaration.column,
+                    declaration.end_line,
+                    declaration.end_column,
+                    declaration.usr,
+                    declaration.is_virtual,
+                    declaration.overrides_usr,
+                ],
+            )?;
+        }
+
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn list_function_declarations(&self) -> Result<Vec<FunctionDeclaration>, PersistenceError> {
+        let mut statement = self.connection.prepare(
+            "SELECT name, kind, namespace, owning_class_usr, signature, file, line, column,
+                    end_line, end_column, usr, is_virtual, overrides_usr
+             FROM function_declarations ORDER BY id",
+        )?;
+
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, u32>(6)?,
+                row.get::<_, u32>(7)?,
+                row.get::<_, u32>(8)?,
+                row.get::<_, u32>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, bool>(11)?,
+                row.get::<_, Option<String>>(12)?,
+            ))
+        })?;
+
+        let mut declarations = Vec::new();
+        for row in rows {
+            let (
+                name,
+                kind,
+                namespace,
+                owning_class_usr,
+                signature,
+                file,
+                line,
+                column,
+                end_line,
+                end_column,
+                usr,
+                is_virtual,
+                overrides_usr,
+            ) = row?;
+            let Some(kind) = FunctionDeclarationKind::parse(&kind) else {
+                continue;
+            };
+
+            declarations.push(FunctionDeclaration {
+                name,
+                kind,
+                namespace,
+                owning_class_usr,
+                signature,
+                file,
+                line,
+                column,
+                end_line,
+                end_column,
+                usr,
+                is_virtual,
+                overrides_usr,
+            });
+        }
+
+        Ok(declarations)
+    }
+
+    /// Replaces the full set of call edges (US-5) with the ones from the
+    /// latest `libclang` extraction, mirroring `replace_type_usages`.
+    pub fn replace_call_edges(&mut self, calls: &[CallEdge]) -> Result<(), PersistenceError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM call_edges", [])?;
+
+        for call in calls {
+            let (callee_usr, is_dynamic_dispatch, unresolved_reason) = match &call.resolution {
+                CallResolution::Resolved {
+                    callee_usr,
+                    is_dynamic_dispatch,
+                } => (Some(callee_usr.clone()), Some(*is_dynamic_dispatch), None),
+                CallResolution::Unresolved { reason } => (None, None, Some(reason.clone())),
+            };
+
+            transaction.execute(
+                "INSERT INTO call_edges (
+                    caller_usr, callee_usr, is_dynamic_dispatch, unresolved_reason, file, line, column
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    call.caller_usr,
+                    callee_usr,
+                    is_dynamic_dispatch,
+                    unresolved_reason,
+                    call.file,
+                    call.line,
+                    call.column,
+                ],
+            )?;
+        }
+
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Every recorded call whose target resolves to `callee_usr` — US-5
+    /// criterion 5's "from a definition, list its callers" — answered from
+    /// the persisted index, no reparsing.
+    pub fn list_callers_for(&self, callee_usr: &str) -> Result<Vec<CallEdge>, PersistenceError> {
+        let mut statement = self.connection.prepare(
+            "SELECT caller_usr, callee_usr, is_dynamic_dispatch, unresolved_reason, file, line, column
+             FROM call_edges WHERE callee_usr = ?1 ORDER BY file, line, column",
+        )?;
+
+        let rows = statement.query_map(params![callee_usr], row_to_call_edge)?;
+
+        let mut calls = Vec::new();
+        for row in rows {
+            calls.push(row?);
+        }
+
+        Ok(calls)
+    }
+
+    /// The number of recorded callers per function, keyed by `usr` — mirrors
+    /// `type_usage_counts`, what a function list shows as its "N callers"
+    /// column without a per-row query. Unresolved calls (US-5 criterion 6)
+    /// have no `callee_usr` and so contribute to no function's count.
+    pub fn call_counts(&self) -> Result<HashMap<String, usize>, PersistenceError> {
+        let mut statement = self.connection.prepare(
+            "SELECT callee_usr, COUNT(*) FROM call_edges
+             WHERE callee_usr IS NOT NULL GROUP BY callee_usr",
+        )?;
+
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+
+        let mut counts = HashMap::new();
+        for row in rows {
+            let (callee_usr, count) = row?;
+            counts.insert(callee_usr, count as usize);
+        }
+
+        Ok(counts)
+    }
+}
+
+fn row_to_call_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallEdge> {
+    let caller_usr: String = row.get(0)?;
+    let callee_usr: Option<String> = row.get(1)?;
+    let is_dynamic_dispatch: Option<bool> = row.get(2)?;
+    let unresolved_reason: Option<String> = row.get(3)?;
+    let file: String = row.get(4)?;
+    let line: u32 = row.get(5)?;
+    let column: u32 = row.get(6)?;
+
+    let resolution = match callee_usr {
+        Some(callee_usr) => CallResolution::Resolved {
+            callee_usr,
+            is_dynamic_dispatch: is_dynamic_dispatch.unwrap_or(false),
+        },
+        None => CallResolution::Unresolved {
+            reason: unresolved_reason.unwrap_or_default(),
+        },
+    };
+
+    Ok(CallEdge {
+        caller_usr,
+        resolution,
+        file,
+        line,
+        column,
+    })
 }
 
 /// Adds the `namespace`/`end_line`/`end_column` columns to `type_declarations`
@@ -971,6 +1211,178 @@ mod tests {
         let counts = store.type_usage_counts().expect("compute usage counts");
         assert_eq!(counts.get("c:@N@geometry@S@Point"), Some(&2));
         assert_eq!(counts.get("c:@N@geometry@S@Widget"), Some(&1));
+        assert_eq!(counts.len(), 2);
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    fn sample_function_declarations() -> Vec<FunctionDeclaration> {
+        vec![
+            FunctionDeclaration {
+                name: "area".to_owned(),
+                kind: FunctionDeclarationKind::Method,
+                namespace: "geometry".to_owned(),
+                owning_class_usr: Some("c:@N@geometry@S@Shape".to_owned()),
+                signature: "double geometry::Shape::area() const".to_owned(),
+                file: "/workspace/src/shapes.h".to_owned(),
+                line: 4,
+                column: 19,
+                end_line: 4,
+                end_column: 40,
+                usr: "c:@N@geometry@S@Shape@F@area#1#".to_owned(),
+                is_virtual: true,
+                overrides_usr: None,
+            },
+            FunctionDeclaration {
+                name: "add".to_owned(),
+                kind: FunctionDeclarationKind::FreeFunction,
+                namespace: String::new(),
+                owning_class_usr: None,
+                signature: "int add(int a, int b)".to_owned(),
+                file: "/workspace/src/math.cpp".to_owned(),
+                line: 1,
+                column: 5,
+                end_line: 3,
+                end_column: 1,
+                usr: "c:@F@add#I#I#".to_owned(),
+                is_virtual: false,
+                overrides_usr: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn round_trips_function_declarations() {
+        let db_path = temp_db_path("project-functions");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+        store
+            .replace_function_declarations(&sample_function_declarations())
+            .expect("persist function declarations");
+
+        let declarations = store
+            .list_function_declarations()
+            .expect("list function declarations");
+        assert_eq!(declarations, sample_function_declarations());
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn replacing_function_declarations_clears_previous_entries() {
+        let db_path = temp_db_path("project-functions-replace");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+        store
+            .replace_function_declarations(&sample_function_declarations())
+            .expect("persist function declarations");
+        store
+            .replace_function_declarations(&[])
+            .expect("clear function declarations");
+
+        let declarations = store
+            .list_function_declarations()
+            .expect("list function declarations");
+        assert!(
+            declarations.is_empty(),
+            "expected no function declarations: {declarations:?}"
+        );
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    fn sample_call_edges() -> Vec<CallEdge> {
+        vec![
+            CallEdge {
+                caller_usr: "c:@F@describe#&1$@N@geometry@S@Shape#".to_owned(),
+                resolution: CallResolution::Resolved {
+                    callee_usr: "c:@N@geometry@S@Shape@F@area#1#".to_owned(),
+                    is_dynamic_dispatch: true,
+                },
+                file: "/workspace/src/shapes.cpp".to_owned(),
+                line: 10,
+                column: 19,
+            },
+            CallEdge {
+                caller_usr: "c:@F@compute#".to_owned(),
+                resolution: CallResolution::Resolved {
+                    callee_usr: "c:@F@add#I#I#".to_owned(),
+                    is_dynamic_dispatch: false,
+                },
+                file: "/workspace/src/math.cpp".to_owned(),
+                line: 20,
+                column: 18,
+            },
+            CallEdge {
+                caller_usr: "c:@F@apply#".to_owned(),
+                resolution: CallResolution::Unresolved {
+                    reason: "call target is not statically a function".to_owned(),
+                },
+                file: "/workspace/src/math.cpp".to_owned(),
+                line: 25,
+                column: 12,
+            },
+        ]
+    }
+
+    #[test]
+    fn round_trips_call_edges() {
+        let db_path = temp_db_path("project-calls");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+        store
+            .replace_call_edges(&sample_call_edges())
+            .expect("persist call edges");
+
+        let callers_of_add = store
+            .list_callers_for("c:@F@add#I#I#")
+            .expect("list callers of add");
+        assert_eq!(
+            callers_of_add,
+            vec![sample_call_edges()[1].clone()],
+            "expected exactly compute's call to add"
+        );
+
+        let callers_of_area = store
+            .list_callers_for("c:@N@geometry@S@Shape@F@area#1#")
+            .expect("list callers of area");
+        assert_eq!(callers_of_area, vec![sample_call_edges()[0].clone()]);
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn replacing_call_edges_clears_previous_entries() {
+        let db_path = temp_db_path("project-calls-replace");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+        store
+            .replace_call_edges(&sample_call_edges())
+            .expect("persist call edges");
+        store.replace_call_edges(&[]).expect("clear call edges");
+
+        let callers = store
+            .list_callers_for("c:@F@add#I#I#")
+            .expect("list callers of add");
+        assert!(callers.is_empty(), "expected no callers: {callers:?}");
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn counts_callers_per_function() {
+        let db_path = temp_db_path("project-call-counts");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+        store
+            .replace_call_edges(&sample_call_edges())
+            .expect("persist call edges");
+
+        let counts = store.call_counts().expect("compute call counts");
+        assert_eq!(counts.get("c:@F@add#I#I#"), Some(&1));
+        assert_eq!(counts.get("c:@N@geometry@S@Shape@F@area#1#"), Some(&1));
+        // The unresolved call in `apply` has no `callee_usr` and so
+        // contributes to no function's count.
         assert_eq!(counts.len(), 2);
 
         let _ = fs::remove_file(&db_path);

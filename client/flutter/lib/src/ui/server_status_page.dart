@@ -5,9 +5,11 @@ import '../logging/cli_log.dart';
 import '../project/project_error_message.dart';
 import '../project/project_models.dart';
 import '../server/server_client.dart';
+import 'callers_view.dart';
 import 'dockable_panel.dart';
 import 'execution_log.dart';
 import 'execution_log_view.dart';
+import 'functions_view.dart';
 import 'ide_theme.dart';
 import 'panel_descriptor.dart';
 import 'panel_group.dart';
@@ -42,27 +44,33 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
   // 'usages' starts closed: it opens itself, docked to the center split,
   // only once a type is actually selected (see _selectType) — "entering"
   // the split rather than reserving half the workspace from the outset.
-  final Set<String> _openPanels = {'explorer', 'types', 'log'};
+  final Set<String> _openPanels = {'explorer', 'types', 'functions', 'log'};
   final Map<String, DockSide> _panelSides = {
     'explorer': DockSide.left,
     'types': DockSide.left,
     'usages': DockSide.center,
+    'functions': DockSide.left,
+    'callers': DockSide.center,
     'log': DockSide.right,
   };
   final _screenshotBoundaryKey = GlobalKey();
   SourceFile? _selectedSourceFile;
   Future<String>? _selectedSourceContent;
   TypeDeclaration? _selectedType;
+  FunctionDeclaration? _selectedFunction;
   int? _highlightStartLine;
   int? _highlightEndLine;
   late Future<TypeCatalogListing> _types;
   Future<List<TypeUsage>>? _selectedTypeUsages;
+  late Future<FunctionCatalogListing> _functions;
+  Future<List<CallEdge>>? _selectedFunctionCallers;
 
   @override
   void initState() {
     super.initState();
     _status = _loadServerStatus(notify: false);
     _types = _loadTypes();
+    _functions = _loadFunctions();
   }
 
   void _refresh() {
@@ -137,6 +145,7 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     );
 
     setState(() {
+      _selectedFunction = null;
       _openPanels.add('usages');
       _panelSides['usages'] = DockSide.center;
       _selectedTypeUsages = type.usr.isEmpty
@@ -219,6 +228,107 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
       projectDir: widget.project.projectDir,
       path: usage.file,
     );
+  }
+
+  /// Opens the file where [function] is declared and highlights its body,
+  /// mirroring [_selectType]. Also opens the Callers panel (US-5), docked to
+  /// the center split, and populates it for this function, keyed by its
+  /// stable `usr` rather than by position.
+  void _selectFunction(FunctionDeclaration function) {
+    final sourceFile = widget.project.sourceFiles.firstWhere(
+      (file) => file.path == function.file,
+      orElse: () =>
+          SourceFile(path: function.file, kind: SourceFileKind.header),
+    );
+
+    _selectSourceFile(
+      sourceFile,
+      highlightStartLine: function.line,
+      highlightEndLine: function.endLine > 0 ? function.endLine : function.line,
+    );
+
+    setState(() {
+      _selectedType = null;
+      _selectedFunction = function;
+      _openPanels.add('callers');
+      _panelSides['callers'] = DockSide.center;
+      _selectedFunctionCallers = function.usr.isEmpty
+          ? Future.value(const <CallEdge>[])
+          : _loadCallers(function.usr);
+    });
+  }
+
+  /// Opens the file at the exact location [caller] occurs, for the Callers
+  /// panel's "click a caller, jump to it" navigation (US-5 criterion 5).
+  /// Mirrors [_selectUsage].
+  void _selectCaller(CallEdge caller) {
+    final sourceFile = widget.project.sourceFiles.firstWhere(
+      (file) => file.path == caller.file,
+      orElse: () => SourceFile(path: caller.file, kind: SourceFileKind.header),
+    );
+
+    _selectSourceFile(
+      sourceFile,
+      highlightStartLine: caller.line,
+      highlightEndLine: caller.line,
+    );
+  }
+
+  Future<List<CallEdge>> _loadCallers(String functionUsr) async {
+    try {
+      final callers = await widget.serverClient.listCallers(
+        projectDir: widget.project.projectDir,
+        functionUsr: functionUsr,
+      );
+      _addLog(
+        'Loaded ${callers.length} callers',
+        level: ExecutionLogLevel.success,
+        notify: false,
+      );
+      return callers;
+    } catch (error, stackTrace) {
+      cliLog('list callers exception: $error');
+      cliLog('list callers stack: $stackTrace');
+      _addLog(
+        'Failed to load callers: ${projectErrorMessage(error)}',
+        level: ExecutionLogLevel.error,
+        notify: false,
+      );
+      rethrow;
+    }
+  }
+
+  /// Fetches the file a call occurs in, for the Callers panel's accordion
+  /// (US-5) to show the surrounding code inline. Mirrors
+  /// [_loadUsageSource]: deliberately silent on success.
+  Future<String> _loadCallerSource(CallEdge caller) {
+    return widget.serverClient.readSourceFile(
+      projectDir: widget.project.projectDir,
+      path: caller.file,
+    );
+  }
+
+  Future<FunctionCatalogListing> _loadFunctions() async {
+    try {
+      final listing = await widget.serverClient.listFunctions(
+        widget.project.projectDir,
+      );
+      _addLog(
+        'Loaded ${listing.functions.length} functions',
+        level: ExecutionLogLevel.success,
+        notify: false,
+      );
+      return listing;
+    } catch (error, stackTrace) {
+      cliLog('list functions exception: $error');
+      cliLog('list functions stack: $stackTrace');
+      _addLog(
+        'Failed to load functions: ${projectErrorMessage(error)}',
+        level: ExecutionLogLevel.error,
+        notify: false,
+      );
+      rethrow;
+    }
   }
 
   Future<TypeCatalogListing> _loadTypes() async {
@@ -485,6 +595,95 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
                 usages: snapshot.data ?? const [],
                 onUsageSelected: _selectUsage,
                 loadUsageSource: _loadUsageSource,
+              );
+            },
+          );
+        },
+      ),
+      PanelDescriptor(
+        id: 'functions',
+        title: 'Functions',
+        icon: Icons.functions,
+        defaultSide: DockSide.left,
+        builder: (context) => FutureBuilder<FunctionCatalogListing>(
+          future: _functions,
+          builder: (context, snapshot) {
+            if (snapshot.connectionState != ConnectionState.done) {
+              return const Center(
+                child: Padding(
+                  padding: EdgeInsets.all(16),
+                  child: CircularProgressIndicator(),
+                ),
+              );
+            }
+
+            final error = snapshot.error;
+            if (error != null) {
+              return Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(
+                  'Failed to load functions: ${projectErrorMessage(error)}',
+                  style: const TextStyle(color: IdePalette.red),
+                ),
+              );
+            }
+
+            final listing = snapshot.data;
+            return FunctionsView(
+              functions: listing?.functions ?? const [],
+              callerCounts: listing?.callerCounts ?? const {},
+              onFunctionSelected: _selectFunction,
+              selectedFunction: _selectedFunction,
+            );
+          },
+        ),
+      ),
+      PanelDescriptor(
+        id: 'callers',
+        title: 'Callers',
+        icon: Icons.call_made,
+        // Splits side by side with the source viewer by default, via the
+        // center split, mirroring the Usages panel.
+        defaultSide: DockSide.center,
+        builder: (context) {
+          final callersFuture = _selectedFunctionCallers;
+          if (callersFuture == null) {
+            return CallersView(
+              selectedFunction: null,
+              callers: const [],
+              onCallerSelected: _selectCaller,
+              loadCallerSource: _loadCallerSource,
+            );
+          }
+
+          return FutureBuilder<List<CallEdge>>(
+            future: callersFuture,
+            builder: (context, snapshot) {
+              if (snapshot.connectionState != ConnectionState.done) {
+                return const Center(
+                  child: Padding(
+                    padding: EdgeInsets.all(16),
+                    child: CircularProgressIndicator(),
+                  ),
+                );
+              }
+
+              final error = snapshot.error;
+              if (error != null) {
+                return Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Text(
+                    'Failed to load callers: ${projectErrorMessage(error)}',
+                    style: const TextStyle(color: IdePalette.red),
+                  ),
+                );
+              }
+
+              return CallersView(
+                selectedFunction: _selectedFunction,
+                callers: snapshot.data ?? const [],
+                onCallerSelected: _selectCaller,
+                loadCallerSource: _loadCallerSource,
               );
             },
           );

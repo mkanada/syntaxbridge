@@ -219,6 +219,54 @@ class HttpServerClient implements ServerClient {
         .toList();
   }
 
+  @override
+  Future<FunctionCatalogListing> listFunctions(String projectDir) async {
+    final url = baseUrl
+        .resolve('/projects/functions')
+        .replace(queryParameters: {'project_dir': projectDir});
+    cliLog('HTTP GET $url');
+    final request = await _httpClient.getUrl(url);
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP GET $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException(_errorMessageFromBody(body));
+    }
+
+    return FunctionCatalogListing.fromJson(
+      jsonDecode(body) as Map<String, Object?>,
+    );
+  }
+
+  @override
+  Future<List<CallEdge>> listCallers({
+    required String projectDir,
+    required String functionUsr,
+  }) async {
+    final url = baseUrl
+        .resolve('/projects/functions/callers')
+        .replace(
+          queryParameters: {'project_dir': projectDir, 'usr': functionUsr},
+        );
+    cliLog('HTTP GET $url');
+    final request = await _httpClient.getUrl(url);
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP GET $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException(_errorMessageFromBody(body));
+    }
+
+    final json = jsonDecode(body) as Map<String, Object?>;
+    final callersJson = json['callers'] as List<Object?>? ?? const <Object?>[];
+    return callersJson
+        .whereType<Map<String, Object?>>()
+        .map(CallEdge.fromJson)
+        .toList();
+  }
+
   String _errorMessageFromBody(String body) {
     try {
       final json = jsonDecode(body);

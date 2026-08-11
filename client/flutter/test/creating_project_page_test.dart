@@ -309,4 +309,14 @@ class _ScriptedServerClient implements ServerClient {
     required String projectDir,
     required String typeUsr,
   }) => throw UnimplementedError('not used by this screen');
+
+  @override
+  Future<FunctionCatalogListing> listFunctions(String projectDir) =>
+      throw UnimplementedError('not used by this screen');
+
+  @override
+  Future<List<CallEdge>> listCallers({
+    required String projectDir,
+    required String functionUsr,
+  }) => throw UnimplementedError('not used by this screen');
 }

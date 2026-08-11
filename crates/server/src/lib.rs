@@ -1,3 +1,4 @@
+pub mod function_catalog;
 pub mod ingest;
 pub mod jobs;
 pub mod persistence;

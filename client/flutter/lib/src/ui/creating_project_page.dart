@@ -178,9 +178,11 @@ class _CreatingProjectPageState extends State<CreatingProjectPage> {
     }
   }
 
-  /// A combined fraction across both `libclang` passes, or `null` while the
-  /// type-catalog total isn't known yet (still ingesting) — an indeterminate
-  /// bar is the honest thing to show before there's a total to divide by.
+  /// A combined fraction across all three `libclang` passes (US-5 added the
+  /// function-catalog pass alongside the original type-catalog/source-catalog
+  /// pair), or `null` while the type-catalog total isn't known yet (still
+  /// ingesting) — an indeterminate bar is the honest thing to show before
+  /// there's a total to divide by.
   double? get _progressFraction {
     final typeCatalog = _lastStatus?.typeCatalogProgress;
     if (typeCatalog == null || typeCatalog.total == 0) {
@@ -190,12 +192,18 @@ class _CreatingProjectPageState extends State<CreatingProjectPage> {
     final sourceCatalog = _lastStatus?.sourceCatalogProgress;
     final sourceTotal = sourceCatalog?.total ?? 0;
     final sourceCompleted = sourceCatalog?.completed ?? 0;
-    // The source-catalog pass parses the same units, so until its own total
-    // is known, assume it will mirror the type-catalog total rather than
-    // showing the first half of the bar move twice as fast as the second.
+    final functionCatalog = _lastStatus?.functionCatalogProgress;
+    final functionTotal = functionCatalog?.total ?? 0;
+    final functionCompleted = functionCatalog?.completed ?? 0;
+    // Every pass parses the same units, so until a given pass's own total is
+    // known, assume it will mirror the type-catalog total rather than
+    // showing earlier segments of the bar move faster than later ones.
     final totalUnits =
-        typeCatalog.total + (sourceTotal > 0 ? sourceTotal : typeCatalog.total);
-    final doneUnits = typeCatalog.completed + sourceCompleted;
+        typeCatalog.total +
+        (sourceTotal > 0 ? sourceTotal : typeCatalog.total) +
+        (functionTotal > 0 ? functionTotal : typeCatalog.total);
+    final doneUnits =
+        typeCatalog.completed + sourceCompleted + functionCompleted;
 
     return (doneUnits / totalUnits).clamp(0.0, 1.0);
   }

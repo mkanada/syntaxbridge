@@ -774,7 +774,7 @@ fn declaration_kind_for(kind: clang_sys::CXCursorKind) -> Option<TypeDeclaration
 /// either an include guard's `#define` half or some other valueless
 /// annotation/flag, distinguished with `looks_like_header_guard`; a macro
 /// with replacement tokens is treated as a constant.
-unsafe fn classify_macro(cursor: clang_sys::CXCursor) -> Option<TypeDeclarationKind> {
+pub(crate) unsafe fn classify_macro(cursor: clang_sys::CXCursor) -> Option<TypeDeclarationKind> {
     if unsafe { clang_sys::clang_Cursor_isMacroBuiltin(cursor) } != 0 {
         return None;
     }
@@ -884,7 +884,10 @@ fn describe_cursor(
 /// filtering out system headers and anything outside `project_root` — the
 /// same rule `describe_cursor` applies to declarations, shared here since
 /// `push_usage` needs an identical filter for usage sites.
-fn cursor_site(cursor: clang_sys::CXCursor, project_root: &Path) -> Option<(String, u32, u32)> {
+pub(crate) fn cursor_site(
+    cursor: clang_sys::CXCursor,
+    project_root: &Path,
+) -> Option<(String, u32, u32)> {
     let location = unsafe { clang_sys::clang_getCursorLocation(cursor) };
     if unsafe { clang_sys::clang_Location_isInSystemHeader(location) } != 0 {
         return None;
@@ -927,7 +930,7 @@ fn cursor_site(cursor: clang_sys::CXCursor, project_root: &Path) -> Option<(Stri
 /// Non-namespace parents (a struct nesting another struct, for instance) are
 /// skipped rather than stopping the walk, so a type nested inside a class
 /// still picks up that class's enclosing namespace.
-unsafe fn namespace_of(cursor: clang_sys::CXCursor) -> String {
+pub(crate) unsafe fn namespace_of(cursor: clang_sys::CXCursor) -> String {
     let mut segments = Vec::new();
     let mut parent = unsafe { clang_sys::clang_getCursorSemanticParent(cursor) };
 
@@ -953,7 +956,7 @@ unsafe fn namespace_of(cursor: clang_sys::CXCursor) -> String {
 
 /// The line/column of the end of `cursor`'s extent (e.g. the closing `}` of
 /// a struct/class/union/enum body), for highlighting the whole declaration.
-unsafe fn extent_end(cursor: clang_sys::CXCursor) -> (u32, u32) {
+pub(crate) unsafe fn extent_end(cursor: clang_sys::CXCursor) -> (u32, u32) {
     let extent = unsafe { clang_sys::clang_getCursorExtent(cursor) };
     let end = unsafe { clang_sys::clang_getRangeEnd(extent) };
 

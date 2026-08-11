@@ -27,7 +27,7 @@ verificáveis, e não como intenções.
 | US-2 | Lista de arquivos fonte e leitura de conteúdo | pronto | US-1 |
 | US-3 | Catálogo de tipos do projeto | pronto | US-2 |
 | US-4 | Usos de cada tipo e navegação | pronto | US-3 |
-| US-5 | Funções, métodos e macros, e seus usos | planejado | US-3 |
+| US-5 | Funções, métodos e macros, e seus usos | parcial | US-3 |
 | US-6 | Isolamento e caracterização comportamental | planejado | US-5 |
 | US-7 | Mapeamento de tipos C++ → Dart | planejado | US-4, US-5 |
 | US-8 | Geração do código Dart | planejado | US-7 |
@@ -568,7 +568,38 @@ O *scan* é feito antes, de modo que a navegação seja imediata.
 
 ## US-5 — Funções, métodos e macros, e seus usos
 
-**Status:** planejado · **Depende de:** US-3
+**Status:** parcial — catalogação de funções/métodos/construtores/
+destrutores/macros-função, grafo de chamadas estático (com despacho dinâmico e
+chamadas não resolvíveis marcados) e navegação definição↔chamadores existem e
+são testados; herança múltipla, sobrecarga de operadores e a política para
+`inline`/`constexpr`/`template`/membros gerados pelo compilador seguem em
+aberto (ver abaixo) · **Depende de:** US-3 ·
+**Implementação:** `crates/server/src/function_catalog.rs`,
+`crates/server/src/persistence/project_store.rs`
+(tabelas `function_declarations`/`call_edges`,
+`replace_function_declarations`/`list_function_declarations`,
+`replace_call_edges`/`list_callers_for`/`call_counts`),
+`crates/server/src/project_service.rs` (`FunctionCatalogListing`,
+`list_functions`, `list_callers`, `CreationProgress::function_catalog`),
+`crates/server/src/jobs.rs` (`JobPhase::CatalogingFunctions`, `derive_phase`),
+`crates/server/src/server.rs` (`GET /projects/functions`,
+`GET /projects/functions/callers`, `function_catalog` em
+`GET /projects/jobs/{job_id}`),
+`client/flutter/lib/src/project/project_models.dart`
+(`FunctionDeclaration`, `FunctionDeclarationKind`, `CallResolution`,
+`CallEdge`, `FunctionCatalogListing`, `ProjectCreationJobPhase.catalogingFunctions`),
+`client/flutter/lib/src/server/server_client.dart`/`http_server_client.dart`
+(`listFunctions`, `listCallers`),
+`client/flutter/lib/src/ui/functions_view.dart` (painel "Functions"),
+`client/flutter/lib/src/ui/callers_view.dart` (painel "Callers"),
+`client/flutter/lib/src/ui/server_status_page.dart` (fiação entre os dois,
+mesmo padrão de US-4) ·
+**Testes:** `crates/server/tests/function_catalog.rs`,
+`crates/server/tests/function_catalog_route.rs`, testes inline em
+`persistence/project_store.rs` e `jobs.rs`,
+`client/flutter/test/functions_view_test.dart`,
+`client/flutter/test/callers_view_test.dart`,
+`client/flutter/test/app_test.dart`
 
 ### Objetivo do usuário
 
@@ -577,43 +608,132 @@ com a mesma navegação imediata de US-4, indo da definição ao uso e vice-vers
 
 ### Observações e decisões em aberto
 
-- **"Resolver questões relativas a herança de classes" é um subprojeto**, não um
-  item. Precisa ser quebrado em: métodos virtuais e `override`, sobrecargas,
-  herança múltipla, métodos herdados não redefinidos, ponteiros para função,
-  *callbacks*, e chamadas por despacho dinâmico.
-- **Distinguir grafo de chamadas estático de chamadas resolvíveis.** Uma parte
-  das chamadas não é resolvível estaticamente e a ferramenta precisa dizer isso
-  em vez de escolher um alvo arbitrário — a informação "aqui há despacho
-  dinâmico" é justamente o que importa em US-7.
-- **Sobrecarga é o ponto de atrito com Dart**, que não a tem. Registrar assinatura
-  completa (não só nome) desde este passo evita retrabalho em US-7 e US-8.
-- **Funções `inline`, `constexpr`, `template` e geradas pelo compilador**
-  (construtores, operadores implícitos) precisam de política explícita: entram
-  no catálogo? São convertidas? São ignoradas?
-- Compartilha com US-4 a mesma infraestrutura de índice; implementar as duas
-  com mecanismos separados seria duplicação.
+- **Resolvido: fonte da informação e custo — mas não do jeito cogitado.** A
+  ideia original ("compartilha com US-4 a mesma infraestrutura de índice; duas
+  passadas separadas seriam duplicação") só se sustentava em parte: o grafo de
+  chamadas só existe dentro de corpos de função, e `type_catalog::
+  extract_type_catalog` faz o parse com `CXTranslationUnit_SkipFunctionBodies`
+  desde a correção de escala do Verovio 5.7.0 — reaproveitar aquela AST era
+  literalmente impossível para este passo. `function_catalog::
+  extract_function_catalog_cancellable` é portanto uma **terceira** passada
+  completa de `libclang` sobre cada unidade de compilação (com corpos desta
+  vez), independente das duas de US-3/US-4 — mesmo padrão de paralelização por
+  núcleo (um `CXIndex` por worker) e o mesmo trade-off de custo já documentado
+  em "Escala" abaixo. O que *foi* reaproveitado, como sugerido, é a
+  infraestrutura de job/progresso/cancelamento de US-1/US-4: `CreationProgress`
+  ganhou um terceiro `ExtractionProgress` (`function_catalog`) e
+  `progress::Cancellation` já compartilhado é checado por esta passada também,
+  então `DELETE /projects/jobs/{job_id}` interrompe as três passadas juntas.
+- **Resolvido: taxonomia de declarações.** `FunctionDeclarationKind` cobre
+  `FreeFunction`, `Method`, `Constructor`, `Destructor` e `FunctionMacro` — as
+  quatro primeiras exigem `clang_isCursorDefinition` (mesma regra de US-3 para
+  tipos: sem definição, sem entrada no catálogo; isso deixa construtores/
+  destrutores/métodos *pure virtual* ou apenas declarados, sem corpo em
+  lugar nenhum da TU, de fora — mesma lacuna documentada em US-3 como
+  "forward declaration vs. definição", agora também para funções).
+  `FunctionMacro` reaproveita a classificação já existente em
+  `type_catalog::classify_macro` (US-3) em vez de reimplementá-la; as demais
+  variantes de macro (`ConstantMacro`, `HeaderGuard`, `AnnotationMacro`) não
+  são callables e continuam vivendo só no catálogo de tipos.
+- **Resolvido: sobrecarga.** Cada `FunctionDeclaration` carrega `signature`
+  (tipo de retorno, nome qualificado por namespace/classe, tipos e nomes de
+  parâmetro, `const` quando aplicável) além do `usr` — os dois já distinguem
+  duas sobrecargas do mesmo nome sem retrabalho futuro em US-7/US-8.
+- **Resolvido: despacho dinâmico, via `clang_Cursor_isDynamicCall`.** Em vez de
+  inferir despacho dinâmico por heurística (virtual + ausência de qualificador
+  `Base::`), `libclang` expõe essa resposta diretamente para qualquer
+  `CXCursor_CallExpr`. `CallResolution::Resolved.is_dynamic_dispatch` usa essa
+  função; o `callee_usr` associado continua sendo o alvo estático (o método
+  encontrado por *name lookup* no tipo estático do receptor), não o *overrider*
+  real — coerente com o que `libclang` consegue saber sem executar o programa.
+- **Resolvido: chamadas não resolvíveis.** `clang_getCursorReferenced` numa
+  chamada indireta (ex.: através de ponteiro para função) resolve para a
+  declaração da variável/parâmetro, não para uma função — `record_call`
+  detecta isso (o cursor referenciado não é `FunctionDecl`/`CXXMethod`/
+  `Constructor`/`Destructor`) e grava `CallResolution::Unresolved { reason }`
+  em vez de omitir a chamada ou adivinhar um alvo.
+- **Resolvido (parcial): método herdado não redefinido.** Como o catálogo só
+  registra cursores de definição, um método que a classe derivada não
+  redefine simplesmente não tem cursor próprio nela — só existe a definição na
+  classe base, então a atribuição correta já sai de graça da mesma regra que
+  resolve a taxonomia de declarações. Ainda não implementado: uma navegação
+  explícita "ver todos os métodos herdados desta classe, redefinidos ou não"
+  (mencionada no texto original) — hoje o usuário só vê o método listado sob a
+  classe base.
+- **Resolvido (parcial): definição ↔ chamadores (critério 5).** A direção
+  "da definição, listar chamadores" está completa: `ProjectStore::
+  list_callers_for` responde a partir do índice persistido, sem reparsear, e
+  `CallersView` deixa clicar num chamador para abrir o arquivo na linha exata
+  da chamada. A leitura literal da segunda metade — "de uma chamada é possível
+  ir à definição", isto é, clicar numa chamada *qualquer dentro do código
+  fonte já aberto* e pular para a definição do que ela chama — **não está
+  implementada**: `SourceFileViewer` não tem hoje nenhum tratamento de clique
+  sobre uma `CallExpr`. O que existe é o inverso mais útil na prática (uma
+  lista de todas as chamadas de uma função, cada uma navegável), não o
+  "go to definition" clássico de IDE a partir de um ponto arbitrário do texto.
+- **Ainda em aberto: herança múltipla.** `first_overridden_usr` só grava o
+  primeiro cursor de `clang_getOverriddenCursors` quando um método sobrescreve
+  métodos de mais de uma base — a "resolução de herança de classes" continuada
+  como subprojeto no texto original (métodos virtuais puros, sobrecargas *entre
+  bases*, `override` com múltiplos ancestrais) segue sem tratamento dedicado.
+- **Ainda em aberto: sobrecarga de operadores, `inline`, `constexpr`,
+  `template` e membros gerados pelo compilador.** Nenhuma política explícita
+  foi definida para essas categorias; o comportamento atual (aparecem no
+  catálogo apenas se e quando `libclang` materializa um cursor de definição
+  visível, o que variou entre casos observados nos testes) não é uma decisão
+  deliberada, só o efeito colateral de reaproveitar a mesma regra de
+  `clang_isCursorDefinition` usada para os demais casos.
+- **Ainda em aberto: incrementalidade.** Mesma lacuna de US-3/US-4 — a
+  passada inteira é refeita a cada criação de projeto.
+- **Ainda em aberto: macros não geram uso/chamada.** Uma macro-função aparece
+  no catálogo (`FunctionMacro`), mas uma expansão de macro não vira uma aresta
+  no grafo de chamadas — a expansão acontece no pré-processador, antes da AST
+  que `visit_call_site` percorre, e correlacioná-la exigiria consultar o
+  *preprocessing record* (mesma lacuna que US-4 já registrava para usos de
+  tipo em macros).
 
 ### Critérios de aceitação (testáveis)
 
-1. O catálogo contém cada função livre, método, construtor, destrutor e macro
-   do projeto, com assinatura completa.
-2. Duas sobrecargas do mesmo nome aparecem como entradas distintas.
-3. Uma chamada a método virtual através de ponteiro para a classe base é
-   registrada e marcada como despacho dinâmico.
-4. Um método herdado e não redefinido é atribuído à classe que o define.
-5. Da definição de uma função é possível listar seus chamadores, e de uma
-   chamada é possível ir à definição.
-6. Chamadas não resolvíveis estaticamente aparecem marcadas como tal, e não
-   omitidas.
+1. **Satisfeito:** o catálogo contém cada função livre, método, construtor,
+   destrutor e macro-função do projeto, com assinatura completa. Provado por
+   `extract_function_catalog_lists_every_callable_with_full_signature`.
+2. **Satisfeito:** duas sobrecargas do mesmo nome aparecem como entradas
+   distintas (usr e assinatura diferentes) — mesmo teste, par `add(int, int)`/
+   `add(double, double)`.
+3. **Satisfeito:** uma chamada a método virtual através de referência à classe
+   base é registrada e marcada como despacho dinâmico
+   (`clang_Cursor_isDynamicCall`). Provado por
+   `extract_function_catalog_records_the_call_graph_with_libclang`
+   (`describe(const Shape&)` chamando `shape.area()`).
+4. **Satisfeito:** um método herdado e não redefinido é atribuído à classe que
+   o define (`Circle` não redefine `perimeter`, que aparece só sob `Shape`) —
+   mesmo teste do critério 1.
+5. **Satisfeito (parcial):** de uma função é possível listar seus chamadores
+   (`list_callers_for`/`GET /projects/functions/callers`/`CallersView`), e
+   clicar num chamador abre o arquivo na linha exata da chamada. A leitura
+   inversa literal — de um ponto arbitrário do código fonte, ir direto à
+   definição do que está sendo chamado ali — não está implementada (ver
+   observação acima).
+6. **Satisfeito:** uma chamada não resolvível estaticamente (aqui, através de
+   ponteiro para função) aparece marcada como tal
+   (`CallResolution::Unresolved`), não omitida — mesmo teste do critério 3
+   (`apply`'s `op(x, y)`).
 
 ### Condições de testabilidade
 
-- O fixture precisa conter deliberadamente: uma hierarquia com método virtual
-  redefinido e outro não redefinido, um par de sobrecargas, um ponteiro para
-  função, e uma macro-função — cada um existe para tornar um critério acima
-  verificável.
-- Os números esperados de chamadores precisam ser pequenos o bastante para
-  serem escritos à mão no teste.
+- **Satisfeito:** `FUNCTIONS_CPP` em `crates/server/tests/function_catalog.rs`
+  contém, deliberadamente: uma hierarquia (`Shape`/`Circle`) com um método
+  virtual redefinido (`area`) e outro não redefinido (`perimeter`), um par de
+  sobrecargas (`add(int, int)`/`add(double, double)`), um ponteiro para função
+  (`BinaryOp`, chamado indiretamente dentro de `apply`) e uma macro-função
+  (`SQUARE`).
+- **Satisfeito:** os números esperados de chamadores são pequenos e escritos à
+  mão no teste (um chamador para `add(int, int)`, um para `area`, uma chamada
+  não resolvível dentro de `apply`).
+- Rotas de leitura (`GET /projects/functions`, `GET /projects/functions/
+  callers`) são testadas sem executar `libclang`, populando o banco
+  diretamente — mesmo padrão de `type_catalog_route.rs`
+  (`crates/server/tests/function_catalog_route.rs`).
 
 ---
 
@@ -1013,6 +1133,19 @@ ou não; ao contrário de US-4, uma caracterização comportamental *tem* uma
 noção de "meio caminho seguro para persistir" que uma indexação de tipos não
 tem, então pode não fazer sentido herdar a mesma solução sem adaptação.
 
+**US-5 reaproveitou só a metade que fazia sentido.** Ao contrário de US-4 (que
+reaproveitou a *passada* inteira de US-3, já que usos de tipo cabem na mesma
+varredura sem corpos de função), o grafo de chamadas de US-5 só existe dentro
+de corpos de função — reaproveitar a AST de US-3/US-4 era impossível, então
+`function_catalog::extract_function_catalog_cancellable` é uma terceira
+passada `libclang` independente (ver US-5 para o detalhe). O que *foi*
+reaproveitado é exatamente o mecanismo de job desta seção:
+`CreationProgress` ganhou um terceiro `ExtractionProgress`
+(`function_catalog`), e `progress::Cancellation`, já compartilhado entre as
+duas primeiras passadas, passou a ser checado pela terceira também, sem
+nenhum flag novo — `DELETE /projects/jobs/{job_id}` continua parando a
+criação de projeto inteira, agora com uma passada a mais dentro dela.
+
 ### Versionamento do esquema de persistência
 
 Não há versão de esquema nem migração genérica. Os passos seguintes vão
@@ -1064,6 +1197,18 @@ estrutural. Um projeto ainda maior, ou uma máquina com menos núcleos (o
 sandbox Flatpak, por exemplo), volta a bater no mesmo problema. A correção de
 verdade é a já registrada acima em "Trabalho longo": tirar a ingestão da
 requisição HTTP síncrona e dar progresso real ao usuário.
+
+**US-5 piora este número de propósito, por uma razão específica.** A
+extração do grafo de chamadas precisa dos corpos de função, que as duas
+passadas acima deliberadamente pulam (`CXTranslationUnit_SkipFunctionBodies`)
+para ficarem rápidas — não há meio-termo em `libclang`: ou os corpos são
+parseados (caro) ou o grafo de chamadas simplesmente não existe. `create_project`
+agora faz uma **terceira** passada completa, com corpos, do mesmo tamanho de
+custo por arquivo que motivou a otimização das outras duas. É um trade-off
+consciente (documentado no módulo `function_catalog.rs`), não uma regressão
+não percebida, mas soma ao mesmo risco de escala desta seção — um projeto que
+já era lento com 2 passadas fica mais lento ainda com 3, e a paralelização por
+núcleo é a mesma mitigação parcial, com o mesmo limite.
 
 ### Erros e diagnósticos
 

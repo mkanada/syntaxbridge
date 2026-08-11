@@ -48,4 +48,16 @@ abstract class ServerClient {
     required String projectDir,
     required String typeUsr,
   });
+
+  /// The function/method/macro catalog already persisted for a project
+  /// (US-5), together with each function's caller count, without reparsing.
+  Future<FunctionCatalogListing> listFunctions(String projectDir);
+
+  /// Every recorded caller of the function identified by [functionUsr]
+  /// (its stable `usr`), from the persisted call graph (US-5), without
+  /// reparsing.
+  Future<List<CallEdge>> listCallers({
+    required String projectDir,
+    required String functionUsr,
+  });
 }

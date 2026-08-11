@@ -6,22 +6,25 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use crate::function_catalog::{self, CallEdge, FunctionCatalogError, FunctionDeclaration};
 use crate::ingest::{self, CompilationUnit, CreateProjectRequest, CreatedProject, IngestError};
 use crate::persistence::{GlobalStore, PersistenceError, ProjectRecord, ProjectStore};
 use crate::progress::{Cancellation, ExtractionProgress};
 use crate::source_catalog::{self, SourceCatalogError, SourceFile};
 use crate::type_catalog::{self, TypeCatalogError, TypeDeclaration, TypeUsage};
 
-/// Live progress trackers for `create_project`'s two `libclang` passes, so a
-/// caller running it in the background (`jobs.rs`) can report real progress
-/// to a poller instead of the caller having to wait for the whole thing.
-/// `cancellation` is shared between both passes (US-4 criterion 7): stopping
-/// a job stops indexing regardless of which pass is currently running,
-/// rather than requiring a separate flag per pass.
+/// Live progress trackers for `create_project`'s three `libclang` passes, so
+/// a caller running it in the background (`jobs.rs`) can report real
+/// progress to a poller instead of the caller having to wait for the whole
+/// thing. `cancellation` is shared between all three (US-4 criterion 7,
+/// extended to US-5's pass): stopping a job stops indexing regardless of
+/// which pass is currently running, rather than requiring a separate flag
+/// per pass.
 #[derive(Default)]
 pub struct CreationProgress {
     pub type_catalog: ExtractionProgress,
     pub source_catalog: ExtractionProgress,
+    pub function_catalog: ExtractionProgress,
     pub cancellation: Cancellation,
 }
 
@@ -34,6 +37,7 @@ pub enum ProjectCreationError {
     Persistence(PersistenceError),
     TypeCatalog(TypeCatalogError),
     SourceCatalog(SourceCatalogError),
+    FunctionCatalog(FunctionCatalogError),
 }
 
 impl ProjectCreationError {
@@ -43,6 +47,7 @@ impl ProjectCreationError {
             Self::Persistence(_) => false,
             Self::TypeCatalog(_) => false,
             Self::SourceCatalog(_) => false,
+            Self::FunctionCatalog(_) => false,
         }
     }
 
@@ -55,6 +60,7 @@ impl ProjectCreationError {
             self,
             Self::TypeCatalog(TypeCatalogError::Cancelled)
                 | Self::SourceCatalog(SourceCatalogError::Cancelled)
+                | Self::FunctionCatalog(FunctionCatalogError::Cancelled)
         )
     }
 }
@@ -66,6 +72,7 @@ impl fmt::Display for ProjectCreationError {
             Self::Persistence(error) => write!(formatter, "{error}"),
             Self::TypeCatalog(error) => write!(formatter, "{error}"),
             Self::SourceCatalog(error) => write!(formatter, "{error}"),
+            Self::FunctionCatalog(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -93,6 +100,12 @@ impl From<TypeCatalogError> for ProjectCreationError {
 impl From<SourceCatalogError> for ProjectCreationError {
     fn from(error: SourceCatalogError) -> Self {
         Self::SourceCatalog(error)
+    }
+}
+
+impl From<FunctionCatalogError> for ProjectCreationError {
+    fn from(error: FunctionCatalogError) -> Self {
+        Self::FunctionCatalog(error)
     }
 }
 
@@ -124,6 +137,13 @@ pub fn create_project(
         progress.map(|progress| &progress.cancellation),
     )?;
 
+    let function_catalog = function_catalog::extract_function_catalog_cancellable(
+        &project.compilation_units,
+        &project.input_source_dir,
+        progress.map(|progress| &progress.function_catalog),
+        progress.map(|progress| &progress.cancellation),
+    )?;
+
     let project_db_path = project.project_dir.join("project.db");
     let mut project_store = ProjectStore::open(&project_db_path)?;
     project_store.replace_compilation_units(&project.compilation_units)?;
@@ -131,6 +151,8 @@ pub fn create_project(
     project_store.replace_type_dependencies(&project.type_dependencies)?;
     project_store.replace_type_usages(&type_usages)?;
     project_store.replace_source_files(&project.source_files)?;
+    project_store.replace_function_declarations(&function_catalog.declarations)?;
+    project_store.replace_call_edges(&function_catalog.calls)?;
 
     let global_store = GlobalStore::open(global_db_path)?;
     global_store.register_project(
@@ -403,6 +425,42 @@ pub fn list_type_usages(
     let project_db_path = project_dir.join("project.db");
     let project_store = ProjectStore::open(&project_db_path)?;
     Ok(project_store.list_type_usages_for(type_usr)?)
+}
+
+/// Serves the function/method/macro catalog already persisted for a project
+/// (US-5), without reparsing — mirrors `TypeCatalogListing`/`list_types`.
+/// `caller_counts` rides along keyed by `usr`, same reasoning as
+/// `TypeCatalogListing::usage_counts`.
+#[derive(Debug, Serialize)]
+pub struct FunctionCatalogListing {
+    pub functions: Vec<FunctionDeclaration>,
+    pub caller_counts: HashMap<String, usize>,
+}
+
+pub fn list_functions(project_dir: &Path) -> Result<FunctionCatalogListing, ListTypesError> {
+    if !is_openable_project(project_dir) {
+        return Err(ListTypesError::NotFound(project_dir.to_path_buf()));
+    }
+
+    let project_db_path = project_dir.join("project.db");
+    let project_store = ProjectStore::open(&project_db_path)?;
+    Ok(FunctionCatalogListing {
+        functions: project_store.list_function_declarations()?,
+        caller_counts: project_store.call_counts()?,
+    })
+}
+
+/// Serves every recorded caller of one function (identified by its stable
+/// `usr`), from the persisted call graph (US-5) without reparsing — what
+/// backs "click a function, see every place it's called" (criterion 5).
+pub fn list_callers(project_dir: &Path, callee_usr: &str) -> Result<Vec<CallEdge>, ListTypesError> {
+    if !is_openable_project(project_dir) {
+        return Err(ListTypesError::NotFound(project_dir.to_path_buf()));
+    }
+
+    let project_db_path = project_dir.join("project.db");
+    let project_store = ProjectStore::open(&project_db_path)?;
+    Ok(project_store.list_callers_for(callee_usr)?)
 }
 
 /// Reads a single source file's content for display, refusing to read

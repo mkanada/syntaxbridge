@@ -342,6 +342,129 @@ void main() {
     },
   );
 
+  testWidgets('shows the function catalog for the project', (tester) async {
+    final fakeClient = _FakeServerClient(
+      const ServerStatus(service: 'syntax-bridge-server', status: 'ok'),
+      functions: const [
+        FunctionDeclaration(
+          name: 'area',
+          kind: FunctionDeclarationKind.method,
+          namespace: 'geometry',
+          signature: 'double geometry::Shape::area() const',
+          file: '/tmp/projects/counter/input-source/fixture/shapes.h',
+          line: 4,
+          column: 19,
+          isVirtual: true,
+        ),
+      ],
+    );
+
+    await tester.pumpWidget(SyntaxBridgeApp(serverClient: fakeClient));
+    await tester.pumpAndSettle();
+    await _skipToIde(tester);
+
+    expect(find.text('Functions'), findsOneWidget);
+    await tester.tap(find.text('Functions'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('geometry::area'), findsOneWidget);
+    expect(find.text('double geometry::Shape::area() const'), findsOneWidget);
+    expect(find.text('virtual'), findsOneWidget);
+    expect(find.widgetWithText(ListTile, 'method'), findsOneWidget);
+  });
+
+  testWidgets(
+    'shows caller counts and navigates from the function list to a caller '
+    'site (US-5)',
+    (tester) async {
+      const areaUsr = 'c:@N@geometry@S@Shape@F@area#1#';
+      final fakeClient = _FakeServerClient(
+        const ServerStatus(service: 'syntax-bridge-server', status: 'ok'),
+        project: const CreatedProject(
+          name: 'counter',
+          projectDir: '/tmp/projects/counter',
+          inputSourceDir: '/tmp/projects/counter/input-source',
+          compilationUnits: [],
+          sourceFiles: [
+            SourceFile(
+              path: '/tmp/projects/counter/input-source/fixture/shapes.h',
+              kind: SourceFileKind.header,
+            ),
+            SourceFile(
+              path: '/tmp/projects/counter/input-source/fixture/main.cpp',
+              kind: SourceFileKind.translationUnit,
+            ),
+          ],
+        ),
+        functions: const [
+          FunctionDeclaration(
+            name: 'area',
+            kind: FunctionDeclarationKind.method,
+            namespace: 'geometry',
+            signature: 'double geometry::Shape::area() const',
+            file: '/tmp/projects/counter/input-source/fixture/shapes.h',
+            line: 4,
+            column: 19,
+            usr: areaUsr,
+            isVirtual: true,
+          ),
+        ],
+        callerCounts: const {areaUsr: 1},
+        callersByFunction: const {
+          areaUsr: [
+            CallEdge(
+              callerUsr: 'c:@F@describe#',
+              resolution: CallResolution.resolved(
+                calleeUsr: areaUsr,
+                isDynamicDispatch: true,
+              ),
+              file: '/tmp/projects/counter/input-source/fixture/main.cpp',
+              line: 10,
+              column: 19,
+            ),
+          ],
+        },
+        sourceFileContent: 'return shape.area();\n',
+      );
+
+      await tester.pumpWidget(SyntaxBridgeApp(serverClient: fakeClient));
+      await tester.pumpAndSettle();
+      await _skipToIde(tester);
+
+      await tester.tap(find.text('Functions'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('1 caller'), findsOneWidget);
+      // The Callers panel only enters (docked to the center split) once a
+      // function is actually selected, mirroring the Usages panel.
+      expect(find.text('Callers'), findsNothing);
+
+      await tester.tap(find.text('geometry::area'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Callers'), findsWidgets);
+      expect(find.text('1 caller of geometry::area'), findsOneWidget);
+      expect(find.text('main.cpp:10'), findsOneWidget);
+      expect(find.text('dynamic dispatch'), findsOneWidget);
+
+      final openInEditor = find.byKey(
+        const Key(
+          'caller-open-/tmp/projects/counter/input-source/fixture/main.cpp:10',
+        ),
+      );
+      await tester.ensureVisible(openInEditor);
+      await tester.pumpAndSettle();
+      await tester.tap(openInEditor);
+      await tester.pumpAndSettle();
+
+      expect(
+        fakeClient.readSourceFilePath,
+        '/tmp/projects/counter/input-source/fixture/main.cpp',
+      );
+      expect(find.text('main.cpp'), findsWidgets);
+    },
+  );
+
   testWidgets('opens a source file and displays its content on click', (
     tester,
   ) async {
@@ -849,6 +972,9 @@ class _FakeServerClient implements ServerClient {
     this.types = const <TypeDeclaration>[],
     this.usageCounts = const <String, int>{},
     this.usagesByType = const <String, List<TypeUsage>>{},
+    this.functions = const <FunctionDeclaration>[],
+    this.callerCounts = const <String, int>{},
+    this.callersByFunction = const <String, List<CallEdge>>{},
   });
 
   final ServerStatus status;
@@ -861,6 +987,9 @@ class _FakeServerClient implements ServerClient {
   final List<TypeDeclaration> types;
   final Map<String, int> usageCounts;
   final Map<String, List<TypeUsage>> usagesByType;
+  final List<FunctionDeclaration> functions;
+  final Map<String, int> callerCounts;
+  final Map<String, List<CallEdge>> callersByFunction;
   String? createdProjectName;
   String? readSourceFilePath;
   String? openedProjectDir;
@@ -952,6 +1081,16 @@ class _FakeServerClient implements ServerClient {
     required String projectDir,
     required String typeUsr,
   }) async => usagesByType[typeUsr] ?? const <TypeUsage>[];
+
+  @override
+  Future<FunctionCatalogListing> listFunctions(String projectDir) async =>
+      FunctionCatalogListing(functions: functions, callerCounts: callerCounts);
+
+  @override
+  Future<List<CallEdge>> listCallers({
+    required String projectDir,
+    required String functionUsr,
+  }) async => callersByFunction[functionUsr] ?? const <CallEdge>[];
 }
 
 class _FakePathPicker implements PathPicker {
