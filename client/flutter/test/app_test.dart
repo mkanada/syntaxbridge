@@ -41,7 +41,7 @@ void main() {
     await _skipToIde(tester);
 
     expect(find.text('Syntax Bridge workspace'), findsOneWidget);
-    expect(find.text('Explorer'), findsOneWidget);
+    expect(find.text('Source Files'), findsOneWidget);
     expect(find.text('Execution log'), findsOneWidget);
     expect(find.byTooltip('Refresh'), findsWidgets);
     expect(find.byTooltip('Capture screen'), findsOneWidget);
@@ -562,10 +562,10 @@ void main() {
     await tester.pumpAndSettle();
     await _skipToIde(tester);
 
-    expect(find.text('Explorer'), findsOneWidget);
+    expect(find.text('Source Files'), findsOneWidget);
     expect(find.text('Execution log'), findsOneWidget);
     expect(
-      tester.getTopLeft(find.text('Explorer')).dx,
+      tester.getTopLeft(find.text('Source Files')).dx,
       lessThan(tester.getTopLeft(find.text('Execution log')).dx),
     );
 
@@ -591,16 +591,16 @@ void main() {
 
     expect(
       tester.getTopLeft(find.text('Execution log')).dy,
-      greaterThan(tester.getTopLeft(find.text('Explorer')).dy),
+      greaterThan(tester.getTopLeft(find.text('Source Files')).dy),
     );
 
-    await tester.tap(find.byTooltip('Dock Explorer panel'));
+    await tester.tap(find.byTooltip('Dock Source Files panel'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Dock right').last);
     await tester.pumpAndSettle();
 
     expect(
-      tester.getTopLeft(find.text('Explorer')).dx,
+      tester.getTopLeft(find.text('Source Files')).dx,
       greaterThan(tester.getTopLeft(find.text('Syntax Bridge workspace')).dx),
     );
   });
@@ -623,17 +623,17 @@ void main() {
       await tester.pumpAndSettle();
       await _skipToIde(tester);
 
-      await tester.tap(find.byTooltip('Dock Explorer panel'));
+      await tester.tap(find.byTooltip('Dock Source Files panel'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('Dock center').last);
       await tester.pumpAndSettle();
 
       // Center-docked, split side by side with the main workspace content —
       // not overlaid or replaced.
-      expect(find.text('Explorer'), findsOneWidget);
+      expect(find.text('Source Files'), findsOneWidget);
       expect(find.text('Syntax Bridge workspace'), findsOneWidget);
       expect(
-        tester.getTopLeft(find.text('Explorer')).dx,
+        tester.getTopLeft(find.text('Source Files')).dx,
         greaterThan(tester.getTopLeft(find.text('Syntax Bridge workspace')).dx),
       );
 
@@ -644,12 +644,12 @@ void main() {
 
       // Two panels sharing the center dock still both show at once: it's a
       // split, not a tab group hiding one behind the other.
-      expect(find.text('Explorer'), findsOneWidget);
+      expect(find.text('Source Files'), findsOneWidget);
       expect(find.text('Execution log'), findsOneWidget);
       expect(find.text('Syntax Bridge workspace'), findsOneWidget);
       expect(
         tester.getTopLeft(find.text('Execution log')).dx,
-        greaterThan(tester.getTopLeft(find.text('Explorer')).dx),
+        greaterThan(tester.getTopLeft(find.text('Source Files')).dx),
       );
     },
   );
@@ -746,7 +746,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(fakeClient.openedProjectDir, '/tmp/projects/counter');
-    expect(find.text('Explorer'), findsOneWidget);
+    expect(find.text('Source Files'), findsOneWidget);
     expect(find.text('input-source/fixture/main.cpp'), findsOneWidget);
   });
 
@@ -840,7 +840,7 @@ void main() {
       '/home/user/syntax-bridge-projects/verovio',
     );
     expect(find.text(_importDialogPrompt), findsNothing);
-    expect(find.text('Explorer'), findsOneWidget);
+    expect(find.text('Source Files'), findsOneWidget);
   });
 
   testWidgets('keeps the import dialog open and shows the error on failure', (

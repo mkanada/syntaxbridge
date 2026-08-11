@@ -19,8 +19,9 @@ class SourceFileViewer extends StatefulWidget {
 
   /// A line range to scroll into view and highlight once [content] loads,
   /// 1-indexed and inclusive. `null` leaves the viewer at the top with
-  /// nothing highlighted, e.g. when opening a file from the Explorer rather
-  /// than from a navigator that points at a specific declaration.
+  /// nothing highlighted, e.g. when opening a file from the Source Files
+  /// panel rather than from a navigator that points at a specific
+  /// declaration.
   final int? highlightStartLine;
   final int? highlightEndLine;
 

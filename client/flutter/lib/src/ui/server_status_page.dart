@@ -5,6 +5,7 @@ import '../logging/cli_log.dart';
 import '../project/project_error_message.dart';
 import '../project/project_models.dart';
 import '../server/server_client.dart';
+import 'accordion_panel_group.dart';
 import 'callers_view.dart';
 import 'dockable_panel.dart';
 import 'execution_log.dart';
@@ -455,6 +456,7 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
                         descriptors,
                         DockSide.left,
                         constraints.maxWidth,
+                        accordion: true,
                       ),
                       rightPanels: _panelsFor(
                         context,
@@ -502,7 +504,7 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     return [
       PanelDescriptor(
         id: 'explorer',
-        title: 'Explorer',
+        title: 'Source Files',
         icon: Icons.folder_open_outlined,
         defaultSide: DockSide.left,
         builder: (context) => SourceFilesView(
@@ -705,13 +707,17 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
   /// share a [TabbedPanelGroup] so each keeps full height instead of
   /// splitting it. The center side passes `groupAsTabs: false` instead: its
   /// panels split side by side (the center split), so each one always gets
-  /// its own standalone frame rather than being hidden behind a tab.
+  /// its own standalone frame rather than being hidden behind a tab. The
+  /// left side passes [accordion] instead: its panels become collapsible
+  /// sections of one [AccordionPanelGroup], headers all visible at once,
+  /// each opening to show its content on click.
   List<Widget> _panelsFor(
     BuildContext context,
     List<PanelDescriptor> descriptors,
     DockSide side,
     double screenWidth, {
     bool groupAsTabs = true,
+    bool accordion = false,
   }) {
     final openOnSide = [
       for (final descriptor in descriptors)
@@ -726,6 +732,28 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
 
     final compact = screenWidth < 980;
     final displaySide = compact ? DockSide.top : side;
+
+    if (accordion) {
+      return [
+        _ConstrainedDockPanel(
+          side: displaySide,
+          child: AccordionPanelGroup(
+            items: [
+              for (final descriptor in openOnSide)
+                AccordionItem(
+                  id: descriptor.id,
+                  title: descriptor.title,
+                  icon: descriptor.icon,
+                  side: _panelSides[descriptor.id] ?? descriptor.defaultSide,
+                  onClose: () => _closePanel(descriptor.id),
+                  onDockSide: (newSide) => _dockPanel(descriptor.id, newSide),
+                  child: descriptor.builder(context),
+                ),
+            ],
+          ),
+        ),
+      ];
+    }
 
     if (!groupAsTabs || openOnSide.length == 1) {
       return [
