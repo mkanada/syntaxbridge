@@ -27,7 +27,7 @@ verificáveis, e não como intenções.
 | US-2 | Lista de arquivos fonte e leitura de conteúdo | pronto | US-1 |
 | US-3 | Catálogo de tipos do projeto | pronto | US-2 |
 | US-4 | Usos de cada tipo e navegação | pronto | US-3 |
-| US-5 | Funções, métodos e macros, e seus usos | parcial | US-3 |
+| US-5 | Funções, métodos e macros, e seus usos | pronto | US-3 |
 | US-6 | Isolamento e caracterização comportamental | planejado | US-5 |
 | US-7 | Mapeamento de tipos C++ → Dart | planejado | US-4, US-5 |
 | US-8 | Geração do código Dart | planejado | US-7 |
@@ -43,6 +43,11 @@ respectivamente, e removidos do repositório.
 `docs/plans/ui-lists.md` é o complemento de interface: enquanto este documento
 diz *o que* o usuário consegue fazer em cada passo, aquele diz *onde* cada lista
 aparece na UI e o que a interface atual precisa mudar para sustentá-la.
+
+`docs/plans/conversao-guiada-por-exemplos.md` é o complemento de execução: este
+documento diz *o que* cada passo entrega, aquele propõe *em que ordem*
+construir US-7 a US-10 — atravessando o produto de ponta a ponta com exemplos
+C++ → Dart mínimos e engrossando esse caminho um degrau por vez.
 
 ---
 
@@ -339,8 +344,9 @@ Tabelas `type_declarations` e `type_dependencies` no `project.db`.
   macros" à parte dos tipos nomeados. Builtins do compilador (`__STDC__` etc.)
   são descartados no catálogo. **Ainda falta:** macro de compilação
   condicional (`#ifdef`/`#if` fora de guardas de header) não tem representação
-  própria — hoje cai em `AnnotationMacro` — e o destino de cada subtipo em
-  Dart (US-7) ainda não foi definido.
+  própria — hoje cai em `AnnotationMacro`. Decisão: não abordado agora, ver
+  "Preprocessing record de macros" nas observações transversais. O destino de
+  cada subtipo em Dart (US-7) ainda não foi definido.
 - O grafo de dependências (`TypeDependency`) já implementado não estava
   previsto no plano original e é mais valioso do que a lista: é ele que dá
   ordem topológica de geração em US-8 e fecho transitivo em US-6.
@@ -475,7 +481,8 @@ O *scan* é feito antes, de modo que a navegação seja imediata.
   na extração de usos (`TypeUsageKind` não tem variante para elas), porque
   correlacioná-las depende do *preprocessing record*, que este passe não
   consulta. Ficam de fora até esse trabalho ser feito, não apenas com menos
-  precisão.
+  precisão. Decisão: não abordado agora, ver "Preprocessing record de macros"
+  nas observações transversais.
 - **Segue em aberto: usos dentro de código não compilado.** Continua
   verdadeiro e sem solução — `#ifdef` desligado é invisível ao `libclang`.
 - **Resolvido: cancelamento (critério 7).** Progresso já era relatado de
@@ -568,37 +575,48 @@ O *scan* é feito antes, de modo que a navegação seja imediata.
 
 ## US-5 — Funções, métodos e macros, e seus usos
 
-**Status:** parcial — catalogação de funções/métodos/construtores/
-destrutores/macros-função, grafo de chamadas estático (com despacho dinâmico e
-chamadas não resolvíveis marcados) e navegação definição↔chamadores existem e
-são testados; herança múltipla, sobrecarga de operadores e a política para
-`inline`/`constexpr`/`template`/membros gerados pelo compilador seguem em
-aberto (ver abaixo) · **Depende de:** US-3 ·
-**Implementação:** `crates/server/src/function_catalog.rs`,
+**Status:** pronto — catalogação de funções/métodos/construtores/destrutores/
+macros-função/templates, grafo de chamadas estático (com despacho dinâmico,
+chamadas não resolvíveis e herança múltipla marcados) e navegação
+definição↔chamadores nas duas direções existem e são testados. Seguem
+deliberadamente em aberto, sem bloquear os próximos passos: incrementalidade
+(mesma lacuna de US-3/US-4) e macros no grafo de chamadas (decisão explícita
+de não abordar agora — ver "Preprocessing record de macros" nas observações
+transversais) · **Depende de:** US-3 ·
+**Implementação:** `crates/server/src/function_catalog.rs`
+(`FunctionDeclarationKind::FunctionTemplate`, `overridden_usrs_of`,
+`parameter_list` via *child-visiting*, resolução de chamada a template via
+`clang_getSpecializedCursorTemplate`),
 `crates/server/src/persistence/project_store.rs`
 (tabelas `function_declarations`/`call_edges`,
 `replace_function_declarations`/`list_function_declarations`,
-`replace_call_edges`/`list_callers_for`/`call_counts`),
+`replace_call_edges`/`list_callers_for`/`list_calls_in_file`/`call_counts`,
+coluna `overridden_usrs_json`, migração `migrate_function_columns`),
 `crates/server/src/project_service.rs` (`FunctionCatalogListing`,
-`list_functions`, `list_callers`, `CreationProgress::function_catalog`),
+`list_functions`, `list_callers`, `list_calls_in_file`,
+`CreationProgress::function_catalog`),
 `crates/server/src/jobs.rs` (`JobPhase::CatalogingFunctions`, `derive_phase`),
 `crates/server/src/server.rs` (`GET /projects/functions`,
-`GET /projects/functions/callers`, `function_catalog` em
-`GET /projects/jobs/{job_id}`),
+`GET /projects/functions/callers`, `GET /projects/functions/calls-in-file`,
+`function_catalog` em `GET /projects/jobs/{job_id}`),
 `client/flutter/lib/src/project/project_models.dart`
-(`FunctionDeclaration`, `FunctionDeclarationKind`, `CallResolution`,
-`CallEdge`, `FunctionCatalogListing`, `ProjectCreationJobPhase.catalogingFunctions`),
+(`FunctionDeclaration.overriddenUsrs`, `FunctionDeclarationKind.functionTemplate`,
+`CallResolution`, `CallEdge`, `FunctionCatalogListing`,
+`ProjectCreationJobPhase.catalogingFunctions`),
 `client/flutter/lib/src/server/server_client.dart`/`http_server_client.dart`
-(`listFunctions`, `listCallers`),
+(`listFunctions`, `listCallers`, `listCallsInFile`),
 `client/flutter/lib/src/ui/functions_view.dart` (painel "Functions"),
 `client/flutter/lib/src/ui/callers_view.dart` (painel "Callers"),
-`client/flutter/lib/src/ui/server_status_page.dart` (fiação entre os dois,
-mesmo padrão de US-4) ·
+`client/flutter/lib/src/ui/source_file_viewer.dart` (`calls`/`onCallSelected`,
+linha clicável quando há chamada registrada),
+`client/flutter/lib/src/ui/server_status_page.dart` (`_selectCallTarget`,
+`_loadCallsInFile`, fiação entre os painéis) ·
 **Testes:** `crates/server/tests/function_catalog.rs`,
 `crates/server/tests/function_catalog_route.rs`, testes inline em
 `persistence/project_store.rs` e `jobs.rs`,
 `client/flutter/test/functions_view_test.dart`,
 `client/flutter/test/callers_view_test.dart`,
+`client/flutter/test/source_file_viewer_test.dart`,
 `client/flutter/test/app_test.dart`
 
 ### Objetivo do usuário
@@ -660,29 +678,64 @@ com a mesma navegação imediata de US-4, indo da definição ao uso e vice-vers
   explícita "ver todos os métodos herdados desta classe, redefinidos ou não"
   (mencionada no texto original) — hoje o usuário só vê o método listado sob a
   classe base.
-- **Resolvido (parcial): definição ↔ chamadores (critério 5).** A direção
-  "da definição, listar chamadores" está completa: `ProjectStore::
-  list_callers_for` responde a partir do índice persistido, sem reparsear, e
-  `CallersView` deixa clicar num chamador para abrir o arquivo na linha exata
-  da chamada. A leitura literal da segunda metade — "de uma chamada é possível
-  ir à definição", isto é, clicar numa chamada *qualquer dentro do código
-  fonte já aberto* e pular para a definição do que ela chama — **não está
-  implementada**: `SourceFileViewer` não tem hoje nenhum tratamento de clique
-  sobre uma `CallExpr`. O que existe é o inverso mais útil na prática (uma
-  lista de todas as chamadas de uma função, cada uma navegável), não o
-  "go to definition" clássico de IDE a partir de um ponto arbitrário do texto.
-- **Ainda em aberto: herança múltipla.** `first_overridden_usr` só grava o
-  primeiro cursor de `clang_getOverriddenCursors` quando um método sobrescreve
-  métodos de mais de uma base — a "resolução de herança de classes" continuada
-  como subprojeto no texto original (métodos virtuais puros, sobrecargas *entre
-  bases*, `override` com múltiplos ancestrais) segue sem tratamento dedicado.
-- **Ainda em aberto: sobrecarga de operadores, `inline`, `constexpr`,
-  `template` e membros gerados pelo compilador.** Nenhuma política explícita
-  foi definida para essas categorias; o comportamento atual (aparecem no
-  catálogo apenas se e quando `libclang` materializa um cursor de definição
-  visível, o que variou entre casos observados nos testes) não é uma decisão
-  deliberada, só o efeito colateral de reaproveitar a mesma regra de
-  `clang_isCursorDefinition` usada para os demais casos.
+- **Resolvido: definição ↔ chamadores (critério 5), nas duas direções.** A
+  direção "da definição, listar chamadores" já estava completa
+  (`ProjectStore::list_callers_for`/`CallersView`). A direção inversa — "de
+  uma chamada, já visível no código fonte aberto, ir à definição" — ganhou
+  `ProjectStore::list_calls_in_file` (espelha `list_callers_for`, mas
+  filtrando por `file` em vez de `callee_usr`) e a rota
+  `GET /projects/functions/calls-in-file`; `SourceFileViewer` recebe os
+  `CallEdge`s do arquivo aberto e torna clicável qualquer linha com uma
+  chamada registrada, chamando `_selectCallTarget` (em
+  `server_status_page.dart`), que resolve o `callee_usr` no catálogo já
+  carregado e reusa `_selectFunction` para navegar. **Simplificação
+  deliberada:** a resolução não é precisa por coluna — `SourceFileViewer` não
+  tem layout por token para *hit-test*, então uma linha com mais de uma
+  chamada resolve para a primeira (por coluna), não para a mais próxima do
+  clique. Prefere-se levar a *alguma* chamada da linha a não levar a
+  nenhuma.
+- **Resolvido: herança múltipla.** `first_overridden_usr` (que só guardava o
+  primeiro cursor de `clang_getOverriddenCursors`) virou `overridden_usrs_of`,
+  devolvendo todos os cursores sobrescritos — `FunctionDeclaration.overrides_usr:
+  Option<String>` virou `overridden_usrs: Vec<String>`, persistido como
+  `overridden_usrs_json` (mesmo padrão de `arguments_json` em
+  `compilation_units`, já que herança múltipla é a única situação em que a
+  lista passa de um elemento). Provado por
+  `extract_function_catalog_records_every_overridden_base_under_multiple_inheritance`,
+  com um `Square` que sobrescreve `area()` de duas bases não relacionadas
+  (`Drawable`/`Measurable`).
+- **Resolvido: sobrecarga de operadores, `inline`, `constexpr`, `template` e
+  membros gerados pelo compilador.** Testado empiricamente com `libclang`
+  (não presumido), a política ficou:
+  - **Operadores, `inline`, `constexpr`:** já funcionavam — mesmo cursor
+    `CXCursor_FunctionDecl`/`CXXMethod` que qualquer função/método, sem
+    tratamento especial algum. O que parecia "não decidido" já era correto,
+    só não estava confirmado.
+  - **Templates (função e método):** eram invisíveis — o cursor
+    `CXCursor_FunctionTemplate` não estava em `function_declaration_kind_for`.
+    Ganharam `FunctionDeclarationKind::FunctionTemplate`, catalogando a
+    declaração *primária* do template (não cada instanciação — monomorfização
+    é decisão de US-7, listada lá). Descoberto no processo: `parameter_list`
+    usava `clang_Cursor_getNumArguments`/`clang_Cursor_getArgument`, que não
+    suportam `CXCursor_FunctionTemplate` (devolvem lista vazia
+    silenciosamente) — reescrita para percorrer os filhos do cursor
+    coletando `CXCursor_ParmDecl`, o que também corrigiu templates. E uma
+    chamada a um template resolve, via `clang_getCursorReferenced`, para a
+    *instanciação implícita*, cujo `usr` difere do da declaração primária que
+    o catálogo guarda — `record_call` agora usa
+    `clang_getSpecializedCursorTemplate` para mapear de volta à declaração
+    primária, senão os chamadores de um template nunca apareceriam sob sua
+    própria entrada no catálogo. Provado por
+    `extract_function_catalog_lists_function_and_method_templates_by_their_primary_declaration`.
+  - **Membros gerados pelo compilador** (ex.: construtor de cópia implícito):
+    confirmado empiricamente que `libclang` **não emite cursor algum** para
+    eles na travessia por filhos usada aqui, mesmo quando o membro é
+    efetivamente usado (ODR-used) — não é "aparecem às vezes, dependendo do
+    caso" como o texto anterior especulava; é "nunca aparecem, com esta API".
+    Não há o que catalogar sem trocar de abordagem (ex.: forçar
+    instanciação por outro mecanismo do `libclang`), o que fica fora de
+    escopo — repetir esse achado aqui evita que um agente futuro gaste tempo
+    reinvestigando o que já foi checado.
 - **Ainda em aberto: incrementalidade.** Mesma lacuna de US-3/US-4 — a
   passada inteira é refeita a cada criação de projeto.
 - **Ainda em aberto: macros não geram uso/chamada.** Uma macro-função aparece
@@ -690,7 +743,8 @@ com a mesma navegação imediata de US-4, indo da definição ao uso e vice-vers
   no grafo de chamadas — a expansão acontece no pré-processador, antes da AST
   que `visit_call_site` percorre, e correlacioná-la exigiria consultar o
   *preprocessing record* (mesma lacuna que US-4 já registrava para usos de
-  tipo em macros).
+  tipo em macros). Decisão: não abordado agora, ver "Preprocessing record de
+  macros" nas observações transversais.
 
 ### Critérios de aceitação (testáveis)
 
@@ -708,12 +762,19 @@ com a mesma navegação imediata de US-4, indo da definição ao uso e vice-vers
 4. **Satisfeito:** um método herdado e não redefinido é atribuído à classe que
    o define (`Circle` não redefine `perimeter`, que aparece só sob `Shape`) —
    mesmo teste do critério 1.
-5. **Satisfeito (parcial):** de uma função é possível listar seus chamadores
+5. **Satisfeito:** de uma função é possível listar seus chamadores
    (`list_callers_for`/`GET /projects/functions/callers`/`CallersView`), e
-   clicar num chamador abre o arquivo na linha exata da chamada. A leitura
-   inversa literal — de um ponto arbitrário do código fonte, ir direto à
-   definição do que está sendo chamado ali — não está implementada (ver
-   observação acima).
+   clicar num chamador abre o arquivo na linha exata da chamada. Na direção
+   inversa, clicar numa chamada já visível num arquivo fonte aberto pula
+   para a definição do que ela chama
+   (`list_calls_in_file`/`GET /projects/functions/calls-in-file`/
+   `SourceFileViewer.onCallSelected`) — com a simplificação de coluna
+   descrita na observação acima quando há mais de uma chamada na mesma
+   linha. Provado por
+   `calls_in_file_route_returns_the_persisted_calls_for_a_file`, pelos
+   testes de `SourceFileViewer` em `source_file_viewer_test.dart`, e
+   ponta a ponta por `app_test.dart` (clicar a chamada de `area` dentro de
+   `describe` abre `shapes.h` e popula o painel "Callers" para `area`).
 6. **Satisfeito:** uma chamada não resolvível estaticamente (aqui, através de
    ponteiro para função) aparece marcada como tal
    (`CallResolution::Unresolved`), não omitida — mesmo teste do critério 3
@@ -730,10 +791,20 @@ com a mesma navegação imediata de US-4, indo da definição ao uso e vice-vers
 - **Satisfeito:** os números esperados de chamadores são pequenos e escritos à
   mão no teste (um chamador para `add(int, int)`, um para `area`, uma chamada
   não resolvível dentro de `apply`).
+- **Satisfeito:** herança múltipla e templates usam fixtures próprios,
+  separados de `FUNCTIONS_CPP`, para não perturbar as contagens exatas que
+  esse primeiro já fixa — mesma razão pela qual US-3 mantém o teste de
+  homônimos em namespace separado do fixture combinado.
 - Rotas de leitura (`GET /projects/functions`, `GET /projects/functions/
-  callers`) são testadas sem executar `libclang`, populando o banco
-  diretamente — mesmo padrão de `type_catalog_route.rs`
-  (`crates/server/tests/function_catalog_route.rs`).
+  callers`, `GET /projects/functions/calls-in-file`) são testadas sem
+  executar `libclang`, populando o banco diretamente — mesmo padrão de
+  `type_catalog_route.rs` (`crates/server/tests/function_catalog_route.rs`).
+- **Satisfeito:** testes de widget de `SourceFileViewer` populam `calls`
+  diretamente (sem servidor real) para provar o clique-para-navegar de forma
+  determinística, isolada da complexidade de acordeões/painéis dockados da
+  página inteira — que por sua vez exigem `tester.ensureVisible` antes do
+  `tap` nos testes de ponta a ponta em `app_test.dart`, já que um painel
+  dockado ao centro pode empurrar a linha clicada para fora da área visível.
 
 ---
 
@@ -945,7 +1016,9 @@ apontando de volta para o C++ de origem.
 ### Observações e decisões em aberto
 
 - Ferramentas: `dart analyze` e `dart format` sobre o pacote gerado. O Dart SDK
-  ainda não está no manifesto Flatpak.
+  **já está** no manifesto Flatpak (módulo `dart-sdk`, versão 3.12.2 com
+  `sha256` fixado, em `build-aux/flatpak/dev.syntax_bridge.SyntaxBridge.json`),
+  então este passo é testável no ambiente de destino desde já.
 - Diagnósticos do analisador precisam ser traduzidos para a origem C++ pela
   rastreabilidade de US-8; um erro Dart sem essa correlação é inútil para o
   usuário.
@@ -961,7 +1034,10 @@ apontando de volta para o C++ de origem.
 ### Condições de testabilidade
 
 - Dart SDK disponível no ambiente de teste — e, para valer, dentro do Flatpak.
+  Satisfeita: o manifesto instala o SDK em `/app/lib/dart-sdk` e expõe
+  `/app/bin/dart`.
 - Versão do SDK fixada, senão a saída do analisador varia entre máquinas.
+  Satisfeita: 3.12.2, por URL de release com `sha256`.
 
 ---
 
@@ -1210,6 +1286,26 @@ não percebida, mas soma ao mesmo risco de escala desta seção — um projeto q
 já era lento com 2 passadas fica mais lento ainda com 3, e a paralelização por
 núcleo é a mesma mitigação parcial, com o mesmo limite.
 
+### Preprocessing record de macros — decisão: não abordar agora
+
+US-3, US-4 e US-5 documentam, cada um separadamente, uma lacuna com uma única
+causa raiz: o `libclang` separa preprocessamento (onde macros vivem) da AST
+(onde os três passes atuais operam), e nenhum deles consulta o
+*preprocessing record*. Concretamente:
+
+- US-3: macro de compilação condicional (`#ifdef`/`#if` fora de guarda de
+  header) não tem representação própria, cai genericamente em
+  `AnnotationMacro`.
+- US-4: uso de tipo dentro de uma expansão de macro não gera `TypeUsage`.
+- US-5: chamada dentro de uma expansão de macro-função não gera aresta no
+  grafo de chamadas.
+
+**Decisão:** essa lacuna não será abordada agora. Resolvê-la de uma vez
+(consultar o *preprocessing record*) destravaria as três simultaneamente, mas
+nenhuma delas bloqueia os próximos passos do roadmap (US-6 em diante). Fica
+registrada aqui como trabalho futuro, não como pendência ativa — os três
+pontos abaixo remetem a esta seção em vez de repetir a decisão.
+
 ### Erros e diagnósticos
 
 Não há política de como falhas de parse, de build, de KLEE ou do analisador Dart
@@ -1225,10 +1321,25 @@ a rede e a disco existe, e o que é recusado.
 ### Ambiente de teste
 
 O `AGENTS.md` exige rodar os testes dentro do Flatpak. Hoje o manifesto oferece
-`rust-stable` e `llvm21`; **KLEE, GoogleTest e Dart SDK não estão nele**. Os
-passos US-6, US-9, US-10 e US-11 não são testáveis no ambiente de destino
-enquanto isso não mudar — essa é a dependência de infraestrutura mais
-importante do roadmap e não aparecia em nenhum plano.
+`rust-stable`, `llvm21` e o **Dart SDK 3.12.2** (módulo `dart-sdk`, instalado em
+`/app/lib/dart-sdk` com `/app/bin/dart` no caminho). **KLEE e GoogleTest
+continuam fora dele.**
+
+Consequência por passo:
+
+- **US-9 e US-11 são testáveis no ambiente de destino desde já** — o que
+  precisavam era o Dart SDK, e ele está lá, com versão fixada por `sha256`.
+- **US-6 continua bloqueado**: KLEE (para descobrir entradas que cobrem todos os
+  ramos) e GoogleTest (para materializar e executar os casos) não têm
+  substituto no manifesto atual.
+- **US-10 herda o bloqueio de US-6 apenas para o oráculo**, não para a execução:
+  rodar os testes Dart gerados já é possível. Um oráculo escrito à mão, em vez
+  de gerado por KLEE, tiraria US-10 da fila de espera de US-6 — é exatamente o
+  que `docs/plans/conversao-guiada-por-exemplos.md` propõe.
+
+Ou seja: a dependência de infraestrutura mais importante do roadmap encolheu de
+"três ferramentas ausentes bloqueando quatro passos" para "duas ferramentas
+ausentes bloqueando um passo", e esse passo tem contorno conhecido.
 
 ### Higiene do repositório
 
