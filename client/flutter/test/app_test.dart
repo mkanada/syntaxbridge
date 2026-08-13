@@ -465,6 +465,94 @@ void main() {
     },
   );
 
+  testWidgets('navigates from a call in an open source file to its definition '
+      '(US-5 criterion 5)', (tester) async {
+    const describeUsr = 'c:@F@describe#';
+    const areaUsr = 'c:@N@geometry@S@Shape@F@area#1#';
+    const mainCppPath = '/tmp/projects/counter/input-source/fixture/main.cpp';
+    const shapesHPath = '/tmp/projects/counter/input-source/fixture/shapes.h';
+    final callToArea = CallEdge(
+      callerUsr: describeUsr,
+      resolution: const CallResolution.resolved(
+        calleeUsr: areaUsr,
+        isDynamicDispatch: true,
+      ),
+      file: mainCppPath,
+      line: 2,
+      column: 19,
+    );
+
+    final fakeClient = _FakeServerClient(
+      const ServerStatus(service: 'syntax-bridge-server', status: 'ok'),
+      project: const CreatedProject(
+        name: 'counter',
+        projectDir: '/tmp/projects/counter',
+        inputSourceDir: '/tmp/projects/counter/input-source',
+        compilationUnits: [],
+        sourceFiles: [
+          SourceFile(path: mainCppPath, kind: SourceFileKind.translationUnit),
+          SourceFile(path: shapesHPath, kind: SourceFileKind.header),
+        ],
+      ),
+      functions: const [
+        FunctionDeclaration(
+          name: 'describe',
+          kind: FunctionDeclarationKind.freeFunction,
+          signature: 'double describe(const Shape &shape)',
+          file: mainCppPath,
+          line: 1,
+          column: 8,
+          usr: describeUsr,
+        ),
+        FunctionDeclaration(
+          name: 'area',
+          kind: FunctionDeclarationKind.method,
+          namespace: 'geometry',
+          signature: 'double geometry::Shape::area() const',
+          file: shapesHPath,
+          line: 4,
+          column: 19,
+          usr: areaUsr,
+          isVirtual: true,
+        ),
+      ],
+      callerCounts: const {areaUsr: 1},
+      callersByFunction: {
+        areaUsr: [callToArea],
+      },
+      callsByFile: {
+        mainCppPath: [callToArea],
+      },
+      sourceFileContent:
+          'double describe(const Shape& shape) {\n'
+          '    return shape.area();\n'
+          '}\n',
+    );
+
+    await tester.pumpWidget(SyntaxBridgeApp(serverClient: fakeClient));
+    await tester.pumpAndSettle();
+    await _skipToIde(tester);
+
+    await tester.tap(find.text('Functions'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('describe'));
+    await tester.pumpAndSettle();
+
+    // Selecting `describe` opens its own (empty) Callers panel first —
+    // the baseline this test's tap needs to move away from.
+    expect(find.text('0 callers of describe'), findsOneWidget);
+    expect(fakeClient.readSourceFilePath, mainCppPath);
+
+    final callLine = find.text('    return shape.area();');
+    await tester.ensureVisible(callLine);
+    await tester.pumpAndSettle();
+    await tester.tap(callLine);
+    await tester.pumpAndSettle();
+
+    expect(fakeClient.readSourceFilePath, shapesHPath);
+    expect(find.text('1 caller of geometry::area'), findsOneWidget);
+  });
+
   testWidgets('opens a source file and displays its content on click', (
     tester,
   ) async {
@@ -975,6 +1063,7 @@ class _FakeServerClient implements ServerClient {
     this.functions = const <FunctionDeclaration>[],
     this.callerCounts = const <String, int>{},
     this.callersByFunction = const <String, List<CallEdge>>{},
+    this.callsByFile = const <String, List<CallEdge>>{},
   });
 
   final ServerStatus status;
@@ -990,6 +1079,7 @@ class _FakeServerClient implements ServerClient {
   final List<FunctionDeclaration> functions;
   final Map<String, int> callerCounts;
   final Map<String, List<CallEdge>> callersByFunction;
+  final Map<String, List<CallEdge>> callsByFile;
   String? createdProjectName;
   String? readSourceFilePath;
   String? openedProjectDir;
@@ -1091,6 +1181,12 @@ class _FakeServerClient implements ServerClient {
     required String projectDir,
     required String functionUsr,
   }) async => callersByFunction[functionUsr] ?? const <CallEdge>[];
+
+  @override
+  Future<List<CallEdge>> listCallsInFile({
+    required String projectDir,
+    required String file,
+  }) async => callsByFile[file] ?? const <CallEdge>[];
 }
 
 class _FakePathPicker implements PathPicker {

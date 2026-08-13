@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(flutter test *)",
+      "Bash(flutter analyze *)",
+      "Bash(cargo test *)",
+      "Bash(just package-test)",
+      "Bash(cargo fmt *)",
+      "Bash(dart format *)",
+      "Bash(du -sh *)",
+      "Bash(git check-ignore *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo check *)",
+      "Bash(tar -tzf *)",
+      "Bash(tar -tf *)",
+      "Bash(just test *)"
+    ]
+  }
+}

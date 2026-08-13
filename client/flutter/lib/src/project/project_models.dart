@@ -372,7 +372,8 @@ enum FunctionDeclarationKind {
   method,
   constructor,
   destructor,
-  functionMacro;
+  functionMacro,
+  functionTemplate;
 
   static FunctionDeclarationKind fromJson(String? value) {
     return switch (value) {
@@ -381,6 +382,7 @@ enum FunctionDeclarationKind {
       'constructor' => FunctionDeclarationKind.constructor,
       'destructor' => FunctionDeclarationKind.destructor,
       'function_macro' => FunctionDeclarationKind.functionMacro,
+      'function_template' => FunctionDeclarationKind.functionTemplate,
       _ => FunctionDeclarationKind.freeFunction,
     };
   }
@@ -393,6 +395,7 @@ enum FunctionDeclarationKind {
       FunctionDeclarationKind.constructor => 'constructor',
       FunctionDeclarationKind.destructor => 'destructor',
       FunctionDeclarationKind.functionMacro => 'function macro',
+      FunctionDeclarationKind.functionTemplate => 'template',
     };
   }
 }
@@ -414,7 +417,7 @@ class FunctionDeclaration {
     this.endColumn = 0,
     this.usr = '',
     this.isVirtual = false,
-    this.overridesUsr,
+    this.overriddenUsrs = const <String>[],
   });
 
   factory FunctionDeclaration.fromJson(Map<String, Object?> json) {
@@ -431,7 +434,11 @@ class FunctionDeclaration {
       endColumn: json['end_column'] as int? ?? 0,
       usr: json['usr'] as String? ?? '',
       isVirtual: json['is_virtual'] as bool? ?? false,
-      overridesUsr: json['overrides_usr'] as String?,
+      overriddenUsrs:
+          (json['overridden_usrs'] as List<dynamic>?)
+              ?.map((entry) => entry as String)
+              .toList() ??
+          const <String>[],
     );
   }
 
@@ -451,8 +458,9 @@ class FunctionDeclaration {
   final String usr;
   final bool isVirtual;
 
-  /// `usr` of the immediate virtual method this one overrides, if any.
-  final String? overridesUsr;
+  /// `usr` of every virtual method this one overrides — more than one under
+  /// multiple inheritance, empty when it overrides nothing.
+  final List<String> overriddenUsrs;
 
   /// The function's name, qualified with its enclosing namespace when it has
   /// one, so overloads and homonyms in different scopes read as distinct

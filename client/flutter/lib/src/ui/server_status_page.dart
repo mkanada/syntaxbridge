@@ -65,6 +65,7 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
   Future<List<TypeUsage>>? _selectedTypeUsages;
   late Future<FunctionCatalogListing> _functions;
   Future<List<CallEdge>>? _selectedFunctionCallers;
+  Future<List<CallEdge>>? _selectedFileCalls;
 
   @override
   void initState() {
@@ -123,7 +124,68 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
       _selectedType = selectedType;
       _highlightStartLine = highlightStartLine;
       _highlightEndLine = highlightEndLine;
+      _selectedFileCalls = _loadCallsInFile(file.path);
     });
+  }
+
+  Future<List<CallEdge>> _loadCallsInFile(String file) async {
+    try {
+      final calls = await widget.serverClient.listCallsInFile(
+        projectDir: widget.project.projectDir,
+        file: file,
+      );
+      _addLog(
+        'Loaded ${calls.length} calls in $file',
+        level: ExecutionLogLevel.success,
+        notify: false,
+      );
+      return calls;
+    } catch (error, stackTrace) {
+      cliLog('list calls in file exception: $error');
+      cliLog('list calls in file stack: $stackTrace');
+      _addLog(
+        'Failed to load calls in $file: ${projectErrorMessage(error)}',
+        level: ExecutionLogLevel.error,
+        notify: false,
+      );
+      rethrow;
+    }
+  }
+
+  /// Jumps from a call, clicked directly in an open source file, to the
+  /// definition it targets (US-5 criterion 5's other direction — the
+  /// complement of [_selectCaller], which goes from a definition to its
+  /// callers). Looks the target up in the function catalog already loaded
+  /// in [_functions] rather than adding another round trip, since the
+  /// catalog is small enough to hold in full and this is the same list
+  /// [FunctionsView] already renders.
+  Future<void> _selectCallTarget(CallEdge call) async {
+    final calleeUsr = call.resolution.calleeUsr;
+    if (calleeUsr == null) {
+      _addLog(
+        'Cannot navigate: ${call.resolution.unresolvedReason ?? 'call target is not statically known'}',
+        level: ExecutionLogLevel.error,
+      );
+      return;
+    }
+
+    final listing = await _functions;
+    FunctionDeclaration? target;
+    for (final function in listing.functions) {
+      if (function.usr == calleeUsr) {
+        target = function;
+        break;
+      }
+    }
+    if (target == null) {
+      _addLog(
+        'Cannot navigate: definition not found in the catalog',
+        level: ExecutionLogLevel.error,
+      );
+      return;
+    }
+
+    _selectFunction(target);
   }
 
   /// Opens the file where [type] is declared and highlights its body, so
@@ -485,6 +547,8 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
                         selectedFileContent: _selectedSourceContent,
                         highlightStartLine: _highlightStartLine,
                         highlightEndLine: _highlightEndLine,
+                        selectedFileCalls: _selectedFileCalls,
+                        onCallSelected: _selectCallTarget,
                       ),
                     ),
                   );
@@ -1010,6 +1074,8 @@ class _WorkspaceCenter extends StatelessWidget {
     this.selectedFileContent,
     this.highlightStartLine,
     this.highlightEndLine,
+    this.selectedFileCalls,
+    this.onCallSelected,
   });
 
   final Future<ServerStatus> status;
@@ -1019,6 +1085,8 @@ class _WorkspaceCenter extends StatelessWidget {
   final Future<String>? selectedFileContent;
   final int? highlightStartLine;
   final int? highlightEndLine;
+  final Future<List<CallEdge>>? selectedFileCalls;
+  final ValueChanged<CallEdge>? onCallSelected;
 
   @override
   Widget build(BuildContext context) {
@@ -1034,6 +1102,8 @@ class _WorkspaceCenter extends StatelessWidget {
                 content: selectedFileContent,
                 highlightStartLine: highlightStartLine,
                 highlightEndLine: highlightEndLine,
+                calls: selectedFileCalls,
+                onCallSelected: onCallSelected,
               )
             : SingleChildScrollView(
                 padding: const EdgeInsets.all(18),

@@ -32,7 +32,7 @@ fn sample_declarations() -> Vec<FunctionDeclaration> {
             end_column: 40,
             usr: "c:@N@geometry@S@Shape@F@area#1#".to_owned(),
             is_virtual: true,
-            overrides_usr: None,
+            overridden_usrs: Vec::new(),
         },
         FunctionDeclaration {
             name: "add".to_owned(),
@@ -47,7 +47,7 @@ fn sample_declarations() -> Vec<FunctionDeclaration> {
             end_column: 1,
             usr: "c:@F@add#I#I#".to_owned(),
             is_virtual: false,
-            overrides_usr: None,
+            overridden_usrs: Vec::new(),
         },
     ]
 }
@@ -175,6 +175,48 @@ fn callers_route_returns_the_persisted_callers_for_a_function() {
     assert_eq!(callers.len(), 1, "unexpected response body: {body}");
     assert_eq!(callers[0]["caller_usr"], "c:@F@describe#");
     assert_eq!(callers[0]["resolution"]["is_dynamic_dispatch"], true);
+}
+
+#[test]
+fn calls_in_file_route_returns_the_persisted_calls_for_a_file() {
+    let workspace =
+        TempWorkspace::new("functions-calls-in-file-route").expect("create temporary workspace");
+    let project_dir = workspace.path().join("projects/counter");
+    fs::create_dir_all(&project_dir).expect("create project dir");
+
+    let mut store =
+        ProjectStore::open(&project_dir.join("project.db")).expect("open project store");
+    store
+        .replace_call_edges(&sample_calls())
+        .expect("persist call edges");
+
+    let server = SyntaxBridgeServer::bind("127.0.0.1:0")
+        .expect("bind test server")
+        .with_global_db_path(workspace.path().join("global.db"));
+    let addr = server.local_addr().expect("read server address");
+    let handle = server.spawn().expect("spawn test server");
+
+    let query = format!(
+        "/projects/functions/calls-in-file?project_dir={}&file={}",
+        percent_encode(&project_dir.display().to_string()),
+        percent_encode("/workspace/src/math.cpp"),
+    );
+    let (status, body) = http_get(addr, &query);
+    handle.shutdown().expect("stop test server");
+
+    assert!(
+        status.starts_with("HTTP/1.1 200"),
+        "unexpected response: {status} body={body}"
+    );
+
+    let json: Value = serde_json::from_str(&body).expect("parse response body");
+    let calls = json
+        .get("calls")
+        .and_then(Value::as_array)
+        .expect("response includes calls array");
+    assert_eq!(calls.len(), 1, "unexpected response body: {body}");
+    assert_eq!(calls[0]["caller_usr"], "c:@F@compute#");
+    assert_eq!(calls[0]["file"], "/workspace/src/math.cpp");
 }
 
 #[test]

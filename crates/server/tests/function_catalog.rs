@@ -347,6 +347,237 @@ fn extract_function_catalog_records_the_call_graph_with_libclang() {
     }
 }
 
+/// A diamond-shaped multiple-inheritance case: `Square` overrides `area()`
+/// from two unrelated bases (`Drawable` and `Measurable`) that happen to
+/// declare a same-signature virtual method. Both bases give `area()` a body
+/// (not `= 0`) so they get their own catalog entry too (a pure virtual has
+/// no definition and, per US-5's "sem definição, sem entrada", wouldn't be
+/// cataloged at all — that's not what this test is exercising). Kept as its
+/// own fixture, separate from `FUNCTIONS_CPP`, so this test doesn't perturb
+/// that other fixture's exact declaration counts.
+const MULTIPLE_INHERITANCE_CPP: &str = r#"
+class Drawable {
+public:
+    virtual double area() const { return 0.0; }
+    virtual ~Drawable() {}
+};
+
+class Measurable {
+public:
+    virtual double area() const { return 0.0; }
+    virtual ~Measurable() {}
+};
+
+class Square : public Drawable, public Measurable {
+public:
+    explicit Square(double side) : side_(side) {}
+    double area() const override { return side_ * side_; }
+
+private:
+    double side_;
+};
+"#;
+
+fn write_multiple_inheritance_fixture(project_root: &Path) -> CompilationUnit {
+    fs::create_dir_all(project_root).expect("create project dir");
+    let file_path = project_root.join("diamond.cpp");
+    fs::write(&file_path, MULTIPLE_INHERITANCE_CPP).expect("write diamond.cpp");
+
+    CompilationUnit {
+        directory: project_root.display().to_string(),
+        file: file_path.display().to_string(),
+        command: None,
+        arguments: vec!["clang++".to_owned(), "-std=c++17".to_owned()],
+    }
+}
+
+/// US-5's open item on multiple inheritance: `Square::area` overrides
+/// same-signature virtuals from two unrelated bases, and both must be
+/// recorded — not just the first `clang_getOverriddenCursors` happens to
+/// return.
+#[test]
+fn extract_function_catalog_records_every_overridden_base_under_multiple_inheritance() {
+    let workspace = TempWorkspace::new("function-catalog-multiple-inheritance")
+        .expect("create temporary workspace");
+    let project_root = workspace.path().join("project");
+    let unit = write_multiple_inheritance_fixture(&project_root);
+
+    let catalog = function_catalog::extract_function_catalog(
+        std::slice::from_ref(&unit),
+        &project_root,
+        None,
+    )
+    .expect("extract function catalog");
+
+    let area_declarations: Vec<_> = catalog
+        .declarations
+        .iter()
+        .filter(|declaration| declaration.name == "area")
+        .collect();
+    assert_eq!(
+        area_declarations.len(),
+        3,
+        "expected Drawable::area, Measurable::area and Square::area as three distinct \
+         declarations: {area_declarations:#?}"
+    );
+
+    // Exactly one of the three (Square's) overrides anything; the other two
+    // are each other's bases, and override nothing themselves.
+    let mut overriding: Vec<_> = area_declarations
+        .iter()
+        .filter(|declaration| !declaration.overridden_usrs.is_empty())
+        .collect();
+    assert_eq!(
+        overriding.len(),
+        1,
+        "expected exactly one area() declaration (Square's) to override anything: \
+         {area_declarations:#?}"
+    );
+    let square_area = overriding.remove(0);
+
+    assert_eq!(
+        square_area.overridden_usrs.len(),
+        2,
+        "expected Square::area to override both base area() methods: {square_area:#?}"
+    );
+
+    let base_usrs: Vec<&str> = area_declarations
+        .iter()
+        .filter(|declaration| declaration.usr != square_area.usr)
+        .map(|declaration| declaration.usr.as_str())
+        .collect();
+    assert_eq!(base_usrs.len(), 2);
+    for base_usr in base_usrs {
+        assert!(
+            square_area
+                .overridden_usrs
+                .iter()
+                .any(|usr| usr == base_usr),
+            "expected {base_usr} among Square::area's overridden usrs: {:#?}",
+            square_area.overridden_usrs
+        );
+    }
+}
+
+/// A free function template and a method template — US-5's open item on
+/// templates: both used to be invisible to the catalog (their cursor kind,
+/// `CXCursor_FunctionTemplate`, wasn't in `function_declaration_kind_for`'s
+/// match). `use_templates` calls both, once each, so the fixture also
+/// exercises that a call to a template resolves back to the primary
+/// template declaration, not to an untracked implicit instantiation.
+const TEMPLATES_CPP: &str = r#"
+template <typename T>
+T templated(T a, T b) {
+    return a + b;
+}
+
+struct Box {
+    template <typename T>
+    T identity(T value) { return value; }
+};
+
+int use_templates() {
+    int sum = templated(1, 2);
+    Box box;
+    int same = box.identity(3);
+    return sum + same;
+}
+"#;
+
+fn write_templates_fixture(project_root: &Path) -> CompilationUnit {
+    fs::create_dir_all(project_root).expect("create project dir");
+    let file_path = project_root.join("templates.cpp");
+    fs::write(&file_path, TEMPLATES_CPP).expect("write templates.cpp");
+
+    CompilationUnit {
+        directory: project_root.display().to_string(),
+        file: file_path.display().to_string(),
+        command: None,
+        arguments: vec!["clang++".to_owned(), "-std=c++17".to_owned()],
+    }
+}
+
+#[test]
+fn extract_function_catalog_lists_function_and_method_templates_by_their_primary_declaration() {
+    let workspace =
+        TempWorkspace::new("function-catalog-templates").expect("create temporary workspace");
+    let project_root = workspace.path().join("project");
+    let unit = write_templates_fixture(&project_root);
+
+    let catalog = function_catalog::extract_function_catalog(
+        std::slice::from_ref(&unit),
+        &project_root,
+        None,
+    )
+    .expect("extract function catalog");
+
+    let templated = catalog
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "templated")
+        .unwrap_or_else(|| {
+            panic!(
+                "expected the `templated` function template in the catalog: {:#?}",
+                catalog.declarations
+            )
+        });
+    assert_eq!(templated.kind, FunctionDeclarationKind::FunctionTemplate);
+    assert_eq!(templated.owning_class_usr, None);
+    assert_eq!(templated.signature, "T templated(T a, T b)");
+
+    let identity = catalog
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "identity")
+        .unwrap_or_else(|| {
+            panic!(
+                "expected the `Box::identity` method template in the catalog: {:#?}",
+                catalog.declarations
+            )
+        });
+    assert_eq!(identity.kind, FunctionDeclarationKind::FunctionTemplate);
+    assert!(
+        identity.owning_class_usr.is_some(),
+        "expected identity's owning class to be Box: {identity:#?}"
+    );
+    assert_eq!(identity.signature, "T Box::identity(T value)");
+
+    // Both templates are called exactly once from `use_templates` — the
+    // call must resolve back to the primary template's own usr, the one
+    // the catalog entries above carry, not to an untracked implicit
+    // instantiation with a different usr.
+    let use_templates_usr = catalog
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "use_templates")
+        .expect("expected use_templates in the catalog")
+        .usr
+        .clone();
+
+    let calls_from_use_templates: Vec<_> = catalog
+        .calls
+        .iter()
+        .filter(|call| call.caller_usr == use_templates_usr)
+        .collect();
+
+    let resolves_to = |callee_usr: &str| {
+        calls_from_use_templates.iter().any(|call| {
+            matches!(
+                &call.resolution,
+                CallResolution::Resolved { callee_usr: actual, .. } if actual == callee_usr
+            )
+        })
+    };
+    assert!(
+        resolves_to(&templated.usr),
+        "expected a call resolving to templated's own usr: {calls_from_use_templates:#?}"
+    );
+    assert!(
+        resolves_to(&identity.usr),
+        "expected a call resolving to identity's own usr: {calls_from_use_templates:#?}"
+    );
+}
+
 struct TempWorkspace {
     path: PathBuf,
 }

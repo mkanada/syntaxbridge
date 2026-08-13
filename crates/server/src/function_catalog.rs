@@ -37,6 +37,14 @@ pub enum FunctionDeclarationKind {
     /// `HeaderGuard`, `AnnotationMacro`) already have a home in US-3's
     /// catalog and aren't duplicated here.
     FunctionMacro,
+    /// A function or method template's *primary* declaration (`template
+    /// <typename T> T f(T a)`) — `CXCursor_FunctionTemplate`, a cursor kind
+    /// `FreeFunction`/`Method` don't match, so templates were invisible to
+    /// the catalog until this variant was added. Each instantiation is a
+    /// separate question (monomorphization is an open C++→Dart mapping
+    /// decision, see US-7) and isn't cataloged separately here — only the
+    /// one generic declaration is.
+    FunctionTemplate,
 }
 
 impl FunctionDeclarationKind {
@@ -47,6 +55,7 @@ impl FunctionDeclarationKind {
             Self::Constructor => "constructor",
             Self::Destructor => "destructor",
             Self::FunctionMacro => "function_macro",
+            Self::FunctionTemplate => "function_template",
         }
     }
 
@@ -57,6 +66,7 @@ impl FunctionDeclarationKind {
             "constructor" => Some(Self::Constructor),
             "destructor" => Some(Self::Destructor),
             "function_macro" => Some(Self::FunctionMacro),
+            "function_template" => Some(Self::FunctionTemplate),
             _ => None,
         }
     }
@@ -84,8 +94,11 @@ pub struct FunctionDeclaration {
     pub end_column: u32,
     pub usr: String,
     pub is_virtual: bool,
-    /// `usr` of the immediate virtual method this one overrides, if any.
-    pub overrides_usr: Option<String>,
+    /// `usr` of every virtual method this one overrides — more than one
+    /// under multiple inheritance, when a derived class overrides methods
+    /// from more than one base with the same signature. Empty when the
+    /// method overrides nothing (including for non-methods).
+    pub overridden_usrs: Vec<String>,
 }
 
 /// Whether a call site's target could be determined statically, and if so,
@@ -510,8 +523,22 @@ fn record_call(cursor: clang_sys::CXCursor, state: &mut CallVisitorState<'_>) {
     } else {
         let referenced_kind = unsafe { clang_sys::clang_getCursorKind(referenced) };
         if function_declaration_kind_for(referenced_kind).is_some() {
+            // A call to a template function/method resolves `referenced` to
+            // the *implicit instantiation*, whose usr differs from the
+            // primary template declaration the catalog actually holds (see
+            // `FunctionDeclarationKind::FunctionTemplate`'s docs). Mapping
+            // back to the primary template via
+            // `clang_getSpecializedCursorTemplate` is what lets a template's
+            // callers show up under its own catalog entry — a no-op
+            // (null cursor) for a non-template callee.
+            let template = unsafe { clang_sys::clang_getSpecializedCursorTemplate(referenced) };
+            let usr_source = if unsafe { clang_sys::clang_Cursor_isNull(template) } != 0 {
+                referenced
+            } else {
+                template
+            };
             let callee_usr = unsafe {
-                type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(referenced))
+                type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(usr_source))
             };
             if callee_usr.is_empty() {
                 CallResolution::Unresolved {
@@ -549,6 +576,7 @@ fn function_declaration_kind_for(kind: clang_sys::CXCursorKind) -> Option<Functi
         clang_sys::CXCursor_CXXMethod => Some(FunctionDeclarationKind::Method),
         clang_sys::CXCursor_Constructor => Some(FunctionDeclarationKind::Constructor),
         clang_sys::CXCursor_Destructor => Some(FunctionDeclarationKind::Destructor),
+        clang_sys::CXCursor_FunctionTemplate => Some(FunctionDeclarationKind::FunctionTemplate),
         _ => None,
     }
 }
@@ -577,7 +605,7 @@ fn describe_macro(cursor: clang_sys::CXCursor, project_root: &Path) -> Option<Fu
         end_column,
         usr,
         is_virtual: false,
-        overrides_usr: None,
+        overridden_usrs: Vec::new(),
     })
 }
 
@@ -597,11 +625,17 @@ fn describe_function(
     let (end_line, end_column) = unsafe { type_catalog::extent_end(cursor) };
     let usr = unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(cursor)) };
 
+    // `FunctionTemplate` is included because it covers both free-function
+    // and method templates (same cursor kind either way, see the module's
+    // policy notes) — `owning_class_of` itself already returns `None` when
+    // the semantic parent isn't a record type, so this is safe for a free
+    // function template too.
     let is_method_like = matches!(
         kind,
         FunctionDeclarationKind::Method
             | FunctionDeclarationKind::Constructor
             | FunctionDeclarationKind::Destructor
+            | FunctionDeclarationKind::FunctionTemplate
     );
     let owning_class = if is_method_like {
         unsafe { owning_class_of(cursor) }
@@ -611,7 +645,7 @@ fn describe_function(
     let owning_class_usr = owning_class.as_ref().map(|(usr, _name)| usr.clone());
 
     let is_virtual = unsafe { clang_sys::clang_CXXMethod_isVirtual(cursor) } != 0;
-    let overrides_usr = unsafe { first_overridden_usr(cursor) };
+    let overridden_usrs = unsafe { overridden_usrs_of(cursor) };
     let is_const = unsafe { clang_sys::clang_CXXMethod_isConst(cursor) } != 0;
 
     let mut qualified_segments: Vec<String> = Vec::new();
@@ -639,7 +673,7 @@ fn describe_function(
         end_column,
         usr,
         is_virtual,
-        overrides_usr,
+        overridden_usrs,
     })
 }
 
@@ -672,12 +706,13 @@ unsafe fn owning_class_of(cursor: clang_sys::CXCursor) -> Option<(String, String
     Some((usr, name))
 }
 
-/// The `usr` of the immediate virtual method `cursor` overrides, if any
-/// (US-5 criterion 4's flip side — this is how a redefinition finds the base
-/// it redefines). When a method overrides more than one base (multiple
-/// inheritance), only the first is kept; disambiguating all of them is out
-/// of scope for this pass (see US-5's open item on inheritance).
-unsafe fn first_overridden_usr(cursor: clang_sys::CXCursor) -> Option<String> {
+/// The `usr` of every immediate virtual method `cursor` overrides (US-5
+/// criterion 4's flip side — this is how a redefinition finds the base(s) it
+/// redefines). Under multiple inheritance, `clang_getOverriddenCursors`
+/// already returns one cursor per overridden base method — all of them are
+/// kept, not just the first, so a method overriding same-signature virtuals
+/// from more than one base is attributed to every one of them.
+unsafe fn overridden_usrs_of(cursor: clang_sys::CXCursor) -> Vec<String> {
     let mut cursors: *mut clang_sys::CXCursor = std::ptr::null_mut();
     let mut count: c_uint = 0;
     unsafe {
@@ -685,17 +720,24 @@ unsafe fn first_overridden_usr(cursor: clang_sys::CXCursor) -> Option<String> {
     }
 
     if cursors.is_null() || count == 0 {
-        return None;
+        return Vec::new();
     }
 
-    let first = unsafe { *cursors };
-    let usr = unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(first)) };
+    let mut usrs = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let overridden = unsafe { *cursors.add(index as usize) };
+        let usr =
+            unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(overridden)) };
+        if !usr.is_empty() {
+            usrs.push(usr);
+        }
+    }
 
     unsafe {
         clang_sys::clang_disposeOverriddenCursors(cursors);
     }
 
-    if usr.is_empty() { None } else { Some(usr) }
+    usrs
 }
 
 /// Builds a full signature string: return type (omitted for
@@ -725,28 +767,46 @@ unsafe fn build_signature(
     format!("{return_prefix}{qualified_name}({params}){const_suffix}")
 }
 
+/// Walks `cursor`'s direct children collecting `ParmDecl`s, rather than
+/// `clang_Cursor_getNumArguments`/`clang_Cursor_getArgument`: those two only
+/// support a fixed set of cursor kinds that, per `libclang`, does not
+/// include `CXCursor_FunctionTemplate` — confirmed empirically, they
+/// silently report zero arguments for a method/function template, which
+/// would make every template's signature claim an empty parameter list.
+/// Child-visiting works uniformly across every callable kind this module
+/// handles, so there's no need for a kind-specific fallback.
 unsafe fn parameter_list(cursor: clang_sys::CXCursor) -> String {
-    let count = unsafe { clang_sys::clang_Cursor_getNumArguments(cursor) };
-    if count <= 0 {
-        return String::new();
+    let mut parts: Vec<String> = Vec::new();
+
+    extern "C" fn collect(
+        cursor: clang_sys::CXCursor,
+        _parent: clang_sys::CXCursor,
+        data: clang_sys::CXClientData,
+    ) -> clang_sys::CXChildVisitResult {
+        let parts = unsafe { &mut *(data as *mut Vec<String>) };
+        if unsafe { clang_sys::clang_getCursorKind(cursor) } == clang_sys::CXCursor_ParmDecl {
+            let argument_type = unsafe { clang_sys::clang_getCursorType(cursor) };
+            let type_spelling = unsafe {
+                type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(argument_type))
+            };
+            let argument_name = unsafe {
+                type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(cursor))
+            };
+            parts.push(if argument_name.is_empty() {
+                type_spelling
+            } else {
+                format!("{type_spelling} {argument_name}")
+            });
+        }
+        clang_sys::CXChildVisit_Continue
     }
 
-    let mut parts = Vec::with_capacity(count as usize);
-    for index in 0..count {
-        let argument = unsafe { clang_sys::clang_Cursor_getArgument(cursor, index as c_uint) };
-        let argument_type = unsafe { clang_sys::clang_getCursorType(argument) };
-        let type_spelling = unsafe {
-            type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(argument_type))
-        };
-        let argument_name = unsafe {
-            type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(argument))
-        };
-
-        parts.push(if argument_name.is_empty() {
-            type_spelling
-        } else {
-            format!("{type_spelling} {argument_name}")
-        });
+    unsafe {
+        clang_sys::clang_visitChildren(
+            cursor,
+            collect,
+            &mut parts as *mut Vec<String> as *mut c_void,
+        );
     }
 
     parts.join(", ")

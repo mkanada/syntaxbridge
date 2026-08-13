@@ -160,6 +160,10 @@ fn app(global_db_path: PathBuf) -> Router {
         .route("/projects/types/usages", get(list_type_usages_from_http))
         .route("/projects/functions", get(list_functions_from_http))
         .route("/projects/functions/callers", get(list_callers_from_http))
+        .route(
+            "/projects/functions/calls-in-file",
+            get(list_calls_in_file_from_http),
+        )
         .with_state(state)
 }
 
@@ -640,6 +644,40 @@ async fn list_callers_from_http(Query(query): Query<CallersQuery>) -> Response {
             json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!({"error":"list_callers_failed","message":error.to_string()}),
+            )
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct CallsInFileQuery {
+    project_dir: PathBuf,
+    file: String,
+}
+
+/// Serves every recorded call site within one file (US-5 criterion 5's other
+/// direction), from the persisted call graph — the request the source
+/// viewer makes when opening a file, so clicking a call already on screen
+/// can jump straight to its definition.
+async fn list_calls_in_file_from_http(Query(query): Query<CallsInFileQuery>) -> Response {
+    log_server(format_args!(
+        "listing calls in file: project_dir={} file={}",
+        query.project_dir.display(),
+        query.file
+    ));
+
+    match tokio::task::spawn_blocking(move || {
+        project_service::list_calls_in_file(&query.project_dir, &query.file)
+    })
+    .await
+    {
+        Ok(Ok(calls)) => json_response(StatusCode::OK, json!({ "calls": calls })),
+        Ok(Err(error)) => list_types_error_response(error),
+        Err(error) => {
+            log_server(format_args!("list calls in file task failed: {error}"));
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":"list_calls_in_file_failed","message":error.to_string()}),
             )
         }
     }

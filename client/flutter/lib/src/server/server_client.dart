@@ -60,4 +60,13 @@ abstract class ServerClient {
     required String projectDir,
     required String functionUsr,
   });
+
+  /// Every recorded call site within [file] (US-5 criterion 5's other
+  /// direction), from the persisted call graph, without reparsing — what
+  /// lets the source viewer offer "click a call, jump to its definition"
+  /// for a file already open on screen.
+  Future<List<CallEdge>> listCallsInFile({
+    required String projectDir,
+    required String file,
+  });
 }

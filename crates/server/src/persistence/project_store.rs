@@ -97,7 +97,7 @@ impl ProjectStore {
                 end_column INTEGER NOT NULL,
                 usr TEXT NOT NULL DEFAULT '',
                 is_virtual INTEGER NOT NULL,
-                overrides_usr TEXT
+                overridden_usrs_json TEXT NOT NULL DEFAULT '[]'
             );
             CREATE TABLE IF NOT EXISTS call_edges (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,6 +114,7 @@ impl ProjectStore {
         )?;
 
         migrate_type_columns(&connection)?;
+        migrate_function_columns(&connection)?;
 
         Ok(Self { connection })
     }
@@ -517,10 +518,11 @@ impl ProjectStore {
         transaction.execute("DELETE FROM function_declarations", [])?;
 
         for declaration in declarations {
+            let overridden_usrs_json = serde_json::to_string(&declaration.overridden_usrs)?;
             transaction.execute(
                 "INSERT INTO function_declarations (
                     name, kind, namespace, owning_class_usr, signature, file, line, column,
-                    end_line, end_column, usr, is_virtual, overrides_usr
+                    end_line, end_column, usr, is_virtual, overridden_usrs_json
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     declaration.name,
@@ -535,7 +537,7 @@ impl ProjectStore {
                     declaration.end_column,
                     declaration.usr,
                     declaration.is_virtual,
-                    declaration.overrides_usr,
+                    overridden_usrs_json,
                 ],
             )?;
         }
@@ -547,7 +549,7 @@ impl ProjectStore {
     pub fn list_function_declarations(&self) -> Result<Vec<FunctionDeclaration>, PersistenceError> {
         let mut statement = self.connection.prepare(
             "SELECT name, kind, namespace, owning_class_usr, signature, file, line, column,
-                    end_line, end_column, usr, is_virtual, overrides_usr
+                    end_line, end_column, usr, is_virtual, overridden_usrs_json
              FROM function_declarations ORDER BY id",
         )?;
 
@@ -565,7 +567,7 @@ impl ProjectStore {
                 row.get::<_, u32>(9)?,
                 row.get::<_, String>(10)?,
                 row.get::<_, bool>(11)?,
-                row.get::<_, Option<String>>(12)?,
+                row.get::<_, String>(12)?,
             ))
         })?;
 
@@ -584,11 +586,12 @@ impl ProjectStore {
                 end_column,
                 usr,
                 is_virtual,
-                overrides_usr,
+                overridden_usrs_json,
             ) = row?;
             let Some(kind) = FunctionDeclarationKind::parse(&kind) else {
                 continue;
             };
+            let overridden_usrs: Vec<String> = serde_json::from_str(&overridden_usrs_json)?;
 
             declarations.push(FunctionDeclaration {
                 name,
@@ -603,7 +606,7 @@ impl ProjectStore {
                 end_column,
                 usr,
                 is_virtual,
-                overrides_usr,
+                overridden_usrs,
             });
         }
 
@@ -655,6 +658,27 @@ impl ProjectStore {
         )?;
 
         let rows = statement.query_map(params![callee_usr], row_to_call_edge)?;
+
+        let mut calls = Vec::new();
+        for row in rows {
+            calls.push(row?);
+        }
+
+        Ok(calls)
+    }
+
+    /// Every recorded call site within `file` — the flip side of
+    /// `list_callers_for`: instead of "who calls this function", "what does
+    /// this file, already open in the source viewer, call". Answers US-5
+    /// criterion 5's other direction (click a call in open source, jump to
+    /// its definition) from the persisted index, no reparsing.
+    pub fn list_calls_in_file(&self, file: &str) -> Result<Vec<CallEdge>, PersistenceError> {
+        let mut statement = self.connection.prepare(
+            "SELECT caller_usr, callee_usr, is_dynamic_dispatch, unresolved_reason, file, line, column
+             FROM call_edges WHERE file = ?1 ORDER BY line, column",
+        )?;
+
+        let rows = statement.query_map(params![file], row_to_call_edge)?;
 
         let mut calls = Vec::new();
         for row in rows {
@@ -779,6 +803,22 @@ fn migrate_type_columns(connection: &Connection) -> Result<(), PersistenceError>
     }
 
     Ok(())
+}
+
+/// A project database created before `overridden_usrs_json` replaced the
+/// single-base `overrides_usr` column (multiple-inheritance support in
+/// US-5) is missing the new column — same pattern as
+/// `migrate_type_columns`. The old `overrides_usr` column, if present, is
+/// left in place unused rather than dropped: SQLite's `DROP COLUMN` support
+/// is recent enough to not be worth relying on, and an orphaned column is
+/// harmless.
+fn migrate_function_columns(connection: &Connection) -> Result<(), PersistenceError> {
+    ensure_column(
+        connection,
+        "function_declarations",
+        "overridden_usrs_json",
+        "overridden_usrs_json TEXT NOT NULL DEFAULT '[]'",
+    )
 }
 
 fn ensure_column(
@@ -962,6 +1002,66 @@ mod tests {
                 usr: String::new(),
             }]
         );
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    /// Multiple-inheritance support (US-5) replaced the single-base
+    /// `overrides_usr` column with `overridden_usrs_json`; a database
+    /// created before that change needs the new column added, mirroring
+    /// `opening_a_pre_namespace_database_adds_the_missing_columns` above.
+    #[test]
+    fn opening_a_pre_multiple_inheritance_database_adds_the_missing_column() {
+        let db_path = temp_db_path("project-functions-pre-multiple-inheritance-migration");
+        {
+            let connection = Connection::open(&db_path).expect("create legacy database");
+            connection
+                .execute_batch(
+                    "CREATE TABLE function_declarations (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        namespace TEXT NOT NULL,
+                        owning_class_usr TEXT,
+                        signature TEXT NOT NULL,
+                        file TEXT NOT NULL,
+                        line INTEGER NOT NULL,
+                        column INTEGER NOT NULL,
+                        end_line INTEGER NOT NULL,
+                        end_column INTEGER NOT NULL,
+                        usr TEXT NOT NULL DEFAULT '',
+                        is_virtual INTEGER NOT NULL,
+                        overrides_usr TEXT
+                    );",
+                )
+                .expect("create legacy table");
+            connection
+                .execute(
+                    "INSERT INTO function_declarations (
+                        name, kind, namespace, owning_class_usr, signature, file, line, column,
+                        end_line, end_column, usr, is_virtual, overrides_usr
+                     ) VALUES ('area', 'method', 'geometry', 'c:@N@geometry@S@Shape',
+                        'double geometry::Shape::area() const', '/workspace/src/shapes.h',
+                        4, 19, 4, 40, 'c:@N@geometry@S@Shape@F@area#1#', 1,
+                        'c:@N@geometry@S@Drawable@F@area#1#')",
+                    [],
+                )
+                .expect("insert legacy row");
+        }
+
+        let store = ProjectStore::open(&db_path).expect("open and migrate legacy database");
+        let declarations = store
+            .list_function_declarations()
+            .expect("list function declarations after migration");
+
+        // The migration only adds the new column with its default (`[]`) —
+        // it does not backfill data from the old `overrides_usr` column,
+        // same "aceitável por ora" stance as the rest of this migration
+        // family. What matters here is that opening the legacy database
+        // doesn't fail and the new column reads back as valid, empty JSON.
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].name, "area");
+        assert_eq!(declarations[0].overridden_usrs, Vec::<String>::new());
 
         let _ = fs::remove_file(&db_path);
     }
@@ -1231,7 +1331,10 @@ mod tests {
                 end_column: 40,
                 usr: "c:@N@geometry@S@Shape@F@area#1#".to_owned(),
                 is_virtual: true,
-                overrides_usr: None,
+                overridden_usrs: vec![
+                    "c:@N@geometry@S@Drawable@F@area#1#".to_owned(),
+                    "c:@N@geometry@S@Measurable@F@area#1#".to_owned(),
+                ],
             },
             FunctionDeclaration {
                 name: "add".to_owned(),
@@ -1246,7 +1349,7 @@ mod tests {
                 end_column: 1,
                 usr: "c:@F@add#I#I#".to_owned(),
                 is_virtual: false,
-                overrides_usr: None,
+                overridden_usrs: Vec::new(),
             },
         ]
     }
@@ -1384,6 +1487,30 @@ mod tests {
         // The unresolved call in `apply` has no `callee_usr` and so
         // contributes to no function's count.
         assert_eq!(counts.len(), 2);
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn lists_calls_within_a_file() {
+        let db_path = temp_db_path("project-calls-in-file");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+        store
+            .replace_call_edges(&sample_call_edges())
+            .expect("persist call edges");
+
+        let calls = store
+            .list_calls_in_file("/workspace/src/math.cpp")
+            .expect("list calls in file");
+        assert_eq!(
+            calls,
+            vec![
+                sample_call_edges()[1].clone(),
+                sample_call_edges()[2].clone(),
+            ],
+            "expected both math.cpp calls, ordered by line, and none from shapes.cpp"
+        );
 
         let _ = fs::remove_file(&db_path);
     }

@@ -267,6 +267,32 @@ class HttpServerClient implements ServerClient {
         .toList();
   }
 
+  @override
+  Future<List<CallEdge>> listCallsInFile({
+    required String projectDir,
+    required String file,
+  }) async {
+    final url = baseUrl
+        .resolve('/projects/functions/calls-in-file')
+        .replace(queryParameters: {'project_dir': projectDir, 'file': file});
+    cliLog('HTTP GET $url');
+    final request = await _httpClient.getUrl(url);
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP GET $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException(_errorMessageFromBody(body));
+    }
+
+    final json = jsonDecode(body) as Map<String, Object?>;
+    final callsJson = json['calls'] as List<Object?>? ?? const <Object?>[];
+    return callsJson
+        .whereType<Map<String, Object?>>()
+        .map(CallEdge.fromJson)
+        .toList();
+  }
+
   String _errorMessageFromBody(String body) {
     try {
       final json = jsonDecode(body);

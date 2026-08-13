@@ -463,6 +463,20 @@ pub fn list_callers(project_dir: &Path, callee_usr: &str) -> Result<Vec<CallEdge
     Ok(project_store.list_callers_for(callee_usr)?)
 }
 
+/// Serves every recorded call site within one file, from the persisted call
+/// graph (US-5) without reparsing — the flip side of `list_callers`, what
+/// backs "click a call already on screen in the source viewer, jump to its
+/// definition" (criterion 5's other direction).
+pub fn list_calls_in_file(project_dir: &Path, file: &str) -> Result<Vec<CallEdge>, ListTypesError> {
+    if !is_openable_project(project_dir) {
+        return Err(ListTypesError::NotFound(project_dir.to_path_buf()));
+    }
+
+    let project_db_path = project_dir.join("project.db");
+    let project_store = ProjectStore::open(&project_db_path)?;
+    Ok(project_store.list_calls_in_file(file)?)
+}
+
 /// Reads a single source file's content for display, refusing to read
 /// anything outside `project_dir`'s `input-source` subtree even if the
 /// caller supplies an absolute path elsewhere on disk.

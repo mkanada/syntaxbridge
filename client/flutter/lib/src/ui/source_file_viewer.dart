@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 
+import '../project/project_models.dart';
 import 'ide_theme.dart';
 
 const double _lineHeight = 22;
@@ -12,6 +13,8 @@ class SourceFileViewer extends StatefulWidget {
     required this.content,
     this.highlightStartLine,
     this.highlightEndLine,
+    this.calls,
+    this.onCallSelected,
   });
 
   final String path;
@@ -24,6 +27,21 @@ class SourceFileViewer extends StatefulWidget {
   /// declaration.
   final int? highlightStartLine;
   final int? highlightEndLine;
+
+  /// Every recorded call site within this file (US-5), used to make a call
+  /// already on screen clickable — "from a call, go to its definition",
+  /// the direction `CallersView` doesn't cover (that one goes the other
+  /// way: from a definition, list its callers). `null` while calls haven't
+  /// loaded yet, same as [content] loading: the viewer just shows text with
+  /// nothing clickable until it resolves.
+  final Future<List<CallEdge>>? calls;
+
+  /// Invoked when a line with a recorded call is tapped. When more than one
+  /// call sits on the same line, the first one (by column) is reported —
+  /// column-precise hit testing isn't implemented (this viewer has no
+  /// per-token layout to hit-test against), so a busy line resolves to *a*
+  /// call on it rather than none, which is the more useful default.
+  final ValueChanged<CallEdge>? onCallSelected;
 
   @override
   State<SourceFileViewer> createState() => _SourceFileViewerState();
@@ -80,6 +98,23 @@ class _SourceFileViewerState extends State<SourceFileViewer> {
 
   @override
   Widget build(BuildContext context) {
+    return FutureBuilder<List<CallEdge>>(
+      future: widget.calls ?? Future.value(const <CallEdge>[]),
+      builder: (context, callsSnapshot) {
+        final callsByLine = <int, List<CallEdge>>{};
+        for (final call in callsSnapshot.data ?? const <CallEdge>[]) {
+          callsByLine.putIfAbsent(call.line, () => []).add(call);
+        }
+
+        return _buildContent(context, callsByLine);
+      },
+    );
+  }
+
+  Widget _buildContent(
+    BuildContext context,
+    Map<int, List<CallEdge>> callsByLine,
+  ) {
     return FutureBuilder<String>(
       future: widget.content,
       builder: (context, snapshot) {
@@ -122,6 +157,8 @@ class _SourceFileViewerState extends State<SourceFileViewer> {
               number: number,
               code: lines[index],
               highlighted: highlighted,
+              calls: callsByLine[number] ?? const <CallEdge>[],
+              onCallSelected: widget.onCallSelected,
             );
           },
         );
@@ -135,14 +172,47 @@ class _SourceLine extends StatelessWidget {
     required this.number,
     required this.code,
     this.highlighted = false,
+    this.calls = const <CallEdge>[],
+    this.onCallSelected,
   });
 
   final int number;
   final String code;
   final bool highlighted;
 
+  /// Recorded calls on this line. When more than one, tapping resolves to
+  /// the first (by column) — see [SourceFileViewer.onCallSelected].
+  final List<CallEdge> calls;
+  final ValueChanged<CallEdge>? onCallSelected;
+
   @override
   Widget build(BuildContext context) {
+    final callback = onCallSelected;
+    final isClickable = calls.isNotEmpty && callback != null;
+
+    Widget codeText = Text(
+      code,
+      softWrap: false,
+      overflow: TextOverflow.fade,
+      style: const TextStyle(
+        color: IdePalette.codeText,
+        fontFamily: 'monospace',
+        fontSize: 13,
+        height: 1.3,
+      ),
+    );
+
+    if (isClickable) {
+      codeText = MouseRegion(
+        cursor: SystemMouseCursors.click,
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () => callback(calls.first),
+          child: codeText,
+        ),
+      );
+    }
+
     return ColoredBox(
       color: highlighted ? IdePalette.selection : Colors.transparent,
       child: SizedBox(
@@ -162,19 +232,7 @@ class _SourceLine extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 14),
-            Expanded(
-              child: Text(
-                code,
-                softWrap: false,
-                overflow: TextOverflow.fade,
-                style: const TextStyle(
-                  color: IdePalette.codeText,
-                  fontFamily: 'monospace',
-                  fontSize: 13,
-                  height: 1.3,
-                ),
-              ),
-            ),
+            Expanded(child: codeText),
           ],
         ),
       ),
