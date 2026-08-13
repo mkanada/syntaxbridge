@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "casos": [
+    { "funcao": "soma", "args": [2, 3], "espera": 5 },
+    { "funcao": "soma", "args": [-1, 1], "espera": 0 },
+    { "funcao": "soma", "args": [0, 0], "espera": 0 },
+    {
+      "funcao": "soma",
+      "args": [2147483647, 1],
+      "espera": -2147483648,
+      "divergencia_conhecida": "overflow-int32"
+    }
+  ]
+}

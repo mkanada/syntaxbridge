@@ -1,0 +1,7 @@
+id = "E02"
+nome = "Controle de fluxo, laços, recursão"
+nivel = 2
+status = "passa"
+motivo = "golden, dart analyze/format e oráculo comportamental passam"
+constroi = ["if-else", "while", "for", "recursao", "bool", "double", "divisao-inteira-vs-real"]
+passos = ["US-8", "US-9", "US-10"]

@@ -69,4 +69,11 @@ abstract class ServerClient {
     required String projectDir,
     required String file,
   });
+
+  /// Transpiles the project's free functions and `struct`s to Dart (US-8,
+  /// E01–E03 scope) and returns the emitted package. Synchronous — these
+  /// examples transpile in milliseconds, so there's no job/progress
+  /// mechanism here yet (mirrors the server route's own design, see
+  /// `docs/plans/primeiro-corte-e01-e03.md`).
+  Future<TranspiledPackage> transpileProject(String projectDir);
 }

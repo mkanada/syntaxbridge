@@ -602,6 +602,57 @@ void main() {
     expect(find.text('types.h'), findsWidgets);
   });
 
+  testWidgets(
+    'opens a C++ file, transpiles the project, and shows the matching Dart',
+    (tester) async {
+      const dartSource = 'int soma(int a, int b) {\n  return a + b;\n}\n';
+      final fakeClient = _FakeServerClient(
+        const ServerStatus(service: 'syntax-bridge-server', status: 'ok'),
+        project: const CreatedProject(
+          name: 'counter',
+          projectDir: '/tmp/projects/counter',
+          inputSourceDir: '/tmp/projects/counter/input-source',
+          compilationUnits: [],
+          sourceFiles: [
+            SourceFile(
+              path: '/tmp/projects/counter/input-source/src/aritmetica.cpp',
+              kind: SourceFileKind.translationUnit,
+            ),
+          ],
+        ),
+        sourceFileContent: 'int soma(int a, int b) {\n    return a + b;\n}',
+        transpiledPackage: const TranspiledPackage(
+          packageName: 'e01_funcao_aritmetica',
+          files: {
+            'pubspec.yaml': 'name: e01_funcao_aritmetica\n',
+            'lib/aritmetica.dart': dartSource,
+          },
+        ),
+      );
+
+      await tester.pumpWidget(SyntaxBridgeApp(serverClient: fakeClient));
+      await tester.pumpAndSettle();
+      await _skipToIde(tester);
+
+      await tester.tap(find.text('input-source/src/aritmetica.cpp'));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byTooltip('Transpile'));
+      await tester.pumpAndSettle();
+
+      expect(fakeClient.transpileProjectDir, '/tmp/projects/counter');
+      // The Dart Output panel opened (its own title, distinct from the C++
+      // viewer alongside it) and shows the generated body — checked via the
+      // return line's indentation (2 spaces), since the signature line
+      // itself is identical text in both the C++ source and the Dart output
+      // for this trivial example, so it can't disambiguate which panel
+      // rendered it.
+      expect(find.text('Dart Output'), findsOneWidget);
+      expect(find.text('  return a + b;'), findsOneWidget);
+      expect(find.text('    return a + b;'), findsOneWidget);
+    },
+  );
+
   testWidgets('opens path pickers for workspace and source archive', (
     tester,
   ) async {
@@ -1064,6 +1115,7 @@ class _FakeServerClient implements ServerClient {
     this.callerCounts = const <String, int>{},
     this.callersByFunction = const <String, List<CallEdge>>{},
     this.callsByFile = const <String, List<CallEdge>>{},
+    this.transpiledPackage,
   });
 
   final ServerStatus status;
@@ -1080,10 +1132,12 @@ class _FakeServerClient implements ServerClient {
   final Map<String, int> callerCounts;
   final Map<String, List<CallEdge>> callersByFunction;
   final Map<String, List<CallEdge>> callsByFile;
+  final TranspiledPackage? transpiledPackage;
   String? createdProjectName;
   String? readSourceFilePath;
   String? openedProjectDir;
   String? forgottenProjectDir;
+  String? transpileProjectDir;
   late List<RecentProject> _remainingProjects = recentProjects;
 
   @override
@@ -1187,6 +1241,13 @@ class _FakeServerClient implements ServerClient {
     required String projectDir,
     required String file,
   }) async => callsByFile[file] ?? const <CallEdge>[];
+
+  @override
+  Future<TranspiledPackage> transpileProject(String projectDir) async {
+    transpileProjectDir = projectDir;
+    return transpiledPackage ??
+        const TranspiledPackage(packageName: 'output', files: {});
+  }
 }
 
 class _FakePathPicker implements PathPicker {

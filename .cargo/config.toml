@@ -4,3 +4,11 @@ replace-with = "vendored-sources"
 [source.vendored-sources]
 directory = "vendor"
 
+# Local override: the user's global ~/.cargo/config.toml sets
+# `rustc-wrapper = "sccache"`, and sccache reaches out over the network,
+# which the agent sandbox blocks (every cargo invocation then fails with
+# "Operation not permitted" unless the sandbox is bypassed). This repo
+# doesn't need a shared compile cache badly enough to require that, so
+# disable the wrapper for this workspace only.
+[build]
+rustc-wrapper = ""

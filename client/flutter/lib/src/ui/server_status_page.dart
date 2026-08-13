@@ -7,6 +7,7 @@ import '../project/project_models.dart';
 import '../server/server_client.dart';
 import 'accordion_panel_group.dart';
 import 'callers_view.dart';
+import 'dart_output_view.dart';
 import 'dockable_panel.dart';
 import 'execution_log.dart';
 import 'execution_log_view.dart';
@@ -52,6 +53,7 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     'usages': DockSide.center,
     'functions': DockSide.left,
     'callers': DockSide.center,
+    'dartOutput': DockSide.center,
     'log': DockSide.right,
   };
   final _screenshotBoundaryKey = GlobalKey();
@@ -66,6 +68,7 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
   late Future<FunctionCatalogListing> _functions;
   Future<List<CallEdge>>? _selectedFunctionCallers;
   Future<List<CallEdge>>? _selectedFileCalls;
+  Future<TranspiledPackage>? _transpiledPackage;
 
   @override
   void initState() {
@@ -105,6 +108,41 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
         'Screenshot capture failed: ${projectErrorMessage(error)}',
         level: ExecutionLogLevel.error,
       );
+    }
+  }
+
+  /// Transpiles the whole project (US-8, E01–E03 scope) and opens the Dart
+  /// Output panel, docked to the center split next to the source viewer —
+  /// mirrors how [_selectType]/[_selectFunction] open their own panels only
+  /// once there's something to show, rather than reserving the space from
+  /// the outset.
+  void _transpileProject() {
+    _addLog('Transpiling project');
+    setState(() {
+      _openPanels.add('dartOutput');
+      _panelSides['dartOutput'] = DockSide.center;
+      _transpiledPackage = _loadTranspiledPackage();
+    });
+  }
+
+  Future<TranspiledPackage> _loadTranspiledPackage() async {
+    try {
+      final package = await widget.serverClient.transpileProject(
+        widget.project.projectDir,
+      );
+      _addLog(
+        'Transpiled ${package.files.length} file(s) into package "${package.packageName}"',
+        level: ExecutionLogLevel.success,
+      );
+      return package;
+    } catch (error, stackTrace) {
+      cliLog('transpile project exception: $error');
+      cliLog('transpile project stack: $stackTrace');
+      _addLog(
+        'Failed to transpile project: ${projectErrorMessage(error)}',
+        level: ExecutionLogLevel.error,
+      );
+      rethrow;
     }
   }
 
@@ -496,6 +534,7 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
             _TitleBar(
               onRefresh: _refresh,
               onCaptureScreen: _captureScreen,
+              onTranspile: _transpileProject,
               panels: descriptors,
               openPanelIds: _openPanels,
               onTogglePanel: _togglePanel,
@@ -756,6 +795,18 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
         },
       ),
       PanelDescriptor(
+        id: 'dartOutput',
+        title: 'Dart Output',
+        icon: Icons.code,
+        // Splits side by side with the source viewer by default, via the
+        // center split, mirroring the Usages/Callers panels.
+        defaultSide: DockSide.center,
+        builder: (context) => DartOutputView(
+          package: _transpiledPackage,
+          selectedCppPath: _selectedSourceFile?.path,
+        ),
+      ),
+      PanelDescriptor(
         id: 'log',
         title: 'Execution log',
         icon: Icons.receipt_long_outlined,
@@ -998,6 +1049,7 @@ class _TitleBar extends StatelessWidget {
   const _TitleBar({
     required this.onRefresh,
     required this.onCaptureScreen,
+    required this.onTranspile,
     required this.panels,
     required this.openPanelIds,
     required this.onTogglePanel,
@@ -1005,6 +1057,7 @@ class _TitleBar extends StatelessWidget {
 
   final VoidCallback onRefresh;
   final VoidCallback onCaptureScreen;
+  final VoidCallback onTranspile;
 
   /// Every registered panel, open or closed — what the Panels menu lists.
   final List<PanelDescriptor> panels;
@@ -1047,6 +1100,11 @@ class _TitleBar extends StatelessWidget {
                   child: Text(panel.title),
                 ),
             ],
+          ),
+          IdeToolbarIcon(
+            icon: Icons.code,
+            tooltip: 'Transpile',
+            onPressed: onTranspile,
           ),
           IdeToolbarIcon(
             icon: Icons.refresh_rounded,

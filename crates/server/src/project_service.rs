@@ -8,9 +8,11 @@ use serde::Serialize;
 
 use crate::function_catalog::{self, CallEdge, FunctionCatalogError, FunctionDeclaration};
 use crate::ingest::{self, CompilationUnit, CreateProjectRequest, CreatedProject, IngestError};
+use crate::ir;
 use crate::persistence::{GlobalStore, PersistenceError, ProjectRecord, ProjectStore};
 use crate::progress::{Cancellation, ExtractionProgress};
 use crate::source_catalog::{self, SourceCatalogError, SourceFile};
+use crate::transpile::{self, TranspileError, TranspiledPackage};
 use crate::type_catalog::{self, TypeCatalogError, TypeDeclaration, TypeUsage};
 
 /// Live progress trackers for `create_project`'s three `libclang` passes, so
@@ -153,6 +155,7 @@ pub fn create_project(
     project_store.replace_source_files(&project.source_files)?;
     project_store.replace_function_declarations(&function_catalog.declarations)?;
     project_store.replace_call_edges(&function_catalog.calls)?;
+    project_store.replace_ir(&function_catalog.ir_functions, &function_catalog.ir_records)?;
 
     let global_store = GlobalStore::open(global_db_path)?;
     global_store.register_project(
@@ -497,4 +500,101 @@ pub fn read_source_file(
     }
 
     fs::read_to_string(&canonical_path).map_err(ReadSourceFileError::Io)
+}
+
+#[derive(Debug)]
+pub enum TranspileProjectError {
+    NotFound(PathBuf),
+    Persistence(PersistenceError),
+    Transpile(TranspileError),
+}
+
+impl TranspileProjectError {
+    pub fn is_client_error(&self) -> bool {
+        matches!(self, Self::NotFound(_))
+    }
+}
+
+impl fmt::Display for TranspileProjectError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound(path) => {
+                write!(
+                    formatter,
+                    "no syntax-bridge project found at {}",
+                    path.display()
+                )
+            }
+            Self::Persistence(error) => write!(formatter, "{error}"),
+            Self::Transpile(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for TranspileProjectError {}
+
+impl From<PersistenceError> for TranspileProjectError {
+    fn from(error: PersistenceError) -> Self {
+        Self::Persistence(error)
+    }
+}
+
+impl From<TranspileError> for TranspileProjectError {
+    fn from(error: TranspileError) -> Self {
+        Self::Transpile(error)
+    }
+}
+
+/// Transpiles a project's free functions to Dart (E01–E03 scope, US-8) and
+/// writes the resulting package under `<project_dir>/transpiled/` — nothing
+/// is written outside the project directory. Synchronous by design (PR2
+/// decision, `docs/plans/primeiro-corte-e01-e03.md` §7): these examples
+/// transpile in milliseconds, so this doesn't yet reuse `jobs.rs` the way
+/// project creation (US-1) does — that's for when the cost actually shows up
+/// (E11/E13), same call `list_types`'s docs already make for reparsing.
+///
+/// Reads the IR `create_project` already persisted (`ProjectStore::list_ir`)
+/// instead of reparsing every compilation unit with `libclang` again here —
+/// the same "serve from the store, don't reparse" rule `list_types`/
+/// `list_functions`/`list_callers` already follow for their own catalogs.
+/// Falls back to a full parse only for a project whose database predates IR
+/// persistence (an empty `list_ir` result despite the project having
+/// compilation units) so an old project doesn't silently transpile into an
+/// empty package.
+pub fn transpile_project(project_dir: &Path) -> Result<TranspiledPackage, TranspileProjectError> {
+    if !is_openable_project(project_dir) {
+        return Err(TranspileProjectError::NotFound(project_dir.to_path_buf()));
+    }
+
+    let project_db_path = project_dir.join("project.db");
+    let project_store = ProjectStore::open(&project_db_path)?;
+    let compilation_units = project_store.list_compilation_units()?;
+    let type_catalog = project_store.list_type_declarations()?;
+    let type_mappings = project_store.list_type_mappings()?;
+    let input_source_dir = project_dir.join("input-source");
+    let package_name = project_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("syntax_bridge_output");
+
+    let (ir_functions, ir_records) = project_store.list_ir()?;
+    let package =
+        if ir_functions.is_empty() && ir_records.is_empty() && !compilation_units.is_empty() {
+            transpile::transpile_with_mappings(
+                &compilation_units,
+                &input_source_dir,
+                package_name,
+                &type_catalog,
+                &type_mappings,
+            )?
+        } else {
+            let module = ir::Module {
+                functions: ir_functions,
+                records: ir_records,
+            };
+            transpile::emit_package(&module, package_name, &type_catalog, &type_mappings)?
+        };
+    transpile::write_package(&package, &project_dir.join("transpiled"))?;
+
+    Ok(package)
 }

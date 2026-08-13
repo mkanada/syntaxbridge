@@ -325,4 +325,8 @@ class _ScriptedServerClient implements ServerClient {
     required String projectDir,
     required String file,
   }) => throw UnimplementedError('not used by this screen');
+
+  @override
+  Future<TranspiledPackage> transpileProject(String projectDir) =>
+      throw UnimplementedError('not used by this screen');
 }

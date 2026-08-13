@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "casos": [
+    { "funcao": "divide_inteiro", "args": [7, 2], "espera": 3 },
+    { "funcao": "divide_inteiro", "args": [-7, 2], "espera": -3 },
+    { "funcao": "divide_real", "args": [7.0, 2.0], "espera": 3.5 },
+    { "funcao": "fatorial", "args": [0], "espera": 1 },
+    { "funcao": "fatorial", "args": [1], "espera": 1 },
+    { "funcao": "fatorial", "args": [5], "espera": 120 },
+    { "funcao": "soma_ate", "args": [0], "espera": 0 },
+    { "funcao": "soma_ate", "args": [-3], "espera": 0 },
+    { "funcao": "soma_ate", "args": [5], "espera": 15 },
+    { "funcao": "soma_enquanto", "args": [5], "espera": 15 },
+    { "funcao": "eh_par", "args": [4], "espera": true },
+    { "funcao": "eh_par", "args": [7], "espera": false },
+    { "funcao": "negar", "args": [5], "espera": -5 },
+    { "funcao": "negar", "args": [0], "espera": 0 }
+  ]
+}

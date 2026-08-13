@@ -1,0 +1,7 @@
+id = "E01"
+nome = "Função aritmética livre"
+nivel = 1
+status = "passa"
+motivo = "golden, dart analyze/format e oráculo comportamental passam"
+constroi = ["funcao-livre", "int", "expressao-binaria", "return"]
+passos = ["US-7", "US-8", "US-9", "US-10"]

@@ -293,6 +293,24 @@ class HttpServerClient implements ServerClient {
         .toList();
   }
 
+  @override
+  Future<TranspiledPackage> transpileProject(String projectDir) async {
+    final url = baseUrl
+        .resolve('/projects/transpile')
+        .replace(queryParameters: {'project_dir': projectDir});
+    cliLog('HTTP POST $url');
+    final request = await _httpClient.postUrl(url);
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP POST $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException(_errorMessageFromBody(body));
+    }
+
+    return TranspiledPackage.fromJson(jsonDecode(body) as Map<String, Object?>);
+  }
+
   String _errorMessageFromBody(String body) {
     try {
       final json = jsonDecode(body);

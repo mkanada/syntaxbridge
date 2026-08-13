@@ -1819,7 +1819,35 @@ entrada não representa risco para a máquina do usuário.
 
 ## US-7 — Mapeamento de tipos C++ → Dart
 
-**Status:** planejado · **Depende de:** US-4, US-5
+**Status:** parcial — fatia mínima do E03 (`docs/plans/primeiro-corte-e01-e03.md`
+PR5). `crates/server/src/mapping.rs`: `MappingOption { id, label, description,
+consequences: Vec<Consequence> }`, `MappingDecision { type_usr, option_id,
+decided_at }`, e `options_for(declaration, catalog, decisions)` — já com a
+assinatura de solver (recebe catálogo e decisões, mesmo sem consultá-los
+ainda) para não precisar mudar quando E09 exigir resolução de verdade.
+Critério 1 satisfeito e testado: `struct`/`class` devolve exatamente uma
+opção. Critério 5/Q9 satisfeito e testado: qualquer outro tipo devolve uma
+opção de código ponte, nunca lista vazia. Persistência: tabela
+`type_mappings (type_usr PRIMARY KEY, option_id, decided_at)` em
+`project_store.rs`, com `set_type_mapping` (upsert, não
+`replace_*`/`delete`-then-`insert` como as demais tabelas — decisões são
+dado do usuário, não catálogo derivado, e não podem ser apagadas quando
+outro catálogo é reextraído) e `list_type_mappings`; critério 4 (reabrir
+preserva a decisão) e critério 7 (round-trip) provados por teste inline.
+`decisions.toml` (mesmo subconjunto flat de TOML que `example.toml` usa) lido
+e aplicado ao banco sem passar pela UI, cruzado contra `options_for` de
+verdade (não um id escrito à mão) em
+`e03_decisions_toml_applies_to_the_database_without_going_through_the_ui`.
+**Falta:** o solver de viabilidade global de verdade (Q9 completo — E09 é
+quem dimensiona isso), as rotas `GET`/`PUT /projects/mappings`, a UI, e —
+importante — **`transpile::transpile` ainda não consulta `type_mappings` nem
+`options_for` ao gerar Dart**: `Ponto` é sempre emitido como classe
+diretamente, sem checar se existe decisão gravada. Isso é honesto para E03
+porque `Ponto` só tem uma opção possível (nada a decidir), mas significa que
+o critério "tipo sem decisão produz falha explícita" não está de fato
+conectado ponta a ponta — só valeria a pena resolver quando um tipo tiver
+mais de uma opção de verdade, o que só acontece a partir do E07 · **Depende
+de:** US-4, US-5
 
 ### Objetivo do usuário
 
@@ -1968,7 +1996,46 @@ nada mais.
 
 ## US-8 — Geração do código Dart
 
-**Status:** planejado · **Depende de:** US-7
+**Status:** parcial — fatia do E01+E02+E03 (`docs/plans/primeiro-corte-e01-e03.md`,
+PRs 1–5): IR em `crates/server/src/ir/` (`Module`, `Function`, `Record`,
+`Field`, `Param`, `Type::{Int, Bool, Double, Void, Record, Unsupported}`,
+`Stmt::{Return, VarDecl, Assign, FieldAssign, If, While, For, ExprStmt, Unsupported}`,
+`Expr::{IntLiteral, BoolLiteral, Ref, Binary, Unary, Call, FieldAccess,
+RecordConstruct, Unsupported}`, `BinaryOp` com aritmética/comparação/`And`,
+`UnaryOp::Neg`, tudo com `Origin`), lowering em `crates/server/src/lower/cpp.rs`
+como extensão do passe de `function_catalog` (critério do roteiro item 1: sem
+quarta passada `libclang`) — inclusive `lower_record`, chamado do mesmo
+`visit_cursor` para `StructDecl`/`ClassDecl` sem cortar a recursão para
+métodos inline —, emissor determinístico em `crates/server/src/emit/dart.rs`,
+orquestração em `crates/server/src/transpile.rs` e rota síncrona
+`POST /projects/transpile`. Critérios 1–4 satisfeitos e testados para funções
+livres com aritmética, comparação, `if`/`else`, `while`, `for`, recursão,
+negação unária e `struct` POD com semântica de valor (`tests/lower_cpp.rs`,
+`tests/emit_dart.rs`, `tests/transpile.rs`, `tests/transpile_route.rs`,
+`tests/conversion_examples.rs`); critério 5 (silêncio proibido) também
+testado — inclusive o caso em que um `Stmt::Unsupported` em qualquer
+profundidade (corpo, `if`, `while`, `for`) precisa derrubar a função inteira,
+não só a si mesmo, senão statements seguintes referenciam nomes nunca
+declarados em Dart (achado registrado em
+`examples/E01-funcao-aritmetica/NOTES.md`). A armadilha do E02 — `int / int`
+trunca em C++ e precisa virar `~/` em Dart, não `/` — está resolvida e testada
+(`examples/E02-controle-de-fluxo/NOTES.md`), decidida pelo tipo do próprio nó
+`Binary`, não por inspecionar os operandos. A armadilha do E03 — C++ copia um
+`struct` passado por valor, Dart passa a referência — está resolvida e testada
+(`examples/E03-struct-pod/NOTES.md`): `lower::cpp::
+collect_params_with_clone_prelude` insere um autoclone (`p = Ponto(p.x, p.y);`)
+como primeiro statement do corpo para todo parâmetro `Record` por valor,
+regra geral, não por fixture. No cliente, `client/flutter/lib/src/ui/dart_output_view.dart`
+(painel "Dart Output" em `server_status_page.dart`, acionado pelo botão
+"Transpile" da barra de título) já mostra o Dart gerado ao lado do arquivo C++
+aberto, casando pelo stem do nome de arquivo (`matchingDartPath`) — cobre a
+parte do objetivo do usuário de "obter o código Dart correspondente" enquanto
+não existe navegação arquivo-a-arquivo automática. **Falta para "pronto":**
+`transpile::transpile` ainda não consulta `mapping::options_for`/`type_mappings`
+(US-7 está pronto o bastante para E03 porque `Ponto` só tem uma opção — nada a
+decidir; passa a importar de verdade a partir do E07), templates/monomorfização,
+e qualquer coisa além de função livre e `struct` POD (métodos, classes com
+herança, `break`/`continue`) · **Depende de:** US-7
 
 ### Objetivo do usuário
 
@@ -2045,7 +2112,19 @@ oráculo, UI, e então um degrau por vez.
 
 ## US-9 — Validação estática do Dart gerado
 
-**Status:** planejado · **Depende de:** US-8
+**Status:** parcial — critérios 1 e 2 satisfeitos, mas não como passo
+independente: `transpile::transpile` (`crates/server/src/transpile.rs`) já
+encana todo `.dart` emitido pelo `dart format --output=show` (lendo de
+stdin) antes de devolver o pacote — não por replicar à mão a heurística de
+quebra de linha do `dart_style` (tentativa inicial que quebrou em
+`dart format --set-exit-if-changed`, ver
+`examples/E01-funcao-aritmetica/NOTES.md`), mas invocando o formatador real.
+`tests/transpile.rs` roda `dart analyze`/`dart format --set-exit-if-changed`
+de verdade sobre o pacote escrito em disco, inclusive para um caso com nó
+`Unsupported`. **Falta:** critério 3 inteiro (tradução de diagnóstico para
+arquivo/linha C++ de origem — `DartDiagnostic`), a rota
+`POST /projects/validate` como endpoint próprio, e o painel de diagnósticos
+na UI · **Depende de:** US-8
 
 ### Objetivo do usuário
 
@@ -2104,10 +2183,45 @@ fixada, e o contrato é a saída delas.
 
 ## US-10 — Prova de equivalência comportamental
 
-**Status:** planejado · **Depende de:** US-8, mais uma fonte de oráculo — a
-fase A de US-6 ou os casos escritos à mão da escada de exemplos. **Deixou de
-depender de US-6 inteiro**, e portanto de KLEE, quando a rodada 1 decidiu que
-US-6 tem duas fases (ver "As duas fases" em US-6)
+**Status:** parcial — a fatia do E01+E02+E03, pela fonte "casos escritos à mão
+da escada" (`docs/plans/primeiro-corte-e01-e03.md` PR3/PR4/PR5), com suporte a
+argumento agregado desde o E03 (`{"x": 3.0, "y": 4.0}` em `oracle/cases.json`,
+resolvido contra `ir::Record` re-extraído no próprio harness, emitido como
+`Ponto{3.0, 4.0}` para C++ e `Ponto(3.0, 4.0)` para Dart — ordem de campo
+vem do `ir::Record`, não da ordem das chaves no JSON). Implementado dentro do
+próprio harness (`crates/server/tests/conversion_examples.rs`, não em
+`crates/server/src/`, já que o oráculo por enquanto só serve o corpus de
+exemplos): `run_cpp_oracle` compila e executa um `main` C++ sintético contra
+as flags reais do `compile_commands.json`, `run_dart_oracle` roda o
+equivalente sobre o Dart **transpilado** com `dart run`,
+`compare_oracle_outputs` reduz os dois a forma canônica e compara — a fonte
+da verdade é o C++ executado, `espera` em `oracle/cases.json` é só
+conferência de sanidade (critério testado:
+`espera` errado no exemplo aponta o erro para o exemplo, não para o
+produto). Critério 3 (teste de mutação) satisfeito por
+`mutation_test_a_sabotaged_dart_emitter_is_caught_by_the_oracle`: como
+recompilar o emissor mutado dentro do próprio processo de teste não é
+prático, o teste alimenta `compare_oracle_outputs` — a função de produção
+real, não uma cópia — com C++ real e um pacote Dart sabotado à mão
+(byte-a-byte o que `emit_binary_op` produziria com `+` trocado por `-`), e
+afirma que a mensagem de erro carrega origem e os dois valores. Uma
+divergência conhecida e declarada (overflow de `int` de 32 vs. 64 bits, E01)
+é tratada como informação (`divergencia_conhecida` em `oracle/cases.json`),
+não como falha — mas o harness falha se os dois lados um dia passarem a
+concordar, para a premissa não apodrecer em silêncio. **Falta:** critério 1
+como declarado (associar caso↔função do catálogo, não só nome), critério 4
+(relatório de fração de funções provadas), a tabela de regras de
+equivalência por tipo de `crates/server/src/equivalence.rs` (hoje a
+comparação é só igualdade textual canônica de inteiros/booleanos/`double`
+— `double` com `std::setprecision(15)` do lado C++ para reduzir, sem
+eliminar, o descompasso com o `toString()` de Dart; comparação por bits
+fica para quando `equivalence.rs` existir — o que E01+E02 precisam, nada
+além), e qualquer ligação com US-6/`behavior_traces` (a
+fonte "casos escritos à mão" é deliberadamente a única usada até aqui) ·
+**Depende de:** US-8, mais uma fonte de oráculo — a fase A de US-6 ou os
+casos escritos à mão da escada de exemplos. **Deixou de depender de US-6
+inteiro**, e portanto de KLEE, quando a rodada 1 decidiu que US-6 tem duas
+fases (ver "As duas fases" em US-6)
 
 ### Objetivo do usuário
 

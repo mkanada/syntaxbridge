@@ -700,3 +700,26 @@ class ProjectCreationJobStatus {
   final String? errorMessage;
   final bool isClientError;
 }
+
+/// The response of `POST /projects/transpile` (US-8, E01–E03 scope): the
+/// Dart package emitted from the project's free functions and `struct`s.
+/// Mirrors `transpile::TranspiledPackage` in `crates/server/src/transpile.rs`.
+class TranspiledPackage {
+  const TranspiledPackage({required this.packageName, required this.files});
+
+  factory TranspiledPackage.fromJson(Map<String, Object?> json) {
+    final filesJson = json['files'] as Map<String, Object?>? ?? const {};
+    return TranspiledPackage(
+      packageName: json['package_name'] as String? ?? '',
+      files: filesJson.map(
+        (path, content) => MapEntry(path, content as String? ?? ''),
+      ),
+    );
+  }
+
+  final String packageName;
+
+  /// Package-relative path (`"pubspec.yaml"`, `"lib/aritmetica.dart"`) →
+  /// file contents.
+  final Map<String, String> files;
+}

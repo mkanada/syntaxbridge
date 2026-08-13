@@ -46,6 +46,16 @@ test-host: rust-test flutter-test
 # Run a fuller local verification pass.
 ci: fmt-check lint test
 
+# Run the conversion examples corpus (examples/), on the host machine.
+examples *args:
+    cargo test -p syntax-bridge-server --test conversion_examples {{args}}
+
+# Regenerate examples/*/expected/ goldens from the current transpiler output.
+# Always review the diff before committing — the golden is a review tool,
+# not the contract (dart analyze + the behavioral oracle are).
+examples-bless *args:
+    SYNTAX_BRIDGE_BLESS=1 cargo test -p syntax-bridge-server --test conversion_examples {{args}}
+
 # Build and install the Flatpak package, without running its in-sandbox tests.
 package-build:
     scripts/build-flatpak-package.sh

@@ -1,0 +1,3 @@
+name: e03_struct_pod
+environment:
+  sdk: '>=3.0.0 <4.0.0'

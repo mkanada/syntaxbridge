@@ -8,6 +8,8 @@ use crate::function_catalog::{
     CallEdge, CallResolution, FunctionDeclaration, FunctionDeclarationKind,
 };
 use crate::ingest::CompilationUnit;
+use crate::ir;
+use crate::mapping::MappingDecision;
 use crate::source_catalog::{SourceFile, SourceFileKind};
 use crate::type_catalog::{
     TypeDeclaration, TypeDeclarationKind, TypeDependency, TypeUsage, TypeUsageKind,
@@ -110,7 +112,20 @@ impl ProjectStore {
                 column INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_call_edges_caller_usr ON call_edges(caller_usr);
-            CREATE INDEX IF NOT EXISTS idx_call_edges_callee_usr ON call_edges(callee_usr);",
+            CREATE INDEX IF NOT EXISTS idx_call_edges_callee_usr ON call_edges(callee_usr);
+            CREATE TABLE IF NOT EXISTS type_mappings (
+                type_usr TEXT PRIMARY KEY,
+                option_id TEXT NOT NULL,
+                decided_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ir_functions (
+                usr TEXT PRIMARY KEY,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ir_records (
+                usr TEXT PRIMARY KEY,
+                data TEXT NOT NULL
+            );",
         )?;
 
         migrate_type_columns(&connection)?;
@@ -174,6 +189,14 @@ impl ProjectStore {
     /// Replaces the full set of cataloged type declarations with the ones
     /// from the latest `libclang` extraction, since they describe the
     /// current state of the source tree rather than an append-only history.
+    ///
+    /// `type_mappings` is *not* wholesale-replaced the same way — it holds a
+    /// user decision, not derived state, so wiping it on every re-extraction
+    /// would silently discard a choice the user made. But a decision whose
+    /// `type_usr` no longer names anything in the fresh catalog (the type
+    /// was renamed or removed, so `libclang` now assigns it a different USR
+    /// or none at all) is orphaned, pointing at nothing — pruned here, in
+    /// the same transaction, once the new catalog is in place.
     pub fn replace_type_declarations(
         &mut self,
         declarations: &[TypeDeclaration],
@@ -198,6 +221,11 @@ impl ProjectStore {
                 ],
             )?;
         }
+
+        transaction.execute(
+            "DELETE FROM type_mappings WHERE type_usr NOT IN (SELECT usr FROM type_declarations)",
+            [],
+        )?;
 
         transaction.commit()?;
         Ok(())
@@ -709,6 +737,104 @@ impl ProjectStore {
         }
 
         Ok(counts)
+    }
+
+    /// Records (or updates) the chosen mapping option for one type — keyed
+    /// by `type_usr` (US-3's stable identity). Unlike every other table in
+    /// this store, `type_mappings` isn't wholesale-replaced on
+    /// re-extraction: it holds user decisions, not derived catalog data, so
+    /// an upsert per type is what makes "reabrir o projeto preserva a
+    /// decisão gravada" (US-7 criterion 4) true without any extra plumbing —
+    /// this table is simply never cleared by anything else in this store.
+    pub fn set_type_mapping(&mut self, decision: &MappingDecision) -> Result<(), PersistenceError> {
+        self.connection.execute(
+            "INSERT INTO type_mappings (type_usr, option_id, decided_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(type_usr) DO UPDATE SET
+                 option_id = excluded.option_id,
+                 decided_at = excluded.decided_at",
+            params![decision.type_usr, decision.option_id, decision.decided_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_type_mappings(&self) -> Result<Vec<MappingDecision>, PersistenceError> {
+        let mut statement = self.connection.prepare(
+            "SELECT type_usr, option_id, decided_at FROM type_mappings ORDER BY type_usr",
+        )?;
+
+        let rows = statement.query_map([], |row| {
+            Ok(MappingDecision {
+                type_usr: row.get(0)?,
+                option_id: row.get(1)?,
+                decided_at: row.get(2)?,
+            })
+        })?;
+
+        let mut decisions = Vec::new();
+        for row in rows {
+            decisions.push(row?);
+        }
+
+        Ok(decisions)
+    }
+
+    /// Persists the IR `lower::cpp` produced alongside the
+    /// declarations/calls stored by [`Self::replace_function_declarations`]/
+    /// [`Self::replace_call_edges`] — reused by `project_service::transpile_project`
+    /// so transpiling doesn't reparse every compilation unit with `libclang`
+    /// on every request; only project creation (or a future reingest) needs
+    /// to re-derive it. Wholesale DELETE+replace like every other catalog
+    /// table here: this is derived state, not a user decision (unlike
+    /// `type_mappings`, deliberately never cleared by this method).
+    pub fn replace_ir(
+        &mut self,
+        functions: &[ir::Function],
+        records: &[ir::Record],
+    ) -> Result<(), PersistenceError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM ir_functions", [])?;
+        transaction.execute("DELETE FROM ir_records", [])?;
+
+        for function in functions {
+            let data = serde_json::to_string(function)?;
+            transaction.execute(
+                "INSERT INTO ir_functions (usr, data) VALUES (?1, ?2)",
+                params![function.usr, data],
+            )?;
+        }
+        for record in records {
+            let data = serde_json::to_string(record)?;
+            transaction.execute(
+                "INSERT INTO ir_records (usr, data) VALUES (?1, ?2)",
+                params![record.usr, data],
+            )?;
+        }
+
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn list_ir(&self) -> Result<(Vec<ir::Function>, Vec<ir::Record>), PersistenceError> {
+        let mut functions_statement = self
+            .connection
+            .prepare("SELECT data FROM ir_functions ORDER BY usr")?;
+        let function_rows = functions_statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut functions = Vec::new();
+        for row in function_rows {
+            functions.push(serde_json::from_str(&row?)?);
+        }
+
+        let mut records_statement = self
+            .connection
+            .prepare("SELECT data FROM ir_records ORDER BY usr")?;
+        let record_rows = records_statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut records = Vec::new();
+        for row in record_rows {
+            records.push(serde_json::from_str(&row?)?);
+        }
+
+        Ok((functions, records))
     }
 }
 
@@ -1511,6 +1637,228 @@ mod tests {
             ],
             "expected both math.cpp calls, ordered by line, and none from shapes.cpp"
         );
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    fn sample_type_mapping() -> MappingDecision {
+        MappingDecision {
+            type_usr: "c:@S@Ponto".to_owned(),
+            option_id: "classe-direta".to_owned(),
+            decided_at: "2026-08-12T00:00:00Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn round_trips_type_mappings() {
+        let db_path = temp_db_path("project-type-mappings");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+        store
+            .set_type_mapping(&sample_type_mapping())
+            .expect("persist type mapping");
+
+        let decisions = store.list_type_mappings().expect("list type mappings");
+        assert_eq!(decisions, vec![sample_type_mapping()]);
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    /// US-7 criterion 4: reopening a project preserves the decision — proven
+    /// here at the persistence layer by opening the same database twice.
+    #[test]
+    fn reopening_the_project_preserves_the_recorded_type_mapping() {
+        let db_path = temp_db_path("project-type-mappings-reopen");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+        store
+            .set_type_mapping(&sample_type_mapping())
+            .expect("persist type mapping");
+        drop(store);
+
+        let reopened = ProjectStore::open(&db_path).expect("reopen project store");
+        let decisions = reopened.list_type_mappings().expect("list type mappings");
+        assert_eq!(decisions, vec![sample_type_mapping()]);
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    /// Setting a mapping twice for the same `type_usr` updates it in place
+    /// (upsert on the primary key) rather than erroring or duplicating.
+    #[test]
+    fn setting_a_type_mapping_again_updates_it_in_place() {
+        let db_path = temp_db_path("project-type-mappings-update");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+        store
+            .set_type_mapping(&sample_type_mapping())
+            .expect("persist type mapping");
+        let updated = MappingDecision {
+            option_id: "codigo-ponte".to_owned(),
+            decided_at: "2026-08-13T00:00:00Z".to_owned(),
+            ..sample_type_mapping()
+        };
+        store
+            .set_type_mapping(&updated)
+            .expect("update type mapping");
+
+        let decisions = store.list_type_mappings().expect("list type mappings");
+        assert_eq!(decisions, vec![updated]);
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    /// Regression test: unlike every other catalog table (`type_declarations`
+    /// itself, `type_dependencies`, `source_files`, ...), which is a
+    /// wholesale DELETE+replace on every re-extraction since it describes
+    /// derived state, `type_mappings` holds a *user decision* — wiping it on
+    /// every re-extraction would silently discard a choice the user made.
+    /// But a decision recorded for a `type_usr` that no longer exists in the
+    /// fresh catalog (the type was renamed or removed, so `libclang`
+    /// assigned it a different/no USR) is dead weight pointing at nothing —
+    /// `replace_type_declarations` must prune exactly those orphaned rows,
+    /// in the same transaction, while leaving a decision for a type that's
+    /// still present untouched.
+    #[test]
+    fn replacing_type_declarations_prunes_mappings_for_types_no_longer_in_the_catalog() {
+        let db_path = temp_db_path("project-type-mappings-prune");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+        let surviving_type = TypeDeclaration {
+            usr: "c:@S@Ponto".to_owned(),
+            ..sample_type_declarations()[0].clone()
+        };
+        store
+            .replace_type_declarations(std::slice::from_ref(&surviving_type))
+            .expect("seed initial catalog");
+        store
+            .set_type_mapping(&sample_type_mapping())
+            .expect("persist mapping for the surviving type");
+        let renamed_type_mapping = MappingDecision {
+            type_usr: "c:@S@PontoAntigo".to_owned(),
+            ..sample_type_mapping()
+        };
+        store
+            .set_type_mapping(&renamed_type_mapping)
+            .expect("persist mapping for a type about to disappear");
+
+        // Re-extraction: `Ponto` survives, but whatever `c:@S@PontoAntigo`
+        // used to name is gone from the fresh catalog (renamed/removed).
+        store
+            .replace_type_declarations(&[surviving_type])
+            .expect("replace with a catalog missing the renamed type");
+
+        let decisions = store.list_type_mappings().expect("list type mappings");
+        assert_eq!(
+            decisions,
+            vec![sample_type_mapping()],
+            "the orphaned decision should be pruned, the surviving one kept"
+        );
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    fn sample_ir_origin() -> ir::Origin {
+        ir::Origin {
+            file: "/project/input-source/src/aritmetica.cpp".to_owned(),
+            line: 2,
+            column: 1,
+        }
+    }
+
+    fn sample_ir_function() -> ir::Function {
+        ir::Function {
+            name: "soma".to_owned(),
+            usr: "c:@F@soma#I#I#".to_owned(),
+            params: vec![
+                ir::Param {
+                    name: "a".to_owned(),
+                    ty: ir::Type::Int,
+                },
+                ir::Param {
+                    name: "b".to_owned(),
+                    ty: ir::Type::Int,
+                },
+            ],
+            return_type: ir::Type::Int,
+            body: vec![ir::Stmt::Return {
+                value: Some(ir::Expr::Binary {
+                    op: ir::BinaryOp::Add,
+                    lhs: Box::new(ir::Expr::Ref {
+                        name: "a".to_owned(),
+                        ty: ir::Type::Int,
+                        origin: sample_ir_origin(),
+                    }),
+                    rhs: Box::new(ir::Expr::Ref {
+                        name: "b".to_owned(),
+                        ty: ir::Type::Int,
+                        origin: sample_ir_origin(),
+                    }),
+                    ty: ir::Type::Int,
+                    origin: sample_ir_origin(),
+                }),
+                origin: sample_ir_origin(),
+            }],
+            origin: sample_ir_origin(),
+        }
+    }
+
+    fn sample_ir_record() -> ir::Record {
+        ir::Record {
+            name: "Ponto".to_owned(),
+            usr: "c:@S@Ponto".to_owned(),
+            fields: vec![
+                ir::Field {
+                    name: "x".to_owned(),
+                    ty: ir::Type::Double,
+                },
+                ir::Field {
+                    name: "y".to_owned(),
+                    ty: ir::Type::Double,
+                },
+            ],
+            origin: sample_ir_origin(),
+        }
+    }
+
+    /// `project_service::transpile_project` reuses this instead of
+    /// reparsing every compilation unit with `libclang` on every request
+    /// (the same waste `list_types`/`list_functions` already avoid for
+    /// their own catalogs) — round-trip through JSON must reproduce the IR
+    /// exactly, `Box`-nested expressions included.
+    #[test]
+    fn round_trips_ir_functions_and_records() {
+        let db_path = temp_db_path("project-ir-round-trip");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+        store
+            .replace_ir(&[sample_ir_function()], &[sample_ir_record()])
+            .expect("persist ir");
+
+        let (functions, records) = store.list_ir().expect("list ir");
+        assert_eq!(functions, vec![sample_ir_function()]);
+        assert_eq!(records, vec![sample_ir_record()]);
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    /// Unlike `type_mappings`, the IR *is* derived catalog data — a second
+    /// `replace_ir` (as a reingest would trigger) must wholesale-replace the
+    /// previous contents, not accumulate alongside them.
+    #[test]
+    fn replacing_ir_clears_previous_entries() {
+        let db_path = temp_db_path("project-ir-replace");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+        store
+            .replace_ir(&[sample_ir_function()], &[sample_ir_record()])
+            .expect("persist initial ir");
+        store
+            .replace_ir(&[], &[])
+            .expect("replace with an empty ir");
+
+        let (functions, records) = store.list_ir().expect("list ir");
+        assert!(functions.is_empty());
+        assert!(records.is_empty());
 
         let _ = fs::remove_file(&db_path);
     }

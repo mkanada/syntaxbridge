@@ -1,10 +1,15 @@
+pub mod emit;
 pub mod function_catalog;
 pub mod ingest;
+pub mod ir;
 pub mod jobs;
+pub mod lower;
+pub mod mapping;
 pub mod persistence;
 pub mod progress;
 pub mod project_service;
 pub mod server;
 pub mod source_catalog;
 pub mod toolchain;
+pub mod transpile;
 pub mod type_catalog;

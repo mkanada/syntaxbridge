@@ -13,7 +13,11 @@
       "Bash(cargo check *)",
       "Bash(tar -tzf *)",
       "Bash(tar -tf *)",
-      "Bash(just test *)"
+      "Bash(just test *)",
+      "Bash(cargo build *)",
+      "Bash(just flutter-test)",
+      "Bash(just flutter-test *)",
+      "Bash(just flutter-analyze)"
     ]
   }
 }

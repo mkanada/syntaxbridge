@@ -431,7 +431,13 @@ fn collect_cmake_source_dirs(
     Ok(())
 }
 
-fn read_compilation_units(path: &Path) -> Result<Vec<CompilationUnit>, IngestError> {
+/// Reads a CMake-generated `compile_commands.json` into `CompilationUnit`s.
+/// `pub` (not just crate-internal) so the `examples/` harness
+/// (`tests/conversion_examples.rs`) can reuse this instead of hand-rolling a
+/// second JSON parser for the same file shape — it configures each example
+/// with `cmake` directly, without going through the tarball/zip ingestion
+/// this module otherwise exists for.
+pub fn read_compilation_units(path: &Path) -> Result<Vec<CompilationUnit>, IngestError> {
     log_ingest(format_args!("reading compile commands: {}", path.display()));
     #[derive(Deserialize)]
     struct RawCompilationUnit {

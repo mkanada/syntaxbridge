@@ -1,0 +1,7 @@
+id = "E03"
+nome = "struct POD"
+nivel = 3
+status = "passa"
+motivo = "golden, dart analyze/format e oráculo comportamental passam"
+constroi = ["struct-pod", "acesso-a-campo", "semantica-de-valor", "mapeamento-tipo-trivial"]
+passos = ["US-7", "US-8", "US-9", "US-10"]

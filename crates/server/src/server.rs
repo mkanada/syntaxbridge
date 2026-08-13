@@ -164,6 +164,7 @@ fn app(global_db_path: PathBuf) -> Router {
             "/projects/functions/calls-in-file",
             get(list_calls_in_file_from_http),
         )
+        .route("/projects/transpile", post(transpile_project_from_http))
         .with_state(state)
 }
 
@@ -681,6 +682,47 @@ async fn list_calls_in_file_from_http(Query(query): Query<CallsInFileQuery>) -> 
             )
         }
     }
+}
+
+/// Transpiles a project's free functions to Dart (E01–E03 scope, US-8) and
+/// returns the emitted package inline, so the client can show it without a
+/// second round trip — mirrors `list_types_from_http`'s shape.
+async fn transpile_project_from_http(Query(query): Query<ProjectDirQuery>) -> Response {
+    log_server(format_args!(
+        "transpiling project: project_dir={}",
+        query.project_dir.display()
+    ));
+
+    match tokio::task::spawn_blocking(move || {
+        project_service::transpile_project(&query.project_dir)
+    })
+    .await
+    {
+        Ok(Ok(package)) => json_response(StatusCode::OK, package),
+        Ok(Err(error)) => transpile_project_error_response(error),
+        Err(error) => {
+            log_server(format_args!("transpile task failed: {error}"));
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":"transpile_failed","message":error.to_string()}),
+            )
+        }
+    }
+}
+
+fn transpile_project_error_response(error: project_service::TranspileProjectError) -> Response {
+    let status = if error.is_client_error() {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    log_server(format_args!(
+        "transpile failed: status={status} error={error:?}"
+    ));
+    json_response(
+        status,
+        json!({"error":"transpile_failed","message":error.to_string()}),
+    )
 }
 
 fn list_types_error_response(error: ListTypesError) -> Response {

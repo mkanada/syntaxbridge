@@ -21,6 +21,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use crate::ingest::CompilationUnit;
+use crate::ir;
+use crate::lower;
 use crate::progress::{Cancellation, ExtractionProgress};
 use crate::type_catalog::{self, TypeDeclarationKind};
 
@@ -133,6 +135,15 @@ pub struct CallEdge {
 pub struct FunctionCatalog {
     pub declarations: Vec<FunctionDeclaration>,
     pub calls: Vec<CallEdge>,
+    /// IR of every free function's body, lowered by `lower::cpp` during the
+    /// same traversal that builds `declarations`/`calls` — see that module's
+    /// docs for why this isn't a fourth `libclang` pass. Only free functions
+    /// are lowered so far (E01–E03 scope, `docs/plans/primeiro-corte-e01-e03.md`);
+    /// methods/constructors/destructors are not yet represented in IR.
+    pub ir_functions: Vec<ir::Function>,
+    /// IR of every `struct`/`class` *definition*, lowered the same way —
+    /// E03 scope (`docs/plans/primeiro-corte-e01-e03.md` §7 PR5).
+    pub ir_records: Vec<ir::Record>,
 }
 
 #[derive(Debug)]
@@ -234,8 +245,13 @@ pub fn extract_function_catalog_cancellable(
     let mut declarations = Vec::new();
     let mut call_seen = HashSet::new();
     let mut calls = Vec::new();
+    let mut ir_seen = HashSet::new();
+    let mut ir_functions = Vec::new();
+    let mut ir_record_seen = HashSet::new();
+    let mut ir_records = Vec::new();
 
-    for (partial_declarations, partial_calls) in partials {
+    for (partial_declarations, partial_calls, partial_ir_functions, partial_ir_records) in partials
+    {
         for declaration in partial_declarations {
             if seen.insert(declaration_identity(&declaration)) {
                 declarations.push(declaration);
@@ -247,18 +263,34 @@ pub fn extract_function_catalog_cancellable(
                 calls.push(call);
             }
         }
+
+        for function in partial_ir_functions {
+            if ir_seen.insert(function.usr.clone()) {
+                ir_functions.push(function);
+            }
+        }
+
+        for record in partial_ir_records {
+            if ir_record_seen.insert(record.usr.clone()) {
+                ir_records.push(record);
+            }
+        }
     }
 
     log_function_catalog(format_args!(
-        "extract_function_catalog: done in {:.2}s, {} declarations, {} calls",
+        "extract_function_catalog: done in {:.2}s, {} declarations, {} calls, {} ir functions, {} ir records",
         extraction_started.elapsed().as_secs_f64(),
         declarations.len(),
-        calls.len()
+        calls.len(),
+        ir_functions.len(),
+        ir_records.len()
     ));
 
     Ok(FunctionCatalog {
         declarations,
         calls,
+        ir_functions,
+        ir_records,
     })
 }
 
@@ -268,7 +300,12 @@ fn parse_chunk(
     project_root: &Path,
     progress: Option<&ExtractionProgress>,
     cancellation: Option<&Cancellation>,
-) -> (Vec<FunctionDeclaration>, Vec<CallEdge>) {
+) -> (
+    Vec<FunctionDeclaration>,
+    Vec<CallEdge>,
+    Vec<ir::Function>,
+    Vec<ir::Record>,
+) {
     // Each worker thread needs its own load: see
     // `type_catalog::parse_chunk` for why the calling thread's
     // `load_libclang()` doesn't cover this one.
@@ -281,6 +318,8 @@ fn parse_chunk(
     let mut declarations = Vec::new();
     let mut call_seen = HashSet::new();
     let mut calls = Vec::new();
+    let mut ir_functions = Vec::new();
+    let mut ir_records = Vec::new();
 
     unsafe {
         let index = clang_sys::clang_createIndex(0, 0);
@@ -299,6 +338,8 @@ fn parse_chunk(
                 seen: &mut seen,
                 calls: &mut calls,
                 call_seen: &mut call_seen,
+                ir_functions: &mut ir_functions,
+                ir_records: &mut ir_records,
             };
 
             log_function_catalog(format_args!(
@@ -323,7 +364,7 @@ fn parse_chunk(
         clang_sys::clang_disposeIndex(index);
     }
 
-    (declarations, calls)
+    (declarations, calls, ir_functions, ir_records)
 }
 
 fn log_function_catalog(args: fmt::Arguments<'_>) {
@@ -346,6 +387,8 @@ struct VisitorState<'a> {
     seen: &'a mut HashSet<String>,
     calls: &'a mut Vec<CallEdge>,
     call_seen: &'a mut HashSet<(String, CallResolution, String, u32, u32)>,
+    ir_functions: &'a mut Vec<ir::Function>,
+    ir_records: &'a mut Vec<ir::Record>,
 }
 
 fn call_identity(call: &CallEdge) -> (String, CallResolution, String, u32, u32) {
@@ -443,12 +486,37 @@ extern "C" fn visit_cursor(
         return clang_sys::CXChildVisit_Recurse;
     }
 
+    // E03 scope: struct/class *definitions* become IR records, lowered on
+    // this same already-parsed cursor. Falls through to `Recurse` below
+    // (not returned early) — the generic walk still needs to descend into
+    // the record's own body to reach any inline method definitions the
+    // existing `function_declaration_kind_for` handling already covers.
+    if (kind == clang_sys::CXCursor_StructDecl || kind == clang_sys::CXCursor_ClassDecl)
+        && unsafe { clang_sys::clang_isCursorDefinition(cursor) } != 0
+        && let Some(record) = lower::cpp::lower_record(cursor, state.project_root)
+    {
+        state.ir_records.push(record);
+    }
+
     if let Some(declaration_kind) = function_declaration_kind_for(kind)
         && unsafe { clang_sys::clang_isCursorDefinition(cursor) } != 0
         && let Some(declaration) = describe_function(cursor, declaration_kind, state.project_root)
     {
         let caller_usr = declaration.usr.clone();
+        let declared_kind = declaration.kind;
         push_declaration(state, declaration);
+
+        // IR lowering (E01–E03 scope: free functions only, see
+        // `lower::cpp`'s docs) walks this same already-parsed cursor with
+        // its own `clang_visitChildren` call, the same way the call-graph
+        // visitor just below does — not a second `libclang` parse.
+        if declared_kind == FunctionDeclarationKind::FreeFunction
+            && !caller_usr.is_empty()
+            && let Some(function_ir) =
+                lower::cpp::lower_function(cursor, &caller_usr, state.project_root)
+        {
+            state.ir_functions.push(function_ir);
+        }
 
         // The call graph only lives inside this cursor's own subtree, so
         // it's walked here with a dedicated visitor carrying `caller_usr` —

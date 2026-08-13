@@ -185,6 +185,10 @@ class _FakeServerClient implements ServerClient {
     required String projectDir,
     required String file,
   }) async => const [];
+
+  @override
+  Future<TranspiledPackage> transpileProject(String projectDir) async =>
+      const TranspiledPackage(packageName: 'output', files: {});
 }
 
 const _projectWithCompilationUnits = CreatedProject(
