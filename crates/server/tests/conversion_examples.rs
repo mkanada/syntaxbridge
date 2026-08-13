@@ -1018,7 +1018,8 @@ fn e03_decisions_toml_applies_to_the_database_without_going_through_the_ui() {
     // Criterion 3 cross-check: the recorded option must actually be one
     // `mapping::options_for` would offer for `Ponto` — not just any string.
     let ponto = ir_record_declaration_for(&e03.input_dir(), "Ponto");
-    let options = mapping::options_for(&ponto, &[], &[]);
+    let facts = mapping::ProjectFacts::new(&[]);
+    let options = mapping::options_for(&ponto, &facts, &[]);
     assert_eq!(
         options.len(),
         1,

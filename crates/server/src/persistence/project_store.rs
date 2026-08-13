@@ -99,6 +99,8 @@ impl ProjectStore {
                 end_column INTEGER NOT NULL,
                 usr TEXT NOT NULL DEFAULT '',
                 is_virtual INTEGER NOT NULL,
+                is_pure_virtual INTEGER NOT NULL DEFAULT 0,
+                is_defaulted INTEGER NOT NULL DEFAULT 0,
                 overridden_usrs_json TEXT NOT NULL DEFAULT '[]'
             );
             CREATE TABLE IF NOT EXISTS call_edges (
@@ -550,8 +552,9 @@ impl ProjectStore {
             transaction.execute(
                 "INSERT INTO function_declarations (
                     name, kind, namespace, owning_class_usr, signature, file, line, column,
-                    end_line, end_column, usr, is_virtual, overridden_usrs_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    end_line, end_column, usr, is_virtual, is_pure_virtual, is_defaulted,
+                    overridden_usrs_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     declaration.name,
                     declaration.kind.as_str(),
@@ -565,6 +568,8 @@ impl ProjectStore {
                     declaration.end_column,
                     declaration.usr,
                     declaration.is_virtual,
+                    declaration.is_pure_virtual,
+                    declaration.is_defaulted,
                     overridden_usrs_json,
                 ],
             )?;
@@ -577,7 +582,8 @@ impl ProjectStore {
     pub fn list_function_declarations(&self) -> Result<Vec<FunctionDeclaration>, PersistenceError> {
         let mut statement = self.connection.prepare(
             "SELECT name, kind, namespace, owning_class_usr, signature, file, line, column,
-                    end_line, end_column, usr, is_virtual, overridden_usrs_json
+                    end_line, end_column, usr, is_virtual, is_pure_virtual, is_defaulted,
+                    overridden_usrs_json
              FROM function_declarations ORDER BY id",
         )?;
 
@@ -595,7 +601,9 @@ impl ProjectStore {
                 row.get::<_, u32>(9)?,
                 row.get::<_, String>(10)?,
                 row.get::<_, bool>(11)?,
-                row.get::<_, String>(12)?,
+                row.get::<_, bool>(12)?,
+                row.get::<_, bool>(13)?,
+                row.get::<_, String>(14)?,
             ))
         })?;
 
@@ -614,6 +622,8 @@ impl ProjectStore {
                 end_column,
                 usr,
                 is_virtual,
+                is_pure_virtual,
+                is_defaulted,
                 overridden_usrs_json,
             ) = row?;
             let Some(kind) = FunctionDeclarationKind::parse(&kind) else {
@@ -634,6 +644,8 @@ impl ProjectStore {
                 end_column,
                 usr,
                 is_virtual,
+                is_pure_virtual,
+                is_defaulted,
                 overridden_usrs,
             });
         }
@@ -944,6 +956,18 @@ fn migrate_function_columns(connection: &Connection) -> Result<(), PersistenceEr
         "function_declarations",
         "overridden_usrs_json",
         "overridden_usrs_json TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column(
+        connection,
+        "function_declarations",
+        "is_pure_virtual",
+        "is_pure_virtual INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        connection,
+        "function_declarations",
+        "is_defaulted",
+        "is_defaulted INTEGER NOT NULL DEFAULT 0",
     )
 }
 
@@ -1457,6 +1481,8 @@ mod tests {
                 end_column: 40,
                 usr: "c:@N@geometry@S@Shape@F@area#1#".to_owned(),
                 is_virtual: true,
+                is_pure_virtual: false,
+                is_defaulted: false,
                 overridden_usrs: vec![
                     "c:@N@geometry@S@Drawable@F@area#1#".to_owned(),
                     "c:@N@geometry@S@Measurable@F@area#1#".to_owned(),
@@ -1475,6 +1501,8 @@ mod tests {
                 end_column: 1,
                 usr: "c:@F@add#I#I#".to_owned(),
                 is_virtual: false,
+                is_pure_virtual: false,
+                is_defaulted: false,
                 overridden_usrs: Vec::new(),
             },
         ]

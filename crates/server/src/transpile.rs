@@ -168,7 +168,8 @@ pub fn emit_package(
         let Some(decision) = decisions.iter().find(|d| d.type_usr == record.usr) else {
             continue;
         };
-        let options = mapping::options_for(declaration, type_catalog, decisions);
+        let facts = mapping::ProjectFacts::new(type_catalog);
+        let options = mapping::options_for(declaration, &facts, decisions);
         if !options.iter().any(|option| option.id == decision.option_id) {
             return Err(TranspileError::UnknownMappingOption {
                 type_usr: record.usr.clone(),

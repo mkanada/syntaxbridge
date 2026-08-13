@@ -32,6 +32,8 @@ fn sample_declarations() -> Vec<FunctionDeclaration> {
             end_column: 40,
             usr: "c:@N@geometry@S@Shape@F@area#1#".to_owned(),
             is_virtual: true,
+            is_pure_virtual: false,
+            is_defaulted: false,
             overridden_usrs: Vec::new(),
         },
         FunctionDeclaration {
@@ -47,6 +49,8 @@ fn sample_declarations() -> Vec<FunctionDeclaration> {
             end_column: 1,
             usr: "c:@F@add#I#I#".to_owned(),
             is_virtual: false,
+            is_pure_virtual: false,
+            is_defaulted: false,
             overridden_usrs: Vec::new(),
         },
     ]

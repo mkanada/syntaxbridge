@@ -96,6 +96,20 @@ pub struct FunctionDeclaration {
     pub end_column: u32,
     pub usr: String,
     pub is_virtual: bool,
+    /// Whether this is a pure virtual method (`= 0`), i.e. carries no body of
+    /// its own — the fact `mapping::options_for` needs to tell a genuine
+    /// interface (every virtual member pure) from a class that only *looks*
+    /// like one until a member with a real default body shows up (US-7,
+    /// `docs/mapping-solver-cases.md` case B03). Always `false` for a
+    /// non-virtual member.
+    pub is_pure_virtual: bool,
+    /// Whether this was declared `= default` (most commonly `virtual
+    /// ~X() = default;`, written only to keep a base class safely
+    /// polymorphic) — `mapping::options_for` treats a *defaulted* destructor
+    /// as carrying no real teardown logic, unlike a destructor with a body,
+    /// which is the actual RAII signal (US-7, `docs/mapping-solver-cases.md`
+    /// cases C05/C06). Always `false` for a non-defaulted member.
+    pub is_defaulted: bool,
     /// `usr` of every virtual method this one overrides — more than one
     /// under multiple inheritance, when a derived class overrides methods
     /// from more than one base with the same signature. Empty when the
@@ -498,8 +512,22 @@ extern "C" fn visit_cursor(
         state.ir_records.push(record);
     }
 
+    // A pure virtual method (`= 0`) never has a body, so
+    // `clang_isCursorDefinition` is never true for it — its declaration is
+    // still the one and only cursor for that virtual slot, and skipping it
+    // would make `mapping::options_for`'s interface-vs-mixin rule (US-7,
+    // `docs/mapping-solver-cases.md` case B03) blind to every pure
+    // interface method. Unlike an ordinary in-header prototype (which *is*
+    // correctly skipped here, to avoid double-counting it alongside its
+    // out-of-line definition), a pure virtual method can never gain a
+    // separate defining cursor elsewhere, so this can't introduce a
+    // duplicate.
+    let is_pure_virtual_declaration =
+        unsafe { clang_sys::clang_CXXMethod_isPureVirtual(cursor) } != 0;
+
     if let Some(declaration_kind) = function_declaration_kind_for(kind)
-        && unsafe { clang_sys::clang_isCursorDefinition(cursor) } != 0
+        && (unsafe { clang_sys::clang_isCursorDefinition(cursor) } != 0
+            || is_pure_virtual_declaration)
         && let Some(declaration) = describe_function(cursor, declaration_kind, state.project_root)
     {
         let caller_usr = declaration.usr.clone();
@@ -673,6 +701,8 @@ fn describe_macro(cursor: clang_sys::CXCursor, project_root: &Path) -> Option<Fu
         end_column,
         usr,
         is_virtual: false,
+        is_pure_virtual: false,
+        is_defaulted: false,
         overridden_usrs: Vec::new(),
     })
 }
@@ -713,6 +743,8 @@ fn describe_function(
     let owning_class_usr = owning_class.as_ref().map(|(usr, _name)| usr.clone());
 
     let is_virtual = unsafe { clang_sys::clang_CXXMethod_isVirtual(cursor) } != 0;
+    let is_pure_virtual = unsafe { clang_sys::clang_CXXMethod_isPureVirtual(cursor) } != 0;
+    let is_defaulted = unsafe { clang_sys::clang_CXXMethod_isDefaulted(cursor) } != 0;
     let overridden_usrs = unsafe { overridden_usrs_of(cursor) };
     let is_const = unsafe { clang_sys::clang_CXXMethod_isConst(cursor) } != 0;
 
@@ -741,6 +773,8 @@ fn describe_function(
         end_column,
         usr,
         is_virtual,
+        is_pure_virtual,
+        is_defaulted,
         overridden_usrs,
     })
 }
