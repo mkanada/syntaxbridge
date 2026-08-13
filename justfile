@@ -129,3 +129,9 @@ flatpak-run *args:
 clean:
     cargo clean
     cd client/flutter && flutter clean
+
+# Stage everything, commit, and push.
+publish message:
+    git add .
+    git commit -m "{{message}}"
+    git push
