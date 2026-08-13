@@ -70,8 +70,9 @@ contato com o que existe é estender `function_catalog.rs`.
   `sha256`. `dart analyze`, `dart format` e `dart run` são utilizáveis hoje.
 - **`clang++` e `libclang`** vêm da extensão `llvm21`, já usada pelos passes
   existentes.
-- **KLEE e GoogleTest não estão** no manifesto, e não são necessários aqui — o
-  oráculo deste corte é escrito à mão.
+- **KLEE não está** no manifesto, e não é necessário aqui — o oráculo deste
+  corte é escrito à mão. (GoogleTest entrou no manifesto em 2026-08-13, ver
+  AGENTS.md, mas também não é necessário aqui pela mesma razão.)
 
 ### Comandos
 

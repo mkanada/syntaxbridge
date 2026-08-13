@@ -33,14 +33,24 @@ Ferramentas previstas para analise dos artefatos de saida:
 Ferramentas previstas para geracao e execucao de testes unitarios de entrada:
 
 - `klee` (fora da v1)
-- GoogleTest (`gtest`). (fora da v1)
+- GoogleTest (`gtest`/`gmock`) — **incorporado**: modulo `googletest` no
+  manifesto Flatpak (`build-aux/flatpak/dev.syntax_bridge.SyntaxBridge.json`),
+  construido via CMake a partir do release v1.18.0, instalado em `/app/lib` e
+  `/app/include`. Disponibilidade coberta por
+  `googletest_compiles_and_runs_a_small_test_suite` em
+  `crates/server/tests/toolchain_availability.rs`.
 
-Decisao registrada (Q10 em `docs/plans/User Steps.md`): as duas ficam **fora da
-v1** e nao entram no manifesto Flatpak por ora. A geracao de entradas sinteticas
-(fase B de US-6) depende delas e esta adiada; a caracterizacao por execucao real
-(fase A) usa apenas `cmake`, `clang++` e `llvm-cov`, que ja estao no manifesto.
-A inclusao volta a ser avaliada quando a fase A tiver medido, com `llvm-cov`,
-quanta cobertura ela deixa de fora.
+Decisao registrada (Q10 em `docs/plans/User Steps.md`), revista em 2026-08-13:
+GoogleTest deixou de estar "fora da v1" e foi incorporado ao manifesto Flatpak,
+por decisao explicita do usuario — reversao parcial de Q10. **`klee` continua
+fora da v1**: e a peca cara da decisao original (arrastaria LLVM proprio, um
+solver SMT e uma biblioteca C substituta), e a fase B de US-6 (geracao de
+entradas sinteticas) continua adiada porque depende de `klee` mesmo com
+GoogleTest ja disponivel — GoogleTest sozinho materializa/executa casos, mas
+nao os descobre. A caracterizacao por execucao real (fase A) segue usando
+apenas `cmake`, `clang++` e `llvm-cov`, ja no manifesto antes desta mudanca. A
+inclusao de `klee` volta a ser avaliada quando a fase A tiver medido, com
+`llvm-cov`, quanta cobertura ela deixa de fora.
 
 ## Metodo de desenvolvimento
 
@@ -98,7 +108,8 @@ Estrutura:
   (`persistence/project_store.rs`).
 - Cliente Flutter em `client/flutter`, com `lib/src/{project,server,ui,io,logging}`.
 - Manifesto Flatpak em `build-aux/flatpak/dev.syntax_bridge.SyntaxBridge.json`,
-  com as extensoes `rust-stable`, `llvm21` e o modulo `dart-sdk`.
+  com as extensoes `rust-stable`, `llvm21` e os modulos `dart-sdk` e
+  `googletest`.
 
 ### Comandos
 

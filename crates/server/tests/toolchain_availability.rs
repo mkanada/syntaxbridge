@@ -26,6 +26,20 @@ int main() {
 }
 "#;
 
+const GOOGLETEST_SOURCE: &str = r#"
+#include <gtest/gtest.h>
+
+namespace bridge_fixture {
+int add(int a, int b) {
+    return a + b;
+}
+}
+
+TEST(BridgeFixtureTest, AddsTwoNumbers) {
+    EXPECT_EQ(bridge_fixture::add(2, 3), 5);
+}
+"#;
+
 const DART_SOURCE: &str = r#"
 class Counter {
   const Counter(this.value);
@@ -94,6 +108,48 @@ fn clang_compiles_a_small_cpp_program() {
         .expect("run compiled C++ fixture");
 
     assert_success(run);
+}
+
+/// GoogleTest (`gtest`/`gtest_main`), added to the Flatpak manifest's
+/// `googletest` module — see AGENTS.md's tooling list. Compiles and links a
+/// one-assertion suite against the bundled static libraries and runs it,
+/// mirroring `clang_compiles_a_small_cpp_program` above: this only proves
+/// the *toolchain* is reachable (headers findable, libraries linkable, the
+/// resulting binary runs and reports success), not anything about a real
+/// project's own test suite.
+#[test]
+fn googletest_compiles_and_runs_a_small_test_suite() {
+    let workspace = TempWorkspace::new("googletest").expect("create temporary workspace");
+    let source_path = workspace.path().join("sample_test.cpp");
+    let binary_path = workspace.path().join("sample_test");
+
+    fs::write(&source_path, GOOGLETEST_SOURCE).expect("write GoogleTest fixture");
+
+    let mut compile = Command::new("clang++");
+    compile.arg("-std=c++17").arg(&source_path);
+    add_googletest_toolchain_flags(&mut compile);
+    compile
+        .arg("-lgtest")
+        .arg("-lgtest_main")
+        .arg("-lpthread")
+        .arg("-o")
+        .arg(&binary_path);
+    let compile = compile
+        .output()
+        .expect("run clang++ against the GoogleTest fixture");
+
+    assert_success(compile);
+
+    let run = Command::new(&binary_path)
+        .output()
+        .expect("run compiled GoogleTest fixture");
+
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    assert_success(run);
+    assert!(
+        stdout.contains("PASSED"),
+        "expected gtest's own \"PASSED\" summary in stdout, got: {stdout}"
+    );
 }
 
 #[test]
@@ -234,6 +290,22 @@ int main(int argc, char **argv) {
     return 0;
 }
 "#;
+
+/// `/app/include`/`/app/lib` is where the Flatpak manifest's `googletest`
+/// module installs (`CMAKE_INSTALL_PREFIX=/app`, the default `flatpak-builder`
+/// sets for every module) — but `clang++` inside the Flatpak sandbox doesn't
+/// search `/app/include` by default the way it searches the stdlib, so this
+/// has to be explicit. Only added when the header is actually there, so this
+/// stays a no-op (and the compile fails with a clear "header not found"
+/// instead of a silently-wrong include path) on a host that never ran
+/// `just package-build`.
+fn add_googletest_toolchain_flags(command: &mut Command) {
+    let prefix = Path::new("/app");
+    if prefix.join("include/gtest/gtest.h").is_file() {
+        command.arg("-I").arg(prefix.join("include"));
+        command.arg("-L").arg(prefix.join("lib"));
+    }
+}
 
 fn add_llvm_toolchain_flags(command: &mut Command) {
     for includedir in llvm_include_dirs() {

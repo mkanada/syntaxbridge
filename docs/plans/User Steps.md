@@ -87,7 +87,7 @@ pré-requisito duro.
 | ~~Q7~~ | US-6.3 | **Respondida:** o produto compila o projeto de entrada, só os alvos necessários, dentro do mecanismo de job. |
 | ~~Q8~~ | Observações transversais → Modelo intermediário | **Respondida:** a IR deixou de ser fronteira exigida, mas segue existindo como estrutura interna de US-8. |
 | ~~Q9~~ | US-7 | **Respondida:** resolver de fato — só opções válidas são apresentadas, e código ponte garante que a lista nunca seja vazia. |
-| ~~Q10~~ | US-6.4 / Observações transversais → Ambiente de teste | **Respondida:** KLEE e GoogleTest adiados; a via sintética fica fora da v1. |
+| ~~Q10~~ | US-6.4 / Observações transversais → Ambiente de teste | **Respondida, parcialmente revista em 2026-08-13:** KLEE e GoogleTest adiados originalmente; GoogleTest foi depois incorporado ao manifesto Flatpak (decisão explícita do usuário) — KLEE continua adiado. A via sintética (fase B) continua fora da v1: ainda depende de KLEE. |
 
 ---
 
@@ -1044,7 +1044,9 @@ literalmente; cada uma é seguida da consequência que ela produz nos sub-passos
      entregável de US-6 e destrava US-10 sem esperar ferramenta nenhuma.
    - **Fase B — entradas sintéticas sobre código isolado.** Instrumenta o
      código isolado de US-6.4, com entradas geradas por KLEE. Depende de
-     US-6.4, de KLEE e de GoogleTest, nenhum dos três disponível hoje.
+     US-6.4 e de KLEE — GoogleTest já está disponível no ambiente Flatpak
+     (revisão de Q10, ver AGENTS.md), mas isso sozinho não destrava a fase B:
+     GoogleTest materializa e executa casos, quem os descobre é KLEE.
    A instrumentação de US-6.2 é a **mesma** nas duas fases — muda o que é
    compilado e quem produz as entradas, não o que é gravado. Isso é o que
    permite que a fase B substitua a fase A sem trocar o formato do registro,
@@ -1125,7 +1127,7 @@ entregar a fase A inteira antes de tocar em qualquer parte da fase B.
 | O que é instrumentado | o código original do projeto | o código isolado de US-6.4 |
 | De onde vêm as execuções | perfis de execução do usuário (US-6.3) | KLEE (US-6.3) |
 | Cobertura | medida por `llvm-cov`, parcial e reportada | buscada por ramo, ainda assim medida |
-| Ferramentas | `cmake`, `clang++`, `llvm-cov` — **todas no Flatpak hoje** | KLEE + GoogleTest — **nenhum no Flatpak hoje** |
+| Ferramentas | `cmake`, `clang++`, `llvm-cov` — **todas no Flatpak hoje** | KLEE (fora) + GoogleTest (**já no Flatpak**, revisão de Q10) |
 | Sub-passos envolvidos | US-6.1, US-6.2, US-6.3(A), US-6.5 | US-6.3(B), US-6.4 |
 | Destrava | US-10 com oráculo real | cobertura de ramos garantida |
 
@@ -1621,8 +1623,9 @@ na fase B, com entradas sintéticas geradas por KLEE sobre o código isolado.
 
 **Status:** **adiado (fora da v1)** por Q10 — fase B apenas; não bloqueia o
 primeiro incremento de US-6, e US-6 é dado por completo com a fase A ·
-**Depende de:** US-6.3 (fase A entregue) e da reversão de Q10 (KLEE e GoogleTest
-no manifesto Flatpak)
+**Depende de:** US-6.3 (fase A entregue) e da reversão de Q10 para KLEE —
+GoogleTest já foi incorporado ao manifesto Flatpak em 2026-08-13 (ver
+AGENTS.md), mas KLEE segue fora, e é ele quem ainda bloqueia este sub-passo
 
 ##### Objetivo do usuário
 
@@ -1665,40 +1668,48 @@ ramos.
 
 - O fixture precisa incluir, de propósito, uma função pura, uma função com
   efeito colateral em global, uma que recebe ponteiro, e uma que não termina.
-- KLEE e GoogleTest precisam estar disponíveis no ambiente Flatpak — hoje não
-  estão no manifesto. Enquanto não estiverem, este sub-passo não é testável no
+- KLEE precisa estar disponível no ambiente Flatpak — hoje não está no
+  manifesto (GoogleTest já está, desde a revisão de Q10 em 2026-08-13; ver
+  AGENTS.md). Enquanto KLEE não estiver, este sub-passo não é testável no
   ambiente de destino (ver "Observações transversais → Ambiente de teste").
 
 ##### Roteiro de implementação (para um agente)
 
 **Não comece por aqui — e, por ora, não comece de jeito nenhum.** Com a fase A
 entregue, este sub-passo deixou de ser pré-requisito de qualquer coisa e passou
-a ser uma melhoria de cobertura; Q10 o declarou fora da v1. Sem KLEE no
-ambiente, o trabalho não tem como ser provado por teste, e a regra de ouro do
-`AGENTS.md` não admite começar assim. O roteiro abaixo fica registrado para o
-dia em que Q10 for revista com dado de cobertura em mãos.
+a ser uma melhoria de cobertura; Q10 o declarou fora da v1 para a parte que
+depende de KLEE. Sem KLEE no ambiente, o trabalho não tem como ser provado por
+teste, e a regra de ouro do `AGENTS.md` não admite começar assim. O roteiro
+abaixo fica registrado para o dia em que a parte de KLEE de Q10 for revista com
+dado de cobertura em mãos.
 
-**Resolvido (Q10): KLEE e GoogleTest ficam adiados — não entram no manifesto
-Flatpak por ora.** A via sintética fica fora da v1 e US-6 é considerado completo
-com a fase A. A alternativa descartada era adicioná-los a
-`build-aux/flatpak/dev.syntax_bridge.SyntaxBridge.json`, onde KLEE arrastaria
-LLVM próprio, um SMT solver e uma biblioteca C substituta — de longe o módulo
-mais pesado que o manifesto teria.
+**Resolvido (Q10): KLEE e GoogleTest ficavam adiados — nenhum entrava no
+manifesto Flatpak por ora.** Revisto em 2026-08-13, parcialmente: **GoogleTest
+foi incorporado** ao manifesto (`build-aux/flatpak/dev.syntax_bridge.SyntaxBridge.json`,
+módulo `googletest`, construído via CMake a partir do release v1.18.0 — ver
+AGENTS.md), por decisão explícita do usuário. **KLEE continua fora** — era a
+alternativa descartada mais pesada das duas: arrastaria LLVM próprio, um SMT
+solver e uma biblioteca C substituta, de longe o módulo mais pesado que o
+manifesto teria. A via sintética (fase B) continua fora da v1 e US-6 continua
+dado por completo com a fase A, porque GoogleTest sozinho não a destrava —
+falta quem descubra as entradas que cobrem os ramos, e esse é o papel do KLEE.
 
-O adiamento não é definitivo: a decisão de incluí-los volta à mesa quando houver
-**dado** — a fase A roda sobre o Verovio, `llvm-cov` reporta quanta cobertura os
-perfis de execução reais alcançam, e a diferença para 100% é o tamanho exato do
-problema que KLEE resolveria. Decidir antes disso seria decidir sem medida. Dois
-fatos empurram a favor do adiamento: a criação de perfis em lote (Q6) é o
-mecanismo pelo qual o usuário aumenta cobertura sem KLEE, e US-6 inteiro é
-opcional para o usuário (ver "US-6 é opcional de ponta a ponta"), o que tira a
-fase B de qualquer caminho crítico.
+O adiamento de KLEE não é definitivo: a decisão de incluí-lo volta à mesa
+quando houver **dado** — a fase A roda sobre o Verovio, `llvm-cov` reporta
+quanta cobertura os perfis de execução reais alcançam, e a diferença para 100%
+é o tamanho exato do problema que KLEE resolveria. Decidir antes disso seria
+decidir sem medida. Dois fatos empurram a favor do adiamento: a criação de
+perfis em lote (Q6) é o mecanismo pelo qual o usuário aumenta cobertura sem
+KLEE, e US-6 inteiro é opcional para o usuário (ver "US-6 é opcional de ponta a
+ponta"), o que tira a fase B de qualquer caminho crítico.
 
-Se e quando a resposta virar "entra", a ordem é:
+Se e quando a resposta sobre KLEE virar "entra", a ordem é:
 
 1. **Manifesto primeiro**, com um teste de disponibilidade no padrão de
-   `crates/server/tests/toolchain_availability.rs`. Sem isso, nada abaixo é
-   testável no ambiente de destino.
+   `crates/server/tests/toolchain_availability.rs`. A metade de GoogleTest já
+   está feita (módulo `googletest` no manifesto,
+   `googletest_compiles_and_runs_a_small_test_suite`); falta só a de KLEE. Sem
+   isso, nada abaixo é testável no ambiente de destino.
 2. **Fatiamento (*slicing*)**, em `crates/server/src/characterization/slice.rs`:
    fecho transitivo sobre `type_dependencies` (US-3) mais `call_edges` (US-5) a
    partir da função alvo — a mesma travessia de US-6.1, reaproveitada, com
@@ -1819,17 +1830,32 @@ entrada não representa risco para a máquina do usuário.
 
 ## US-7 — Mapeamento de tipos C++ → Dart
 
-**Status:** parcial — fatia mínima do E03 (`docs/plans/primeiro-corte-e01-e03.md`
-PR5). `crates/server/src/mapping.rs`: `MappingOption { id, label, description,
-consequences: Vec<Consequence> }`, `MappingDecision { type_usr, option_id,
-decided_at }`, e `options_for(declaration, catalog, decisions)` — já com a
-assinatura de solver (recebe catálogo e decisões, mesmo sem consultá-los
-ainda) para não precisar mudar quando E09 exigir resolução de verdade.
-Critério 1 satisfeito e testado: `struct`/`class` devolve exatamente uma
-opção. Critério 5/Q9 satisfeito e testado: qualquer outro tipo devolve uma
-opção de código ponte, nunca lista vazia. Persistência: tabela
-`type_mappings (type_usr PRIMARY KEY, option_id, decided_at)` em
-`project_store.rs`, com `set_type_mapping` (upsert, não
+**Status:** parcial — solver por regras implementado e testado contra o
+corpus de `docs/mapping-solver-cases.md` (22 casos, `mapping-solver-fixtures/`
+na raiz), além da fatia mínima do E03
+(`docs/plans/primeiro-corte-e01-e03.md` PR5). `crates/server/src/mapping.rs`:
+`MappingOption { id, label, description, consequences: Vec<Consequence> }`,
+`MappingDecision { type_usr, option_id, decided_at }`, `ProjectFacts`
+(catálogo de tipos + usos + funções + grafo de chamadas, de onde o solver
+lê de verdade agora — não só a assinatura preparada para isso), e cinco
+pontos de entrada: `options_for` (tipo), `overload_options_for` (grupo de
+sobrecarga), `template_options_for` (monomorfização local vs. decisão
+global), `signature_options_for` (ponteiro/inteiro de largura
+fixa/`float`/`setjmp`/`goto`/thread-mutex, por assinatura ou varredura
+textual do corpo) e `string_usage_conflict` (`std::string` texto vs. binário,
+projeto inteiro). Critério 1 satisfeito e testado: `struct`/`class` sem
+herança múltipla devolve exatamente uma opção. Critério 2 satisfeito e
+testado: herança múltipla devolve uma combinação classe+mixins com
+consequências, e resolve o conflito de diamante (duas bases declarando o
+mesmo método) sobrescrevendo explicitamente em vez de confiar na ordem de
+`with`. Critério 3 satisfeito para o caso testado (B01: uma opção que
+mutaria outro tipo por referência não-const é documentada como restrição, não
+oferecida como se não houvesse consequência). Critério 5/Q9 satisfeito e
+testado: qualquer tipo sem mapeamento direto devolve uma opção de código
+ponte, nunca lista vazia. Critério 6 satisfeito e testado: toda opção que
+teria efeito em outro tipo carrega `Consequence` estruturado citando esse
+tipo. Persistência: tabela `type_mappings (type_usr PRIMARY KEY, option_id,
+decided_at)` em `project_store.rs`, com `set_type_mapping` (upsert, não
 `replace_*`/`delete`-then-`insert` como as demais tabelas — decisões são
 dado do usuário, não catálogo derivado, e não podem ser apagadas quando
 outro catálogo é reextraído) e `list_type_mappings`; critério 4 (reabrir
@@ -1839,8 +1865,11 @@ e aplicado ao banco sem passar pela UI, cruzado contra `options_for` de
 verdade (não um id escrito à mão) em
 `e03_decisions_toml_applies_to_the_database_without_going_through_the_ui`.
 **Falta:** o solver de viabilidade global de verdade (Q9 completo — E09 é
-quem dimensiona isso), as rotas `GET`/`PUT /projects/mappings`, a UI, e —
-importante — **`transpile::transpile` ainda não consulta `type_mappings` nem
+quem dimensiona isso; o que existe hoje é regras heurísticas sobre fatos já
+extraídos, não uma satisfação de restrições real — ver as limitações
+conhecidas registradas em `docs/mapping-solver-cases.md`, casos B06 e C03),
+as rotas `GET`/`PUT /projects/mappings`, a UI, e — importante —
+**`transpile::transpile` ainda não consulta `type_mappings` nem
 `options_for` ao gerar Dart**: `Ponto` é sempre emitido como classe
 diretamente, sem checar se existe decisão gravada. Isso é honesto para E03
 porque `Ponto` só tem uma opção possível (nada a decidir), mas significa que
@@ -2640,9 +2669,11 @@ fora do diretório do projeto, e por isso precisa do portal de arquivos).
 ### Ambiente de teste
 
 O `AGENTS.md` exige rodar os testes dentro do Flatpak. Hoje o manifesto oferece
-`rust-stable`, `llvm21` e o **Dart SDK 3.12.2** (módulo `dart-sdk`, instalado em
-`/app/lib/dart-sdk` com `/app/bin/dart` no caminho). **KLEE e GoogleTest
-continuam fora dele.**
+`rust-stable`, `llvm21`, o **Dart SDK 3.12.2** (módulo `dart-sdk`, instalado em
+`/app/lib/dart-sdk` com `/app/bin/dart` no caminho) e, desde 2026-08-13, o
+**GoogleTest v1.18.0** (módulo `googletest`, construído via CMake, instalado em
+`/app/lib`/`/app/include` — decisão explícita do usuário revendo Q10). **Só
+`klee` continua fora dele.**
 
 Consequência por passo:
 
@@ -2652,20 +2683,21 @@ Consequência por passo:
   as respostas da rodada 1 produziram: a via de execução real precisa de
   `cmake`, `clang++` e, para medir cobertura, `llvm-profdata`/`llvm-cov` — os
   três já vêm da extensão `llvm21` e do runtime, nenhum é novo no manifesto.
-- **US-6 fase B está adiada, não apenas bloqueada** (Q10 respondida): KLEE (para
-  descobrir entradas que cobrem todos os ramos) e GoogleTest (para materializar
-  e executar os casos) não entram no manifesto por ora, e a via sintética fica
-  fora da v1. A inclusão volta à mesa quando a fase A tiver rodado sobre o
-  Verovio e `llvm-cov` mostrar, com número medido, quanta cobertura ela deixa de
-  fora. Ver **Q10** em US-6.4.
+- **US-6 fase B está adiada, não apenas bloqueada** (Q10 respondida, revista
+  parcialmente): GoogleTest (para materializar e executar os casos) já entrou
+  no manifesto, mas KLEE (para descobrir entradas que cobrem todos os ramos)
+  continua fora, e é ele quem ainda impede a via sintética — GoogleTest
+  sozinho não descobre entrada nenhuma. A inclusão de KLEE volta à mesa quando
+  a fase A tiver rodado sobre o Verovio e `llvm-cov` mostrar, com número
+  medido, quanta cobertura ela deixa de fora. Ver **Q10** em US-6.4.
 - **US-10 não herda mais bloqueio nenhum**: o oráculo pode vir dos casos
   escritos à mão da escada de exemplos ou dos `behavior_traces` da fase A de
   US-6, no mesmo formato, e rodar os testes Dart gerados já é possível.
 
 Ou seja: a dependência de infraestrutura mais importante do roadmap encolheu de
-"três ferramentas ausentes bloqueando quatro passos" para "duas ferramentas
-ausentes bloqueando **meio** passo" — a fase sintética de US-6 —, e essa fase
-tem contorno conhecido e não bloqueia mais nada a jusante.
+"três ferramentas ausentes bloqueando quatro passos" para "uma ferramenta
+ausente (`klee`) bloqueando **meio** passo" — a fase sintética de US-6 —, e essa
+fase tem contorno conhecido e não bloqueia mais nada a jusante.
 
 Uma capacidade nova entra no ambiente com US-6.3, e vale registrar aqui porque
 não é ferramenta ausente e sim uso ausente: o produto passa a **compilar** o

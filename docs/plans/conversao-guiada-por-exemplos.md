@@ -336,10 +336,13 @@ a exigência viraria cerimônia. Decidir antes do E03.
   US-9 exige. (`User Steps.md` afirmava o contrário em três pontos; corrigido.)
 - **`clang++` e `libclang`: disponíveis** via a extensão `llvm21`, já usada
   pelos passes existentes. O runner de oráculo do lado C++ não pede nada novo.
-- **KLEE e GoogleTest: continuam fora do manifesto** — e, com o oráculo escrito
-  à mão, saem do caminho crítico. Voltam a ser necessários em US-6, quando a
-  geração automática de casos substituir a escrita manual. Essa substituição
-  não deve mudar o formato de `oracle/cases.json`; se mudar, o formato foi mal
+- **KLEE continua fora do manifesto** (GoogleTest entrou em 2026-08-13, ver
+  AGENTS.md) — e, com o oráculo escrito à mão, os dois saem do caminho crítico
+  da escada. Voltam a ser necessários juntos em US-6, quando a geração
+  automática de casos substituir a escrita manual — GoogleTest sozinho
+  materializa/executa, mas quem descobre os casos é o KLEE, ainda ausente.
+  Essa substituição não deve mudar o formato de `oracle/cases.json`; se mudar,
+  o formato foi mal
   projetado.
 - **Execução de código de terceiros.** O oráculo compila e executa o código C++
   do exemplo. Nos exemplos deste corpus isso é inofensivo — são arquivos que
