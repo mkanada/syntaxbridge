@@ -18,6 +18,13 @@ verificáveis, e não como intenções.
 - **Condições de testabilidade** — o que precisa existir (fixture, determinismo,
   isolamento, ambiente) para que os critérios acima possam virar teste. Quando
   esta seção não estiver satisfeita, o passo ainda não é implementável por TDD.
+- **Roteiro de implementação** — presente nos passos ainda não prontos: a
+  sequência concreta, em ordem de execução, que um agente deve seguir para
+  implementar o passo por TDD. Cada item nomeia o arquivo que muda e o teste
+  que precisa falhar antes dele. Onde o roteiro disser "receita padrão", ver a
+  seção "Receita padrão de implementação" logo abaixo do índice — ela descreve
+  o caminho que US-3, US-4 e US-5 já percorreram, para não ser reescrito em
+  cada passo.
 
 ## Índice
 
@@ -28,17 +35,23 @@ verificáveis, e não como intenções.
 | US-3 | Catálogo de tipos do projeto | pronto | US-2 |
 | US-4 | Usos de cada tipo e navegação | pronto | US-3 |
 | US-5 | Funções, métodos e macros, e seus usos | pronto | US-3 |
-| US-6 | Isolamento e caracterização comportamental | planejado | US-5 |
+| US-6 | Isolamento e caracterização comportamental (**opcional para o usuário**) | planejado (fase A destravada; fase B fora da v1) | US-5 |
 | US-7 | Mapeamento de tipos C++ → Dart | planejado | US-4, US-5 |
 | US-8 | Geração do código Dart | planejado | US-7 |
 | US-9 | Validação estática do Dart gerado | planejado | US-8 |
-| US-10 | Prova de equivalência comportamental | planejado | US-6, US-8 |
+| US-10 | Prova de equivalência comportamental | planejado | US-8 (+ oráculo) |
 | US-11 | Exportação do projeto convertido | planejado | US-9, US-10 |
 | US-12 | Re-ingestão preservando decisões | planejado | US-7 |
 
 Este arquivo é a fonte única do roadmap. Os antigos `docs/plans/ingest.md` e
 `docs/plans/separate-compilation-units.md` foram absorvidos por US-1 e US-6,
 respectivamente, e removidos do repositório.
+
+US-6 está desdobrado em cinco sub-passos (US-6.1 a US-6.5). O desdobramento
+nasceu de uma decisão arquitetural em aberto, **hoje tomada** (as quatro
+respostas da rodada 1, no início do item): US-6 tem duas fases, e a fase A —
+execução real instrumentada — não depende de KLEE, de GoogleTest nem de
+isolamento, e portanto é implementável no ambiente atual.
 
 `docs/plans/ui-lists.md` é o complemento de interface: enquanto este documento
 diz *o que* o usuário consegue fazer em cada passo, aquele diz *onde* cada lista
@@ -48,6 +61,98 @@ aparece na UI e o que a interface atual precisa mudar para sustentá-la.
 documento diz *o que* cada passo entrega, aquele propõe *em que ordem*
 construir US-7 a US-10 — atravessando o produto de ponta a ponta com exemplos
 C++ → Dart mínimos e engrossando esse caminho um degrau por vez.
+
+---
+
+## Perguntas abertas (rodada 2)
+
+As quatro perguntas da rodada 1 (US-6, OBS 1 e OBS 2) foram respondidas e estão
+incorporadas ao corpo do documento — ver "Notas do revisor" em US-6. A revisão
+que incorporou aquelas respostas gerou seis novas, Q5 a Q10, e **todas as seis
+já foram respondidas**. A decisão de cada uma está escrita por extenso no lugar
+onde ela pesa; esta tabela guarda só o veredito e o ponteiro.
+
+Duas delas mudam o produto mais do que o resumo sugere, e vale lê-las por
+extenso: **Q9** decidiu, contra a recomendação original, que a viabilidade de
+mapeamento é *resolvida* e não apenas alertada — resolver o mapeamento de tipos
+entre linguagens é o objetivo principal do produto. E, junto com esta rodada,
+ficou decidido que **US-6 inteiro é opcional para o usuário** (ver "US-6 é
+opcional de ponta a ponta"), o que proíbe qualquer passo posterior de tê-lo como
+pré-requisito duro.
+
+| # | Onde | Decide |
+| --- | --- | --- |
+| ~~Q5~~ | US-6.2 | **Respondida:** a instrumentação entra por reescrita de uma cópia do fonte (opção a). |
+| ~~Q6~~ | US-6.3 | **Respondida:** perfil de execução confirmado, com criação em lote por molde; arquivos de entrada sempre copiados para o projeto. |
+| ~~Q7~~ | US-6.3 | **Respondida:** o produto compila o projeto de entrada, só os alvos necessários, dentro do mecanismo de job. |
+| ~~Q8~~ | Observações transversais → Modelo intermediário | **Respondida:** a IR deixou de ser fronteira exigida, mas segue existindo como estrutura interna de US-8. |
+| ~~Q9~~ | US-7 | **Respondida:** resolver de fato — só opções válidas são apresentadas, e código ponte garante que a lista nunca seja vazia. |
+| ~~Q10~~ | US-6.4 / Observações transversais → Ambiente de teste | **Respondida:** KLEE e GoogleTest adiados; a via sintética fica fora da v1. |
+
+---
+
+## Receita padrão de implementação
+
+US-3, US-4 e US-5 foram implementados pela mesma sequência. Ela funcionou, está
+provada por testes em todos os níveis, e os roteiros dos passos seguintes
+apenas dizem "receita padrão" em vez de repeti-la. Um agente que for implementar
+qualquer passo abaixo deve seguir esta ordem, e cada item é um commit
+potencialmente independente:
+
+1. **Fixture primeiro, em texto, dentro do próprio teste.** Uma `const &str`
+   com o C++ mínimo que exercita o comportamento (padrão de `USAGE_TAXONOMY_CPP`
+   em `type_catalog.rs` e `FUNCTIONS_CPP` em `tests/function_catalog.rs`).
+   Posições esperadas são **calculadas do texto** (`locate_in`), nunca contadas
+   à mão. Um comportamento novo que perturbaria contagens exatas de um fixture
+   existente ganha fixture próprio, separado.
+2. **Teste de extração que falha.** Em `crates/server/tests/<assunto>.rs`,
+   afirmando sobre a estrutura de dados retornada, não sobre a UI.
+3. **Modelo de dados + extração**, em `crates/server/src/<assunto>.rs`. Toda
+   entidade nova carrega o `usr` do `libclang` como identidade estável (decisão
+   de US-3); posição (arquivo/linha/coluna) é dado de navegação, nunca chave.
+4. **Persistência**, em `crates/server/src/persistence/project_store.rs`:
+   `CREATE TABLE IF NOT EXISTS` em `ProjectStore::open`, um par
+   `replace_*`/`list_*`, e teste inline de *round-trip* no mesmo arquivo.
+   Coluna nova em tabela que já existe **exige** migração pontual via
+   `ensure_column` (padrão de `migrate_type_columns`/`migrate_function_columns`),
+   senão projetos criados por versões anteriores quebram ao reabrir.
+5. **Serviço**, em `crates/server/src/project_service.rs`: uma struct `*Listing`
+   que agrega o que a tela precisa em uma resposta só (padrão de
+   `TypeCatalogListing`/`FunctionCatalogListing`), lida do banco, sem reparsear.
+6. **Rota**, em `crates/server/src/server.rs`, com struct de `Query` própria, e
+   teste em `crates/server/tests/<assunto>_route.rs` que **popula o banco
+   diretamente** e nunca carrega `libclang` — é o que mantém a suíte de rotas
+   rápida e independente de toolchain.
+7. **Modelo do cliente**, em `client/flutter/lib/src/project/project_models.dart`,
+   espelhado à mão a partir do JSON do servidor. Esta é a fronteira que já
+   produziu um bug de contrato divergente (`build_layers`, ver "Contrato
+   cliente/servidor"): ao adicionar um campo, conferir os dois lados no mesmo
+   commit.
+8. **Cliente**, em `server_client.dart` (abstrato) e `http_server_client.dart`
+   (implementação); os testes de widget usam um falso roteirizado, nunca rede.
+9. **UI**, em `client/flutter/lib/src/ui/<assunto>_view.dart`, com teste de
+   widget próprio e isolado, mais a fiação em `server_status_page.dart`.
+10. **Ponta a ponta** em `client/flutter/test/app_test.dart` — lembrando de
+    `tester.ensureVisible` antes de `tap` em painéis dockados.
+11. **Trabalho longo** (qualquer coisa que passe de segundos): reaproveitar
+    `progress::ExtractionProgress` (contadores atômicos), `progress::Cancellation`
+    (o `AtomicBool` checado por unidade de trabalho) e o `JobRegistry` de
+    `jobs.rs`, acrescentando uma variante a `JobPhase` e um campo a
+    `CreationProgress`. Nunca inventar um segundo mecanismo de job.
+
+Duas regras de disciplina, importadas de `conversao-guiada-por-exemplos.md` §8
+porque valem para todos os passos, não só para a escada de exemplos:
+
+- **Silêncio é proibido.** Toda construção que o produto não sabe tratar vira um
+  registro explícito com origem (arquivo, linha) e motivo — nunca uma omissão.
+  É a regra que já produziu `CallResolution::Unresolved` em US-5, em vez de
+  simplesmente descartar chamadas indiretas.
+- **Nenhum caso especial por fixture.** Um ramo no código que dependa de nome de
+  arquivo, de função ou de projeto significa que a regra geral ainda não foi
+  encontrada.
+
+Rodar testes: `just test` (dentro do Flatpak) ou `just test-host`. Sempre pelas
+receitas do `justfile`, não por `cargo`/`flutter` cru.
 
 ---
 
@@ -810,79 +915,905 @@ com a mesma navegação imediata de US-4, indo da definição ao uso e vice-vers
 
 ## US-6 — Isolamento e caracterização comportamental
 
-**Status:** planejado · **Depende de:** US-5
+**Status:** planejado — **fase A destravada** pelas respostas da rodada 1 (não
+depende de KLEE, GoogleTest nem isolamento); fase B **adiada** por decisão
+explícita (Q10) · **Depende de:** US-5
 
 Este passo absorve o conteúdo do antigo plano de separação de unidades de
 compilação, que era mantido em documento próprio.
 
+### US-6 é opcional de ponta a ponta
+
+**Decisão do usuário, e ela vale para US-6 inteiro, não só para a escolha de
+quais funções caracterizar.** O Syntax Bridge deve *oferecer as ferramentas* de
+caracterização comportamental, mas o usuário pode escolher simplesmente não
+executá-las e ainda assim converter o projeto. Caracterização é instrumento de
+confiança, não pedágio do fluxo de conversão.
+
+Isso vai além de OBS 1: OBS 1 dizia que a caracterização é *seletiva* (o usuário
+escolhe quais funções); esta decisão diz que ela é *dispensável* (o usuário pode
+escolher nenhuma, inclusive nunca abrir a tela). As consequências atravessam
+vários passos:
+
+- **Nenhum passo posterior pode ter US-6 como pré-requisito duro.** US-7, US-8,
+  US-9 e US-11 precisam funcionar com zero traces gravados. Um projeto sem
+  caracterização alguma é um estado normal do produto, não um estado incompleto,
+  e não pode produzir erro, aviso repetido nem bloqueio de exportação.
+- **US-10 é o passo que mais sente, e já estava preparado.** Ele depende de "uma
+  fonte de oráculo", que pode ser a fase A de US-6 *ou* os casos escritos à mão
+  da escada de exemplos — nunca de US-6 obrigatoriamente. Sem oráculo algum,
+  US-10 não roda, e o produto **reporta cobertura de prova zero** em vez de
+  fingir sucesso: é a mesma regra de "silêncio é proibido" da receita padrão.
+- **Exportar sem prova é um caminho legítimo** (US-11), desde que o relatório
+  diga com clareza o que não foi provado. A decisão de exportar código não
+  verificado é do usuário; a de escondê-lo dele, nunca.
+- **Custo de caracterizar precisa ser visível antes de ser pago.** Como US-6
+  compila o projeto de entrada (Q7) e roda execuções reais, e isso leva minutos
+  num projeto do tamanho do Verovio, o usuário só decide bem se souber o preço
+  antes de entrar — daí o mecanismo de job (progresso + cancelamento) valer aqui
+  tanto quanto em US-1.
+- **Na UI**, isso significa que os painéis de caracterização são uma área que o
+  usuário visita se quiser, e o fluxo principal (catálogos → mapeamento →
+  geração → exportação) não passa por dentro deles.
+
+### Notas do revisor sobre OBS 1 e OBS 2 (ler antes das duas)
+
+> Esta seção é o **registro histórico** da rodada 1 de revisão. As quatro
+> perguntas que ela levanta foram todas respondidas — as respostas e as
+> consequências estão no fim dela, e já estão incorporadas aos sub-passos. Quem
+> quiser só o resultado pode pular direto para "As duas fases, e por que a ordem
+> importa".
+
+**Inconsistência encontrada e corrigida:** o índice no topo do documento já
+classificava US-6 como `planejado`, mas o corpo deste item dizia
+`Status: adiado` — um rótulo que nem existe na taxonomia definida em "Como ler
+cada passo" (`pronto`/`parcial`/`planejado`). Corrigido acima. `adiado` parecia
+ser um jeito informal de dizer "bloqueado por KLEE/GoogleTest ausentes do
+Flatpak" (já registrado em "Observações transversais → Ambiente de teste"). Vale
+manter essa constatação porque o desdobramento abaixo mostra que nem tudo em
+US-6 está de fato bloqueado por essa ausência — só a via que depende de KLEE.
+
+**Sobre OBS 1 (passo opcional, escolhido pelo usuário):** isso corrige uma
+premissa que os critérios de aceitação antigos carregavam implicitamente — eles
+falavam em "uma função pura simples do fixture" como se a caracterização fosse
+automática/global em vez de seletiva. Com OBS 1, faltam três decisões que o
+texto original não tinha: onde o usuário faz a escolha (provável extensão do
+painel "Functions" de US-5, não uma tela nova), como a escolha é persistida, e
+o que acontece quando a função escolhida chama outra que não foi escolhida — a
+seleção não elimina o problema de granularidade do isolamento já registrado
+abaixo (agora US-6.4), só decide *quais* funções entram na fila. Virou **US-6.1**.
+
+**Sobre OBS 2 (ferramenta de log estruturado):** este é o ponto que mais precisa
+de decisão sua, porque a nota admite duas leituras que levam a arquiteturas bem
+diferentes e o texto não deixa claro qual é a pretendida:
+
+1. É a instrumentação injetada no código *isolado* — o que a frase "a função em
+   questão, instrumentada" do objetivo original já previa. Complementa KLEE, não
+   o substitui.
+2. É uma instrumentação injetada no código *original*, para captar comportamento
+   de execuções reais (a suíte de testes que o projeto C++ de entrada já tiver,
+   por exemplo via GoogleTest, ou uma sessão manual do usuário). Isso evitaria,
+   para um primeiro incremento, todo o problema de *program slicing*/mocks —
+   e destravaria boa parte de US-6 sem depender de KLEE, que hoje não está no
+   Flatpak.
+
+A leitura 1 dá cobertura de ramos "de graça" via busca de entradas, mas herda
+tudo que já está em aberto sobre isolamento e a ausência do KLEE. A leitura 2 é
+mais barata e não depende de ferramenta ausente, mas só prova o que as
+execuções reais exercitarem — a cobertura deixa de ser garantida e precisa ser
+medida e reportada como parcial. Registrei as duas como uma decisão explícita em
+**US-6.3**, com uma pergunta direta abaixo. Isso também é o motivo de este item
+ter sido desdobrado: sem separar "o que caracterizar" (US-6.1), "o que gravar"
+(US-6.2), "de onde vêm as execuções" (US-6.3), "como isolar, se necessário"
+(US-6.4) e "onde e com que limites o resultado vive" (US-6.5), a decisão sobre
+OBS 2 fica implícita dentro de um único item grande demais para revisar aos
+poucos.
+
+**Perguntas para revisão — respondidas.** As respostas estão preservadas
+literalmente; cada uma é seguida da consequência que ela produz nos sub-passos.
+
+1. Em OBS 1, a seleção é só de funções "folha" (que não chamam outras
+   não selecionadas), ou qualquer função — aceitando que suas dependências
+   sejam automaticamente incluídas/mockadas pelo mecanismo de isolamento
+   (US-6.4)?
+
+   Resposta: Permitir as duas coisas: Somente a função e a função e tudo o que ela chama.
+
+   **Consequência:** a seleção não é um booleano, é um par
+   `(função, escopo)` com dois escopos — `FunctionOnly` e `FunctionAndCallees`.
+   O segundo é o **fecho transitivo** sobre o grafo de chamadas de US-5, que
+   já existe persistido (`call_edges`) e portanto não custa nada extrair de
+   novo. Decisão de projeto derivada: persistir apenas a *raiz* da seleção e
+   derivar o fecho a cada leitura, nunca materializá-lo — assim uma mudança no
+   código (US-12) ou uma chamada nova recalculam o conjunto sozinhas, em vez de
+   deixarem uma lista salva desatualizada. Detalhado em US-6.1.
+
+2. Em OBS 2, a leitura pretendida é (a) instrumentação do código isolado
+   gerado a partir de entradas sintéticas, (b) instrumentação do código
+   original rodando com testes/uso reais, ou (c) as duas, em fases
+   diferentes? A resposta decide se US-6.3/US-6.4 (isolamento, KLEE) precisam
+   estar prontos antes do primeiro incremento entregável de US-6, ou não.
+
+   Resposta: opção c.
+
+   **Consequência:** US-6 passa a ter duas fases explícitas, e a **fase A não
+   depende de KLEE nem de isolamento**:
+   - **Fase A — execução real instrumentada.** Instrumenta o código original,
+     roda o programa como ele é, grava o comportamento observado. Depende só de
+     `clang++` e `cmake`, ambos já no Flatpak. É o primeiro incremento
+     entregável de US-6 e destrava US-10 sem esperar ferramenta nenhuma.
+   - **Fase B — entradas sintéticas sobre código isolado.** Instrumenta o
+     código isolado de US-6.4, com entradas geradas por KLEE. Depende de
+     US-6.4, de KLEE e de GoogleTest, nenhum dos três disponível hoje.
+   A instrumentação de US-6.2 é a **mesma** nas duas fases — muda o que é
+   compilado e quem produz as entradas, não o que é gravado. Isso é o que
+   permite que a fase B substitua a fase A sem trocar o formato do registro,
+   exatamente como `conversao-guiada-por-exemplos.md` §9 exige do formato de
+   `oracle/cases.json`. US-6.4 deixa de ser bloqueante para US-6 inteiro e
+   passa a ser bloqueante só da fase B.
+
+3. Ainda em OBS 2: a granularidade da escolha é por tipo (toda struct `X`
+   sempre gravada onde aparecer) ou por local de uso (só esta variável, nesta
+   função)? E o padrão é gravar tudo e o usuário restringe (*opt-out*), ou
+   nada até ele marcar (*opt-in*)?
+
+   Resposta: O 'gravar/não gravar' é controlado de dentro de uma função. É nas funções que
+   se decide se uma instância de uma struct será ou não gravada no log.
+
+   **Consequência:** a unidade de escolha é o par
+   `(função selecionada, entidade dentro dela)` — um parâmetro, uma variável
+   local, o retorno, `this`, um global lido/escrito ali — e **não** o tipo. Dois
+   desdobramentos concretos:
+   - É **opt-in** por construção: não existe "gravar tudo" a partir de dentro de
+     uma função; só existe marcar. Nada é gravado até haver marcação, o que
+     também mantém o critério 3 de US-6.1 (nenhum artefato para função não
+     selecionada) trivialmente satisfeito.
+   - A UI da marcação é o **visualizador de código fonte** com a função aberta,
+     não uma tela de tipos: o usuário marca onde a entidade aparece. Isso exige
+     do servidor uma lista de *entidades capturáveis por função*, que hoje não
+     existe — o passe de US-5 já parseia corpos de função (é o único que
+     parseia), mas só registra parâmetros e chamadas. Detalhado em US-6.2 como
+     a primeira tarefa daquele sub-passo, e explicitamente **sem quarta passada
+     `libclang`**.
+
+4. Se a resposta a (2) for (b) ou (c): os projetos de entrada que o produto
+   precisa suportar costumam já trazer sua própria suíte de testes (GoogleTest
+   ou outra)? Se sim, rodar essa suíte já existente sob instrumentação parece
+   o caminho mais barato para um primeiro oráculo de US-10, sem esperar KLEE —
+   vale registrar isso como o incremento inicial de US-6.3 se confirmado.
+
+   Resposta: O projeto pode não trazer suíte alguma de teste. No meu caso, o Verovio não possui suíte de testes.
+
+   **Consequência — a mais pesada das quatro.** O caminho mais barato que a
+   pergunta cogitava (rodar a suíte existente sob instrumentação) **não está
+   disponível** no caso de referência do produto. A fase A precisa então de
+   outra fonte de execuções, e a que o Verovio oferece é a óbvia: o projeto
+   produz um **executável**, e rodá-lo sobre um arquivo de entrada real
+   (`verovio partitura.mei -o saida.svg`) exercita o código de verdade. Isso
+   introduz um conceito que o documento não tinha: o **perfil de execução** —
+   alvo executável, argumentos, arquivos de entrada, diretório de trabalho e
+   código de saída esperado — configurado pelo usuário e persistido no projeto.
+   Duas consequências de segunda ordem, ambas novas:
+   - O produto passa a **compilar** o projeto de entrada. Até US-5 ele apenas
+     *configura* o CMake (`CMAKE_EXPORT_COMPILE_COMMANDS`) e lê
+     `compile_commands.json`; nunca chamou `cmake --build`. Ver Q7 (respondida:
+     compila só os alvos necessários, dentro do mecanismo de job).
+   - A cobertura deixa de ser garantida (é o que a via real cobra em troca de
+     não depender de KLEE), mas **é medível sem KLEE**: `clang++` com
+     `-fprofile-instr-generate -fcoverage-mapping` mais `llvm-profdata`/`llvm-cov`,
+     tudo já disponível pela extensão `llvm21` do manifesto. Isso satisfaz o
+     critério 2 de US-6.3 ("medida e reportada, nunca presumida") na fase A.
+   - Uma suíte de testes do projeto de entrada, quando existir, vira apenas
+     *mais um perfil de execução*, não um caminho de código próprio. Essa é a
+     forma de acomodar as duas realidades sem duas implementações.
+
 ### Objetivo do usuário
 
-Que o Syntax Bridge documente, por execução real, como cada função se comporta:
-gerar código isolado por função — a função em questão, instrumentada, mais as
-definições mínimas necessárias para executá-la em todos os ramos — e gravar no
-banco o comportamento observado (parâmetros de entrada, resultado, coleções
-modificadas, efeitos).
+Que o Syntax Bridge documente, por execução real, como cada função escolhida
+pelo usuário se comporta, e grave no banco o comportamento observado (entradas,
+resultado, coleções modificadas, efeitos) de acordo com os dados que o próprio
+usuário marcar para captura. Este objetivo geral é realizado pelos cinco
+sub-passos abaixo.
 
-### Observações e decisões em aberto
+### As duas fases, e por que a ordem importa
 
-- **Granularidade do isolamento.** O plano antigo falava em isolar *unidades de
-  compilação* (criando mocks de tudo o que cada uma precisa); este passo fala em
-  isolar *funções*. São coisas diferentes e provavelmente ambas necessárias: a
-  unidade de compilação é o que compila, a função é o que se caracteriza.
-  Decidir se a função isolada é compilada dentro de uma TU sintética própria (com
-  mocks) ou extraída da TU original.
+Decorrência da resposta 2 (opção "c"). Um agente que for implementar US-6 deve
+entregar a fase A inteira antes de tocar em qualquer parte da fase B.
+
+| | Fase A — execução real | Fase B — entradas sintéticas |
+| --- | --- | --- |
+| O que é instrumentado | o código original do projeto | o código isolado de US-6.4 |
+| De onde vêm as execuções | perfis de execução do usuário (US-6.3) | KLEE (US-6.3) |
+| Cobertura | medida por `llvm-cov`, parcial e reportada | buscada por ramo, ainda assim medida |
+| Ferramentas | `cmake`, `clang++`, `llvm-cov` — **todas no Flatpak hoje** | KLEE + GoogleTest — **nenhum no Flatpak hoje** |
+| Sub-passos envolvidos | US-6.1, US-6.2, US-6.3(A), US-6.5 | US-6.3(B), US-6.4 |
+| Destrava | US-10 com oráculo real | cobertura de ramos garantida |
+
+O que as duas fases **compartilham** é o que não pode divergir: a seleção
+(US-6.1), a marcação de captura e o formato do registro (US-6.2), e o esquema
+de persistência (US-6.5). Se a fase B precisar mudar o formato do registro, o
+formato foi mal projetado na fase A — mesmo critério que
+`conversao-guiada-por-exemplos.md` §9 aplica ao `oracle/cases.json`.
+
+### Ordem de implementação recomendada
+
+1. US-6.1 (seleção) — puro CRUD sobre dado já existente, sem toolchain.
+2. US-6.2, parte 1 (listar entidades capturáveis por função) — extensão do
+   passe de US-5, sem passe novo.
+3. US-6.2, parte 2 (marcação de captura) — CRUD, mesma forma de US-6.1.
+4. US-6.5, parte 1 (esquema de `characterization_runs`/`behavior_traces`) —
+   antes de gerar qualquer trace, para que o gerador já escreva no formato final.
+5. US-6.2, parte 3 (emissão da instrumentação + runtime de trace em C++).
+6. US-6.3 fase A (perfis de execução, build instrumentado, coleta, cobertura).
+7. US-6.5, parte 2 (limites de execução, determinismo, segurança).
+8. US-6.4 e US-6.3 fase B — **fora da v1** por Q10; só voltam à fila se a
+   cobertura medida na fase A justificar KLEE no manifesto.
+
+### OBS 1 (original). Passo opcional, de acordo com escolha do usuário.
+O objetivo é extrair comportamento do código, mas não precisamos fazer isto para TUDO. As funções/métodos/trechos do código que passarão por isto serão escolhigos pelo usuário.
+
+### OBS 2 (original). Ferramenta de geração de 'log' estruturado.
+Gerar código que grave os dados de variáveis, conteúdo de structs, collections. O usuário deverá ser capaz de definir quais dados/classes/variáveis/structs/collections serão gravados.
+
+---
+
+#### US-6.1 — Seleção do escopo de caracterização
+
+**Status:** planejado · **Depende de:** US-5
+
+##### Objetivo do usuário
+
+Escolher quais funções/métodos serão caracterizados, em vez de o sistema tentar
+caracterizar tudo. Nada é caracterizado até o usuário selecionar algo.
+
+##### Observações e decisões em aberto
+
+- **Resolvido (resposta 1): dois escopos de seleção, não um booleano.**
+  `SelectionScope::FunctionOnly` seleciona exatamente aquela função;
+  `SelectionScope::FunctionAndCallees` seleciona também o **fecho transitivo**
+  das funções que ela chama, sobre o grafo `call_edges` já persistido em US-5.
+- **Só a raiz é persistida; o fecho é derivado a cada leitura.** Materializar o
+  fecho no banco criaria uma cópia que envelhece: bastaria o usuário adicionar
+  uma chamada no código para a lista salva ficar errada, e US-12
+  (re-ingestão) teria que reconciliá-la. Derivar é barato — é uma travessia de
+  um grafo já indexado — e sempre correto.
+- **O fecho precisa de três defesas, todas testáveis.** (a) Ciclos: recursão
+  direta e mútua existem em código real, então a travessia usa conjunto de
+  visitados. (b) Chamadas não resolvíveis: um `CallResolution::Unresolved` de
+  US-5 é uma fronteira do fecho que não dá para atravessar — deve ser
+  **reportada** como fronteira incompleta, com origem e motivo, nunca
+  silenciosamente ignorada (regra "silêncio é proibido"). (c) Despacho
+  dinâmico: `call_edges` guarda o alvo *estático*; num fecho, um método virtual
+  deveria puxar também os *overriders*, que `FunctionDeclaration.overridden_usrs`
+  permite descobrir na direção inversa. Decisão: incluir os *overriders* no
+  fecho e marcá-los como "incluídos por despacho dinâmico", porque excluí-los
+  produziria caracterização de um comportamento que o programa real não tem.
+- **Explosão do fecho é um risco real, não teórico.** Selecionar
+  `FunctionAndCallees` numa função de alto nível do Verovio pode arrastar
+  centenas de funções. A listagem devolvida ao cliente precisa informar o
+  tamanho do fecho *antes* de o usuário confirmar, e a UI precisa mostrar esse
+  número — não é uma otimização, é o que impede o usuário de disparar sem saber
+  uma instrumentação de projeto inteiro.
+- **Desmarcar não apaga resultado (critério 4).** Traces já gravados para uma
+  função que saiu do conjunto efetivo ficam marcados como órfãos, não
+  removidos: apagar é irreversível e cara de refazer (exige recompilar e
+  reexecutar), enquanto marcar é barato e é exatamente a mesma mecânica que
+  US-12 vai precisar para "decisão que deixou de ser válida".
+- Onde a seleção acontece na UI: extensão do painel "Functions" (US-5) com uma
+  ação por linha, não uma tela nova.
+- Relação com US-12 (re-ingestão): uma função selecionada cujo código muda
+  precisa reaparecer como "selecionada, mas pendente de recaracterização" —
+  mesma mecânica já prevista para decisões de US-7.
+
+##### Critérios de aceitação (testáveis)
+
+1. Selecionar N funções no fixture persiste exatamente essas N seleções.
+2. Reabrir o projeto preserva a seleção sem re-executar nada.
+3. Nenhum artefato de caracterização (código isolado, trace, registro no banco)
+   é gerado para uma função não selecionada.
+4. Desmarcar uma função remove sua seleção; traces já gravados para funções que
+   saíram do conjunto efetivo ficam marcados como órfãos, não apagados.
+5. Selecionar com escopo `FunctionAndCallees` o topo de uma cadeia de três
+   níveis produz um conjunto efetivo com as três funções; com escopo
+   `FunctionOnly`, com uma só.
+6. Uma cadeia com recursão (direta e mútua) produz fecho finito, sem laço.
+7. Uma chamada não resolvível dentro do fecho aparece na resposta como
+   fronteira incompleta, com arquivo, linha e motivo.
+8. Um método virtual dentro do fecho arrasta seus *overriders*, marcados como
+   incluídos por despacho dinâmico.
+
+##### Condições de testabilidade
+
+- Rotas de leitura/escrita da seleção testáveis sem executar `libclang` nem
+  KLEE — popular o banco diretamente, mesmo padrão de US-3/US-4/US-5.
+- Fixture com uma cadeia de chamadas de pelo menos três níveis, para exercitar
+  o caso "selecionei o meio da cadeia". Como os critérios 6, 7 e 8 pedem
+  recursão, chamada indireta e hierarquia virtual, e como misturar tudo num
+  fixture só tornaria as contagens exatas frágeis, valem fixtures separados —
+  mesma razão já aplicada em US-5 para herança múltipla e templates.
+- A derivação do fecho precisa ser uma função pura sobre
+  `(seleções, call_edges, declarações)`, testável sem banco e sem servidor.
+  Esse é o teste que importa; os demais níveis são encanamento.
+
+##### Roteiro de implementação (para um agente)
+
+Segue a receita padrão. Nenhum item aqui precisa de `libclang`, `cmake` ou
+qualquer toolchain — é o sub-passo mais barato de US-6 e por isso vem primeiro.
+
+1. **`crates/server/src/characterization.rs`** (módulo novo, registrado em
+   `lib.rs`): `SelectionScope { FunctionOnly, FunctionAndCallees }`,
+   `CharacterizationSelection { function_usr, scope }`, e
+   `EffectiveSelection { functions: Vec<SelectedFunction>, boundary: Vec<UnresolvedBoundary> }`,
+   onde `SelectedFunction` carrega `usr`, `signature` e `InclusionReason`
+   (`Root` | `Callee { via_usr }` | `DynamicOverride { of_usr }`).
+2. **Teste primeiro**, em `crates/server/tests/characterization.rs`:
+   `effective_selection_expands_callees_transitively`,
+   `effective_selection_terminates_on_recursive_cycles`,
+   `effective_selection_reports_unresolved_calls_as_boundary`,
+   `effective_selection_includes_dynamic_overriders`. Todos alimentam a função
+   de derivação com vetores de `CallEdge`/`FunctionDeclaration` montados à mão
+   — sem banco, sem parser.
+3. **Derivação:** `characterization::derive_effective_selection(...)`, travessia
+   em largura com `HashSet` de visitados, ordenação final estável por `usr`
+   (senão os testes ficam intermitentes e o critério de determinismo de US-6.5
+   já nasce quebrado).
+4. **Persistência** em `project_store.rs`: tabela
+   `characterization_selections (function_usr TEXT PRIMARY KEY, scope TEXT NOT NULL)`,
+   com `replace_characterization_selections`/`list_characterization_selections`
+   e teste inline de round-trip. Tabela nova, então não há migração a fazer.
+5. **Serviço** em `project_service.rs`: `list_characterization_selections`
+   devolvendo um `CharacterizationSelectionListing` que já traz o conjunto
+   efetivo derivado e o tamanho do fecho; `set_characterization_selection` e
+   `clear_characterization_selection`.
+6. **Rotas** em `server.rs`: `GET /projects/characterization/selections`,
+   `PUT /projects/characterization/selections`,
+   `DELETE /projects/characterization/selections`. Teste em
+   `crates/server/tests/characterization_route.rs`, populando o banco direto.
+7. **Cliente:** modelos em `project_models.dart`, métodos em
+   `server_client.dart`/`http_server_client.dart`.
+8. **UI:** em `functions_view.dart`, um controle por linha com três estados
+   (não selecionada / só esta / esta e o que ela chama) e, quando o escopo for
+   o segundo, o tamanho do fecho ao lado. Painel novo
+   `characterization_view.dart` listando o conjunto efetivo, com as fronteiras
+   incompletas visíveis. Teste de widget próprio, mais a fiação em
+   `server_status_page.dart` e o caso ponta a ponta em `app_test.dart`.
+
+---
+
+#### US-6.2 — Captura estruturada de dados (instrumentação)
+
+**Status:** planejado · **Depende de:** US-6.1
+
+##### Objetivo do usuário
+
+Para uma função selecionada, escolher — de dentro dela, no código fonte —
+quais parâmetros, variáveis locais, campos e coleções são gravados durante a
+execução, e obter um registro estruturado desses valores.
+
+##### Observações e decisões em aberto
+
+- **Resolvido (resposta 2): a instrumentação atua sobre os dois códigos, em
+  fases.** Fase A: o código original do projeto. Fase B: o código isolado de
+  US-6.4. O emissor de instrumentação e o *runtime* de trace são os mesmos nas
+  duas — muda apenas qual árvore de arquivos é instrumentada. Portanto **este
+  sub-passo não depende de US-6.3 nem de US-6.4** e pode ser implementado
+  logo depois de US-6.1.
+- **Resolvido (resposta 3): a unidade de escolha é `(função, entidade)`, e é
+  *opt-in*.** Não existe "marcar o tipo `Point` em todo lugar"; existe "marcar
+  o parâmetro `origin` desta função". Consequência de projeto: o mesmo tipo
+  pode ser gravado numa função e ignorado noutra, o que é o comportamento
+  pedido, e mantém o custo da instrumentação proporcional ao que o usuário
+  marcou, não ao tamanho do projeto.
+- **Falta um catálogo de *entidades capturáveis*, e ele é a primeira tarefa
+  deste sub-passo.** Para o usuário marcar de dentro da função, o servidor
+  precisa saber o que existe dentro dela: parâmetros (já extraídos por
+  `parameter_list` em US-5), variáveis locais (`CXCursor_VarDecl` no corpo —
+  **não** extraídas hoje), o valor de retorno, `this` quando for método, e
+  globais lidos/escritos ali. Isso **não exige uma quarta passada `libclang`**:
+  `function_catalog::extract_function_catalog_cancellable` já é a única passada
+  que parseia corpos de função (as de US-3/US-4 usam
+  `CXTranslationUnit_SkipFunctionBodies`), então a coleta entra na mesma
+  travessia que já monta o grafo de chamadas — mesmo aproveitamento que US-4
+  fez sobre a passada de US-3.
+- **Cada entidade capturável carrega o `usr` do tipo dela**, ligando ao catálogo
+  de US-3. É esse elo que permite ao emissor saber *como* serializar (agregado,
+  escalar, ponteiro, contêiner) e, mais tarde, permite a US-10 comparar valores
+  entre C++ e Dart usando o mapeamento decidido em US-7.
+- **Política de serialização — declarada, não implícita.** Sem isto o critério 2
+  de US-6.5 (duas execuções iguais produzem o mesmo registro) é impossível:
+  - **Endereços nunca são gravados.** Um ponteiro vira `null`, ou o valor
+    apontado, ou uma referência de volta (`{"ref": n}`) quando já visitado.
+    Gravar endereço destrói o determinismo — ASLR muda o valor a cada execução.
+  - **Ciclos** são cortados por um mapa de identidade durante a serialização,
+    emitindo a referência de volta em vez de recursão infinita.
+  - **Profundidade máxima de travessia: 3 níveis** por padrão, configurável por
+    projeto. Ao cortar, o registro diz que cortou (`{"truncated": "depth"}`).
+  - **Coleções: 64 primeiros elementos** por padrão, mais o tamanho total, mais
+    um *hash* estável do conteúdo completo. O hash é o que mantém uma coleção
+    truncada ainda comparável em US-10 — sem ele, truncar destrói o oráculo.
+  - **Ponto flutuante** é gravado em duas formas: decimal canônico e os bits
+    crus. A comparação entre linguagens (US-10) precisa dos bits; o usuário
+    lendo o trace precisa do decimal.
+  - **Ponteiro pendente (*dangling*) é indetectável** e vai continuar sendo —
+    a instrumentação não tem como distingui-lo de um ponteiro válido. Fica
+    registrado aqui como limitação conhecida, não como pendência.
+  - Todo registro carrega `schema_version`. A fase B não deve precisar
+    incrementá-la; se precisar, o formato foi mal projetado.
+- **Resolvido (Q5): a instrumentação entra por reescrita de uma cópia do
+  fonte** — opção (a), a recomendada. O produto gera uma árvore instrumentada em
+  `<projeto>/characterization/instrumented-source/`, guiada pelas posições de
+  cursor que os catálogos de US-3/US-5 já registram, e `input-source` permanece
+  intocado. As alternativas descartadas eram (b) *wrappers* gerados que chamam a
+  função original e (c) um header injetado por `-include` com macros; ambas são
+  mais baratas, mas nenhuma alcança variável local *dentro* do corpo, então
+  escolher qualquer uma delas revogaria na prática a resposta 3 da rodada 1, que
+  já decidiu que variáveis locais são capturáveis. (a) também não muda o
+  comportamento por interposição e mantém o original imutável — o que atende ao
+  critério "nada escreve fora do diretório do projeto" de US-6.5. **Custo
+  aceito:** o produto precisa de um reescritor de fonte guiado por posição de
+  cursor, que ainda não existe, e ele é pré-requisito do item 5 do roteiro
+  abaixo.
+
+##### Critérios de aceitação (testáveis)
+
+1. Para uma função do fixture, o catálogo de entidades capturáveis lista seus
+   parâmetros, suas variáveis locais, seu retorno e — se for método — `this`,
+   cada um com o `usr` do respectivo tipo.
+2. Para uma função com uma struct e uma coleção como parâmetros, marcar ambas
+   produz um registro com o conteúdo de ambas após a execução.
+3. Uma entidade não marcada não aparece no registro.
+4. Uma coleção com mais elementos que o limite é gravada truncada, com tamanho
+   total e hash do conteúdo completo, sem estourar tempo nem memória.
+5. Um ponteiro nulo é registrado como `null`, sem falha da instrumentação.
+6. Um grafo de objetos com ciclo é serializado com referência de volta, e a
+   serialização termina.
+7. Duas execuções do mesmo binário sobre a mesma entrada produzem registros
+   idênticos byte a byte (nenhum endereço, nenhum timestamp no payload).
+
+##### Condições de testabilidade
+
+- Os critérios 1 e 3 são testáveis sem compilar nada: o primeiro é extração
+  (`libclang`), o terceiro é inspeção do código instrumentado gerado, que pode
+  ser comparado com um *golden* em texto.
+- Os critérios 2, 4, 5, 6 e 7 exigem compilar e executar — `clang++` já está no
+  Flatpak, então isso é testável no ambiente de destino desde já, sem esperar
+  US-6.3 (um `main` mínimo escrito pelo teste basta como driver).
+- Fixture com struct aninhada, coleção (`std::vector`/`std::map`), um ponteiro
+  nulo deliberado e uma estrutura com ciclo (dois nós que se apontam).
+- O *runtime* de trace precisa ser um artefato versionado e lido por humanos
+  (`crates/server/resources/trace_runtime/syntax_bridge_trace.hpp`), não uma
+  string embutida no meio do gerador — senão ninguém consegue revisá-lo.
+
+##### Roteiro de implementação (para um agente)
+
+1. **Entidades capturáveis (extração).** Teste primeiro em
+   `crates/server/tests/function_catalog.rs`:
+   `extract_function_catalog_lists_capturable_entities_of_each_function`. Depois
+   estender `function_catalog.rs` com `CapturableEntity { function_usr, kind,
+   name, type_usr, line, column }` e `CapturableEntityKind { Parameter, Local,
+   Return, This, Global }`, coletada na travessia que já existe (`visit_call_site`
+   e vizinhança), sem passe novo. Persistir em tabela `capturable_entities`
+   (receita padrão, passo 4) e expor via
+   `GET /projects/functions/capturable-entities`.
+2. **Marcação (CRUD).** Tabela
+   `capture_marks (function_usr, entity_key, moments TEXT)`, com `moments` em
+   `entry`/`exit`/ambos. Rotas `GET`/`PUT`/`DELETE
+   /projects/characterization/captures`. Mesma forma de US-6.1, testes de rota
+   populando o banco direto.
+3. **Esquema do trace antes do gerador.** Implementar aqui a parte 1 de US-6.5
+   (tabelas `characterization_runs` e `behavior_traces`), para que o emissor já
+   nasça escrevendo no formato definitivo.
+4. **Runtime de trace em C++.** Header versionado, com testes próprios: um
+   `main` de teste que serializa os casos difíceis (ciclo, coleção grande,
+   ponteiro nulo, float) e compara com *golden*. Este é o componente que
+   precisa ser mais bem testado de US-6 inteiro, porque um bug aqui contamina
+   silenciosamente todo o oráculo de US-10.
+5. **Emissor de instrumentação.** Q5 respondida: reescrita de uma cópia do
+   fonte, guiada pelas posições dos cursores já catalogados; teste com
+   *golden* do arquivo instrumentado, mais um teste que compila o resultado.
+6. **Cliente e UI.** `SourceFileViewer` ganha, quando o arquivo aberto contém
+   função selecionada, um marcador clicável por entidade capturável na linha
+   dela — mesma mecânica de linha clicável que US-5 já introduziu para chamadas
+   (`calls`/`onCallSelected`), inclusive a mesma simplificação de resolução por
+   linha e não por coluna.
+
+---
+
+#### US-6.3 — Estratégia de geração de execuções: execução real (fase A) e entradas sintéticas (fase B)
+
+**Status:** planejado — **decisão tomada** (respostas 2 e 4): as duas vias, em
+fases, com a real primeiro. Fase A implementável hoje; fase B bloqueada por
+ferramenta ausente · **Depende de:** US-6.1, US-6.2
+
+##### Objetivo do usuário
+
+Que existam execuções da função selecionada para a instrumentação de US-6.2
+gravar: na fase A, rodando o próprio programa do projeto sobre entradas reais;
+na fase B, com entradas sintéticas geradas por KLEE sobre o código isolado.
+
+##### Observações e decisões em aberto
+
+- **Resolvido: as duas vias, nesta ordem.** A via real vem primeiro porque não
+  depende de nada que falte no ambiente, e porque tira US-6 do caminho crítico
+  de US-10 — mesmo argumento que `conversao-guiada-por-exemplos.md` §3 já fazia
+  com o oráculo escrito à mão. A via KLEE não é descartada: ela substitui a
+  origem das entradas sem mudar o que é gravado.
+- **Resolvido, e é o achado mais consequente desta revisão: não há suíte de
+  testes com que contar** (resposta 4 — o Verovio não tem). A via real precisa
+  então de uma fonte de execuções própria, e a que existe é o **executável que
+  o projeto já produz**. Daí o conceito novo de **perfil de execução**:
+
+  ```
+  RunProfile {
+    id, nome,
+    target,            // alvo executável do CMake
+    args: Vec<String>, // ex.: ["partitura.mei", "-o", "saida.svg"]
+    inputs: Vec<PathBuf>,
+    working_dir,       // sempre dentro de <projeto>/characterization/
+    expected_exit_code,
+    timeout,
+  }
+  ```
+
+  Uma suíte de testes, quando o projeto tiver uma, é apenas mais um perfil
+  (`target = "meus_testes"`), não um caminho de código separado. Foi o que
+  permitiu acomodar as duas realidades sem duplicar a implementação.
+- **Descoberta dos alvos executáveis.** `compile_commands.json` lista unidades
+  de compilação, não alvos — não dá para saber por ele o que vira executável. A
+  fonte correta é a **CMake File API** (`codemodel-v2`): escrever um arquivo de
+  consulta em `<build>/.cmake/api/v1/query/` antes de configurar e ler o
+  `codemodel` resultante, que traz cada alvo com seu tipo (`EXECUTABLE`,
+  `STATIC_LIBRARY`, …) e o caminho do artefato. Isso é uma extensão de
+  `ingest.rs`, onde o `cmake` já é invocado, e vale a pena fazer na mesma
+  configuração em vez de uma segunda.
+- **Resolvido (Q6, parte i): o conceito de perfil de execução está confirmado.**
+  O usuário fornece o alvo executável, os argumentos e os arquivos de entrada; o
+  produto não tenta adivinhar execuções sozinho. A descoberta automática cobre
+  apenas quais *alvos* existem (CMake File API, item acima) — qual usar e com
+  que entradas é decisão do usuário.
+- **Requisito adicional (Q6): criação de perfis em lote sobre um conjunto de
+  arquivos.** Um perfil por arquivo escrito à mão não escala: o caso real é
+  "caracterize este binário sobre cada um dos N arquivos do diretório X". O
+  modelo precisa então de um **molde de perfil** — alvo, forma dos argumentos,
+  `working_dir`, `expected_exit_code` e `timeout` fixos — que, aplicado a um
+  conjunto de arquivos de entrada, gera N `RunProfile`s, um por arquivo. Duas
+  consequências de projeto:
+  - Os argumentos deixam de ser uma lista literal e passam a admitir um
+    *placeholder* para o arquivo corrente (ex.: `["{input}", "-o",
+    "{input_stem}.svg"]`), senão não há como variar a entrada mantendo o
+    resto do comando. Sem isso, o lote só serviria para programas que leem de
+    `stdin`.
+  - Cada perfil gerado continua sendo um `RunProfile` de primeira classe,
+    persistido individualmente, editável e removível — o lote é uma forma de
+    *criar* perfis, não um tipo novo de perfil. Isso mantém US-6.3 e US-6.5 com
+    um único conceito de execução, e é o que permite dizer "esta função foi
+    alcançada por 7 dos 200 perfis" sem tratar lote como caso especial.
+  A relação com a cobertura (`llvm-cov`, item abaixo) é direta: um lote grande é
+  justamente o mecanismo pelo qual o usuário aumenta a cobertura de
+  caracterização sem KLEE.
+- **Resolvido (Q6, parte ii): os arquivos de entrada são copiados para dentro do
+  diretório do projeto.** Cópia é *o* comportamento, não uma opção entre duas —
+  não existe modalidade de perfil que referencie caminhos arbitrários da máquina
+  do usuário, e portanto não há perfil "não reproduzível" a sustentar nem a
+  sinalizar em US-6.5. As entradas vivem sob `<projeto>/characterization/`, o
+  que mantém a execução reproduzível e preserva a regra "nada fora do diretório
+  do projeto" — regra que pesa mais aqui do que em qualquer outro passo, já que
+  este é o passo que executa código arbitrário vindo do input. Sob o Flatpak
+  isso também é o que evita atrito: o portal de arquivos é acionado uma vez, na
+  criação do perfil ou do lote, e nunca mais a cada execução. **Custo aceito:**
+  um lote sobre um diretório de N arquivos copia os N; o diretório do projeto
+  cresce com o tamanho do corpus de entrada.
+- **Resolvido (Q7, parte i): o produto passa a compilar o projeto de entrada, e
+  compila só os alvos necessários ao perfil escolhido.** Até US-5 o CMake era
+  apenas *configurado*; ninguém nunca chamou `cmake --build`. A fase A exige
+  compilar — e não uma vez só: a árvore instrumentada de US-6.2 é uma árvore de
+  fontes distinta, que precisa ser recompilada a cada mudança nas marcações de
+  captura do usuário. A compilação é feita via `cmake --build --target <alvo>`,
+  com o conjunto mínimo de alvos **computado** a partir do grafo de dependências
+  entre alvos que a CMake File API já fornece (item acima), nunca adivinhado.
+  Duas consequências: paga-se menos que o pior caso a cada caracterização, e um
+  alvo quebrado que o perfil não usa deixa de bloquear o trabalho.
+  **Direção futura, fora da v1:** permitir que o usuário configure todos os
+  alvos para teste/conversão diretamente pelo Syntax Bridge — isto é, o
+  conjunto de alvos deixa de ser derivado apenas do perfil e passa a ser
+  também uma escolha explícita do usuário, com a UI correspondente. O modelo
+  de dados deve ser escrito de forma a acomodar isso (o conjunto de alvos a
+  construir é um dado da caracterização, não uma constante derivada do
+  `target` do perfil), mesmo enquanto a única forma de preenchê-lo for a
+  derivação automática.
+- **Uma compilação por alvo, não por perfil.** Com a criação de perfis em lote
+  (Q6), N perfis sobre o mesmo alvo compartilham **uma** compilação e reusam o
+  binário nas N execuções. Registrado explicitamente porque a implementação
+  ingênua — compilar por perfil — multiplicaria por N o custo mais caro do
+  passo.
+- **Resolvido (Q7, parte ii): a compilação roda dentro do mecanismo de job.**
+  Reaproveita o job de US-1/US-4 (progresso + cancelamento), o que o torna a
+  **quarta** instância dele: a requisição devolve `job_id` na hora, `JobPhase`
+  ganha uma fase de construção, o progresso é relatado enquanto o
+  `cmake --build` roda, e `DELETE /projects/jobs/{id}` interrompe a compilação
+  em andamento. Compilar sincronamente dentro da requisição HTTP está
+  descartado: é exatamente o erro já cometido e corrigido em US-1, que produziu
+  o travamento relatado no Verovio 5.7.0.
+- **Cobertura sem KLEE, e isso resolve o critério 2.** Compilar a árvore
+  instrumentada com `-fprofile-instr-generate -fcoverage-mapping` e processar o
+  `.profraw` com `llvm-profdata merge` + `llvm-cov export` dá cobertura de
+  linha e de região por função. `llvm-profdata` e `llvm-cov` vêm da extensão
+  `llvm21`, já no manifesto — nenhuma ferramenta nova. A cobertura entra no
+  registro da execução (US-6.5) e é o que permite dizer ao usuário "esta função
+  foi caracterizada em 40% dos seus ramos", em vez de deixá-lo supor 100%.
+- **Uma função selecionada que nenhum perfil alcança é um resultado, não um
+  erro.** Precisa aparecer como "0 execuções, não caracterizada" — é a
+  informação que diz ao usuário que falta um perfil, e é o que impede US-10 de
+  reportar cobertura de prova inflada.
+- **Fase B (KLEE) permanece descrita em US-6.4**, junto com o isolamento de que
+  depende. Papel de cada ferramenta: KLEE descobre entradas que cobrem os
+  ramos, GoogleTest materializa e executa os casos.
+
+##### Critérios de aceitação (testáveis)
+
+1. Para uma função pura simples do fixture alcançada por um perfil de execução,
+   rodar o perfil produz ao menos um registro de comportamento.
+2. A cobertura efetivamente exercitada é medida (`llvm-cov`) e reportada por
+   função — nunca presumida.
+3. Rodar o mesmo perfil duas vezes sobre a mesma entrada produz o mesmo
+   conjunto de registros.
+4. Uma função selecionada que nenhum perfil alcança aparece com zero execuções
+   e marcada como não caracterizada.
+5. Um perfil cujo executável termina com código diferente do esperado é
+   reportado como falha do perfil, com a saída padrão e de erro preservadas, e
+   não invalida os registros já coletados por outros perfis.
+6. Um perfil que estoura o timeout é interrompido, e isso é registrado como
+   tal (ver US-6.5).
+7. *(Fase B)* Os casos gerados por KLEE cobrem todos os ramos da função
+   isolada, ou a lacuna é reportada.
+
+##### Condições de testabilidade
+
+- **Fase A é testável no ambiente de destino hoje:** `cmake`, `clang++`,
+  `llvm-profdata` e `llvm-cov` estão todos no Flatpak.
+- O fixture precisa ser um projeto CMake que **produz um executável** e aceita
+  um argumento de entrada — o `sample-cmake-project` atual provavelmente
+  precisa ganhar um alvo executável, ou surge um fixture irmão. Escolher
+  entradas que exercitem apenas parte dos ramos, de propósito, para que o
+  critério 2 tenha o que reportar como parcial.
+- O teste de escala (rodar um perfil sobre o Verovio) segue o precedente já
+  estabelecido: `#[ignore]`d por padrão, como
+  `verovio_5_7_0_import_diagnosis.rs` e o teste de cancelamento de US-4.
+- Determinismo (critério 3) exige que o perfil não dependa de relógio, de rede
+  nem de caminho absoluto da máquina — mais um argumento para copiar as
+  entradas para dentro do projeto (Q6).
+- Fase B depende de US-6.4 e de KLEE no ambiente (ver Q10).
+
+##### Roteiro de implementação (para um agente) — fase A
+
+1. **Descoberta de alvos.** Estender `crates/server/src/ingest.rs` para emitir a
+   consulta `codemodel-v2` da CMake File API antes de configurar e ler os
+   alvos resultantes. Teste primeiro em `crates/server/tests/project_ingest.rs`:
+   `ingest_lists_executable_targets_of_the_cmake_project`. Persistir em tabela
+   `build_targets` e devolver junto de `CreatedProject`/`LoadedProject`.
+2. **Perfis de execução (CRUD).** Tabela `run_profiles`, rotas
+   `GET`/`PUT`/`DELETE /projects/characterization/run-profiles`, testes de rota
+   sem toolchain. UI: painel `run_profiles_view.dart` com o alvo escolhido de
+   uma lista (a de 1), argumentos e arquivos de entrada.
+3. **Build instrumentado.** `crates/server/src/characterization/build.rs`:
+   configura e compila a árvore instrumentada de US-6.2 em
+   `<projeto>/characterization/build/`, com as flags de cobertura, usando
+   `cmake --build --target <alvo>`. Roda dentro de um job
+   (`JobPhase::BuildingInstrumented`), com `Cancellation` checado entre alvos
+   e a saída do compilador em log — o precedente de "silêncio por minutos é
+   indistinguível de travamento" já está pago em US-1 e não deve ser repetido.
+4. **Execução e coleta.** `characterization/run.rs`: executa o perfil com
+   `LLVM_PROFILE_FILE` apontando para dentro do projeto, timeout do perfil,
+   captura de `stdout`/`stderr`, e recolhe os traces que o *runtime* de US-6.2
+   escreveu. Grava um `characterization_run` e seus `behavior_traces` (US-6.5).
+5. **Cobertura.** `characterization/coverage.rs`: `llvm-profdata merge` +
+   `llvm-cov export --format=text`, reduzido a percentual por função e gravado
+   no registro da execução. Teste com um fixture cuja entrada exercita
+   deliberadamente só um dos dois ramos, afirmando que o relatório diz isso.
+6. **Rota e UI.** `POST /projects/characterization/runs` (dispara, devolve
+   `job_id`, reaproveitando `jobs.rs`), `GET /projects/characterization/runs`.
+   Painel de caracterização mostrando, por função selecionada: número de
+   execuções, cobertura e o último trace.
+
+---
+
+#### US-6.4 — Isolamento por função (*program slicing* e *stubs*)
+
+**Status:** **adiado (fora da v1)** por Q10 — fase B apenas; não bloqueia o
+primeiro incremento de US-6, e US-6 é dado por completo com a fase A ·
+**Depende de:** US-6.3 (fase A entregue) e da reversão de Q10 (KLEE e GoogleTest
+no manifesto Flatpak)
+
+##### Objetivo do usuário
+
+Gerar código isolado por função — a função em questão mais as definições
+mínimas necessárias para compilá-la e executá-la sozinha, cobrindo todos os
+ramos.
+
+##### Observações e decisões em aberto
+
+- **Granularidade do isolamento.** O plano antigo falava em isolar *unidades
+  de compilação* (criando mocks de tudo o que cada uma precisa); este passo
+  fala em isolar *funções*. São coisas diferentes e provavelmente ambas
+  necessárias: a unidade de compilação é o que compila, a função é o que se
+  caracteriza. Decidir se a função isolada é compilada dentro de uma TU
+  sintética própria (com mocks) ou extraída da TU original.
 - **Isolar "com as definições mínimas" é *program slicing*.** O mecanismo já
   existe parcialmente: o fecho transitivo sai do grafo `type_dependencies` de
-  US-3 somado ao grafo de chamadas de US-5. O que falta é a política de corte —
-  onde parar e substituir por *stub*.
-- **Papel de cada ferramenta:** KLEE para descobrir entradas que cobrem todos os
-  ramos; GoogleTest para materializar e executar os casos. Isso precisa estar
-  escrito, porque hoje as ferramentas aparecem no `AGENTS.md` sem passo que as
-  consuma.
+  US-3 somado ao grafo de chamadas de US-5. O que falta é a política de
+  corte — onde parar e substituir por *stub*.
+- **Papel de cada ferramenta:** KLEE para descobrir entradas que cobrem todos
+  os ramos; GoogleTest para materializar e executar os casos.
 - **Funções não puras são a maioria e o caso difícil:** I/O, estado global,
-  alocação, ponteiros recebidos, tempo, aleatoriedade, concorrência. Definir
-  quais categorias são caracterizáveis na v1 e quais são explicitamente
-  marcadas como "não caracterizada, requer decisão humana".
-- **Não determinismo e limites de execução:** timeout por função, o que fazer
-  quando o KLEE não converge (a maioria dos casos reais), teto de caminhos
-  explorados, e como isso é reportado sem parecer falha.
-- **Segurança.** Este passo compila e executa código arbitrário vindo do input
-  do usuário. Precisa de posição explícita sobre isolamento de execução — é o
-  argumento mais forte a favor do Flatpak e deve estar escrito aqui, não
-  presumido.
-- **O resultado deste passo é o oráculo de US-10.** Sem essa frase, o passo
-  parece documentação; com ela, fica claro que é a base da prova de equivalência
-  da conversão. O esquema de gravação dos traces precisa ser projetado para essa
-  comparação, não só para exibição.
+  alocação, ponteiros recebidos, tempo, aleatoriedade, concorrência. Isso pesa
+  sobretudo sobre esta via (KLEE precisa sintetizar entradas em torno desses
+  efeitos); na via real de US-6.3, um efeito colateral é só mais um dado
+  observado, não um obstáculo à busca de entradas. Definir quais categorias
+  são caracterizáveis por KLEE na v1 e quais são explicitamente marcadas como
+  "não caracterizada, requer decisão humana".
 
-### Critérios de aceitação (testáveis)
+##### Critérios de aceitação (testáveis)
 
 1. Para uma função pura simples do fixture, o código isolado gerado compila
    sozinho.
-2. Os casos gerados cobrem todos os ramos dessa função, e a cobertura é medida,
-   não presumida.
-3. O comportamento observado (entradas, saída, efeitos) é gravado no banco e
-   pode ser recuperado.
-4. Executar a caracterização duas vezes sobre o mesmo código produz o mesmo
-   registro.
-5. Uma função com dependência não satisfazível é marcada como não caracterizada,
-   com motivo, sem interromper as demais.
-6. Uma função que entra em laço infinito é interrompida pelo timeout e
-   registrada como tal.
-7. Nenhuma etapa deste passo escreve fora do diretório do projeto.
+2. Os casos gerados cobrem todos os ramos dessa função, e a cobertura é
+   medida, não presumida.
+3. Uma função com dependência não satisfazível é marcada como não
+   caracterizada, com motivo, sem interromper as demais.
 
-### Condições de testabilidade
+##### Condições de testabilidade
 
-- Determinismo é pré-requisito: sem entradas fixadas e sem controle de tempo e
-  aleatoriedade, o critério 4 é impossível e o passo inteiro deixa de ser
-  testável.
 - O fixture precisa incluir, de propósito, uma função pura, uma função com
   efeito colateral em global, uma que recebe ponteiro, e uma que não termina.
-- Precisa haver um modo de execução com limites (tempo, memória, caminhos)
+- KLEE e GoogleTest precisam estar disponíveis no ambiente Flatpak — hoje não
+  estão no manifesto. Enquanto não estiverem, este sub-passo não é testável no
+  ambiente de destino (ver "Observações transversais → Ambiente de teste").
+
+##### Roteiro de implementação (para um agente)
+
+**Não comece por aqui — e, por ora, não comece de jeito nenhum.** Com a fase A
+entregue, este sub-passo deixou de ser pré-requisito de qualquer coisa e passou
+a ser uma melhoria de cobertura; Q10 o declarou fora da v1. Sem KLEE no
+ambiente, o trabalho não tem como ser provado por teste, e a regra de ouro do
+`AGENTS.md` não admite começar assim. O roteiro abaixo fica registrado para o
+dia em que Q10 for revista com dado de cobertura em mãos.
+
+**Resolvido (Q10): KLEE e GoogleTest ficam adiados — não entram no manifesto
+Flatpak por ora.** A via sintética fica fora da v1 e US-6 é considerado completo
+com a fase A. A alternativa descartada era adicioná-los a
+`build-aux/flatpak/dev.syntax_bridge.SyntaxBridge.json`, onde KLEE arrastaria
+LLVM próprio, um SMT solver e uma biblioteca C substituta — de longe o módulo
+mais pesado que o manifesto teria.
+
+O adiamento não é definitivo: a decisão de incluí-los volta à mesa quando houver
+**dado** — a fase A roda sobre o Verovio, `llvm-cov` reporta quanta cobertura os
+perfis de execução reais alcançam, e a diferença para 100% é o tamanho exato do
+problema que KLEE resolveria. Decidir antes disso seria decidir sem medida. Dois
+fatos empurram a favor do adiamento: a criação de perfis em lote (Q6) é o
+mecanismo pelo qual o usuário aumenta cobertura sem KLEE, e US-6 inteiro é
+opcional para o usuário (ver "US-6 é opcional de ponta a ponta"), o que tira a
+fase B de qualquer caminho crítico.
+
+Se e quando a resposta virar "entra", a ordem é:
+
+1. **Manifesto primeiro**, com um teste de disponibilidade no padrão de
+   `crates/server/tests/toolchain_availability.rs`. Sem isso, nada abaixo é
+   testável no ambiente de destino.
+2. **Fatiamento (*slicing*)**, em `crates/server/src/characterization/slice.rs`:
+   fecho transitivo sobre `type_dependencies` (US-3) mais `call_edges` (US-5) a
+   partir da função alvo — a mesma travessia de US-6.1, reaproveitada, com
+   política de corte declarada. Teste com asserção sobre o conjunto de
+   declarações incluídas, sem compilar nada.
+3. **Emissão da TU sintética** com *stubs* nos cortes; critério 1 (compila
+   sozinha) provado chamando `clang++` sobre a saída.
+4. **KLEE + GoogleTest** para produzir e executar os casos, gravando no **mesmo**
+   esquema de US-6.5 que a fase A já usa. Se for preciso mudar o esquema aqui,
+   pare: o formato da fase A foi mal projetado e é ele que precisa de conserto.
+
+---
+
+#### US-6.5 — Persistência do comportamento observado, limites de execução e segurança
+
+**Status:** planejado · **Depende de:** US-6.3 (e de US-6.4 quando a via
+escolhida exigir isolamento)
+
+##### Objetivo do usuário
+
+Confiar que o comportamento observado — por qualquer via de US-6.3 — fica
+gravado de forma recuperável e determinística, que execuções que não terminam
+são interrompidas e reportadas, e que rodar código arbitrário do projeto de
+entrada não representa risco para a máquina do usuário.
+
+##### Observações e decisões em aberto
+
+- **O resultado deste sub-passo é o oráculo de US-10.** Sem essa frase, o
+  passo parece documentação; com ela, fica claro que é a base da prova de
+  equivalência da conversão. O esquema de gravação dos traces precisa ser
+  projetado para essa comparação, não só para exibição — ver formato do
+  registro em US-6.2.
+- **Não determinismo e limites de execução:** timeout por função, o que fazer
+  quando o KLEE não converge (a maioria dos casos reais, só relevante se
+  US-6.3 mantiver essa via), teto de caminhos explorados, e como isso é
+  reportado sem parecer falha.
+- **Segurança — posição, agora escrita.** Este passo compila e executa código
+  arbitrário vindo do input do usuário. A posição é: **tudo acontece dentro do
+  *sandbox* do Flatpak, e tudo escreve exclusivamente sob
+  `<projeto>/characterization/`.** O Flatpak não tem rede nem gerenciador de
+  pacotes, o que aqui deixa de ser a limitação que atrapalha US-1 e vira a
+  garantia que sustenta US-6. O que o produto **não** promete: proteção contra
+  um input malicioso que consuma CPU ou disco dentro do sandbox — o timeout e
+  o teto de disco mitigam, não eliminam. Isso precisa estar dito ao usuário,
+  não presumido.
+- **Esquema proposto** (duas tabelas, para que a execução e o comportamento
+  observado não se misturem):
+  - `characterization_runs (id, source, run_profile_id, started_at,
+    finished_at, exit_code, status, coverage_json, log_path)` — `source` em
+    `real`|`synthetic`, `status` em `completed`|`timeout`|`failed`|`cancelled`.
+  - `behavior_traces (run_id, function_usr, invocation_seq, entry_json,
+    exit_json, schema_version, truncated)`.
+  O que varia entre execuções (horário, duração, código de saída) fica na
+  primeira tabela; o que precisa ser idêntico entre execuções (critério 2) fica
+  na segunda. Sem essa separação, o critério 2 nunca passa.
+- **O `invocation_seq` é necessário e sutil:** uma função chamada N vezes numa
+  execução produz N traces, e a ordem deles é parte do comportamento. Manter a
+  ordem de invocação é o que permite a US-10 comparar sequências de chamadas, e
+  não apenas conjuntos.
+- **Relação com `oracle/cases.json`.** `conversao-guiada-por-exemplos.md` §5.3
+  propõe um formato de caso de comportamento escrito à mão para a escada de
+  exemplos, e diz que ele é "o embrião do registro de comportamento de US-6".
+  Isso deve ser levado a sério nos dois sentidos: **quem implementar primeiro
+  define o formato, e o outro se adapta**. Se a escada chegar antes,
+  `behavior_traces.entry_json`/`exit_json` adotam o formato dela; se US-6.2
+  chegar antes, a escada regrava seus casos. Dois formatos concorrentes para a
+  mesma coisa seria o pior resultado possível, porque US-10 consome os dois.
+
+##### Critérios de aceitação (testáveis)
+
+1. O comportamento observado (entradas, saída, efeitos) é gravado no banco e
+   pode ser recuperado.
+2. Executar a caracterização duas vezes sobre o mesmo código produz o mesmo
+   registro (comparando `behavior_traces`, não `characterization_runs`).
+3. Uma função/execução que entra em laço infinito é interrompida pelo timeout
+   e registrada como `status = "timeout"`, com os traces já coletados até ali
+   preservados.
+4. Nenhuma etapa deste passo escreve fora do diretório do projeto.
+5. Uma execução cancelada pelo usuário (`DELETE /projects/jobs/{id}`) para e
+   fica registrada como `cancelled`, sem corromper registros anteriores.
+6. Traces de funções que saíram do conjunto efetivo de US-6.1 continuam
+   legíveis, marcados como órfãos.
+
+##### Condições de testabilidade
+
+- Determinismo é pré-requisito: sem entradas fixadas e sem controle de tempo e
+  aleatoriedade, o critério 2 é impossível e o sub-passo inteiro deixa de ser
+  testável. A política de serialização de US-6.2 (sem endereços, sem
+  timestamps no payload, ordenação estável) é o que torna isso alcançável.
+- Precisa haver um modo de execução com limites (tempo, memória, teto de disco)
   configuráveis pelo teste, senão a suíte fica lenta ou intermitente.
-- KLEE e gtest precisam estar disponíveis no ambiente Flatpak — hoje não estão
-  no manifesto. Enquanto não estiverem, este passo não é testável no ambiente
-  de destino.
+- O critério 3 exige um fixture com laço infinito deliberado, e o teste precisa
+  de timeout curto (~1s) para não travar a suíte.
+- O critério 4 é testável por asserção sobre o sistema de arquivos: gravar a
+  árvore antes e depois e comparar tudo fora de `<projeto>/`.
+
+##### Roteiro de implementação (para um agente)
+
+1. **Tabelas e round-trip primeiro** (é o item 3 do roteiro de US-6.2, feito
+   aqui): `characterization_runs` e `behavior_traces` em `project_store.rs`,
+   com testes inline. Antes do emissor de instrumentação, para que ele já
+   escreva no formato final.
+2. **Rotas de leitura:** `GET /projects/characterization/runs` e
+   `GET /projects/characterization/traces?function_usr=…`, testadas populando o
+   banco direto, sem executar nada — mesmo padrão de
+   `usages_route_returns_the_persisted_usages_for_a_type`.
+3. **Limites de execução:** timeout por perfil e teto de disco em
+   `characterization/run.rs`, ambos configuráveis, com o fixture de laço
+   infinito provando o critério 3.
+4. **Cancelamento:** reaproveitar `progress::Cancellation`, checado entre
+   perfis e, no build, entre alvos. Nada novo — é o mesmo `AtomicBool` de US-4.
+5. **Teste de confinamento** (critério 4): um teste que roda uma caracterização
+   completa e afirma que nenhum arquivo fora de `<projeto>/` mudou.
+6. **UI:** o painel de caracterização mostra execuções, status, cobertura e
+   traces; um trace com `truncated` visível como tal, nunca silenciosamente.
 
 ---
 
@@ -923,16 +1854,46 @@ que permitam prosseguir na conversão.
   - preprocessador e compilação condicional;
   - concorrência (threads → isolates, com semântica de memória distinta);
   - `dart:ffi` como escape final quando não houver conversão viável.
-- **Filtrar opções por viabilidade global é um problema de satisfação de
-  restrições**, não uma verificação local: a escolha em A propaga por todo o
-  grafo de tipos. Definir se o produto resolve isso de fato ou se apenas alerta
-  sobre conflitos após a escolha — as duas coisas têm custo muito diferente.
+- **Resolvido (Q9): viabilidade global é resolvida de fato, não apenas
+  alertada.** Filtrar opções por viabilidade global é um problema de satisfação
+  de restrições, não uma verificação local: a escolha em A propaga por todo o
+  grafo de tipos. A decisão foi **contra** a recomendação original (alertar
+  depois da escolha) e a favor de resolver, por um motivo de propósito de
+  produto, não de custo: *resolver o mapeamento de tipos entre linguagens é o
+  objetivo principal do Syntax Bridge*. Um produto que aceita a escolha e depois
+  informa que ela quebrou o projeto empurra ao usuário exatamente o trabalho que
+  ele veio delegar. Consequências, todas assumidas:
+  - **Só opções válidas são apresentadas.** O critério 3 vale na sua redação
+    forte ("não é oferecida"), não na alternativa ("é oferecida marcada como
+    conflitante"). A redação alternativa do critério 3 fica revogada.
+  - **O conjunto de opções nunca é vazio**, porque quando nenhum mapeamento
+    direto é viável o produto **gera código ponte** que torna a conversão
+    possível (ver o item seguinte, que esta resposta também fecha em parte).
+    Isso é o que mantém o problema tratável: sempre existe uma atribuição
+    satisfazível, então o solver busca as combinações válidas em vez de ter que
+    provar insatisfazibilidade global e travar o usuário sem saída.
+  - **Custo aceito:** o produto ganha um componente de satisfação de restrições
+    sobre o grafo de tipos de US-3 — dimensão comparável à do resto do servidor,
+    e o item mais caro de US-7. Cada opção precisa ter suas restrições
+    expressas como dado verificável por máquina (é o que o `Consequence`
+    estruturado do roteiro já exige), senão não há o que resolver.
+  - **Evidência ainda vem do E09.** Herança múltipla é onde o conflito real
+    aparece, e continua sendo o degrau que dimensiona o solver. O que muda é
+    que ele nasce solver desde o começo, ainda que trivial nos degraus
+    iniciais, em vez de nascer validador e ser trocado depois.
 - **As decisões do usuário são o ativo mais valioso do projeto** e precisam ser
   persistidas com identidade estável de tipo (ver US-3) para sobreviver a US-12.
 - **Ordem de decisão importa:** decidir tipos folha antes de tipos que dependem
   deles reduz retrabalho; o grafo de US-3 já dá essa ordem.
-- Falta definir o que é "código ponte": adaptador gerado, classe manual com
-  TODO, ou `ffi`. Sem essa definição o último item do passo não é implementável.
+- **Código ponte: papel decidido (Q9), forma ainda em aberto.** O papel ficou
+  definido pela resposta de Q9: código ponte é o que garante que o conjunto de
+  opções de um tipo nunca seja vazio — quando nenhum mapeamento direto é viável,
+  o produto gera o código intermediário que torna a conversão possível, em vez
+  de declarar o tipo não convertível. Segue em aberto **qual é a forma** desse
+  código: adaptador gerado, classe manual com TODO, ou `dart:ffi`. Sem essa
+  definição o último item do passo não é implementável, e agora ela também é
+  pré-requisito do solver — uma opção que o solver possa sempre oferecer
+  precisa ser uma opção que o emissor de US-8 saiba materializar.
 
 ### Critérios de aceitação (testáveis)
 
@@ -940,10 +1901,13 @@ que permitam prosseguir na conversão.
    Dart, sem apresentar alternativas.
 2. Uma classe com herança múltipla recebe pelo menos uma combinação
    classe+mixin viável, com as consequências descritas.
-3. Uma opção que tornaria outro tipo do projeto não convertível não é oferecida
-   (ou é oferecida marcada como conflitante, conforme a decisão acima).
+3. Uma opção que tornaria outro tipo do projeto não convertível **não é
+   oferecida** — redação forte, conforme a resposta de Q9. A redação
+   alternativa que este critério admitia ("ou é oferecida marcada como
+   conflitante") está revogada.
 4. Escolher uma opção e reabrir o projeto preserva a escolha.
-5. Um tipo sem mapeamento possível recebe ao menos uma opção de código ponte.
+5. Um tipo sem mapeamento direto possível recebe ao menos uma opção de código
+   ponte — e, por Q9, a lista de opções de qualquer tipo é sempre não vazia.
 6. Cada opção apresentada declara explicitamente o que muda nos tipos
    dependentes.
 
@@ -958,6 +1922,48 @@ que permitam prosseguir na conversão.
 - Decisões precisam ser expressáveis como dado (não como interação de UI) para
   que os testes de servidor não dependam do cliente.
 
+### Roteiro de implementação (para um agente)
+
+**Não implemente este passo em largura.** A lista de 18 construções acima é um
+*checklist a consumir*, não um lote. A ordem de consumo é a escada de
+`conversao-guiada-por-exemplos.md`: o E03 força o caso trivial (uma opção só),
+o E07 força a primeira escolha real (sobrecarga), o E09 força a viabilidade
+global (herança múltipla). Cada degrau fecha um punhado de itens do checklist e
+nada mais.
+
+1. **Modelo de decisão, antes de qualquer regra.** Em
+   `crates/server/src/mapping.rs`: `MappingOption { id, rótulo, descrição,
+   consequences: Vec<Consequence> }` e
+   `MappingDecision { type_usr, option_id, decided_at }`. `Consequence` carrega
+   o `usr` do tipo afetado e o que muda nele — é o critério 6, e ele precisa
+   ser dado estruturado, não texto livre, senão o critério 3 não tem como ser
+   verificado por máquina.
+2. **Persistência:** tabela `type_mappings (type_usr TEXT PRIMARY KEY, option_id,
+   decided_at)`, chaveada pelo `usr` de US-3 — é exatamente aqui que a
+   identidade estável se paga, e é o que faz o critério 1 de US-12 passar.
+3. **Regras, uma por vez, cada uma com teste próprio.** `mapping::options_for(
+   declaration, catalog, decisions)` devolve as opções de um tipo — já
+   filtradas por viabilidade global (Q9), e por isso dependentes das decisões
+   já tomadas, não só da declaração. A primeira versão devolve uma opção única
+   para classe sem herança múltipla (critério 1) e uma opção de código ponte
+   com motivo para todo o resto — a lista nunca é vazia, e silêncio é proibido.
+4. **Solver de viabilidade** (Q9, decidido a favor de resolver): as restrições
+   de cada opção são dado estruturado sobre o grafo de US-3, e
+   `mapping::feasible_options(type_usr, catalog, decisions)` devolve só o que
+   mantém o grafo inteiro satisfazível. Função pura sobre catálogo e decisões,
+   testável sem banco. Nasce trivial nos degraus iniciais (E03: uma opção só) e
+   é dimensionado pelo E09, onde herança múltipla produz o primeiro conflito
+   real — mas nasce solver, não validador *a posteriori*, porque trocar um pelo
+   outro depois muda o contrato de `options_for` e a UI que o consome.
+5. **Rotas:** `GET /projects/mappings` (tipos, opções viáveis, decisão atual) e
+   `PUT /projects/mappings`. Testes de rota populando o banco direto.
+6. **Ordem de decisão na UI:** ordenar os tipos pela ordem topológica do grafo
+   `type_dependencies` de US-3, com os tipos folha primeiro. Não é enfeite —
+   é o que evita retrabalho, e o grafo já existe.
+7. **Decisões como dado, sem UI:** um formato de arquivo (`decisions.toml`, na
+   proposta da escada) aplicável ao banco antes de transpilar. É o que permite
+   testar US-8 sem cliente, e é condição de testabilidade já registrada acima.
+
 ---
 
 ## US-8 — Geração do código Dart
@@ -971,9 +1977,14 @@ decididos.
 
 ### Observações e decisões em aberto
 
-- Depende da existência de um **modelo intermediário explícito** (ver eixos
-  transversais): gerar Dart diretamente a partir de cursores do libclang
-  amarraria o produto a C++ e violaria a fronteira exigida pelo `AGENTS.md`.
+- **O modelo intermediário deixou de ser exigência do `AGENTS.md`** (foi
+  retirado da lista de fronteiras) — mas o argumento técnico que o motivava
+  continua de pé: gerar Dart diretamente de cursores do `libclang` amarra o
+  emissor a C++ e faz a extensibilidade por adaptador custar uma reescrita.
+  **Q8 respondida** (ver observações transversais): a retirada significa que a
+  IR deixou de ser fronteira obrigatória e passou a ser detalhe interno de
+  US-8 — `crates/server/src/ir/`, crescendo degrau a degrau da escada de
+  exemplos, não projetada em largura de antemão.
 - Ordem de geração sai da ordem topológica do grafo de tipos de US-3; ciclos
   precisam de política própria.
 - Definir o mapeamento de estrutura de projeto: arquivos, bibliotecas, `part`,
@@ -1001,6 +2012,34 @@ decididos.
   estruturas não ordenadas.
 - Precisa existir um conjunto de decisões de US-7 gravável diretamente pelo
   teste, sem passar pela UI.
+
+### Roteiro de implementação (para um agente)
+
+Este é o passo em que a escada de `conversao-guiada-por-exemplos.md` §7 já tem
+o roteiro detalhado — siga-o, e trate o que está abaixo como o resumo que
+amarra aquele plano a este documento. A ordem é: infra do corpus, E01 fino,
+oráculo, UI, e então um degrau por vez.
+
+1. **Nada de quarta passada `libclang`.** A extração para IR é uma extensão de
+   `function_catalog::extract_function_catalog_cancellable`, que já é a única
+   passada que parseia corpos. Isso é a mesma regra que US-6.2 segue, e pela
+   mesma razão: a seção "Escala" já registra três passadas, e uma quarta é
+   inaceitável.
+2. **`Unsupported` é um nó de primeira classe da IR, desde a primeira versão.**
+   Com origem (arquivo, linha) e motivo. O emissor o transforma em falha
+   explícita ou `TODO` visível. É o critério 5, e é a regra "silêncio é
+   proibido" no ponto onde ela mais importa: Dart que compila e está errado é o
+   único resultado inaceitável.
+3. **Determinismo desde o primeiro commit** (critério 3): ordenação estável em
+   toda coleção emitida, e nenhuma iteração sobre `HashMap`. Retrofitar
+   determinismo depois é caro; nascer com ele é de graça.
+4. **Rastreabilidade (critério 4)** também desde o primeiro commit: cada nó da
+   IR carrega sua origem C++, e o emissor a propaga. Ela é pré-requisito de
+   US-9 (critério 3) e de US-10 (critério 3) — os dois passos seguintes
+   dependem dela, então adicioná-la depois significa refazer os dois.
+5. **A rota nasce síncrona** (`POST /projects/transpile`); quando o custo
+   aparecer, o `jobs.rs` já resolve progresso e cancelamento, e é reaproveitado
+   como US-4 e US-5 fizeram. Não invente um segundo mecanismo.
 
 ---
 
@@ -1039,11 +2078,36 @@ apontando de volta para o C++ de origem.
 - Versão do SDK fixada, senão a saída do analisador varia entre máquinas.
   Satisfeita: 3.12.2, por URL de release com `sha256`.
 
+### Roteiro de implementação (para um agente)
+
+O passo mais barato dos que faltam: as duas ferramentas existem, a versão está
+fixada, e o contrato é a saída delas.
+
+1. **`crates/server/src/validate/dart.rs`:** invoca `dart analyze --format=json`
+   e `dart format --output=none --set-exit-if-changed` sobre o pacote gerado,
+   e traduz a saída para `DartDiagnostic { severity, message, dart_file,
+   dart_line, origin: Option<CppOrigin> }`.
+2. **A tradução para a origem C++ é o trabalho real** (critério 3), e ela só
+   funciona se US-8 tiver emitido a rastreabilidade. Teste primeiro: um pacote
+   Dart com erro deliberado, cuja origem o teste conhece, afirmando que o
+   diagnóstico aponta para o arquivo e a linha C++ certos.
+3. **Avisos informam, erros bloqueiam** — decisão a tomar por escrito no
+   primeiro commit; recomendo essa, por ser a que não impede o usuário de
+   avançar com Dart válido porém imperfeito.
+4. **Rota** `POST /projects/validate` e painel de diagnósticos na UI, com
+   clique levando ao C++ de origem — reaproveitando `SourceFileViewer` e a
+   mesma mecânica de navegação de US-4/US-5.
+5. Nos testes, invocar `dart` pela receita do `justfile` dentro do Flatpak
+   (`just test`), para que a versão exercitada seja a do manifesto.
+
 ---
 
 ## US-10 — Prova de equivalência comportamental
 
-**Status:** planejado · **Depende de:** US-6, US-8
+**Status:** planejado · **Depende de:** US-8, mais uma fonte de oráculo — a
+fase A de US-6 ou os casos escritos à mão da escada de exemplos. **Deixou de
+depender de US-6 inteiro**, e portanto de KLEE, quando a rodada 1 decidiu que
+US-6 tem duas fases (ver "As duas fases" em US-6)
 
 ### Objetivo do usuário
 
@@ -1062,6 +2126,12 @@ mas porque foi testado contra o comportamento observado do original.
   ou alimentam de volta as decisões de US-7.
 - Funções não caracterizadas em US-6 permanecem não provadas — a cobertura da
   prova precisa ser visível ao usuário, e não implícita.
+- **US-6 é opcional, e o caso "nenhuma caracterização" é normal.** Como o
+  usuário pode escolher não rodar US-6 (ver "US-6 é opcional de ponta a ponta"),
+  o estado de zero oráculo não é erro nem projeto incompleto: US-10 simplesmente
+  não tem o que provar e **reporta cobertura de prova zero**, explicitamente. O
+  que ele não pode fazer é bloquear US-11 nem sugerir que a conversão está
+  verificada.
 
 ### Critérios de aceitação (testáveis)
 
@@ -1079,11 +2149,48 @@ mas porque foi testado contra o comportamento observado do original.
 - Precisa de um teste de mutação (critério 3) para provar que a suíte
   efetivamente detecta erro — uma suíte que só passa não prova nada.
 
+### Roteiro de implementação (para um agente)
+
+**Este passo não precisa esperar US-6.** O oráculo pode vir de duas fontes com
+o mesmo formato: os casos escritos à mão da escada de exemplos
+(`oracle/cases.json`) e os `behavior_traces` da fase A de US-6. Comece pelos
+primeiros — é o que `conversao-guiada-por-exemplos.md` §11 item 3 propõe — e
+troque a fonte depois, sem tocar no comparador.
+
+1. **Regras de equivalência primeiro, como tabela declarada.**
+   `crates/server/src/equivalence.rs`, com uma entrada por par de tipos: inteiro
+   de 32 bits vs. `int` de 64, `double` vs. `double` (comparação por bits),
+   `std::string` (bytes) vs. `String` (UTF-16), ordem de coleções, e ponteiro —
+   que simplesmente **não tem correspondente** e precisa de veredito próprio
+   ("não comparável", não "igual"). Cada regra nasce com teste unitário; nenhuma
+   nasce como comparação genérica por igualdade estrutural, que esconderia
+   exatamente as divergências que este passo existe para achar.
+2. **Runner duplo:** executar o caso em C++ (compilado com as flags reais do
+   `compile_commands.json`) e em Dart (`dart run` sobre o pacote gerado),
+   reduzindo os dois a uma forma canônica antes de comparar. **A verdade é o
+   C++ executado**, não o valor que alguém escreveu como esperado — o `espera`
+   escrito à mão é conferência de sanidade.
+3. **Teste de mutação junto do primeiro caso, não no fim** (critério 3): trocar
+   `+` por `-` no emissor e exigir que o oráculo falhe, com origem e valores
+   esperado/obtido. Uma suíte que passa e não falha quando sabotada não prova
+   nada, e descobrir isso tarde custa o dobro.
+4. **Relatório de cobertura de prova** (critério 4): fração de funções com pelo
+   menos um caso comparado, com as não caracterizadas visíveis por nome. Na
+   fase A de US-6 esse número vem baixo de propósito — é honesto, e é o que
+   impede o usuário de confundir "compila" com "está provado".
+5. **Destino das divergências:** relatório, não bloqueio, na primeira versão —
+   uma divergência conhecida e declarada (o overflow de `int` do E01 é o
+   exemplo canônico) é informação, não falha.
+
 ---
 
 ## US-11 — Exportação do projeto convertido
 
-**Status:** planejado · **Depende de:** US-9, US-10
+**Status:** planejado · **Depende de:** US-9 e, quando houver prova, US-10 —
+mas **não** de US-6: como a caracterização é opcional para o usuário (ver "US-6
+é opcional de ponta a ponta"), exportar um projeto sem prova de equivalência é
+um caminho legítimo, desde que o relatório de exportação declare o que não foi
+provado
 
 ### Objetivo do usuário
 
@@ -1110,6 +2217,24 @@ Levar embora o resultado: um pacote Dart utilizável fora do Syntax Bridge.
 
 - O teste precisa validar o pacote exportado *fora* do diretório do projeto,
   para provar que ele não depende do ambiente de origem.
+
+### Roteiro de implementação (para um agente)
+
+1. **Montagem do pacote** em `crates/server/src/export.rs`: código gerado,
+   `pubspec.yaml`, testes de US-10, `CONVERSION_REPORT.md` e a lista de
+   pendências. Determinística, como US-8.
+2. **O relatório do que *não* foi convertido acompanha a exportação**, sempre —
+   é a informação de que o usuário precisa para terminar o trabalho à mão, e
+   ele sai de graça dos nós `Unsupported` de US-8, dos conflitos de US-7 e da
+   cobertura de prova de US-10. Não é um recurso novo; é a agregação de três
+   coisas que já existem.
+3. **Teste de independência** (a condição de testabilidade acima): copiar o
+   pacote exportado para um diretório temporário fora do projeto, rodar
+   `dart pub get`, `dart analyze` e `dart test` ali, e afirmar que passa. É o
+   único teste que prova que a exportação não depende do ambiente de origem.
+4. **Portal de arquivos do Flatpak** para escolher o destino: o `sandbox` não
+   permite caminho arbitrário. Isolar isso atrás de uma interface no cliente,
+   para que o teste possa substituí-la por um diretório temporário.
 
 ---
 
@@ -1143,7 +2268,34 @@ Atualizar o código C++ de entrada sem perder o trabalho de decisão já feito.
 ### Condições de testabilidade
 
 - Requer dois fixtures versionados representando "antes" e "depois", com as
-  mudanças escolhidas para exercitar cada critério acima.
+  mudanças escolhidas para exercitar cada critério acima. A escada de exemplos
+  dá isso de graça: duas versões de um mesmo exemplo, em texto puro, com diff
+  legível na revisão.
+
+### Roteiro de implementação (para um agente)
+
+1. **Diff por `usr`, não por posição.** Comparar o catálogo novo com o gravado
+   produz quatro conjuntos: novos, removidos, inalterados e **alterados**.
+   "Alterado" precisa de um critério explícito — recomendo *hash* do texto do
+   corpo, delimitado por `end_line`/`end_column`, que US-3 já persiste. Sem
+   isso, "alterado" vira "qualquer coisa que mudou de linha", e o critério 4
+   dispara para o projeto inteiro a cada re-ingestão.
+2. **Nada é descartado silenciosamente** (critério 2): uma decisão cujo `usr`
+   sumiu vira decisão órfã, listada com o nome do tipo que ela tinha, para o
+   usuário reatribuir ou descartar. Mesma mecânica dos traces órfãos de US-6.1
+   — vale implementar as duas com o mesmo conceito, não com dois parecidos.
+3. **Marcação para revisão** (critério 4) atinge três coisas ao mesmo tempo:
+   decisões de US-7, seleções de US-6.1 e traces de US-6.5. Todas chaveadas por
+   `usr`, todas com o mesmo estado "válida, mas pendente de revisão".
+4. **Incrementalidade é o item mais caro e o mais adiável.** Reprocessar só as
+   TUs alteradas é o que torna o ciclo usável no Verovio, e é a mesma lacuna que
+   US-3, US-4 e US-5 já registram. Recomendo tratá-la como trabalho próprio,
+   depois que o diff e a preservação de decisões estiverem provados — refazer
+   as três passadas inteiras é lento, mas correto; um cache incremental errado
+   é rápido e corrompe as decisões, que são o ativo mais valioso do produto.
+5. **Rota e UI:** `POST /projects/reingest` devolvendo `job_id` (quarta ou
+   quinta instância do mecanismo de `jobs.rs`), e uma tela de diff mostrando os
+   quatro conjuntos antes de o usuário confirmar.
 
 ---
 
@@ -1154,11 +2306,42 @@ Nenhum está resolvido hoje.
 
 ### Modelo intermediário
 
-O `AGENTS.md` exige a fronteira "modelo intermediário", e o fluxo acima salta de
+O `AGENTS.md` exigia a fronteira "modelo intermediário", e o fluxo acima salta de
 análise (US-3 a US-5) para mapeamento (US-7) sem nomeá-lo. É a peça que sustenta
 a extensibilidade a outras linguagens de entrada e saída — sem ela, cada
 adaptador novo reescreve o produto inteiro. Precisa existir antes de US-8, e a
 decisão de projetá-lo agora ou depois deve ser consciente.
+
+Resposta à observação: Retirei do 'AGENTS.md' o tal 'modelo intermediário'. 
+
+**Resolvido (Q8): a IR deixou de ser fronteira exigida, mas continua existindo
+como estrutura interna de US-8** — leitura (2), a recomendada. A leitura
+descartada era (1) "não haverá IR alguma", com o emissor de US-8 lendo os
+catálogos e os cursores do `libclang` e escrevendo Dart direto: chegaria mais
+rápido ao primeiro Dart gerado, mas o emissor passaria a conhecer C++ e Dart ao
+mesmo tempo, e um segundo par de linguagens exigiria reescrevê-lo inteiro.
+
+O que a decisão significa na prática:
+
+- A IR é a que `conversao-guiada-por-exemplos.md` §7 já propõe concretamente —
+  `crates/server/src/ir/`, dimensionada pelo que cada degrau da escada exige,
+  nascendo com oito nós no E01. **Não é para ser projetada em largura antes do
+  E01**; ela cresce degrau a degrau, como o resto da escada.
+- Ela é estrutura interna, não contrato: não aparece em rota HTTP, não é
+  persistida como formato de intercâmbio, e mudá-la não quebra cliente algum.
+  Retirá-la do `AGENTS.md` foi retirar a *exigência de fronteira*, não a
+  estrutura.
+- O motivo decisivo é de teste, não de arquitetura: sem uma estrutura
+  intermediária, não existe nada que o teste de US-8 possa afirmar entre "o C++
+  entrou" e "o Dart saiu" — todo teste viraria comparação de texto gerado, e a
+  regra de ouro do `AGENTS.md` ficaria difícil de cumprir em qualquer
+  granularidade menor que o arquivo inteiro.
+- A diferença entre (1) e (2) é pequena no E01 e grande no E05, quando o
+  adaptador de biblioteca padrão precisa ser uma tabela substituível e não uma
+  cascata de condicionais dentro do emissor.
+- O `AGENTS.md` continua exigindo fronteiras claras entre análise de entrada e
+  geração de saída; a IR interna é o que sustenta essa exigência sem
+  reintroduzir a fronteira retirada.
 
 ### Extensibilidade por adaptador
 
@@ -1221,6 +2404,19 @@ reaproveitado é exatamente o mecanismo de job desta seção:
 duas primeiras passadas, passou a ser checado pela terceira também, sem
 nenhum flag novo — `DELETE /projects/jobs/{job_id}` continua parando a
 criação de projeto inteira, agora com uma passada a mais dentro dela.
+
+**US-6.3 (fase A) será a quarta instância, e a primeira de um tipo diferente.**
+As três anteriores são trabalho de *análise*: interrompê-las no meio não custa
+nada, porque nada foi persistido até o fim. Compilar o projeto instrumentado e
+executar perfis não é assim — há artefatos de build no disco e traces já
+coletados quando o cancelamento chega. A observação registrada no parágrafo
+anterior sobre US-6 ("uma caracterização comportamental *tem* uma noção de meio
+caminho seguro para persistir, que uma indexação de tipos não tem") se
+materializa exatamente aqui, e a decisão que ela pedia é: **traces já
+coletados sobrevivem ao cancelamento**, gravados sob uma execução com
+`status = "cancelled"`, e o diretório de build sobrevive também (jogá-lo fora
+obrigaria a recompilar tudo na próxima tentativa). O mecanismo continua sendo o
+mesmo `progress::Cancellation`; o que muda é o que se faz ao observá-lo.
 
 ### Versionamento do esquema de persistência
 
@@ -1318,6 +2514,15 @@ O produto compila e executa código arbitrário de terceiros (US-1 e, sobretudo,
 US-6). A postura precisa estar escrita: o que roda dentro do sandbox, que acesso
 a rede e a disco existe, e o que é recusado.
 
+**Escrita, para US-6, em US-6.5** ("Segurança"): tudo dentro do sandbox do
+Flatpak, tudo gravando exclusivamente sob `<projeto>/characterization/`, sem
+rede — com a limitação declarada de que timeout e teto de disco mitigam, mas não
+eliminam, um input que consuma recursos dentro do sandbox. Falta estender a
+mesma redação a US-1 (o `cmake configure` de um projeto de terceiros já executa
+código arbitrário, via `execute_process` em `CMakeLists.txt`, e isso nunca foi
+declarado) e a US-11 (a exportação é a única operação que legitimamente escreve
+fora do diretório do projeto, e por isso precisa do portal de arquivos).
+
 ### Ambiente de teste
 
 O `AGENTS.md` exige rodar os testes dentro do Flatpak. Hoje o manifesto oferece
@@ -1329,17 +2534,30 @@ Consequência por passo:
 
 - **US-9 e US-11 são testáveis no ambiente de destino desde já** — o que
   precisavam era o Dart SDK, e ele está lá, com versão fixada por `sha256`.
-- **US-6 continua bloqueado**: KLEE (para descobrir entradas que cobrem todos os
-  ramos) e GoogleTest (para materializar e executar os casos) não têm
-  substituto no manifesto atual.
-- **US-10 herda o bloqueio de US-6 apenas para o oráculo**, não para a execução:
-  rodar os testes Dart gerados já é possível. Um oráculo escrito à mão, em vez
-  de gerado por KLEE, tiraria US-10 da fila de espera de US-6 — é exatamente o
-  que `docs/plans/conversao-guiada-por-exemplos.md` propõe.
+- **US-6 fase A é testável no ambiente de destino desde já.** É a mudança que
+  as respostas da rodada 1 produziram: a via de execução real precisa de
+  `cmake`, `clang++` e, para medir cobertura, `llvm-profdata`/`llvm-cov` — os
+  três já vêm da extensão `llvm21` e do runtime, nenhum é novo no manifesto.
+- **US-6 fase B está adiada, não apenas bloqueada** (Q10 respondida): KLEE (para
+  descobrir entradas que cobrem todos os ramos) e GoogleTest (para materializar
+  e executar os casos) não entram no manifesto por ora, e a via sintética fica
+  fora da v1. A inclusão volta à mesa quando a fase A tiver rodado sobre o
+  Verovio e `llvm-cov` mostrar, com número medido, quanta cobertura ela deixa de
+  fora. Ver **Q10** em US-6.4.
+- **US-10 não herda mais bloqueio nenhum**: o oráculo pode vir dos casos
+  escritos à mão da escada de exemplos ou dos `behavior_traces` da fase A de
+  US-6, no mesmo formato, e rodar os testes Dart gerados já é possível.
 
 Ou seja: a dependência de infraestrutura mais importante do roadmap encolheu de
 "três ferramentas ausentes bloqueando quatro passos" para "duas ferramentas
-ausentes bloqueando um passo", e esse passo tem contorno conhecido.
+ausentes bloqueando **meio** passo" — a fase sintética de US-6 —, e essa fase
+tem contorno conhecido e não bloqueia mais nada a jusante.
+
+Uma capacidade nova entra no ambiente com US-6.3, e vale registrar aqui porque
+não é ferramenta ausente e sim uso ausente: o produto passa a **compilar** o
+projeto de entrada (`cmake --build`), coisa que hoje nunca faz — só configura.
+Ver Q7 (respondida: só os alvos necessários ao perfil, dentro do mecanismo de
+job de US-1/US-4).
 
 ### Higiene do repositório
 
