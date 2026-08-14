@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "casos": [
+    {
+      "funcao": "testarSoma",
+      "args": [],
+      "espera": 506
+    },
+    {
+      "funcao": "testarSubtracao",
+      "args": [],
+      "espera": 102
+    },
+    {
+      "funcao": "testarMultiplicacao",
+      "args": [],
+      "espera": 102
+    },
+    {
+      "funcao": "testarIgualdade",
+      "args": [],
+      "espera": true
+    },
+    {
+      "funcao": "testarParaDouble",
+      "args": [],
+      "espera": 0.75
+    },
+    {
+      "funcao": "testarReduzirEstatico",
+      "args": [],
+      "espera": 102
+    }
+  ]
+}

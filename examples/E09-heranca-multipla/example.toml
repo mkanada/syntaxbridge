@@ -1,0 +1,7 @@
+id = "E09"
+nome = "Heranca multipla"
+nivel = 9
+status = "passa"
+motivo = "golden, dart analyze/format e oráculo comportamental passam"
+constroi = ["heranca-multipla", "mixin", "estado-em-mixin", "ordem-de-linearizacao"]
+passos = ["US-7", "US-8", "US-9", "US-10"]

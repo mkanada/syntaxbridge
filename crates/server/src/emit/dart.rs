@@ -11,21 +11,55 @@
 //!   any expected type, so the surrounding expression still type-checks.
 //!   The helper is only emitted into a file that actually needs it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
-use crate::ir::{BinaryOp, Expr, Function, Module, Origin, Record, Stmt, Type, UnaryOp};
+use crate::ir::{
+    BinaryOp, Constructor, Expr, Function, Method, Module, Origin, Param, Record, Stmt, Type,
+    UnaryOp,
+};
 
 const INDENT: &str = "  ";
 const UNSUPPORTED_HELPER_NAME: &str = "_syntaxBridgeUnsupported";
 
 /// Groups `module`'s records and functions by the C++ source file they came
-/// from (one `.dart` file per `.cpp`/`.hpp` — the multi-file/dedup story is
-/// E11's armadilha, out of scope here) and emits each, records before
-/// functions. Keys are package-relative paths (`lib/<stem>.dart`); a
-/// `BTreeMap` keeps the result — and therefore every consumer that iterates
-/// it — deterministic (§5 restriction 5).
+/// from (one `.dart` file per `.cpp`/`.hpp`) and emits each, records before
+/// functions — including, since E11, the `import`s a file needs for
+/// whichever other files it references (a header shared by more than one
+/// `.cpp`, E11's own armadilha, means a type or free function's home file
+/// often isn't the file using it). Keys are package-relative paths
+/// (`lib/<stem>.dart`); a `BTreeMap` keeps the result — and therefore every
+/// consumer that iterates it — deterministic (§5 restriction 5).
 pub fn emit_module(module: &Module) -> BTreeMap<String, String> {
+    // E09: gathered across the *whole* module, not per-file — a mixin and
+    // the class that uses it could in principle land in different files
+    // (multi-TU dedup is E11's own armadilha, not reopened here), and
+    // `emit_record` needs to know "is this record used as a mixin
+    // somewhere" before it decides whether to emit `class` or `mixin` and
+    // whether its fields need a default value (a `mixin` can't have any
+    // constructor at all, unlike the ordinary synthetic positional one E03
+    // gives every other record with fields — see `Record::mixins`'s doc
+    // comment).
+    let mixin_usrs: HashSet<&str> = module
+        .records
+        .iter()
+        .flat_map(|record| record.mixins.iter().map(|base| base.usr.as_str()))
+        .collect();
+
+    // E11: which file *declares* each top-level record/function — the other
+    // half of what a file needs to know before it can print its own
+    // `import`s. Method/constructor usrs aren't included (only reachable
+    // through the record that owns them, always emitted in the same file as
+    // that record — see `emit_file`'s doc comment on the one gap this
+    // leaves: a cross-file *method* call, which no fixture exercises yet).
+    let mut usr_to_stem: HashMap<&str, String> = HashMap::new();
+    for record in &module.records {
+        usr_to_stem.insert(record.usr.as_str(), file_stem(&record.origin.file));
+    }
+    for function in &module.functions {
+        usr_to_stem.insert(function.usr.as_str(), file_stem(&function.origin.file));
+    }
+
     let mut functions_by_stem: BTreeMap<String, Vec<&Function>> = BTreeMap::new();
     for function in &module.functions {
         functions_by_stem
@@ -67,7 +101,10 @@ pub fn emit_module(module: &Module) -> BTreeMap<String, String> {
                     .then_with(|| a.name.cmp(&b.name))
             });
 
-            (format!("lib/{stem}.dart"), emit_file(&records, &functions))
+            (
+                format!("lib/{stem}.dart"),
+                emit_file(&stem, &records, &functions, &mixin_usrs, &usr_to_stem),
+            )
         })
         .collect()
 }
@@ -139,14 +176,49 @@ fn fold_diacritic(ch: char) -> char {
     }
 }
 
-fn emit_file(records: &[&Record], functions: &[&Function]) -> String {
+/// One `.dart` file's worth of records and functions, plus the two
+/// cross-file/cross-record lookups it needs to emit correctly: `mixin_usrs`
+/// (E09 — whether a record it declares needs to come out as `mixin`, not
+/// `class`) and `usr_to_stem` (E11 — every top-level record/function's
+/// *declaring* file, so this file can `import` whichever other files it
+/// actually references — a header shared by more than one `.cpp` (E11's own
+/// armadilha) means a type or free function's home file is often not this
+/// one). Doesn't resolve a cross-file *method* call (a method's own usr
+/// isn't in `usr_to_stem` — only its owning record's is, and no fixture
+/// yet calls a method whose receiver's static type lives in another file)
+/// — deliberately narrower than the free-function/record-type case, not a
+/// silent gap: `dart analyze`'s `undefined_method` would surface it loudly
+/// if it ever mattered.
+fn emit_file(
+    stem: &str,
+    records: &[&Record],
+    functions: &[&Function],
+    mixin_usrs: &HashSet<&str>,
+    usr_to_stem: &HashMap<&str, String>,
+) -> String {
     let mut used_expr_helper = false;
+    // Set by `Expr::StringByteLength` (E05's UTF-8-byte-length bridge for
+    // `std::string::size()` — see that variant's doc comment): needs
+    // `dart:convert`'s `utf8`, which nothing else in this emitter uses, so
+    // the import is added only when a file actually needs it, the same
+    // opt-in shape `used_expr_helper` already uses for its own helper
+    // function.
+    let mut used_utf8_encode = false;
     let mut sections: Vec<String> = Vec::new();
     for record in records {
-        sections.push(emit_record(record));
+        sections.push(emit_record(
+            record,
+            mixin_usrs.contains(record.usr.as_str()),
+            &mut used_expr_helper,
+            &mut used_utf8_encode,
+        ));
     }
     for function in functions {
-        sections.push(emit_function(function, &mut used_expr_helper));
+        sections.push(emit_function(
+            function,
+            &mut used_expr_helper,
+            &mut used_utf8_encode,
+        ));
     }
 
     let mut source = sections.join("\n");
@@ -155,6 +227,35 @@ fn emit_file(records: &[&Record], functions: &[&Function]) -> String {
             source.push('\n');
         }
         source.push_str(&emit_unsupported_helper());
+    }
+
+    let mut referenced_usrs: HashSet<&str> = HashSet::new();
+    for record in records {
+        collect_referenced_usrs_in_record(record, &mut referenced_usrs);
+    }
+    for function in functions {
+        collect_referenced_usrs_in_type(&function.return_type, &mut referenced_usrs);
+        for param in &function.params {
+            collect_referenced_usrs_in_type(&param.ty, &mut referenced_usrs);
+        }
+        collect_referenced_usrs_in_stmts(&function.body, &mut referenced_usrs);
+    }
+    let needed_imports: BTreeSet<&str> = referenced_usrs
+        .into_iter()
+        .filter_map(|usr| usr_to_stem.get(usr))
+        .map(String::as_str)
+        .filter(|other_stem| *other_stem != stem)
+        .collect();
+
+    let mut import_lines: Vec<String> = Vec::new();
+    if used_utf8_encode {
+        import_lines.push("import 'dart:convert';".to_owned());
+    }
+    for other_stem in &needed_imports {
+        import_lines.push(format!("import '{other_stem}.dart';"));
+    }
+    if !import_lines.is_empty() {
+        source = format!("{}\n\n{source}", import_lines.join("\n"));
     }
     source
 }
@@ -165,124 +266,523 @@ fn emit_unsupported_helper() -> String {
     )
 }
 
-/// A POD `struct`/`class` becomes a Dart class with every field declared
-/// `final`... except E03's own armadilha rules that out: `mover` mutates its
-/// (by-value-copied) parameter's fields in place, so fields need to stay
-/// mutable. A positional constructor (`Ponto(this.x, this.y);`) doubles as
-/// the copy constructor `lower::cpp` needs for by-value parameter semantics
-/// (`RecordConstruct` emits a call to this same constructor).
-fn emit_record(record: &Record) -> String {
-    let mut source = format!("class {} {{\n", record.name);
-    for field in &record.fields {
-        source.push_str(&format!(
-            "{INDENT}{} {};\n",
-            emit_type(&field.ty),
-            field.name
-        ));
+/// E11: every `usr` a record's own shape and members reach — field/static
+/// field types, base class and mixins, and every constructor's/method's own
+/// params/return type/body — the input `emit_file` needs to decide which
+/// other files this one has to `import`.
+fn collect_referenced_usrs_in_record<'a>(record: &'a Record, out: &mut HashSet<&'a str>) {
+    for field in record.fields.iter().chain(&record.static_fields) {
+        collect_referenced_usrs_in_type(&field.ty, out);
     }
-    let ctor_params = record
-        .fields
-        .iter()
-        .map(|field| format!("this.{}", field.name))
-        .collect::<Vec<_>>()
-        .join(", ");
+    if let Some(base) = &record.base_class {
+        out.insert(base.usr.as_str());
+    }
+    for mixin in &record.mixins {
+        out.insert(mixin.usr.as_str());
+    }
+    for constructor in &record.constructors {
+        for param in &constructor.params {
+            collect_referenced_usrs_in_type(&param.ty, out);
+        }
+        collect_referenced_usrs_in_stmts(&constructor.body, out);
+    }
+    for method in &record.methods {
+        collect_referenced_usrs_in_type(&method.return_type, out);
+        for param in &method.params {
+            collect_referenced_usrs_in_type(&param.ty, out);
+        }
+        if let Some(body) = &method.body {
+            collect_referenced_usrs_in_stmts(body, out);
+        }
+    }
+}
 
-    // A field type the IR can't represent (`dynamic /* unsupported: ... */`
-    // above) means this class's shape is incomplete — silently allowing
-    // construction would accept any value into that field with no signal
-    // anything is wrong. The constructor still declares (and assigns, via
-    // the `this.field` initializing formals) every field, then throws
-    // before returning, the same "compiles, then bails out at the last
-    // possible moment" shape `emit_function` uses for its own bail-out.
-    match first_unsupported_field_reason(record) {
-        Some(reason) => {
-            let message = dart_string_literal(&unsupported_message(&reason, &record.origin));
+fn collect_referenced_usrs_in_type<'a>(ty: &'a Type, out: &mut HashSet<&'a str>) {
+    match ty {
+        Type::Record { usr, .. } => {
+            out.insert(usr.as_str());
+        }
+        Type::List(element) => collect_referenced_usrs_in_type(element, out),
+        Type::Int | Type::Bool | Type::Double | Type::Void | Type::Str | Type::Unsupported(_) => {}
+    }
+}
+
+fn collect_referenced_usrs_in_stmts<'a>(stmts: &'a [Stmt], out: &mut HashSet<&'a str>) {
+    for stmt in stmts {
+        collect_referenced_usrs_in_stmt(stmt, out);
+    }
+}
+
+fn collect_referenced_usrs_in_stmt<'a>(stmt: &'a Stmt, out: &mut HashSet<&'a str>) {
+    match stmt {
+        Stmt::Return { value, .. } => {
+            if let Some(expr) = value {
+                collect_referenced_usrs_in_expr(expr, out);
+            }
+        }
+        Stmt::VarDecl { ty, init, .. } => {
+            collect_referenced_usrs_in_type(ty, out);
+            if let Some(expr) = init {
+                collect_referenced_usrs_in_expr(expr, out);
+            }
+        }
+        Stmt::Assign { value, .. } => collect_referenced_usrs_in_expr(value, out),
+        Stmt::FieldAssign { target, value, .. } => {
+            collect_referenced_usrs_in_expr(target, out);
+            collect_referenced_usrs_in_expr(value, out);
+        }
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_referenced_usrs_in_expr(condition, out);
+            collect_referenced_usrs_in_stmts(then_branch, out);
+            collect_referenced_usrs_in_stmts(else_branch, out);
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            collect_referenced_usrs_in_expr(condition, out);
+            collect_referenced_usrs_in_stmts(body, out);
+        }
+        Stmt::For {
+            init,
+            condition,
+            increment,
+            body,
+            ..
+        } => {
+            if let Some(init) = init {
+                collect_referenced_usrs_in_stmt(init, out);
+            }
+            if let Some(condition) = condition {
+                collect_referenced_usrs_in_expr(condition, out);
+            }
+            if let Some(increment) = increment {
+                collect_referenced_usrs_in_stmt(increment, out);
+            }
+            collect_referenced_usrs_in_stmts(body, out);
+        }
+        Stmt::ExprStmt { expr, .. } => collect_referenced_usrs_in_expr(expr, out),
+        Stmt::Throw { value, .. } => collect_referenced_usrs_in_expr(value, out),
+        Stmt::TryCatch {
+            try_body,
+            catch_type,
+            catch_body,
+            ..
+        } => {
+            collect_referenced_usrs_in_stmts(try_body, out);
+            collect_referenced_usrs_in_type(catch_type, out);
+            collect_referenced_usrs_in_stmts(catch_body, out);
+        }
+        Stmt::TryFinally {
+            try_body,
+            finally_body,
+            ..
+        } => {
+            collect_referenced_usrs_in_stmts(try_body, out);
+            collect_referenced_usrs_in_stmts(finally_body, out);
+        }
+        Stmt::Unsupported { .. } => {}
+    }
+}
+
+fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str>) {
+    match expr {
+        Expr::IntLiteral { .. }
+        | Expr::DoubleLiteral { .. }
+        | Expr::BoolLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::Unsupported { .. } => {}
+        Expr::Ref { ty, .. } | Expr::This { ty, .. } => collect_referenced_usrs_in_type(ty, out),
+        Expr::Binary { lhs, rhs, ty, .. } => {
+            collect_referenced_usrs_in_type(ty, out);
+            collect_referenced_usrs_in_expr(lhs, out);
+            collect_referenced_usrs_in_expr(rhs, out);
+        }
+        Expr::Unary { operand, ty, .. } | Expr::Convert { operand, ty, .. } => {
+            collect_referenced_usrs_in_type(ty, out);
+            collect_referenced_usrs_in_expr(operand, out);
+        }
+        Expr::Call {
+            target,
+            callee_usr,
+            args,
+            ty,
+            ..
+        } => {
+            out.insert(callee_usr.as_str());
+            collect_referenced_usrs_in_type(ty, out);
+            if let Some(target) = target {
+                collect_referenced_usrs_in_expr(target, out);
+            }
+            for arg in args {
+                collect_referenced_usrs_in_expr(arg, out);
+            }
+        }
+        Expr::FieldAccess { target, ty, .. } => {
+            collect_referenced_usrs_in_type(ty, out);
+            collect_referenced_usrs_in_expr(target, out);
+        }
+        Expr::RecordConstruct {
+            type_usr, fields, ..
+        } => {
+            out.insert(type_usr.as_str());
+            for (_name, value) in fields {
+                collect_referenced_usrs_in_expr(value, out);
+            }
+        }
+        Expr::ConstructorCall { type_usr, args, .. } => {
+            out.insert(type_usr.as_str());
+            for arg in args {
+                collect_referenced_usrs_in_expr(arg, out);
+            }
+        }
+        Expr::Index {
+            target, index, ty, ..
+        } => {
+            collect_referenced_usrs_in_type(ty, out);
+            collect_referenced_usrs_in_expr(target, out);
+            collect_referenced_usrs_in_expr(index, out);
+        }
+        Expr::StringByteLength { target, .. } => collect_referenced_usrs_in_expr(target, out),
+    }
+}
+
+/// A POD `struct`/`class` (`record.constructors.is_empty()` — no
+/// user-declared constructor of its own) becomes a Dart class with every
+/// field declared `final`... except E03's own armadilha rules that out:
+/// `mover` mutates its (by-value-copied) parameter's fields in place, so
+/// fields need to stay mutable. A positional constructor
+/// (`Ponto(this.x, this.y);`) doubles as the copy constructor `lower::cpp`
+/// needs for by-value parameter semantics (`RecordConstruct` emits a call to
+/// this same constructor).
+///
+/// A record with its own declared constructor(s) (E04) instead emits each
+/// one for real (`emit_constructor`, sorted by `constructor_index` — see
+/// that field's docs on why sorting, not push order, decides which one is
+/// primary), plus every static field and method. The two shapes don't mix on
+/// the same record: a class with a hand-written constructor also owns its
+/// own field initialization, so the E03 synthetic positional constructor
+/// would either be redundant or, worse, a second and inconsistent way to
+/// construct the same class.
+fn emit_record(
+    record: &Record,
+    is_mixin: bool,
+    used_expr_helper: &mut bool,
+    used_utf8_encode: &mut bool,
+) -> String {
+    // `abstract` is required the moment a class has any unimplemented
+    // member — derived, not stored: a separate `Record.is_abstract` flag
+    // could disagree with the method list it's supposed to summarize, so
+    // this is the one source of truth for both this keyword and
+    // `emit_method`'s own bodyless-signature branch. Meaningless for a
+    // `mixin` declaration (Dart's `mixin` keyword has no `abstract` variant
+    // — a mixin can't be instantiated at all, so nothing to mark abstract),
+    // so skipped entirely for that case.
+    let abstract_keyword = if !is_mixin && record.methods.iter().any(|method| method.body.is_none())
+    {
+        "abstract "
+    } else {
+        ""
+    };
+    let extends_clause = match &record.base_class {
+        Some(base) => format!(" extends {}", base.name),
+        None => String::new(),
+    };
+    // E09: every base beyond a single `extends` becomes a Dart mixin
+    // (`Record::mixins`'s own doc comment on why `mapping::options_for`'s
+    // multiple-inheritance decision always shapes out this way) — never
+    // combined with `extends_clause` by any fixture yet, but concatenated
+    // rather than treated as mutually exclusive, since Dart itself allows
+    // `class X extends A with B, C {}`.
+    let with_clause = if record.mixins.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " with {}",
+            record
+                .mixins
+                .iter()
+                .map(|base| base.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let keyword = if is_mixin { "mixin" } else { "class" };
+    let mut source = format!(
+        "{abstract_keyword}{keyword} {}{extends_clause}{with_clause} {{\n",
+        record.name
+    );
+    for field in &record.fields {
+        // Dart's flow analysis for non-nullable field initialization only
+        // recognizes initializing formals (`this.field`) and initializer
+        // lists, not plain assignment inside a constructor body — which is
+        // how E04+ constructors set fields (`AGENTS.md`: "não implemente em
+        // largura", no need for initializer-list emission yet). A real
+        // constructor (`record.constructors` non-empty) therefore needs a
+        // zero-value default at declaration so `dart analyze` doesn't flag
+        // the field as possibly-unset; the synthetic positional constructor
+        // path below already initializes every field itself and must stay
+        // byte-identical to its pre-E04 output, so it's left untouched. A
+        // `mixin` (E09) always needs the same zero-value default regardless
+        // — it can't have *any* constructor (Dart forbids one on a `mixin`
+        // declaration), so nothing else would ever initialize its fields.
+        if !is_mixin && record.constructors.is_empty() {
             source.push_str(&format!(
-                "\n{INDENT}{}({ctor_params}) {{\n{INDENT}{INDENT}throw UnimplementedError({message});\n{INDENT}}}\n}}\n",
-                record.name
+                "{INDENT}{} {};\n",
+                emit_type(&field.ty),
+                field.name
+            ));
+        } else {
+            source.push_str(&format!(
+                "{INDENT}{} {} = {};\n",
+                emit_type(&field.ty),
+                field.name,
+                scalar_zero_literal(&field.ty)
             ));
         }
-        None => {
-            source.push_str(&format!("\n{INDENT}{}({ctor_params});\n}}\n", record.name));
+    }
+    for field in &record.static_fields {
+        source.push_str(&format!(
+            "{INDENT}static {} {} = {};\n",
+            emit_type(&field.ty),
+            field.name,
+            scalar_zero_literal(&field.ty)
+        ));
+    }
+
+    if is_mixin {
+        // A `mixin` declaration can't have a constructor at all (Dart
+        // rejects one outright) — every field already got its zero-value
+        // default above, which is the only initialization a mixin's own
+        // fields ever get.
+    } else if record.constructors.is_empty() {
+        let ctor_params = record
+            .fields
+            .iter()
+            .map(|field| format!("this.{}", field.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // A field type the IR can't represent (`dynamic /* unsupported: ... */`
+        // above) means this class's shape is incomplete — silently allowing
+        // construction would accept any value into that field with no signal
+        // anything is wrong. The constructor still declares (and assigns, via
+        // the `this.field` initializing formals) every field, then throws
+        // before returning, the same "compiles, then bails out at the last
+        // possible moment" shape `emit_function` uses for its own bail-out.
+        match first_unsupported_field_reason(record) {
+            Some(reason) => {
+                let message = dart_string_literal(&unsupported_message(&reason, &record.origin));
+                source.push_str(&format!(
+                    "\n{INDENT}{}({ctor_params}) {{\n{INDENT}{INDENT}throw UnimplementedError({message});\n{INDENT}}}\n",
+                    record.name
+                ));
+            }
+            None => {
+                source.push_str(&format!("\n{INDENT}{}({ctor_params});\n", record.name));
+            }
+        }
+    } else {
+        let mut constructors: Vec<&Constructor> = record.constructors.iter().collect();
+        constructors.sort_by_key(|constructor| constructor.constructor_index);
+        for constructor in constructors {
+            source.push('\n');
+            source.push_str(&emit_constructor(
+                &record.name,
+                constructor,
+                used_expr_helper,
+                used_utf8_encode,
+            ));
         }
     }
+
+    for method in &record.methods {
+        source.push('\n');
+        source.push_str(&emit_method(method, used_expr_helper, used_utf8_encode));
+    }
+
+    source.push_str("}\n");
     source
 }
 
-fn first_unsupported_field_reason(record: &Record) -> Option<String> {
-    record.fields.iter().find_map(|field| match &field.ty {
-        Type::Unsupported(spelling) => Some(format!(
-            "unsupported field type: {spelling} (field `{}`)",
-            field.name
-        )),
-        _ => None,
-    })
+/// `0` is a valid Dart literal for both `int` and `double` fields (numeric
+/// literal coercion — the same trick `lower::cpp::default_scalar_value` uses
+/// for a record's own zero-valued fields), so both share this one branch.
+/// Only `Int`/`Double`/`Bool` ever reach here: `first_unsupported_field_reason`
+/// (which also scans `static_fields`, see below) bails the whole class out
+/// before this is called for anything else, so the fallback arm is
+/// unreachable in practice, not a silent wrong guess.
+fn scalar_zero_literal(ty: &Type) -> &'static str {
+    match ty {
+        Type::Bool => "false",
+        Type::Int
+        | Type::Double
+        | Type::Record { .. }
+        | Type::Str
+        | Type::List(_)
+        | Type::Void
+        | Type::Unsupported(_) => "0",
+    }
 }
 
-fn emit_function(function: &Function, used_expr_helper: &mut bool) -> String {
-    let params = function
-        .params
-        .iter()
-        .map(|param| format!("{} {}", emit_type(&param.ty), param.name))
-        .collect::<Vec<_>>()
-        .join(", ");
+fn emit_constructor(
+    record_name: &str,
+    constructor: &Constructor,
+    used_expr_helper: &mut bool,
+    used_utf8_encode: &mut bool,
+) -> String {
+    let dart_name = dart_constructor_name(record_name, constructor.constructor_index);
+    let params = format_params(&constructor.params, used_expr_helper, used_utf8_encode);
+    let body = emit_body(
+        &constructor.params,
+        None,
+        &constructor.body,
+        &constructor.origin,
+        used_expr_helper,
+        used_utf8_encode,
+        2,
+    );
+    format!("{INDENT}{dart_name}({params}) {{\n{body}{INDENT}}}\n")
+}
 
-    // E03's armadilha (`docs/plans/primeiro-corte-e01-e03.md` §7 PR5, see
-    // `examples/E03-struct-pod/NOTES.md`): C++ copies a by-value `struct`
-    // parameter; Dart passes the reference. `lower::cpp` already inserts an
-    // explicit self-reassignment (`p = Ponto(p.x, p.y);`) as the first
-    // statement of the body for every such parameter — nothing special is
-    // needed here, the clone is just an ordinary `Stmt::Assign` by the time
-    // it reaches the emitter. Kept as a comment here (not code) because the
-    // interesting decision lives in the lowering step, and duplicating the
-    // reasoning risks the two drifting apart.
-    // A parameter or return type the IR can't represent is emitted as
-    // `dynamic` above — if the body then ran as normal Dart on top of that,
-    // it would silently compute on untyped values (e.g. arithmetic on a
-    // `long` parameter) instead of ever signaling the translation is
-    // incomplete. Checked before the body itself: a signature-level failure
-    // takes priority and makes the body's own contents irrelevant.
-    //
-    // A *body-local* `Type::Unsupported` (a local variable's declared type,
-    // or an expression's own inferred type — e.g. `int / long` promoting to
-    // `long` under C++'s usual arithmetic conversions) needs the same
-    // treatment: `emit_binary_op`'s truncating-division rule, for one, reads
-    // exactly that type to decide `/` vs `~/`, and a type it doesn't
-    // recognize means that decision can't be trusted either way.
-    let bailout_reason = first_unsupported_signature_type(function).or_else(|| {
-        first_unsupported_type_in_list(&function.body)
-            .map(|spelling| format!("unsupported type in expression: {spelling}"))
-    });
-    let signature_bailout = bailout_reason.map(|reason| Stmt::Unsupported {
-        reason,
-        origin: function.origin.clone(),
-    });
+/// `constructor_index == 0` is always the primary, unnamed constructor;
+/// every other index is a named constructor `ClassName.ctorN`, `N` being
+/// `constructor_index + 1` — E04's armadilha, since Dart has no
+/// signature-based constructor overloading and a C++ constructor has no
+/// name of its own to reuse for the rest (see `Expr::ConstructorCall`'s
+/// docs and `examples/E04-classe-com-encapsulamento/NOTES.md`).
+fn dart_constructor_name(record_name: &str, constructor_index: usize) -> String {
+    if constructor_index == 0 {
+        record_name.to_owned()
+    } else {
+        format!("{record_name}.ctor{}", constructor_index + 1)
+    }
+}
 
-    let body = match signature_bailout
-        .as_ref()
-        .or_else(|| first_unsupported_in_list(&function.body))
-    {
-        // A statement the IR can't represent may have declared a variable
-        // (or otherwise established state) that a *later* statement in this
-        // same body depends on — emitting only that one statement as a throw
-        // and the rest as normal Dart would reference names that were never
-        // declared, which is exactly the "compiles and is wrong" failure
-        // mode §5's "silêncio é proibido" rule exists to prevent (confirmed
-        // empirically: `dart analyze` reports `undefined_identifier` for
-        // this, not just a stray warning). So the whole function bails out
-        // instead of just the one statement — same shape as a single
-        // `Stmt::Unsupported`, using the first one's reason/origin. Searched
-        // recursively (nested inside `if`/`while`/`for` bodies too): a
-        // conservative rule, not a scope analysis, but a simple one.
-        Some(unsupported) => emit_stmt(unsupported, 1, used_expr_helper),
-        None => {
-            let mut body = String::new();
-            for stmt in &function.body {
-                body.push_str(&emit_stmt(stmt, 1, used_expr_helper));
-            }
-            body
-        }
+fn emit_method(
+    method: &Method,
+    used_expr_helper: &mut bool,
+    used_utf8_encode: &mut bool,
+) -> String {
+    let params = format_params(&method.params, used_expr_helper, used_utf8_encode);
+    let override_prefix = if method.is_override {
+        format!("{INDENT}@override\n")
+    } else {
+        String::new()
     };
+    let return_type = emit_type(&method.return_type);
+    let name = &method.name;
+
+    // A pure virtual method (`body: None`, E06's abstract-method case) has
+    // no implementation to print — Dart's own abstract-member syntax is a
+    // signature with no body at all, not empty braces (`{}` would mean "does
+    // nothing", not "not implemented").
+    let Some(body_stmts) = &method.body else {
+        return format!("{override_prefix}{INDENT}{return_type} {name}({params});\n");
+    };
+
+    let body = emit_body(
+        &method.params,
+        Some(&method.return_type),
+        body_stmts,
+        &method.origin,
+        used_expr_helper,
+        used_utf8_encode,
+        2,
+    );
+    let static_keyword = if method.is_static { "static " } else { "" };
+    format!(
+        "{override_prefix}{INDENT}{static_keyword}{return_type} {name}({params}) {{\n{body}{INDENT}}}\n"
+    )
+}
+
+/// Every parameter with a `default_value` (E07's C++ default arguments)
+/// becomes a trailing Dart *optional positional* parameter (`[T name =
+/// value]`) — not named (`{T name = value}`), which would force every call
+/// site to name the argument explicitly; C++'s own call sites never do, and
+/// positional keeps the call syntax unchanged. Safe to partition this way
+/// without checking that defaulted parameters are already trailing: C++
+/// itself requires that (a parameter with a default can't precede one
+/// without), so `lower::cpp` never produces an IR parameter list where
+/// they aren't.
+fn format_params(
+    params: &[Param],
+    used_expr_helper: &mut bool,
+    used_utf8_encode: &mut bool,
+) -> String {
+    let mut parts: Vec<String> = params
+        .iter()
+        .filter(|param| param.default_value.is_none())
+        .map(|param| format!("{} {}", emit_type(&param.ty), param.name))
+        .collect();
+
+    let optional: Vec<&Param> = params
+        .iter()
+        .filter(|param| param.default_value.is_some())
+        .collect();
+    if !optional.is_empty() {
+        let optional_text = optional
+            .iter()
+            .map(|param| {
+                format!(
+                    "{} {} = {}",
+                    emit_type(&param.ty),
+                    param.name,
+                    emit_expr(
+                        param
+                            .default_value
+                            .as_ref()
+                            .expect("filtered by is_some above"),
+                        used_expr_helper,
+                        used_utf8_encode,
+                    )
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("[{optional_text}]"));
+    }
+
+    parts.join(", ")
+}
+
+/// `record.fields`' own unsupported check, extended to `static_fields`: a
+/// static field with a type this IR can't represent is exactly as much of an
+/// incomplete shape as an instance field would be, and bails the class out
+/// the same way (see `emit_record`).
+fn first_unsupported_field_reason(record: &Record) -> Option<String> {
+    record
+        .fields
+        .iter()
+        .chain(&record.static_fields)
+        .find_map(|field| match &field.ty {
+            Type::Unsupported(spelling) => Some(format!(
+                "unsupported field type: {spelling} (field `{}`)",
+                field.name
+            )),
+            _ => None,
+        })
+}
+
+fn emit_function(
+    function: &Function,
+    used_expr_helper: &mut bool,
+    used_utf8_encode: &mut bool,
+) -> String {
+    let params = format_params(&function.params, used_expr_helper, used_utf8_encode);
+    let body = emit_body(
+        &function.params,
+        Some(&function.return_type),
+        &function.body,
+        &function.origin,
+        used_expr_helper,
+        used_utf8_encode,
+        1,
+    );
 
     format!(
         "{return_type} {name}({params}) {{\n{body}}}\n",
@@ -291,11 +791,87 @@ fn emit_function(function: &Function, used_expr_helper: &mut bool) -> String {
     )
 }
 
-fn first_unsupported_signature_type(function: &Function) -> Option<String> {
-    if let Type::Unsupported(spelling) = &function.return_type {
-        return Some(format!("unsupported return type: {spelling}"));
+/// Shared by `emit_function`/`emit_method`/`emit_constructor`: computes the
+/// same bail-out-or-emit-normally body a free function always has, at
+/// whichever indentation `depth` the caller's own body sits at (`1` for a
+/// top-level function, `2` for a method or constructor nested inside a
+/// class). `return_type` is `None` for a constructor, which has no return
+/// type of its own to check.
+///
+/// E03's armadilha (`docs/plans/primeiro-corte-e01-e03.md` §7 PR5, see
+/// `examples/E03-struct-pod/NOTES.md`): C++ copies a by-value `struct`
+/// parameter; Dart passes the reference. `lower::cpp` already inserts an
+/// explicit self-reassignment (`p = Ponto(p.x, p.y);`) as the first
+/// statement of the body for every such parameter — nothing special is
+/// needed here, the clone is just an ordinary `Stmt::Assign` by the time it
+/// reaches the emitter. Kept as a comment here (not code) because the
+/// interesting decision lives in the lowering step, and duplicating the
+/// reasoning risks the two drifting apart.
+///
+/// A parameter or return type the IR can't represent is emitted as
+/// `dynamic` — if the body then ran as normal Dart on top of that, it would
+/// silently compute on untyped values (e.g. arithmetic on a `long`
+/// parameter) instead of ever signaling the translation is incomplete.
+/// Checked before the body itself: a signature-level failure takes priority
+/// and makes the body's own contents irrelevant.
+///
+/// A *body-local* `Type::Unsupported` (a local variable's declared type, or
+/// an expression's own inferred type — e.g. `int / long` promoting to `long`
+/// under C++'s usual arithmetic conversions) needs the same treatment:
+/// `emit_binary_op`'s truncating-division rule, for one, reads exactly that
+/// type to decide `/` vs `~/`, and a type it doesn't recognize means that
+/// decision can't be trusted either way.
+fn emit_body(
+    params: &[Param],
+    return_type: Option<&Type>,
+    body: &[Stmt],
+    origin: &Origin,
+    used_expr_helper: &mut bool,
+    used_utf8_encode: &mut bool,
+    depth: usize,
+) -> String {
+    let bailout_reason = return_type
+        .and_then(unsupported_spelling)
+        .map(|spelling| format!("unsupported return type: {spelling}"))
+        .or_else(|| first_unsupported_signature_param(params))
+        .or_else(|| {
+            first_unsupported_type_in_list(body)
+                .map(|spelling| format!("unsupported type in expression: {spelling}"))
+        });
+    let signature_bailout = bailout_reason.map(|reason| Stmt::Unsupported {
+        reason,
+        origin: origin.clone(),
+    });
+
+    match signature_bailout
+        .as_ref()
+        .or_else(|| first_unsupported_in_list(body))
+    {
+        // A statement the IR can't represent may have declared a variable
+        // (or otherwise established state) that a *later* statement in this
+        // same body depends on — emitting only that one statement as a throw
+        // and the rest as normal Dart would reference names that were never
+        // declared, which is exactly the "compiles and is wrong" failure
+        // mode §5's "silêncio é proibido" rule exists to prevent (confirmed
+        // empirically: `dart analyze` reports `undefined_identifier` for
+        // this, not just a stray warning). So the whole body bails out
+        // instead of just the one statement — same shape as a single
+        // `Stmt::Unsupported`, using the first one's reason/origin. Searched
+        // recursively (nested inside `if`/`while`/`for` bodies too): a
+        // conservative rule, not a scope analysis, but a simple one.
+        Some(unsupported) => emit_stmt(unsupported, depth, used_expr_helper, used_utf8_encode),
+        None => {
+            let mut text = String::new();
+            for stmt in body {
+                text.push_str(&emit_stmt(stmt, depth, used_expr_helper, used_utf8_encode));
+            }
+            text
+        }
     }
-    function.params.iter().find_map(|param| match &param.ty {
+}
+
+fn first_unsupported_signature_param(params: &[Param]) -> Option<String> {
+    params.iter().find_map(|param| match &param.ty {
         Type::Unsupported(spelling) => Some(format!(
             "unsupported parameter type: {spelling} (parameter `{}`)",
             param.name
@@ -352,13 +928,32 @@ fn stmt_unsupported_type_spelling(stmt: &Stmt) -> Option<&str> {
             })
             .or_else(|| first_unsupported_type_in_list(body)),
         Stmt::ExprStmt { expr, .. } => expr_unsupported_type_spelling(expr),
+        Stmt::Throw { value, .. } => expr_unsupported_type_spelling(value),
+        Stmt::TryCatch {
+            try_body,
+            catch_type,
+            catch_body,
+            ..
+        } => unsupported_spelling(catch_type)
+            .or_else(|| first_unsupported_type_in_list(try_body))
+            .or_else(|| first_unsupported_type_in_list(catch_body)),
+        Stmt::TryFinally {
+            try_body,
+            finally_body,
+            ..
+        } => first_unsupported_type_in_list(try_body)
+            .or_else(|| first_unsupported_type_in_list(finally_body)),
         Stmt::Unsupported { .. } => None,
     }
 }
 
 fn expr_unsupported_type_spelling(expr: &Expr) -> Option<&str> {
     match expr {
-        Expr::IntLiteral { .. } | Expr::BoolLiteral { .. } | Expr::Unsupported { .. } => None,
+        Expr::IntLiteral { .. }
+        | Expr::DoubleLiteral { .. }
+        | Expr::BoolLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::Unsupported { .. } => None,
         Expr::Ref { ty, .. } => unsupported_spelling(ty),
         Expr::Binary { ty, lhs, rhs, .. } => unsupported_spelling(ty)
             .or_else(|| expr_unsupported_type_spelling(lhs))
@@ -369,7 +964,10 @@ fn expr_unsupported_type_spelling(expr: &Expr) -> Option<&str> {
         Expr::Convert { ty, operand, .. } => {
             unsupported_spelling(ty).or_else(|| expr_unsupported_type_spelling(operand))
         }
-        Expr::Call { ty, args, .. } => unsupported_spelling(ty)
+        Expr::Call {
+            ty, target, args, ..
+        } => unsupported_spelling(ty)
+            .or_else(|| target.as_deref().and_then(expr_unsupported_type_spelling))
             .or_else(|| args.iter().find_map(expr_unsupported_type_spelling)),
         Expr::FieldAccess { ty, target, .. } => {
             unsupported_spelling(ty).or_else(|| expr_unsupported_type_spelling(target))
@@ -377,6 +975,18 @@ fn expr_unsupported_type_spelling(expr: &Expr) -> Option<&str> {
         Expr::RecordConstruct { fields, .. } => fields
             .iter()
             .find_map(|(_name, value)| expr_unsupported_type_spelling(value)),
+        // A `ConstructorCall`'s own type is always its (already-checked)
+        // owning record's type, never itself `Unsupported` — only its
+        // arguments can be. `This` carries a placeholder `Void` type (see
+        // its doc comment) that's never meant to be checked here.
+        Expr::ConstructorCall { args, .. } => args.iter().find_map(expr_unsupported_type_spelling),
+        Expr::This { .. } => None,
+        Expr::Index {
+            target, index, ty, ..
+        } => unsupported_spelling(ty)
+            .or_else(|| expr_unsupported_type_spelling(target))
+            .or_else(|| expr_unsupported_type_spelling(index)),
+        Expr::StringByteLength { target, .. } => expr_unsupported_type_spelling(target),
     }
 }
 
@@ -411,11 +1021,24 @@ fn first_unsupported_in_stmt(stmt: &Stmt) -> Option<&Stmt> {
             .and_then(first_unsupported_in_stmt)
             .or_else(|| increment.as_deref().and_then(first_unsupported_in_stmt))
             .or_else(|| first_unsupported_in_list(body)),
+        Stmt::TryCatch {
+            try_body,
+            catch_body,
+            ..
+        } => first_unsupported_in_list(try_body).or_else(|| first_unsupported_in_list(catch_body)),
+        Stmt::TryFinally {
+            try_body,
+            finally_body,
+            ..
+        } => {
+            first_unsupported_in_list(try_body).or_else(|| first_unsupported_in_list(finally_body))
+        }
         Stmt::Return { .. }
         | Stmt::VarDecl { .. }
         | Stmt::Assign { .. }
         | Stmt::FieldAssign { .. }
-        | Stmt::ExprStmt { .. } => None,
+        | Stmt::ExprStmt { .. }
+        | Stmt::Throw { .. } => None,
     }
 }
 
@@ -426,15 +1049,25 @@ fn emit_type(ty: &Type) -> String {
         Type::Double => "double".to_owned(),
         Type::Void => "void".to_owned(),
         Type::Record { name, .. } => name.clone(),
+        Type::Str => "String".to_owned(),
+        Type::List(element) => format!("List<{}>", emit_type(element)),
         Type::Unsupported(spelling) => format!("dynamic /* unsupported: {spelling} */"),
     }
 }
 
-fn emit_stmt(stmt: &Stmt, depth: usize, used_expr_helper: &mut bool) -> String {
+fn emit_stmt(
+    stmt: &Stmt,
+    depth: usize,
+    used_expr_helper: &mut bool,
+    used_utf8_encode: &mut bool,
+) -> String {
     let pad = INDENT.repeat(depth);
     match stmt {
         Stmt::Return { value, .. } => match value {
-            Some(expr) => format!("{pad}return {};\n", emit_expr(expr, used_expr_helper)),
+            Some(expr) => format!(
+                "{pad}return {};\n",
+                emit_expr(expr, used_expr_helper, used_utf8_encode)
+            ),
             None => format!("{pad}return;\n"),
         },
         // Dart requires every non-nullable local to be initialized where
@@ -446,39 +1079,66 @@ fn emit_stmt(stmt: &Stmt, depth: usize, used_expr_helper: &mut bool) -> String {
             Some(expr) => format!(
                 "{pad}{} {name} = {};\n",
                 emit_type(ty),
-                emit_expr(expr, used_expr_helper)
+                emit_expr(expr, used_expr_helper, used_utf8_encode)
             ),
             None => format!("{pad}late {} {name};\n", emit_type(ty)),
         },
         Stmt::Assign { name, value, .. } => {
-            format!("{pad}{name} = {};\n", emit_expr(value, used_expr_helper))
+            format!(
+                "{pad}{name} = {};\n",
+                emit_expr(value, used_expr_helper, used_utf8_encode)
+            )
         }
         Stmt::FieldAssign {
             target,
             field,
             value,
             ..
-        } => format!(
-            "{pad}{}.{field} = {};\n",
-            emit_expr(target, used_expr_helper),
-            emit_expr(value, used_expr_helper)
-        ),
+        } => match target {
+            // Bare `field = value;` for an implicit `this.field = value;` —
+            // same omission `emit_expr`'s `FieldAccess` arm applies for a
+            // read (see its comment).
+            Expr::This { .. } => {
+                format!(
+                    "{pad}{field} = {};\n",
+                    emit_expr(value, used_expr_helper, used_utf8_encode)
+                )
+            }
+            _ => format!(
+                "{pad}{}.{field} = {};\n",
+                emit_expr(target, used_expr_helper, used_utf8_encode),
+                emit_expr(value, used_expr_helper, used_utf8_encode)
+            ),
+        },
         Stmt::If {
             condition,
             then_branch,
             else_branch,
             ..
         } => {
-            let mut source = format!("{pad}if ({}) {{\n", emit_expr(condition, used_expr_helper));
+            let mut source = format!(
+                "{pad}if ({}) {{\n",
+                emit_expr(condition, used_expr_helper, used_utf8_encode)
+            );
             for inner in then_branch {
-                source.push_str(&emit_stmt(inner, depth + 1, used_expr_helper));
+                source.push_str(&emit_stmt(
+                    inner,
+                    depth + 1,
+                    used_expr_helper,
+                    used_utf8_encode,
+                ));
             }
             if else_branch.is_empty() {
                 source.push_str(&format!("{pad}}}\n"));
             } else {
                 source.push_str(&format!("{pad}}} else {{\n"));
                 for inner in else_branch {
-                    source.push_str(&emit_stmt(inner, depth + 1, used_expr_helper));
+                    source.push_str(&emit_stmt(
+                        inner,
+                        depth + 1,
+                        used_expr_helper,
+                        used_utf8_encode,
+                    ));
                 }
                 source.push_str(&format!("{pad}}}\n"));
             }
@@ -489,10 +1149,15 @@ fn emit_stmt(stmt: &Stmt, depth: usize, used_expr_helper: &mut bool) -> String {
         } => {
             let mut source = format!(
                 "{pad}while ({}) {{\n",
-                emit_expr(condition, used_expr_helper)
+                emit_expr(condition, used_expr_helper, used_utf8_encode)
             );
             for inner in body {
-                source.push_str(&emit_stmt(inner, depth + 1, used_expr_helper));
+                source.push_str(&emit_stmt(
+                    inner,
+                    depth + 1,
+                    used_expr_helper,
+                    used_utf8_encode,
+                ));
             }
             source.push_str(&format!("{pad}}}\n"));
             source
@@ -506,25 +1171,94 @@ fn emit_stmt(stmt: &Stmt, depth: usize, used_expr_helper: &mut bool) -> String {
         } => {
             let init_text = init
                 .as_deref()
-                .map(|stmt| emit_for_clause(stmt, used_expr_helper))
+                .map(|stmt| emit_for_clause(stmt, used_expr_helper, used_utf8_encode))
                 .unwrap_or_default();
             let condition_text = condition
                 .as_ref()
-                .map(|expr| emit_expr(expr, used_expr_helper))
+                .map(|expr| emit_expr(expr, used_expr_helper, used_utf8_encode))
                 .unwrap_or_default();
             let increment_text = increment
                 .as_deref()
-                .map(|stmt| emit_for_clause(stmt, used_expr_helper))
+                .map(|stmt| emit_for_clause(stmt, used_expr_helper, used_utf8_encode))
                 .unwrap_or_default();
             let mut source =
                 format!("{pad}for ({init_text}; {condition_text}; {increment_text}) {{\n");
             for inner in body {
-                source.push_str(&emit_stmt(inner, depth + 1, used_expr_helper));
+                source.push_str(&emit_stmt(
+                    inner,
+                    depth + 1,
+                    used_expr_helper,
+                    used_utf8_encode,
+                ));
             }
             source.push_str(&format!("{pad}}}\n"));
             source
         }
-        Stmt::ExprStmt { expr, .. } => format!("{pad}{};\n", emit_expr(expr, used_expr_helper)),
+        Stmt::ExprStmt { expr, .. } => format!(
+            "{pad}{};\n",
+            emit_expr(expr, used_expr_helper, used_utf8_encode)
+        ),
+        Stmt::Throw { value, .. } => format!(
+            "{pad}throw {};\n",
+            emit_expr(value, used_expr_helper, used_utf8_encode)
+        ),
+        Stmt::TryCatch {
+            try_body,
+            catch_type,
+            catch_var,
+            catch_body,
+            ..
+        } => {
+            let mut source = format!("{pad}try {{\n");
+            for inner in try_body {
+                source.push_str(&emit_stmt(
+                    inner,
+                    depth + 1,
+                    used_expr_helper,
+                    used_utf8_encode,
+                ));
+            }
+            source.push_str(&format!(
+                "{pad}}} on {} catch ({catch_var}) {{\n",
+                emit_type(catch_type)
+            ));
+            for inner in catch_body {
+                source.push_str(&emit_stmt(
+                    inner,
+                    depth + 1,
+                    used_expr_helper,
+                    used_utf8_encode,
+                ));
+            }
+            source.push_str(&format!("{pad}}}\n"));
+            source
+        }
+        Stmt::TryFinally {
+            try_body,
+            finally_body,
+            ..
+        } => {
+            let mut source = format!("{pad}try {{\n");
+            for inner in try_body {
+                source.push_str(&emit_stmt(
+                    inner,
+                    depth + 1,
+                    used_expr_helper,
+                    used_utf8_encode,
+                ));
+            }
+            source.push_str(&format!("{pad}}} finally {{\n"));
+            for inner in finally_body {
+                source.push_str(&emit_stmt(
+                    inner,
+                    depth + 1,
+                    used_expr_helper,
+                    used_utf8_encode,
+                ));
+            }
+            source.push_str(&format!("{pad}}}\n"));
+            source
+        }
         Stmt::Unsupported { reason, origin } => format!(
             "{pad}// TODO(syntax-bridge): {reason}\n{pad}throw UnimplementedError({message});\n",
             message = dart_string_literal(&unsupported_message(reason, origin)),
@@ -538,7 +1272,11 @@ fn emit_stmt(stmt: &Stmt, depth: usize, used_expr_helper: &mut bool) -> String {
 /// `ForStmt`; anything else falls back to the same `Never`-returning helper
 /// `Expr::Unsupported` uses, kept syntactically valid rather than emitting
 /// non-expression text into an expression slot.
-fn emit_for_clause(stmt: &Stmt, used_expr_helper: &mut bool) -> String {
+fn emit_for_clause(
+    stmt: &Stmt,
+    used_expr_helper: &mut bool,
+    used_utf8_encode: &mut bool,
+) -> String {
     match stmt {
         Stmt::VarDecl {
             name,
@@ -548,7 +1286,7 @@ fn emit_for_clause(stmt: &Stmt, used_expr_helper: &mut bool) -> String {
         } => format!(
             "{} {name} = {}",
             emit_type(ty),
-            emit_expr(expr, used_expr_helper)
+            emit_expr(expr, used_expr_helper, used_utf8_encode)
         ),
         Stmt::VarDecl {
             name,
@@ -557,9 +1295,12 @@ fn emit_for_clause(stmt: &Stmt, used_expr_helper: &mut bool) -> String {
             ..
         } => format!("late {} {name}", emit_type(ty)),
         Stmt::Assign { name, value, .. } => {
-            format!("{name} = {}", emit_expr(value, used_expr_helper))
+            format!(
+                "{name} = {}",
+                emit_expr(value, used_expr_helper, used_utf8_encode)
+            )
         }
-        Stmt::ExprStmt { expr, .. } => emit_expr(expr, used_expr_helper),
+        Stmt::ExprStmt { expr, .. } => emit_expr(expr, used_expr_helper, used_utf8_encode),
         other => {
             *used_expr_helper = true;
             format!(
@@ -573,54 +1314,111 @@ fn emit_for_clause(stmt: &Stmt, used_expr_helper: &mut bool) -> String {
     }
 }
 
-fn emit_expr(expr: &Expr, used_expr_helper: &mut bool) -> String {
+fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bool) -> String {
     match expr {
         Expr::IntLiteral { value, .. } => value.to_string(),
+        Expr::DoubleLiteral { value, .. } => value.to_string(),
         Expr::BoolLiteral { value, .. } => value.to_string(),
+        Expr::StringLiteral { value, .. } => dart_string_literal(value),
         Expr::Ref { name, .. } => name.clone(),
         Expr::Binary {
             op, lhs, rhs, ty, ..
         } => format!(
             "{} {} {}",
-            emit_expr(lhs, used_expr_helper),
+            emit_expr(lhs, used_expr_helper, used_utf8_encode),
             emit_binary_op(*op, ty),
-            emit_expr(rhs, used_expr_helper)
+            emit_expr(rhs, used_expr_helper, used_utf8_encode)
         ),
         Expr::Unary { op, operand, .. } => {
             format!(
                 "{}{}",
                 emit_unary_op(*op),
-                emit_expr(operand, used_expr_helper)
+                emit_expr(operand, used_expr_helper, used_utf8_encode)
             )
         }
         // The only promotion `lower::cpp` currently constructs a `Convert`
         // node for is int → double (see the IR's own doc comment) — Dart
         // never implicitly widens an `int` expression to `double`.
         Expr::Convert { operand, .. } => {
-            format!("{}.toDouble()", emit_expr(operand, used_expr_helper))
+            format!(
+                "{}.toDouble()",
+                emit_expr(operand, used_expr_helper, used_utf8_encode)
+            )
         }
         Expr::Call {
-            callee_name, args, ..
+            target,
+            callee_name,
+            args,
+            ..
         } => {
             let args_text = args
                 .iter()
-                .map(|arg| emit_expr(arg, used_expr_helper))
+                .map(|arg| emit_expr(arg, used_expr_helper, used_utf8_encode))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("{callee_name}({args_text})")
+            // `None` (a free function) and `Some(This)` (a method called on
+            // an implicit receiver, from inside another method) both emit
+            // with no receiver at all — Dart, like C++, never requires
+            // `this.` to reach a class's own members. Only a call on some
+            // other, explicit object prints its receiver.
+            match target.as_deref() {
+                None | Some(Expr::This { .. }) => format!("{callee_name}({args_text})"),
+                Some(receiver) => format!(
+                    "{}.{callee_name}({args_text})",
+                    emit_expr(receiver, used_expr_helper, used_utf8_encode)
+                ),
+            }
         }
-        Expr::FieldAccess { target, field, .. } => {
-            format!("{}.{field}", emit_expr(target, used_expr_helper))
-        }
+        Expr::FieldAccess { target, field, .. } => match target.as_ref() {
+            Expr::This { .. } => field.clone(),
+            _ => format!(
+                "{}.{field}",
+                emit_expr(target, used_expr_helper, used_utf8_encode)
+            ),
+        },
         Expr::RecordConstruct {
             type_name, fields, ..
         } => {
             let args_text = fields
                 .iter()
-                .map(|(_name, value)| emit_expr(value, used_expr_helper))
+                .map(|(_name, value)| emit_expr(value, used_expr_helper, used_utf8_encode))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("{type_name}({args_text})")
+        }
+        Expr::ConstructorCall {
+            type_name,
+            constructor_index,
+            args,
+            ..
+        } => {
+            let args_text = args
+                .iter()
+                .map(|arg| emit_expr(arg, used_expr_helper, used_utf8_encode))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let dart_name = dart_constructor_name(type_name, *constructor_index);
+            format!("{dart_name}({args_text})")
+        }
+        // Only ever reached if `This` somehow ends up as its own top-level
+        // expression rather than (as `lower::cpp` always produces it) the
+        // target of a `FieldAccess`/`Call` — both of which already special-
+        // case it above and never call `emit_expr` on it directly. Kept
+        // total (not `unreachable!()`) so a future lowering change that
+        // *does* produce a bare `This` fails loudly in `dart analyze`
+        // (`this` outside a method) rather than panicking the emitter.
+        Expr::This { .. } => "this".to_owned(),
+        Expr::Index { target, index, .. } => format!(
+            "{}[{}]",
+            emit_expr(target, used_expr_helper, used_utf8_encode),
+            emit_expr(index, used_expr_helper, used_utf8_encode)
+        ),
+        Expr::StringByteLength { target, .. } => {
+            *used_utf8_encode = true;
+            format!(
+                "utf8.encode({}).length",
+                emit_expr(target, used_expr_helper, used_utf8_encode)
+            )
         }
         Expr::Unsupported { reason, origin } => {
             *used_expr_helper = true;

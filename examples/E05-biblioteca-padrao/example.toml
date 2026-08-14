@@ -1,0 +1,7 @@
+id = "E05"
+nome = "std::string, std::vector"
+nivel = 5
+status = "passa"
+motivo = "golden, dart analyze/format e oráculo comportamental passam"
+constroi = ["adaptador-de-biblioteca", "string-por-referencia", "vetor-por-referencia", "indexacao", "operador-sobrecarregado"]
+passos = ["US-7", "US-8", "US-9", "US-10"]

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "casos": [
+    {
+      "funcao": "testarGuardaFechaAoSair",
+      "args": [],
+      "espera": 100
+    },
+    {
+      "funcao": "testarExcecaoCapturada",
+      "args": [],
+      "espera": 43
+    }
+  ]
+}

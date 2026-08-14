@@ -11,7 +11,7 @@
 //! those two sidestep — not an oversight; extracting a call graph without
 //! parsing bodies isn't possible with `libclang`.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CString;
 use std::fmt;
 use std::os::raw::{c_int, c_uint, c_void};
@@ -23,6 +23,7 @@ use serde::Serialize;
 use crate::ingest::CompilationUnit;
 use crate::ir;
 use crate::lower;
+use crate::mapping;
 use crate::progress::{Cancellation, ExtractionProgress};
 use crate::type_catalog::{self, TypeDeclarationKind};
 
@@ -291,6 +292,17 @@ pub fn extract_function_catalog_cancellable(
         }
     }
 
+    // US-7/E07: the first real consultation of `mapping::overload_options_for`
+    // by the generation pipeline itself, not just its own unit tests — see
+    // that function's doc comment for what it decides and why only a subset
+    // of its decisions are acted on here.
+    apply_overload_renames(&mut ir_functions, &mut ir_records, &declarations, &calls);
+
+    // E12: RAII — see the function's own doc comment for exactly what this
+    // rewrites and why it has to run after every record (with its
+    // destructor, if any) is already fully lowered.
+    apply_raii_scope_guards(&mut ir_functions, &ir_records);
+
     log_function_catalog(format_args!(
         "extract_function_catalog: done in {:.2}s, {} declarations, {} calls, {} ir functions, {} ir records",
         extraction_started.elapsed().as_secs_f64(),
@@ -306,6 +318,615 @@ pub fn extract_function_catalog_cancellable(
         ir_functions,
         ir_records,
     })
+}
+
+/// After every function/method is lowered with its original C++ name,
+/// consults `mapping::overload_options_for` for each group of
+/// same-(owning-class, name) declarations (US-7; E07 is the first degrau
+/// where the generation pipeline itself calls this solver, not just its own
+/// unit tests) and, when the decision requires a rename
+/// (`"renomear-por-tipo"`/`"renomear-const-nao-const"`), renames the
+/// corresponding `ir::Function`/`ir::Method` *and* every call site
+/// referencing it by USR — computed once per group and applied everywhere,
+/// the same "can never disagree" discipline `lower::cpp::constructor_ordinal`
+/// already uses for E04's multiple constructors, so a call site can never
+/// end up pointing at a name that no longer exists.
+///
+/// A decision that *doesn't* require a rename (`"assinatura-unica"`,
+/// `"parametro-opcional"`) leaves the group untouched. `"parametro-opcional"`
+/// (overloads differing only in arity) is deliberately not acted on here —
+/// unlike a rename, folding it into Dart would mean *merging* two separate
+/// `Function`/`Method` IR entries into one with an optional trailing
+/// parameter, a different kind of change, and no fixture in this corpus
+/// forces it yet (see `examples/E07-sobrecarga-e-parametros-default/NOTES.md`).
+/// Leaving such a group's declarations with their shared original name is
+/// not silent, either: two same-named top-level Dart declarations fail to
+/// compile, so `dart analyze` surfaces the gap loudly if it's ever reached.
+fn apply_overload_renames(
+    ir_functions: &mut [ir::Function],
+    ir_records: &mut [ir::Record],
+    declarations: &[FunctionDeclaration],
+    calls: &[CallEdge],
+) {
+    let facts = mapping::ProjectFacts {
+        declarations: &[],
+        usages: &[],
+        functions: declarations,
+        calls,
+    };
+
+    let mut groups: BTreeMap<(Option<String>, String), Vec<&FunctionDeclaration>> = BTreeMap::new();
+    for declaration in declarations {
+        if !matches!(
+            declaration.kind,
+            FunctionDeclarationKind::FreeFunction | FunctionDeclarationKind::Method
+        ) {
+            continue;
+        }
+        groups
+            .entry((
+                declaration.owning_class_usr.clone(),
+                declaration.name.clone(),
+            ))
+            .or_default()
+            .push(declaration);
+    }
+
+    let mut renames: HashMap<String, String> = HashMap::new();
+    for ((owning_class_usr, name), group) in &groups {
+        if group.len() <= 1 {
+            continue;
+        }
+        let Some(option) = mapping::overload_options_for(owning_class_usr.as_deref(), name, &facts)
+            .into_iter()
+            .next()
+        else {
+            continue;
+        };
+        if option.id != "renomear-por-tipo" && option.id != "renomear-const-nao-const" {
+            continue;
+        }
+        for declaration in group {
+            if let Some(params) = find_ir_params(ir_functions, ir_records, &declaration.usr) {
+                renames.insert(declaration.usr.clone(), dart_overload_name(name, params));
+            }
+        }
+    }
+
+    if renames.is_empty() {
+        return;
+    }
+
+    for function in ir_functions.iter_mut() {
+        if let Some(new_name) = renames.get(&function.usr) {
+            function.name = new_name.clone();
+        }
+        rename_calls_in_params(&mut function.params, &renames);
+        rename_calls_in_stmts(&mut function.body, &renames);
+    }
+    for record in ir_records.iter_mut() {
+        for method in &mut record.methods {
+            if let Some(new_name) = renames.get(&method.usr) {
+                method.name = new_name.clone();
+            }
+            rename_calls_in_params(&mut method.params, &renames);
+            if let Some(body) = &mut method.body {
+                rename_calls_in_stmts(body, &renames);
+            }
+        }
+        for constructor in &mut record.constructors {
+            rename_calls_in_params(&mut constructor.params, &renames);
+            rename_calls_in_stmts(&mut constructor.body, &renames);
+        }
+    }
+}
+
+fn rename_calls_in_params(params: &mut [ir::Param], renames: &HashMap<String, String>) {
+    for param in params {
+        if let Some(default_value) = &mut param.default_value {
+            rename_calls_in_expr(default_value, renames);
+        }
+    }
+}
+
+/// E12: RAII. C++ runs a local's destructor deterministically the moment it
+/// leaves scope; Dart has no such hook, so the only construct that runs
+/// code unconditionally at block exit — `try`/`finally` — has to stand in
+/// for it. For every free function (methods/constructors aren't scanned —
+/// no fixture yet declares an RAII local *inside* one, and scoping this to
+/// what's actually forced avoids guessing at the interaction with `this`),
+/// finds the *first* top-level `VarDecl` whose type is a record with a real
+/// destructor (`Record::destructor`, only `Some` for one with actual
+/// teardown logic — see that field's doc comment) and wraps everything
+/// after it in a `Stmt::TryFinally` whose `finally_body` is that
+/// destructor's own statements, with every `Expr::This` replaced by a
+/// reference to the local itself (`replace_this_with_ref_in_stmts` —
+/// correct because the destructor's body was lowered exactly like any
+/// other method's, receiver-implicit, and is now being spliced somewhere
+/// that has no `this` of its own to be implicit about).
+///
+/// Only the *first* qualifying local in a function is wrapped, not every
+/// one — two RAII locals in the same function would need *nested*
+/// `try`/`finally` (each one's guard active only from its own declaration
+/// onward), which no fixture forces yet; a second such local today keeps
+/// its plain `VarDecl` and never gets its destructor called, a known gap
+/// rather than a silently wrong nesting.
+fn apply_raii_scope_guards(ir_functions: &mut [ir::Function], ir_records: &[ir::Record]) {
+    let destructors: HashMap<&str, (&str, &[ir::Stmt])> = ir_records
+        .iter()
+        .filter_map(|record| {
+            record
+                .destructor
+                .as_ref()
+                .map(|body| (record.usr.as_str(), (record.name.as_str(), body.as_slice())))
+        })
+        .collect();
+    if destructors.is_empty() {
+        return;
+    }
+
+    for function in ir_functions.iter_mut() {
+        apply_raii_scope_guard_to_stmts(&mut function.body, &destructors);
+    }
+}
+
+fn apply_raii_scope_guard_to_stmts(
+    stmts: &mut Vec<ir::Stmt>,
+    destructors: &HashMap<&str, (&str, &[ir::Stmt])>,
+) {
+    let guard = stmts.iter().enumerate().find_map(|(index, stmt)| {
+        let ir::Stmt::VarDecl {
+            name,
+            ty: ir::Type::Record { usr, .. },
+            ..
+        } = stmt
+        else {
+            return None;
+        };
+        destructors
+            .get(usr.as_str())
+            .map(|(_, body)| (index, name.clone(), *body))
+    });
+    let Some((index, var_name, destructor_body)) = guard else {
+        return;
+    };
+
+    let mut finally_body = destructor_body.to_vec();
+    replace_this_with_ref_in_stmts(&mut finally_body, &var_name);
+
+    let try_body = stmts.split_off(index + 1);
+
+    // The destructor's own body only ever touches state reachable without
+    // `this` — e.g. a static field — the `This`→`Ref` substitution above has
+    // nothing to replace, and the guard local ends up declared but never
+    // read anywhere in the emitted Dart. Dart's analyzer treats that as an
+    // `unused_local_variable` warning (the test harness's `dart analyze`
+    // step fails on any warning), so when neither `try_body` nor
+    // `finally_body` actually names the local, drop the binding and keep
+    // only the constructor call for its side effect — still runs the same
+    // construction, just as a bare expression statement instead of a named
+    // declaration.
+    let guard_decl = stmts.pop().expect("guard index was just read from stmts");
+    let ir::Stmt::VarDecl {
+        name,
+        ty,
+        init,
+        origin,
+    } = guard_decl
+    else {
+        unreachable!("guard_decl was matched as a VarDecl above");
+    };
+    let referenced = stmts_reference_name(&try_body, &var_name)
+        || stmts_reference_name(&finally_body, &var_name);
+    if referenced {
+        stmts.push(ir::Stmt::VarDecl {
+            name,
+            ty,
+            init,
+            origin: origin.clone(),
+        });
+    } else if let Some(init) = init {
+        stmts.push(ir::Stmt::ExprStmt {
+            expr: init,
+            origin: origin.clone(),
+        });
+    }
+
+    stmts.push(ir::Stmt::TryFinally {
+        try_body,
+        finally_body,
+        origin,
+    });
+}
+
+fn stmts_reference_name(stmts: &[ir::Stmt], name: &str) -> bool {
+    stmts.iter().any(|stmt| stmt_references_name(stmt, name))
+}
+
+fn stmt_references_name(stmt: &ir::Stmt, name: &str) -> bool {
+    match stmt {
+        ir::Stmt::Return { value, .. } => value
+            .as_ref()
+            .is_some_and(|expr| expr_references_name(expr, name)),
+        ir::Stmt::VarDecl { init, .. } => init
+            .as_ref()
+            .is_some_and(|expr| expr_references_name(expr, name)),
+        ir::Stmt::Assign { value, .. } => expr_references_name(value, name),
+        ir::Stmt::FieldAssign { target, value, .. } => {
+            expr_references_name(target, name) || expr_references_name(value, name)
+        }
+        ir::Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            expr_references_name(condition, name)
+                || stmts_reference_name(then_branch, name)
+                || stmts_reference_name(else_branch, name)
+        }
+        ir::Stmt::While {
+            condition, body, ..
+        } => expr_references_name(condition, name) || stmts_reference_name(body, name),
+        ir::Stmt::For {
+            init,
+            condition,
+            increment,
+            body,
+            ..
+        } => {
+            init.as_ref()
+                .is_some_and(|stmt| stmt_references_name(stmt, name))
+                || condition
+                    .as_ref()
+                    .is_some_and(|expr| expr_references_name(expr, name))
+                || increment
+                    .as_ref()
+                    .is_some_and(|stmt| stmt_references_name(stmt, name))
+                || stmts_reference_name(body, name)
+        }
+        ir::Stmt::ExprStmt { expr, .. } | ir::Stmt::Throw { value: expr, .. } => {
+            expr_references_name(expr, name)
+        }
+        ir::Stmt::TryCatch {
+            try_body,
+            catch_body,
+            ..
+        } => stmts_reference_name(try_body, name) || stmts_reference_name(catch_body, name),
+        ir::Stmt::TryFinally {
+            try_body,
+            finally_body,
+            ..
+        } => stmts_reference_name(try_body, name) || stmts_reference_name(finally_body, name),
+        ir::Stmt::Unsupported { .. } => false,
+    }
+}
+
+fn expr_references_name(expr: &ir::Expr, name: &str) -> bool {
+    match expr {
+        ir::Expr::Ref { name: ref_name, .. } => ref_name == name,
+        ir::Expr::IntLiteral { .. }
+        | ir::Expr::DoubleLiteral { .. }
+        | ir::Expr::BoolLiteral { .. }
+        | ir::Expr::StringLiteral { .. }
+        | ir::Expr::This { .. }
+        | ir::Expr::Unsupported { .. } => false,
+        ir::Expr::Binary { lhs, rhs, .. } => {
+            expr_references_name(lhs, name) || expr_references_name(rhs, name)
+        }
+        ir::Expr::Unary { operand, .. } | ir::Expr::Convert { operand, .. } => {
+            expr_references_name(operand, name)
+        }
+        ir::Expr::Call { target, args, .. } => {
+            target
+                .as_ref()
+                .is_some_and(|target| expr_references_name(target, name))
+                || args.iter().any(|arg| expr_references_name(arg, name))
+        }
+        ir::Expr::FieldAccess { target, .. } | ir::Expr::StringByteLength { target, .. } => {
+            expr_references_name(target, name)
+        }
+        ir::Expr::RecordConstruct { fields, .. } => fields
+            .iter()
+            .any(|(_name, value)| expr_references_name(value, name)),
+        ir::Expr::ConstructorCall { args, .. } => {
+            args.iter().any(|arg| expr_references_name(arg, name))
+        }
+        ir::Expr::Index { target, index, .. } => {
+            expr_references_name(target, name) || expr_references_name(index, name)
+        }
+    }
+}
+
+fn replace_this_with_ref_in_stmts(stmts: &mut [ir::Stmt], var_name: &str) {
+    for stmt in stmts {
+        replace_this_with_ref_in_stmt(stmt, var_name);
+    }
+}
+
+fn replace_this_with_ref_in_stmt(stmt: &mut ir::Stmt, var_name: &str) {
+    match stmt {
+        ir::Stmt::Return { value, .. } => {
+            if let Some(expr) = value {
+                replace_this_with_ref_in_expr(expr, var_name);
+            }
+        }
+        ir::Stmt::VarDecl { init, .. } => {
+            if let Some(expr) = init {
+                replace_this_with_ref_in_expr(expr, var_name);
+            }
+        }
+        ir::Stmt::Assign { value, .. } => replace_this_with_ref_in_expr(value, var_name),
+        ir::Stmt::FieldAssign { target, value, .. } => {
+            replace_this_with_ref_in_expr(target, var_name);
+            replace_this_with_ref_in_expr(value, var_name);
+        }
+        ir::Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            replace_this_with_ref_in_expr(condition, var_name);
+            replace_this_with_ref_in_stmts(then_branch, var_name);
+            replace_this_with_ref_in_stmts(else_branch, var_name);
+        }
+        ir::Stmt::While {
+            condition, body, ..
+        } => {
+            replace_this_with_ref_in_expr(condition, var_name);
+            replace_this_with_ref_in_stmts(body, var_name);
+        }
+        ir::Stmt::For {
+            init,
+            condition,
+            increment,
+            body,
+            ..
+        } => {
+            if let Some(init) = init {
+                replace_this_with_ref_in_stmt(init, var_name);
+            }
+            if let Some(condition) = condition {
+                replace_this_with_ref_in_expr(condition, var_name);
+            }
+            if let Some(increment) = increment {
+                replace_this_with_ref_in_stmt(increment, var_name);
+            }
+            replace_this_with_ref_in_stmts(body, var_name);
+        }
+        ir::Stmt::ExprStmt { expr, .. } => replace_this_with_ref_in_expr(expr, var_name),
+        ir::Stmt::Throw { value, .. } => replace_this_with_ref_in_expr(value, var_name),
+        ir::Stmt::TryCatch {
+            try_body,
+            catch_body,
+            ..
+        } => {
+            replace_this_with_ref_in_stmts(try_body, var_name);
+            replace_this_with_ref_in_stmts(catch_body, var_name);
+        }
+        ir::Stmt::TryFinally {
+            try_body,
+            finally_body,
+            ..
+        } => {
+            replace_this_with_ref_in_stmts(try_body, var_name);
+            replace_this_with_ref_in_stmts(finally_body, var_name);
+        }
+        ir::Stmt::Unsupported { .. } => {}
+    }
+}
+
+fn replace_this_with_ref_in_expr(expr: &mut ir::Expr, var_name: &str) {
+    match expr {
+        ir::Expr::This { ty, origin } => {
+            *expr = ir::Expr::Ref {
+                name: var_name.to_owned(),
+                ty: ty.clone(),
+                origin: origin.clone(),
+            };
+        }
+        ir::Expr::IntLiteral { .. }
+        | ir::Expr::DoubleLiteral { .. }
+        | ir::Expr::BoolLiteral { .. }
+        | ir::Expr::StringLiteral { .. }
+        | ir::Expr::Ref { .. }
+        | ir::Expr::Unsupported { .. } => {}
+        ir::Expr::Binary { lhs, rhs, .. } => {
+            replace_this_with_ref_in_expr(lhs, var_name);
+            replace_this_with_ref_in_expr(rhs, var_name);
+        }
+        ir::Expr::Unary { operand, .. } | ir::Expr::Convert { operand, .. } => {
+            replace_this_with_ref_in_expr(operand, var_name);
+        }
+        ir::Expr::Call { target, args, .. } => {
+            if let Some(target) = target {
+                replace_this_with_ref_in_expr(target, var_name);
+            }
+            for arg in args {
+                replace_this_with_ref_in_expr(arg, var_name);
+            }
+        }
+        ir::Expr::FieldAccess { target, .. } | ir::Expr::StringByteLength { target, .. } => {
+            replace_this_with_ref_in_expr(target, var_name);
+        }
+        ir::Expr::RecordConstruct { fields, .. } => {
+            for (_name, value) in fields {
+                replace_this_with_ref_in_expr(value, var_name);
+            }
+        }
+        ir::Expr::ConstructorCall { args, .. } => {
+            for arg in args {
+                replace_this_with_ref_in_expr(arg, var_name);
+            }
+        }
+        ir::Expr::Index { target, index, .. } => {
+            replace_this_with_ref_in_expr(target, var_name);
+            replace_this_with_ref_in_expr(index, var_name);
+        }
+    }
+}
+
+fn find_ir_params<'a>(
+    ir_functions: &'a [ir::Function],
+    ir_records: &'a [ir::Record],
+    usr: &str,
+) -> Option<&'a [ir::Param]> {
+    if let Some(function) = ir_functions.iter().find(|function| function.usr == usr) {
+        return Some(&function.params);
+    }
+    ir_records
+        .iter()
+        .find_map(|record| record.methods.iter().find(|method| method.usr == usr))
+        .map(|method| method.params.as_slice())
+}
+
+/// The deterministic name a renamed overload gets — appends every
+/// parameter's Dart type name, capitalized, to the original C++ name
+/// (`formatarValor` + `[Int]` params → `formatarValorInt`). Computed the
+/// same way regardless of which specific overload in the group is asking,
+/// so two overloads with different parameter types can never collide.
+/// Shares `lower::cpp::overload_type_suffix` with E08's monomorphization
+/// naming (`lower::cpp::monomorphized_template_name`) — same suffix scheme,
+/// same reason to have only one implementation of it.
+fn dart_overload_name(base_name: &str, params: &[ir::Param]) -> String {
+    let mut name = base_name.to_owned();
+    for param in params {
+        name.push_str(&lower::cpp::overload_type_suffix(&param.ty));
+    }
+    name
+}
+
+fn rename_calls_in_stmts(stmts: &mut [ir::Stmt], renames: &HashMap<String, String>) {
+    for stmt in stmts {
+        rename_calls_in_stmt(stmt, renames);
+    }
+}
+
+fn rename_calls_in_stmt(stmt: &mut ir::Stmt, renames: &HashMap<String, String>) {
+    match stmt {
+        ir::Stmt::Return { value, .. } => {
+            if let Some(expr) = value {
+                rename_calls_in_expr(expr, renames);
+            }
+        }
+        ir::Stmt::VarDecl { init, .. } => {
+            if let Some(expr) = init {
+                rename_calls_in_expr(expr, renames);
+            }
+        }
+        ir::Stmt::Assign { value, .. } => rename_calls_in_expr(value, renames),
+        ir::Stmt::FieldAssign { target, value, .. } => {
+            rename_calls_in_expr(target, renames);
+            rename_calls_in_expr(value, renames);
+        }
+        ir::Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            rename_calls_in_expr(condition, renames);
+            rename_calls_in_stmts(then_branch, renames);
+            rename_calls_in_stmts(else_branch, renames);
+        }
+        ir::Stmt::While {
+            condition, body, ..
+        } => {
+            rename_calls_in_expr(condition, renames);
+            rename_calls_in_stmts(body, renames);
+        }
+        ir::Stmt::For {
+            init,
+            condition,
+            increment,
+            body,
+            ..
+        } => {
+            if let Some(init) = init {
+                rename_calls_in_stmt(init, renames);
+            }
+            if let Some(condition) = condition {
+                rename_calls_in_expr(condition, renames);
+            }
+            if let Some(increment) = increment {
+                rename_calls_in_stmt(increment, renames);
+            }
+            rename_calls_in_stmts(body, renames);
+        }
+        ir::Stmt::ExprStmt { expr, .. } => rename_calls_in_expr(expr, renames),
+        ir::Stmt::Throw { value, .. } => rename_calls_in_expr(value, renames),
+        ir::Stmt::TryCatch {
+            try_body,
+            catch_body,
+            ..
+        } => {
+            rename_calls_in_stmts(try_body, renames);
+            rename_calls_in_stmts(catch_body, renames);
+        }
+        ir::Stmt::TryFinally {
+            try_body,
+            finally_body,
+            ..
+        } => {
+            rename_calls_in_stmts(try_body, renames);
+            rename_calls_in_stmts(finally_body, renames);
+        }
+        ir::Stmt::Unsupported { .. } => {}
+    }
+}
+
+fn rename_calls_in_expr(expr: &mut ir::Expr, renames: &HashMap<String, String>) {
+    match expr {
+        ir::Expr::IntLiteral { .. }
+        | ir::Expr::DoubleLiteral { .. }
+        | ir::Expr::BoolLiteral { .. }
+        | ir::Expr::StringLiteral { .. }
+        | ir::Expr::Ref { .. }
+        | ir::Expr::This { .. }
+        | ir::Expr::Unsupported { .. } => {}
+        ir::Expr::Binary { lhs, rhs, .. } => {
+            rename_calls_in_expr(lhs, renames);
+            rename_calls_in_expr(rhs, renames);
+        }
+        ir::Expr::Unary { operand, .. } | ir::Expr::Convert { operand, .. } => {
+            rename_calls_in_expr(operand, renames);
+        }
+        ir::Expr::Call {
+            target,
+            callee_usr,
+            callee_name,
+            args,
+            ..
+        } => {
+            if let Some(target) = target {
+                rename_calls_in_expr(target, renames);
+            }
+            if let Some(new_name) = renames.get(callee_usr) {
+                *callee_name = new_name.clone();
+            }
+            for arg in args {
+                rename_calls_in_expr(arg, renames);
+            }
+        }
+        ir::Expr::FieldAccess { target, .. } | ir::Expr::StringByteLength { target, .. } => {
+            rename_calls_in_expr(target, renames);
+        }
+        ir::Expr::RecordConstruct { fields, .. } => {
+            for (_name, value) in fields {
+                rename_calls_in_expr(value, renames);
+            }
+        }
+        ir::Expr::ConstructorCall { args, .. } => {
+            for arg in args {
+                rename_calls_in_expr(arg, renames);
+            }
+        }
+        ir::Expr::Index { target, index, .. } => {
+            rename_calls_in_expr(target, renames);
+            rename_calls_in_expr(index, renames);
+        }
+    }
 }
 
 fn parse_chunk(
@@ -334,6 +955,7 @@ fn parse_chunk(
     let mut calls = Vec::new();
     let mut ir_functions = Vec::new();
     let mut ir_records = Vec::new();
+    let mut ir_seen = HashSet::new();
 
     unsafe {
         let index = clang_sys::clang_createIndex(0, 0);
@@ -354,6 +976,7 @@ fn parse_chunk(
                 call_seen: &mut call_seen,
                 ir_functions: &mut ir_functions,
                 ir_records: &mut ir_records,
+                ir_seen: &mut ir_seen,
             };
 
             log_function_catalog(format_args!(
@@ -403,6 +1026,12 @@ struct VisitorState<'a> {
     call_seen: &'a mut HashSet<(String, CallResolution, String, u32, u32)>,
     ir_functions: &'a mut Vec<ir::Function>,
     ir_records: &'a mut Vec<ir::Record>,
+    /// E08: dedupes monomorphized-function synthesis within one worker's
+    /// traversal (`CallVisitorState.ir_functions`/`ir_seen` borrow these
+    /// same two) — the cross-worker/explicit-specialization duplicate case
+    /// is handled separately, by the final merge in
+    /// `extract_function_catalog_cancellable`.
+    ir_seen: &'a mut HashSet<String>,
 }
 
 fn call_identity(call: &CallEdge) -> (String, CallResolution, String, u32, u32) {
@@ -532,6 +1161,7 @@ extern "C" fn visit_cursor(
     {
         let caller_usr = declaration.usr.clone();
         let declared_kind = declaration.kind;
+        let owning_class_usr = declaration.owning_class_usr.clone();
         push_declaration(state, declaration);
 
         // IR lowering (E01–E03 scope: free functions only, see
@@ -540,10 +1170,73 @@ extern "C" fn visit_cursor(
         // visitor just below does — not a second `libclang` parse.
         if declared_kind == FunctionDeclarationKind::FreeFunction
             && !caller_usr.is_empty()
-            && let Some(function_ir) =
+            && let Some(mut function_ir) =
                 lower::cpp::lower_function(cursor, &caller_usr, state.project_root)
         {
+            // E08: this cursor is a full explicit specialization
+            // (`template<> std::string dobro<std::string>(...)`) when its
+            // own `clang_getSpecializedCursorTemplate` is non-null — a
+            // real, user-written `FreeFunction` declaration by every other
+            // measure, which is exactly why `function_declaration_kind_for`
+            // never needed a separate case for it. Renamed here via the
+            // same `monomorphized_template_name` every call site
+            // referencing it independently recomputes (`lower_call_expr`),
+            // so a specialization's own declaration and its call sites can
+            // never end up naming it differently.
+            let specialized_template =
+                unsafe { clang_sys::clang_getSpecializedCursorTemplate(cursor) };
+            if unsafe { clang_sys::clang_Cursor_isNull(specialized_template) } == 0 {
+                let base_name = unsafe {
+                    type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(
+                        specialized_template,
+                    ))
+                };
+                function_ir.name = lower::cpp::monomorphized_template_name(&base_name, cursor);
+            }
             state.ir_functions.push(function_ir);
+        }
+
+        // E04: a method's or constructor's *definition* cursor — inline
+        // (a child of the class cursor, reached via the `Recurse` below) or
+        // out-of-line (a separate top-level cursor elsewhere in the same
+        // translation unit) — is lowered here the same way a free function
+        // is, then attached to the record its `owning_class_usr` names.
+        // That record is guaranteed to already be in `state.ir_records` by
+        // this point: C++ requires a complete class definition before any
+        // out-of-line member of it can be defined, and an inline member is
+        // only reached by recursing into the class cursor's children, which
+        // happens strictly after this same function already pushed the
+        // record for that cursor (see the `StructDecl`/`ClassDecl` branch
+        // above). If the record can't be found, the definition is silently
+        // skipped rather than lowered into nothing — should only happen for
+        // a class outside `project_root` (filtered out of the catalog
+        // entirely), never for one of the project's own.
+        if let Some(owner_usr) = &owning_class_usr {
+            if declared_kind == FunctionDeclarationKind::Method
+                && let Some(method_ir) =
+                    lower::cpp::lower_method(cursor, &caller_usr, state.project_root)
+                && let Some(record) = state.ir_records.iter_mut().find(|r| &r.usr == owner_usr)
+            {
+                record.methods.push(method_ir);
+            }
+            if declared_kind == FunctionDeclarationKind::Constructor
+                && let Some(constructor_ir) =
+                    lower::cpp::lower_constructor(cursor, state.project_root)
+                && let Some(record) = state.ir_records.iter_mut().find(|r| &r.usr == owner_usr)
+            {
+                record.constructors.push(constructor_ir);
+            }
+            // E12: unlike a method/constructor, a destructor is never
+            // stored as a callable member — only its body (if it does real
+            // teardown work) matters, for `apply_raii_scope_guards` to
+            // splice in later.
+            if declared_kind == FunctionDeclarationKind::Destructor
+                && let Some(destructor_body) =
+                    lower::cpp::lower_destructor(cursor, state.project_root)
+                && let Some(record) = state.ir_records.iter_mut().find(|r| &r.usr == owner_usr)
+            {
+                record.destructor = Some(destructor_body);
+            }
         }
 
         // The call graph only lives inside this cursor's own subtree, so
@@ -561,6 +1254,8 @@ extern "C" fn visit_cursor(
                 caller_usr: &caller_usr,
                 calls: &mut *state.calls,
                 call_seen: &mut *state.call_seen,
+                ir_functions: &mut *state.ir_functions,
+                ir_seen: &mut *state.ir_seen,
             };
             unsafe {
                 clang_sys::clang_visitChildren(
@@ -582,6 +1277,16 @@ struct CallVisitorState<'a> {
     caller_usr: &'a str,
     calls: &'a mut Vec<CallEdge>,
     call_seen: &'a mut HashSet<(String, CallResolution, String, u32, u32)>,
+    /// E08: monomorphized functions synthesized from a call site's resolved
+    /// *implicit* template instantiation (never independently visited at
+    /// top level, unlike a full explicit specialization — see
+    /// `record_call`). Shares its accumulator with the enclosing
+    /// `VisitorState.ir_functions` so a duplicate (an explicit
+    /// specialization *and* a call to it both reaching this usr) collapses
+    /// the same way any other cross-source duplicate already does, in
+    /// `extract_function_catalog_cancellable`'s final merge.
+    ir_functions: &'a mut Vec<ir::Function>,
+    ir_seen: &'a mut HashSet<String>,
 }
 
 extern "C" fn visit_call_site(
@@ -628,7 +1333,49 @@ fn record_call(cursor: clang_sys::CXCursor, state: &mut CallVisitorState<'_>) {
             // callers show up under its own catalog entry — a no-op
             // (null cursor) for a non-template callee.
             let template = unsafe { clang_sys::clang_getSpecializedCursorTemplate(referenced) };
-            let usr_source = if unsafe { clang_sys::clang_Cursor_isNull(template) } != 0 {
+            let is_template_instantiation =
+                unsafe { clang_sys::clang_Cursor_isNull(template) } == 0;
+
+            // E08: `lower::cpp::lower_call_expr` names this call's callee
+            // via `monomorphized_template_name(base_name, referenced)` —
+            // that name is only backed by a real Dart declaration if one
+            // exists. A full explicit specialization already gets one via
+            // the ordinary top-level `FreeFunction` path above (renamed the
+            // same way); an *implicit* instantiation never independently
+            // reaches that path at all (see
+            // `FunctionDeclarationKind::FunctionTemplate`'s docs), so it's
+            // synthesized here instead, from `referenced` itself — its
+            // instantiation already carries concrete (non-template-
+            // dependent) parameter/return types, confirmed empirically, so
+            // lowering it directly (rather than the abstract primary
+            // template) produces a correct, already-substituted body.
+            // Scoped to `FunctionDecl` (a free function/its instantiation)
+            // to match `lower_call_expr`'s own scope — a template *method*
+            // is E08+E04 territory no fixture forces yet.
+            if is_template_instantiation && referenced_kind == clang_sys::CXCursor_FunctionDecl {
+                let instantiation_usr = unsafe {
+                    type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(referenced))
+                };
+                if !instantiation_usr.is_empty()
+                    && state.ir_seen.insert(instantiation_usr.clone())
+                    && let Some(mut function_ir) = lower::cpp::lower_function(
+                        referenced,
+                        &instantiation_usr,
+                        state.project_root,
+                    )
+                {
+                    let base_name = unsafe {
+                        type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(
+                            template,
+                        ))
+                    };
+                    function_ir.name =
+                        lower::cpp::monomorphized_template_name(&base_name, referenced);
+                    state.ir_functions.push(function_ir);
+                }
+            }
+
+            let usr_source = if !is_template_instantiation {
                 referenced
             } else {
                 template

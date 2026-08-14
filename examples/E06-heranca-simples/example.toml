@@ -1,0 +1,7 @@
+id = "E06"
+nome = "Herança simples e virtual"
+nivel = 6
+status = "passa"
+motivo = "golden, dart analyze/format e oráculo comportamental passam"
+constroi = ["heranca-simples", "extends", "override", "metodo-abstrato", "classe-abstrata", "despacho-dinamico"]
+passos = ["US-7", "US-8", "US-9", "US-10"]

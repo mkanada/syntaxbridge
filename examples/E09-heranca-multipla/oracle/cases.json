@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "casos": [
+    {
+      "funcao": "testarAltitude",
+      "args": [],
+      "espera": 20
+    },
+    {
+      "funcao": "testarProfundidade",
+      "args": [],
+      "espera": 5
+    },
+    {
+      "funcao": "testarMovimento",
+      "args": [],
+      "espera": "voa e nada"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.10)
+project(E09HerancaMultipla CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+add_library(e09_heranca_multipla STATIC src/pato.cpp)
+target_include_directories(e09_heranca_multipla PUBLIC src)

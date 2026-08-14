@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.10)
+project(E07SobrecargaEParametrosDefault CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+add_library(e07_sobrecarga_e_parametros_default STATIC src/formatacao.cpp)
+target_include_directories(e07_sobrecarga_e_parametros_default PUBLIC src)

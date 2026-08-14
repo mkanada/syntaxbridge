@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "casos": [
+    {
+      "funcao": "testarDeposito",
+      "args": [100.0, 50.0],
+      "espera": 150.0
+    },
+    {
+      "funcao": "testarDeposito",
+      "args": [0.0, 25.0],
+      "espera": 25.0
+    },
+    {
+      "funcao": "testarContaVazia",
+      "args": [],
+      "espera": 0.0
+    },
+    {
+      "funcao": "testarContagemDeContas",
+      "args": [],
+      "espera": 2
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "casos": [
+    {
+      "funcao": "saudacao",
+      "args": ["Mundo"],
+      "espera": "Ola, Mundo"
+    },
+    {
+      "funcao": "tamanhoDaMensagem",
+      "args": ["abc"],
+      "espera": 3
+    },
+    {
+      "funcao": "tamanhoDaMensagem",
+      "args": ["ação"],
+      "espera": 6
+    },
+    {
+      "funcao": "mensagensIguais",
+      "args": ["abc", "abc"],
+      "espera": true
+    },
+    {
+      "funcao": "mensagensIguais",
+      "args": ["abc", "abd"],
+      "espera": false
+    },
+    {
+      "funcao": "somaVetor",
+      "args": [[1, 2, 3, 4]],
+      "espera": 10
+    },
+    {
+      "funcao": "somaVetor",
+      "args": [[]],
+      "espera": 0
+    },
+    {
+      "funcao": "maiorValor",
+      "args": [[3, 1, 4, 1, 5, 9, 2, 6]],
+      "espera": 9
+    }
+  ]
+}

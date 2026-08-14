@@ -1864,19 +1864,31 @@ preserva a decisão) e critério 7 (round-trip) provados por teste inline.
 e aplicado ao banco sem passar pela UI, cruzado contra `options_for` de
 verdade (não um id escrito à mão) em
 `e03_decisions_toml_applies_to_the_database_without_going_through_the_ui`.
-**Falta:** o solver de viabilidade global de verdade (Q9 completo — E09 é
-quem dimensiona isso; o que existe hoje é regras heurísticas sobre fatos já
-extraídos, não uma satisfação de restrições real — ver as limitações
-conhecidas registradas em `docs/mapping-solver-cases.md`, casos B06 e C03),
-as rotas `GET`/`PUT /projects/mappings`, a UI, e — importante —
-**`transpile::transpile` ainda não consulta `type_mappings` nem
-`options_for` ao gerar Dart**: `Ponto` é sempre emitido como classe
-diretamente, sem checar se existe decisão gravada. Isso é honesto para E03
-porque `Ponto` só tem uma opção possível (nada a decidir), mas significa que
-o critério "tipo sem decisão produz falha explícita" não está de fato
-conectado ponta a ponta — só valeria a pena resolver quando um tipo tiver
-mais de uma opção de verdade, o que só acontece a partir do E07 · **Depende
-de:** US-4, US-5
+**O E07 é a primeira consulta de verdade a `overload_options_for` pela própria
+geração** (`function_catalog::apply_overload_renames`, não mais só os testes
+unitários do solver): agrupa declarações por `(owning_class_usr, name)`,
+consulta o solver uma vez por grupo, e — quando a decisão é
+`"renomear-por-tipo"`/`"renomear-const-nao-const"` — renomeia a
+declaração e todo call site que a referencia, por `usr`, numa segunda
+passada sobre o módulo inteiro (`examples/E07-sobrecarga-e-parametros-default/NOTES.md`).
+`"parametro-opcional"` (sobrecargas que só diferem em aridade) é uma decisão
+que o solver já devolve mas a geração ainda não age sobre — agir exigiria
+fundir duas entradas de IR num único `Function`/`Method` com parâmetro
+opcional à direita, um tipo de mudança diferente de renomear, e nenhum
+fixture força isso ainda. **Falta:** o solver de viabilidade global de
+verdade (Q9 completo — E09 é quem dimensiona isso; o que existe hoje é regras
+heurísticas sobre fatos já extraídos, não uma satisfação de restrições real —
+ver as limitações conhecidas registradas em `docs/mapping-solver-cases.md`,
+casos B06 e C03), as rotas `GET`/`PUT /projects/mappings`, a UI, agir sobre
+`"parametro-opcional"`, e — importante — **`transpile::transpile` ainda não
+consulta `type_mappings` nem `options_for`** (o mapeamento de *tipo*, distinto
+do de *sobrecarga* que o E07 já consome) **ao gerar Dart**: `Ponto` é sempre
+emitido como classe diretamente, sem checar se existe decisão gravada. Isso é
+honesto para E01–E07 porque todo tipo evolvido até aqui só tem uma opção
+possível (nada a decidir), mas significa que o critério "tipo sem decisão
+produz falha explícita" não está de fato conectado ponta a ponta para
+*tipos* — só valeria a pena resolver quando um tipo tiver mais de uma opção
+de verdade · **Depende de:** US-4, US-5
 
 ### Objetivo do usuário
 
@@ -2025,27 +2037,51 @@ nada mais.
 
 ## US-8 — Geração do código Dart
 
-**Status:** parcial — fatia do E01+E02+E03 (`docs/plans/primeiro-corte-e01-e03.md`,
-PRs 1–5): IR em `crates/server/src/ir/` (`Module`, `Function`, `Record`,
-`Field`, `Param`, `Type::{Int, Bool, Double, Void, Record, Unsupported}`,
-`Stmt::{Return, VarDecl, Assign, FieldAssign, If, While, For, ExprStmt, Unsupported}`,
-`Expr::{IntLiteral, BoolLiteral, Ref, Binary, Unary, Call, FieldAccess,
-RecordConstruct, Unsupported}`, `BinaryOp` com aritmética/comparação/`And`,
-`UnaryOp::Neg`, tudo com `Origin`), lowering em `crates/server/src/lower/cpp.rs`
-como extensão do passe de `function_catalog` (critério do roteiro item 1: sem
-quarta passada `libclang`) — inclusive `lower_record`, chamado do mesmo
-`visit_cursor` para `StructDecl`/`ClassDecl` sem cortar a recursão para
-métodos inline —, emissor determinístico em `crates/server/src/emit/dart.rs`,
-orquestração em `crates/server/src/transpile.rs` e rota síncrona
-`POST /projects/transpile`. Critérios 1–4 satisfeitos e testados para funções
-livres com aritmética, comparação, `if`/`else`, `while`, `for`, recursão,
-negação unária e `struct` POD com semântica de valor (`tests/lower_cpp.rs`,
+**Status:** parcial — fatia do E01–E12 (`docs/plans/primeiro-corte-e01-e03.md`,
+PRs 1–5, e `docs/plans/conversao-guiada-por-exemplos.md` para o E04–E12): IR em
+`crates/server/src/ir/` (`Module`, `Function`, `Record` (com
+`destructor: Option<Vec<Stmt>>`, E12 — nunca emitido como membro, só
+consumido pela síntese de RAII), `Field`, `Param`
+(com `default_value: Option<Expr>`, E07),
+`Method`, `Constructor`, `BaseClass`,
+`Type::{Int, Bool, Double, Void, Record, Str, List, Unsupported}`,
+`Stmt::{Return, VarDecl, Assign, FieldAssign, If, While, For, ExprStmt,
+Throw, TryCatch, TryFinally, Unsupported}` (as três últimas, E12 —
+`TryFinally` nunca lowered de um cursor C++, só sintetizado),
+`Expr::{IntLiteral, DoubleLiteral, BoolLiteral, StringLiteral, Ref, Binary,
+Unary, Call, FieldAccess, RecordConstruct, ConstructorCall, This, Index,
+StringByteLength, Unsupported}`, `BinaryOp` com aritmética/comparação/`And`,
+`UnaryOp::Neg`, tudo com `Origin`), lowering em
+`crates/server/src/lower/cpp.rs` como extensão do passe de `function_catalog`
+(critério do roteiro item 1: sem quarta passada `libclang`) — inclusive
+`lower_record`/`lower_method`/`lower_constructor`, chamados do mesmo
+`visit_cursor` para `StructDecl`/`ClassDecl` e para definições de
+método/construtor (inline ou fora da classe) sem cortar a recursão —, emissor
+determinístico em `crates/server/src/emit/dart.rs`, orquestração em
+`crates/server/src/transpile.rs` e rota síncrona `POST /projects/transpile`.
+Critérios 1–4 satisfeitos e testados para funções livres com aritmética,
+comparação, `if`/`else`, `while`, `for`, recursão, negação unária, `struct`
+POD com semântica de valor, classe com métodos, `this` implícito, visibilidade
+(`private`/`protected` → `_` no nome Dart), campo estático e construtor
+múltiplo (nomeação por ordinal: o primeiro vira o construtor sem nome da
+classe, os demais viram `ClassName.ctorN` — Dart não tem sobrecarga de
+construtor por assinatura), um **adaptador de biblioteca padrão**:
+`std::string` → `String`, `std::vector<T>` → `List<T>`, reconhecidos por
+`lower::cpp::stdlib_template_name` (nome do template primário + namespace
+`std`, não a soletração do tipo) em vez de `lower_record` — `.size()` de
+string vira ponte UTF-8 (`Expr::StringByteLength`), `.size()` de vetor vira
+`.length` direto, `operator[]` de vetor vira `Expr::Index`, `operator+`/`==`
+de string viram `Expr::Binary` (Dart já sobrecarrega os três nativamente) —,
+e agora **herança simples e `virtual`**: `Record.base_class` (`extends`),
+`Method.body: Option<Vec<Stmt>>` (`None` = método virtual puro, vira
+assinatura sem corpo em Dart), `Method.is_override` (`clang_getOverriddenCursors`,
+não casamento de nome) → `abstract class`/`@override` (`tests/lower_cpp.rs`,
 `tests/emit_dart.rs`, `tests/transpile.rs`, `tests/transpile_route.rs`,
-`tests/conversion_examples.rs`); critério 5 (silêncio proibido) também
-testado — inclusive o caso em que um `Stmt::Unsupported` em qualquer
-profundidade (corpo, `if`, `while`, `for`) precisa derrubar a função inteira,
-não só a si mesmo, senão statements seguintes referenciam nomes nunca
-declarados em Dart (achado registrado em
+`tests/conversion_examples.rs`); critério 5
+(silêncio proibido) também testado — inclusive o caso em que um
+`Stmt::Unsupported` em qualquer profundidade (corpo, `if`, `while`, `for`)
+precisa derrubar a função inteira, não só a si mesmo, senão statements
+seguintes referenciam nomes nunca declarados em Dart (achado registrado em
 `examples/E01-funcao-aritmetica/NOTES.md`). A armadilha do E02 — `int / int`
 trunca em C++ e precisa virar `~/` em Dart, não `/` — está resolvida e testada
 (`examples/E02-controle-de-fluxo/NOTES.md`), decidida pelo tipo do próprio nó
@@ -2053,18 +2089,183 @@ trunca em C++ e precisa virar `~/` em Dart, não `/` — está resolvida e testa
 `struct` passado por valor, Dart passa a referência — está resolvida e testada
 (`examples/E03-struct-pod/NOTES.md`): `lower::cpp::
 collect_params_with_clone_prelude` insere um autoclone (`p = Ponto(p.x, p.y);`)
-como primeiro statement do corpo para todo parâmetro `Record` por valor,
-regra geral, não por fixture. No cliente, `client/flutter/lib/src/ui/dart_output_view.dart`
+como primeiro statement do corpo para todo parâmetro `Record` **por valor**
+(checado contra o tipo *cru* do parâmetro, não o `ir::Type` já desembrulhado —
+o E06 precisou reforçar essa distinção quando um parâmetro por referência a um
+`Record` do próprio usuário apareceu pela primeira vez), regra geral, não por
+fixture. A armadilha do E04 — `this` implícito não aparece como filho
+visitável de um `MemberRefExpr` no `libclang` (só no `ast-dump` interno do
+Clang) — está resolvida e testada (`examples/E04-classe-com-encapsulamento/NOTES.md`):
+`lower::cpp::member_ref_receiver` trata zero filhos como `Expr::This`
+diretamente. A armadilha do E05 — `std::string` conta bytes UTF-8,
+`String.length` conta *code units* UTF-16, e os dois discordam fora de ASCII —
+está resolvida e testada com ponte de código, não declarada como divergência
+conhecida (`examples/E05-biblioteca-padrao/NOTES.md`, caso `"ação"`: 6 bytes
+vs. 4 code units, `utf8.encode(x).length` bate com o C++ nos dois). A
+armadilha do E06 — destrutor virtual não tem equivalente em Dart — está
+resolvida por omissão deliberada (`examples/E06-heranca-simples/NOTES.md`):
+`function_catalog` já distingue `Destructor` de `Method` desde o US-5, e
+simplesmente nunca despacha um destrutor para `lower_method`/`Record::methods`
+— nenhum corpo de destrutor deste corpus tem lógica de limpeza real, então
+"não emitir nada" é honesto (RAII de verdade é E12). A armadilha do E07 —
+renomear uma sobrecarga obriga a reescrever todo call site — está resolvida
+e testada (`examples/E07-sobrecarga-e-parametros-default/NOTES.md`):
+`function_catalog::apply_overload_renames` roda depois que todo
+`Function`/`Method` já foi lowered com o nome C++ original, agrupa
+declarações por `(owning_class_usr, name)`, consulta
+`mapping::overload_options_for` uma vez por grupo — a primeira consulta real
+desse solver pela própria geração, não só pelos testes do solver — e quando a
+decisão exige renomear, monta um mapa `usr → novo nome`
+(`function_catalog::dart_overload_name`: nome original + tipo Dart de cada
+parâmetro capitalizado) e varre o módulo inteiro trocando `Expr::Call.callee_name`
+por `callee_usr`, nunca por nome. Um valor default de parâmetro
+(`int passo = 1`) é mapeamento direto — parâmetro opcional posicional do
+Dart (`[int passo = 1]`) — sem passar pelo solver, já que não é sobrecarga. A
+armadilha do E08 — especialização explícita e SFINAE: recusar, não adivinhar
+— está resolvida sem precisar de um caminho de recusa dedicado
+(`examples/E08-templates/NOTES.md`): toda instanciação de template de função
+(implícita ou especialização explícita) é lowered a partir do próprio cursor
+já resolvido (`referenced`), que o `libclang` entrega com tipos concretos
+substituídos e, no caso de uma especialização explícita, com o corpo
+realmente escrito para aquele tipo — nunca o corpo do template primário
+reinterpretado com `T` trocado mecanicamente. `lower::cpp::
+monomorphized_template_name` nomeia cada instanciação de forma determinística
+(`dobro` + tipo Dart concreto de cada parâmetro → `dobroInt`/`dobroDouble`/
+`dobroString`), a mesma função usada tanto para renomear a declaração
+(`function_catalog::record_call`, que agora também sintetiza o
+`ir::Function` de uma instantiação implícita nunca visitada de outra forma)
+quanto todo call site — computada independentemente nos dois lugares a
+partir do mesmo cursor, nunca por referência cruzada. `overload_type_suffix`
+é compartilhado com o esquema de renomeação de sobrecarga do E07
+(`function_catalog::dart_overload_name`), uma implementação só. A armadilha
+do E09 — estado em mixin, ordem de linearização — não precisou de código
+novo além da própria representação (`examples/E09-heranca-multipla/NOTES.md`):
+`Record.mixins` (populado quando uma classe tem mais de um `CXXBaseSpecifier`
+— `base_class`, do E06, continua cobrindo exatamente um) faz toda base virar
+mixin Dart (`with A, B`, nunca `extends`), e um `Record` referenciado como
+mixin em qualquer lugar do módulo (`emit::dart::emit_module` varre o `Module`
+inteiro antes de emitir qualquer arquivo) é emitido como `mixin`, não
+`class` — sem construtor algum (Dart proíbe) e com todo campo já
+valor-zero na própria declaração. Acesso a campo/método herdado de um
+mixin (`pato.altitude`, `pato.subir()`) e a resolução de qual `mover()`
+"vence" não precisaram de nada novo: já operam no nível do cursor que
+*declara* o membro, não de qual `Record` o possui no Dart gerado. A
+armadilha do E10 — talvez a resposta certa seja recusar — já funcionava de
+graça para ponteiro cru (nenhum caso de `lower_type` trata `CXType_Pointer`,
+então cai no catch-all `Type::Unsupported` desde o E01) e revelou um bug
+real para `union` (`examples/E10-ponteiros-union-out-params/NOTES.md`):
+`union` compartilha `CXType_Record` com `struct`/`class` no Clang, então sem
+tratamento próprio virava `Type::Record{usr, name}` apontando para uma
+classe que `function_catalog::visit_cursor` nunca despacha para
+`lower_record` (só `StructDecl`/`ClassDecl`) — uma referência pendurada,
+`dart analyze` acusando `undefined_class`, pega no primeiro fixture que
+teve um `union` de verdade. Corrigido recusando explicitamente
+(`Type::Unsupported`) assim que `lower_type` reconhece
+`CXCursor_UnionDecl`, antes de resolver usr/nome. A armadilha do E11 —
+header incluído em N TUs duplica declaração — já não acontecia na IR
+usada para geração (a dedup por `usr` na junção entre workers, existente
+desde o E01, já cobria isso de graça); a lacuna real era a ausência de
+qualquer `import` entre arquivos Dart gerados, nunca exercitada até um
+fixture com mais de um `.cpp` existir
+(`examples/E11-multi-tu/NOTES.md`). `emit::dart::emit_module` monta
+`usr_to_stem` (todo `Record`/`Function` de nível superior → arquivo que o
+declara) e `emit_file` caminha a própria árvore (`collect_referenced_usrs_in_*`,
+mesmo padrão do `rename_calls_in_*` do E07, mas coletando em vez de
+renomear) para decidir quais `import '<outro>.dart';` imprimir — chamada
+de método entre arquivos fica de fora (só `usr` de `Record`/`Function` é
+mapeado), documentado como lacuna sabida, não silenciosa. A armadilha do
+E12 — RAII não tem construto Dart equivalente — está resolvida por síntese,
+não por tradução direta (`examples/E12-excecoes-raii/NOTES.md`):
+`function_catalog::apply_raii_scope_guards` roda no mesmo ponto de
+pós-processamento que `apply_overload_renames` (E07), procura o primeiro
+`VarDecl` de nível superior de uma função livre cujo tipo tem
+`Record.destructor` com corpo real, e envolve tudo depois dele num
+`ir::Stmt::TryFinally` cujo `finally` é o próprio corpo do destrutor (já
+lowered), com `Expr::This` substituído pela referência ao local
+(`replace_this_with_ref_in_stmts`/`_stmt`/`_expr`, terceiro caminhador
+mecânico da escada, mesmo padrão do E07/E11). `throw`/`try`/`catch` em si
+mapeiam quase direto para o próprio `throw`/`try`/`on T catch` do Dart. Duas
+armadilhas colaterais apareceram só ao montar o fixture: um `DeclRefExpr`
+para campo estático referenciado de *fora* da classe (função livre lendo
+`Guarda::contadorAberto`) precisava de qualificação (`Guarda.contadorAberto`)
+que `lower_expr` nunca tinha produzido antes — corrigido com
+`qualified_static_member_name`, aplicada incondicionalmente (dentro e fora
+da classe, já que não há "classe atual" para decidir por contexto), o que
+também reescreveu (corretamente) a saída do E04 para os próprios acessos
+internos da classe ao seu campo estático; e um guard cujo destrutor só toca
+estado estático (nunca `this`) deixa a variável local sem nenhuma referência
+no Dart emitido, `unused_local_variable` do `dart analyze` — corrigido
+verificando, depois da substituição `This`→`Ref`, se o nome do guard aparece
+em algum dos dois corpos; se não aparece, a declaração vira uma expressão
+solta (só o construtor, pelo efeito colateral) em vez de um `VarDecl`
+nomeado. Múltiplos `catch` no mesmo `try` e `throw`/`catch` sem operando
+(`throw;`, `catch (...)`) recusam explicitamente (`Unsupported`), e a
+passagem de RAII só cobre o primeiro guard de nível superior de uma função
+livre — nem guard aninhado em `if`/`while`/`for`, nem guard dentro de
+método/construtor, nem uma segunda local RAII na mesma função (que exigiria
+`try`/`finally` aninhados) — nenhum fixture força nenhum dos dois ainda,
+lacunas documentadas, não silenciosas. O E13 ("degrau de realidade" — uma
+fatia de `include/vrv/fraction.h`/`src/fraction.cpp` do Verovio 6.2.0,
+extraída e não escrita para o produto, `examples/E13-fatia-real-verovio/
+NOTES.md`) fica **`esperado-falhar`**, e de propósito: seis lacunas reais
+apareceram, nenhuma vista por nenhum fixture sintético em doze degraus —
+inicialização por construtor direto (`Tipo var(args);`, em vez da forma por
+cópia que E01–E12 sempre usaram), `static_cast<T>` explícito (só a promoção
+*implícita* `int`→`double` do E02 é lowered), atribuição composta (`/=`, e
+por extensão `+=`/`-=`/`*=` — todo fixture anterior só escreveu a forma
+expandida), chamada de operador de usuário (`a == b`) de *fora* da própria
+classe (`lower_method_call` espera um `MemberRefExpr` como receptor, forma
+que uma chamada de operador não produz — a própria *definição* do operador
+sempre traduziu bem, o buraco é só no call site), um método estático e um
+de instância com o mesmo nome (válido em C++ por assinatura, proibido em
+Dart — `conflicting_static_and_instance`), e a assinatura fixa que Dart
+exige de `operator==` (`Object`, não o tipo do próprio usuário —
+`invalid_override`, mesmo com o método corretamente lowered e emitido).
+Nenhum dos seis foi corrigido neste degrau — cada um é do tamanho de um
+degrau futuro próprio, não um ajuste de fixture, e "não implemente em
+largura" pede que fiquem documentados, não resolvidos às pressas juntos. Os
+doze degraus anteriores continuam verdes sem nenhuma mudança de código para
+chegar a esse resultado — só o fixture novo. No
+cliente, `client/flutter/lib/src/ui/dart_output_view.dart`
 (painel "Dart Output" em `server_status_page.dart`, acionado pelo botão
 "Transpile" da barra de título) já mostra o Dart gerado ao lado do arquivo C++
 aberto, casando pelo stem do nome de arquivo (`matchingDartPath`) — cobre a
 parte do objetivo do usuário de "obter o código Dart correspondente" enquanto
 não existe navegação arquivo-a-arquivo automática. **Falta para "pronto":**
 `transpile::transpile` ainda não consulta `mapping::options_for`/`type_mappings`
-(US-7 está pronto o bastante para E03 porque `Ponto` só tem uma opção — nada a
-decidir; passa a importar de verdade a partir do E07), templates/monomorfização,
-e qualquer coisa além de função livre e `struct` POD (métodos, classes com
-herança, `break`/`continue`) · **Depende de:** US-7
+para *tipos* (distinto de `overload_options_for`, já consultado desde o E07 —
+US-7 está pronto o bastante para o mapeamento de tipo em E01–E12 porque cada
+tipo evolvido até aqui só tem uma opção — nada a decidir), agir sobre a
+decisão `"parametro-opcional"` do solver de sobrecarga (fundir duas
+sobrecargas de aridade diferente num único `Function`/`Method` — ver
+`examples/E07-sobrecarga-e-parametros-default/NOTES.md`), consultar
+`mapping::template_options_for`/o lado de herança múltipla de
+`mapping::options_for` (os dois solvers já existem e já decidem — inclusive
+detectando conflito de diamante para herança múltipla — mas a geração
+segue estratégias fixas que não checam o resultado, porque nenhum fixture
+ainda expõe uma escolha real entre alternativas viáveis; só passa a
+importar a partir de quando um cenário multi-TU (E11) ou de conflito winner
+fizer diferença — ver `examples/E08-templates/NOTES.md` e
+`examples/E09-heranca-multipla/NOTES.md`), template de método (só função
+livre por enquanto), `std::string`/`std::vector` por valor (todo parâmetro
+do E05 é `const T&`, de propósito — ver
+`examples/E05-biblioteca-padrao/NOTES.md`), ponte real para ponteiro/`union`
+(`dart:ffi`) ou para o idioma de out param (E10 recusa honestamente os dois
+em vez de construir a ponte — ver
+`examples/E10-ponteiros-union-out-params/NOTES.md`), `import` entre
+arquivos para chamada de método (só `Record`/`Function` de nível superior
+são mapeados — ver `examples/E11-multi-tu/NOTES.md`), nome de `library`
+Dart derivado de `namespace` C++ (capturado desde o US-3/US-5, nunca usado
+na geração), guard RAII aninhado em `if`/`while`/`for`, dentro de
+método/construtor, ou mais de um guard na mesma função (exigiria
+`try`/`finally` aninhados — ver `examples/E12-excecoes-raii/NOTES.md`),
+múltiplos `catch`/`throw` ou `catch` sem operando, os seis achados do E13
+(inicialização por construtor direto, `static_cast` explícito, atribuição
+composta, chamada de operador de usuário fora da classe, método estático e
+de instância com o mesmo nome, assinatura de `operator==` exigida pelo Dart
+— ver `examples/E13-fatia-real-verovio/NOTES.md`), e qualquer coisa além
+do que E01–E13 cobrem (`break`/`continue`, `i++`/`--i`, construtor de
+subclasse chamando `super(...)` explicitamente) · **Depende de:** US-7
 
 ### Objetivo do usuário
 
@@ -2089,6 +2290,11 @@ decididos.
   omite, ou bloqueia a geração.
 - Rastreabilidade: cada trecho Dart gerado deve apontar para sua origem C++, o
   que é o que permite a navegação e o diagnóstico em US-9 e US-10.
+- **US-8.1 — Preferências de estilo do código gerado, opcional** (aspas,
+  largura de linha, vírgula final, `final`/`const`, preset de lint do pacote
+  exportado): plano completo em `docs/plans/estilo-de-codigo-gerado.md`. Não
+  bloqueia US-8 nem depende de mais nenhuma ferramenta — reusa `dart
+  format`/`dart fix`, já no manifesto Flatpak.
 
 ### Critérios de aceitação (testáveis)
 
@@ -2212,12 +2418,44 @@ fixada, e o contrato é a saída delas.
 
 ## US-10 — Prova de equivalência comportamental
 
-**Status:** parcial — a fatia do E01+E02+E03, pela fonte "casos escritos à mão
-da escada" (`docs/plans/primeiro-corte-e01-e03.md` PR3/PR4/PR5), com suporte a
+**Status:** parcial — a fatia do E01–E12, pela fonte
+"casos escritos à mão da escada" (`docs/plans/primeiro-corte-e01-e03.md`
+PR3/PR4/PR5, e `docs/plans/conversao-guiada-por-exemplos.md` para o
+E04–E12), com suporte a
 argumento agregado desde o E03 (`{"x": 3.0, "y": 4.0}` em `oracle/cases.json`,
 resolvido contra `ir::Record` re-extraído no próprio harness, emitido como
 `Ponto{3.0, 4.0}` para C++ e `Ponto(3.0, 4.0)` para Dart — ordem de campo
-vem do `ir::Record`, não da ordem das chaves no JSON). Implementado dentro do
+vem do `ir::Record`, não da ordem das chaves no JSON). O E04 não exigiu
+nenhuma mudança no harness do oráculo em si — construtor com argumento
+`double`, método com `this` implícito e campo estático já cabem no mesmo
+formato de caso de função livre com argumentos escalares. O E05 exigiu duas
+formas de literal novas — string (JSON string → `"..."` escapado igual nos
+dois lados) e vetor (JSON array → `std::vector<int>{...}`/`[...]`, só
+elemento `int`, sem despacho por tipo de elemento) — mais o `espera` de uma
+função poder ser uma string comparada por igualdade de texto (o próprio
+armadilha de `"ação"` do E05 é um caso do oráculo, não um teste separado). O
+E06 também não exigiu nenhuma mudança no harness — despacho dinâmico
+(`Cachorro`/`Gato` via `Animal&`) e classe abstrata só aparecem *dentro* dos
+corpos das funções livres testadas (`testarCachorro`/`testarGato`), nunca
+como argumento/retorno do próprio caso, então o mesmo formato de string já
+bastava. O E07, pela mesma razão, também não — sobrecarga renomeada e
+parâmetro default só aparecem dentro dos corpos testados, nunca na própria
+assinatura de caso do oráculo. O E08, mais uma vez — instanciação de
+template e monomorfização só aparecem dentro dos corpos testados
+(`testarDobroInt`/`testarDobroDouble`/`testarDobroString`), nunca na própria
+assinatura de caso. O E09, pela mesma razão de novo — herança múltipla,
+mixin e estado herdado só aparecem dentro dos corpos testados
+(`testarAltitude`/`testarProfundidade`/`testarMovimento`). O E10 também não —
+a única função com caso de oráculo (`somarSemPonteiro`) nunca usa ponteiro
+nem `union`; as funções que usam ficam de fora de `oracle/cases.json` de
+propósito, porque `Unsupported` lança em tempo de execução (correto — é
+esse o critério — mas incompatível com o oráculo chamar e comparar saída).
+O E11 exigiu multi-TU real pela primeira vez (`collect_oracle_sources` já
+compila todos os `.cpp`/`.hpp` de `src/` juntos, e `run_dart_oracle` já
+importava todo `lib/*.dart` gerado no seu próprio driver — os dois já
+cobriam multi-arquivo de graça); a lacuna que faltava era os arquivos
+gerados se importarem *entre si*, que é código de produção
+(`emit::dart`), não do harness. Implementado dentro do
 próprio harness (`crates/server/tests/conversion_examples.rs`, não em
 `crates/server/src/`, já que o oráculo por enquanto só serve o corpus de
 exemplos): `run_cpp_oracle` compila e executa um `main` C++ sintético contra
@@ -2237,7 +2475,21 @@ afirma que a mensagem de erro carrega origem e os dois valores. Uma
 divergência conhecida e declarada (overflow de `int` de 32 vs. 64 bits, E01)
 é tratada como informação (`divergencia_conhecida` em `oracle/cases.json`),
 não como falha — mas o harness falha se os dois lados um dia passarem a
-concordar, para a premissa não apodrecer em silêncio. **Falta:** critério 1
+concordar, para a premissa não apodrecer em silêncio. O E12 também não
+exigiu nenhuma mudança no harness — `throw`/`try`/`catch` capturado
+(`testarExcecaoCapturada`) e o guard RAII fechando escopo
+(`testarGuardaFechaAoSair`, comparando o contador estático antes/depois de
+`usarGuarda()` sair) são só mais duas funções livres com retorno `int`,
+mesmo formato de caso já usado desde o E01; o comportamento novo (exceção
+lançada e capturada, destrutor rodando na saída do `try`/`finally`
+sintetizado) é exercitado pela própria execução real dos dois lados, não
+por nenhuma extensão do formato do oráculo. O E13 nunca chegou a exercitar o
+oráculo — o harness para no `dart analyze` (critério 2 de US-9) antes de
+rodar `oracle/cases.json`, e a fatia real de `Fraction` falha ali por seis
+razões catalogadas em `examples/E13-fatia-real-verovio/NOTES.md`; o caso do
+oráculo em si (`testarSoma`/`testarSubtracao`/etc., mesmo formato de função
+livre com retorno escalar desde o E01) nunca teve chance de rodar contra o
+Dart gerado. **Falta:** critério 1
 como declarado (associar caso↔função do catálogo, não só nome), critério 4
 (relatório de fração de funções provadas), a tabela de regras de
 equivalência por tipo de `crates/server/src/equivalence.rs` (hoje a

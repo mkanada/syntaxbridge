@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "casos": [
+    {
+      "funcao": "testarCachorro",
+      "args": [],
+      "espera": "Eu digo: Au au"
+    },
+    {
+      "funcao": "testarGato",
+      "args": [],
+      "espera": "Eu digo: Miau"
+    }
+  ]
+}

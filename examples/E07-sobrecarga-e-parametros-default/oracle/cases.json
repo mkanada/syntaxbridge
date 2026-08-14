@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "casos": [
+    {
+      "funcao": "testarFormatoInt",
+      "args": [],
+      "espera": "inteiro"
+    },
+    {
+      "funcao": "testarFormatoDouble",
+      "args": [],
+      "espera": "real"
+    },
+    {
+      "funcao": "testarIncrementoPadrao",
+      "args": [],
+      "espera": 11
+    },
+    {
+      "funcao": "testarIncrementoComPasso",
+      "args": [],
+      "espera": 15
+    }
+  ]
+}

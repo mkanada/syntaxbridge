@@ -1,0 +1,7 @@
+id = "E07"
+nome = "Sobrecarga e parametros default"
+nivel = 7
+status = "passa"
+motivo = "golden, dart analyze/format e oráculo comportamental passam"
+constroi = ["sobrecarga-por-tipo", "renomear-call-sites", "parametro-default"]
+passos = ["US-7", "US-8", "US-9", "US-10"]

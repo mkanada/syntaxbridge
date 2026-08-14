@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "casos": [
+    {
+      "funcao": "testarNormaOrigem",
+      "args": [],
+      "espera": 25.0
+    },
+    {
+      "funcao": "testarNormaEscalada",
+      "args": [],
+      "espera": 36.0
+    }
+  ]
+}

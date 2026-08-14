@@ -59,10 +59,12 @@ fn lowers_a_free_function_returning_a_binary_expression() {
             syntax_bridge_server::ir::Param {
                 name: "a".to_owned(),
                 ty: Type::Int,
+                default_value: None,
             },
             syntax_bridge_server::ir::Param {
                 name: "b".to_owned(),
                 ty: Type::Int,
+                default_value: None,
             },
         ]
     );

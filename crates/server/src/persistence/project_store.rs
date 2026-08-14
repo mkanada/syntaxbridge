@@ -1801,10 +1801,12 @@ mod tests {
                 ir::Param {
                     name: "a".to_owned(),
                     ty: ir::Type::Int,
+                    default_value: None,
                 },
                 ir::Param {
                     name: "b".to_owned(),
                     ty: ir::Type::Int,
+                    default_value: None,
                 },
             ],
             return_type: ir::Type::Int,
@@ -1844,6 +1846,12 @@ mod tests {
                     ty: ir::Type::Double,
                 },
             ],
+            static_fields: Vec::new(),
+            constructors: Vec::new(),
+            methods: Vec::new(),
+            base_class: None,
+            mixins: Vec::new(),
+            destructor: None,
             origin: sample_ir_origin(),
         }
     }

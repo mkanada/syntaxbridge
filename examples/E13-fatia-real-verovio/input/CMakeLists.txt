@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.10)
+project(E13FatiaRealVerovio CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+add_library(e13_fatia_real_verovio STATIC src/fraction.cpp src/uso.cpp)
+target_include_directories(e13_fatia_real_verovio PUBLIC src)

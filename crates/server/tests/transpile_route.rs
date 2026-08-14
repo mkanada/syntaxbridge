@@ -137,10 +137,12 @@ fn transpile_route_reuses_persisted_ir_instead_of_reparsing() {
             Param {
                 name: "a".to_owned(),
                 ty: Type::Int,
+                default_value: None,
             },
             Param {
                 name: "b".to_owned(),
                 ty: Type::Int,
+                default_value: None,
             },
         ],
         return_type: Type::Int,

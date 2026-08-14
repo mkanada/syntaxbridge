@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.10)
+project(E10PonteirosUnionOutParams CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+add_library(e10_ponteiros_union_out_params STATIC src/ponteiros.cpp)
+target_include_directories(e10_ponteiros_union_out_params PUBLIC src)

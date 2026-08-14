@@ -1,0 +1,7 @@
+id = "E11"
+nome = "Multi-TU, namespaces, CMake real"
+nivel = 11
+status = "passa"
+motivo = "golden, dart analyze/format e oráculo comportamental passam"
+constroi = ["multi-tu", "header-compartilhado", "dedup-por-usr", "import-entre-arquivos"]
+passos = ["US-7", "US-8", "US-9", "US-10"]

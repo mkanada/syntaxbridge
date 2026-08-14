@@ -1,0 +1,3 @@
+name: e10_ponteiros_union_out_params
+environment:
+  sdk: '>=3.0.0 <4.0.0'

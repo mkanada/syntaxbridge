@@ -25,10 +25,12 @@ fn soma_function() -> Function {
             Param {
                 name: "a".to_owned(),
                 ty: Type::Int,
+                default_value: None,
             },
             Param {
                 name: "b".to_owned(),
                 ty: Type::Int,
+                default_value: None,
             },
         ],
         return_type: Type::Int,
@@ -259,10 +261,12 @@ fn a_function_with_an_unsupported_parameter_type_throws_instead_of_running_its_b
             Param {
                 name: "a".to_owned(),
                 ty: Type::Unsupported("long".to_owned()),
+                default_value: None,
             },
             Param {
                 name: "b".to_owned(),
                 ty: Type::Int,
+                default_value: None,
             },
         ],
         return_type: Type::Int,
@@ -352,6 +356,12 @@ fn a_record_with_an_unsupported_field_type_has_a_throwing_constructor() {
                 ty: Type::Unsupported("long double".to_owned()),
             },
         ],
+        static_fields: Vec::new(),
+        constructors: Vec::new(),
+        methods: Vec::new(),
+        base_class: None,
+        mixins: Vec::new(),
+        destructor: None,
         origin: origin(1),
     };
     let module = Module {
@@ -397,6 +407,7 @@ fn a_binary_expression_with_an_unsupported_result_type_bails_out_the_whole_funct
         params: vec![Param {
             name: "a".to_owned(),
             ty: Type::Int,
+            default_value: None,
         }],
         return_type: Type::Int,
         body: vec![Stmt::Return {
@@ -447,6 +458,7 @@ fn a_local_variable_with_an_unsupported_type_bails_out_the_whole_function() {
         params: vec![Param {
             name: "a".to_owned(),
             ty: Type::Int,
+            default_value: None,
         }],
         return_type: Type::Int,
         body: vec![

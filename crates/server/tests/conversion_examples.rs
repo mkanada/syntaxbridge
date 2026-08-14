@@ -576,6 +576,24 @@ fn json_literal_for_cpp(value: &Value, records: &[ir::Record]) -> Option<String>
         // no int/float branching.
         Value::Number(number) => Some(number.to_string()),
         Value::Bool(boolean) => Some(boolean.to_string()),
+        // A `std::string` argument (E05) — the parameter is always
+        // `const std::string&`, and a quoted C string literal converts
+        // implicitly, so no `std::string{...}` wrapper is needed the way
+        // `Value::Object` needs one for a `Record`.
+        Value::String(text) => Some(quote_string_literal(text)),
+        // A `std::vector<int>` argument (E05) — only element type this
+        // harness produces literals for; `[T]` element-type dispatch beyond
+        // `int` is unexercised and left for whichever future degrau needs
+        // it, same "don't build it before something forces it" call as
+        // everywhere else in this corpus.
+        Value::Array(items) => {
+            let values = items
+                .iter()
+                .map(|item| json_literal_for_cpp(item, records))
+                .collect::<Option<Vec<_>>>()?
+                .join(", ");
+            Some(format!("std::vector<int>{{{values}}}"))
+        }
         Value::Object(fields) => {
             let record = find_matching_record(records, fields)?;
             let values = record
@@ -610,10 +628,40 @@ fn json_literal_for_dart(value: &Value, records: &[ir::Record]) -> Option<String
             // syntax differs from C++'s but the value doesn't.
             Some(format!("{}({values})", record.name))
         }
-        // Same shapes, same textual form as C++ for the ints/bools/doubles
-        // E01–E02 use.
+        // `List<int>` literal syntax (`[1, 2, 3]`) instead of C++'s
+        // `std::vector<int>{...}` — same values, different brackets.
+        Value::Array(items) => {
+            let values = items
+                .iter()
+                .map(|item| json_literal_for_dart(item, records))
+                .collect::<Option<Vec<_>>>()?
+                .join(", ");
+            Some(format!("[{values}]"))
+        }
+        // Same shapes, same textual form as C++ for the ints/bools/doubles/
+        // strings E01–E05 use (Dart and C++ agree on `"..."` escaping for
+        // the plain content this corpus's fixtures use).
         _ => json_literal_for_cpp(value, records),
     }
+}
+
+/// Shared by both languages' `"..."` string-literal syntax — E05's
+/// fixtures only exercise plain content and a `\`/`"` pair would need
+/// escaping either way, so one escaper serves both without a C++/Dart
+/// split the way aggregate/list construction needs.
+fn quote_string_literal(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len() + 2);
+    escaped.push('"');
+    for ch in text.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped.push('"');
+    escaped
 }
 
 fn find_matching_record<'a>(
@@ -633,6 +681,10 @@ fn json_canonical(value: &Value) -> Option<String> {
     match value {
         Value::Number(number) => Some(number.to_string()),
         Value::Bool(boolean) => Some(boolean.to_string()),
+        // A `std::string`/`String` return value (E05) prints as its raw
+        // content on both sides (`std::cout <<`/`print` neither one quotes
+        // it), so the canonical form is the text itself.
+        Value::String(text) => Some(text.clone()),
         _ => None,
     }
 }
