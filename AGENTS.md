@@ -62,6 +62,15 @@ inclusao de `klee` volta a ser avaliada quando a fase A tiver medido, com
   no sistema das ferramentas instaladas na maquina de desenvolvimento.
 - Enquanto o ambiente Flatpak ainda nao existir, registre no resumo final quais
   testes foram executados fora dele e qual cobertura ficou pendente.
+- **Toda tela ou etapa nova de interacao do usuario no cliente Flutter precisa
+  vir acompanhada de um teste de screenshot** (`client/flutter/test/screenshots/`)
+  antes de ser considerada concluida — nao so a tela final de um fluxo, mas
+  tambem estados intermediarios relevantes (formulario preenchido, progresso,
+  erro). Esses testes alimentam a galeria permanente em
+  `docs/screenshots/README.md` (gerada por `just screenshots`, mantida
+  atualizada por `.github/workflows/screenshots.yml` a cada push para `main`),
+  que e como o usuario acompanha o estado visual do produto pelo GitHub sem
+  precisar rodar o app localmente.
 
 ## Diretrizes de implementacao
 
@@ -127,4 +136,8 @@ diretorios e as flags corretas. `just` sozinho lista todas.
 - `just run` - verifica, empacota, instala e executa o app Flatpak.
 - `just package-build` / `just package-test` - empacotamento Flatpak, sem e com
   os testes de sandbox.
-- `just screenshots` - captura as telas do cliente e gera uma galeria HTML.
+- `just screenshots` - captura as telas do cliente e regenera a galeria
+  permanente em `docs/screenshots/README.md`.
+- `just screenshots-wip` - publica um Gist com o estado atual da UI (working
+  tree, sem exigir commit), para acompanhar trabalho em andamento sem tocar no
+  historico do repositorio principal.

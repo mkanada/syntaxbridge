@@ -110,12 +110,20 @@ flutter-test *args:
 
 # Capture Flutter UI screenshots as test artifacts.
 flutter-screenshots *args:
-    cd client/flutter && flutter test test/screenshot_capture_test.dart test/ui_screenshots_test.dart {{args}}
+    cd client/flutter && flutter test test/screenshot_capture_test.dart test/screenshots/ {{args}}
 
-# Capture Flutter UI screenshots and generate a browsable gallery.
+# Capture Flutter UI screenshots and regenerate the docs/screenshots/ gallery
+# that GitHub renders inline (see AGENTS.md: every new client screen/step
+# needs a screenshot test feeding this gallery).
 screenshots *args:
     just flutter-screenshots {{args}}
-    @dir="client/flutter/build/test-screenshots"; html="$dir/index.html"; { printf '%s\n' '<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Syntax Bridge screenshots</title><style>body{font:16px sans-serif;margin:24px;background:#f6f7f8;color:#1d1b20}main{display:grid;gap:24px}figure{margin:0;padding:16px;background:white;border:1px solid #d7dadd;border-radius:8px}img{display:block;max-width:100%;height:auto;border:1px solid #d7dadd}figcaption{margin-bottom:12px;font-weight:600}</style></head><body><main><h1>Syntax Bridge screenshots</h1>'; for image in "$dir"/*.bmp "$dir"/*.png; do [ -e "$image" ] || continue; name="$(basename "$image")"; printf '<figure><figcaption>%s</figcaption><img src="%s" alt="%s"></figure>\n' "$name" "$name" "$name"; done; printf '%s\n' '</main></body></html>'; } > "$html"; printf 'Screenshot gallery: %s\n' "$html"
+    cd client/flutter && dart run tool/generate_screenshot_gallery.dart build/test-screenshots ../../docs/screenshots
+    @printf 'Screenshot gallery: docs/screenshots/README.md\n'
+
+# Publish the current working tree's UI to a Gist, to check from a phone
+# while a change is still in progress. Never touches the main repository.
+screenshots-wip:
+    scripts/publish-wip-screenshots.sh
 
 # Check, rebuild, repackage, reinstall, and run the Flatpak app (no tests; see `just ci`).
 run *args: check package-build

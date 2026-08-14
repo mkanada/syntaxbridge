@@ -1,0 +1,54 @@
+name: Screenshots
+
+# Keeps docs/screenshots/ (the permanent, GitHub-rendered gallery — see
+# AGENTS.md) in sync with the widget-test screenshot suite as a safety net,
+# in case someone pushes without having run `just screenshots` locally
+# first. The job commits back to the branch it ran on when the gallery
+# drifted, using [skip-screenshot-ci] in its own commit message so that
+# push doesn't re-trigger this workflow (see the `if:` guard below).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: screenshots-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  update-gallery:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      !contains(github.event.head_commit.message, '[skip-screenshot-ci]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - uses: extractions/setup-just@v2
+
+      - name: Fetch Flutter dependencies
+        working-directory: client/flutter
+        run: flutter pub get
+
+      - name: Regenerate the screenshot gallery
+        run: just screenshots
+
+      - name: Commit and push the gallery if it changed
+        run: |
+          if git status --porcelain -- docs/screenshots | grep -q .; then
+            git config user.name 'syntax-bridge-screenshots[bot]'
+            git config user.email 'syntax-bridge-screenshots[bot]@users.noreply.github.com'
+            git add docs/screenshots
+            git commit -m 'Atualiza a galeria de screenshots [skip-screenshot-ci]'
+            git push
+          else
+            echo 'docs/screenshots is already up to date.'
+          fi

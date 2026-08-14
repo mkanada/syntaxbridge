@@ -10,6 +10,10 @@
 # Temporary files
 /tmp/
 
+# Ephemeral WIP screenshots published to a Gist by `just screenshots-wip`
+# (scripts/publish-wip-screenshots.sh) — never part of the project history.
+/.wip-screenshots/
+
 # Editor and OS files
 .DS_Store
 Thumbs.db

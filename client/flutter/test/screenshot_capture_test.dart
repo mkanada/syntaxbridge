@@ -25,9 +25,12 @@ void main() {
       tester,
       name: 'screenshot-probe',
       boundaryKey: captureKey,
+      // Infra self-test, not a product screen: keep it out of the gallery
+      // directory the real UI screenshots are gathered from.
+      outputDirectory: 'build/test-screenshots-infra',
     );
 
-    expect(artifact.path, endsWith('screenshot-probe.bmp'));
+    expect(artifact.path, endsWith('screenshot-probe.png'));
     expect(artifact.existsSync(), isTrue);
     expect(artifact.lengthSync(), greaterThan(0));
   });
