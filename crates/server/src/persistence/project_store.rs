@@ -804,19 +804,20 @@ impl ProjectStore {
         functions: &[ir::Function],
         records: &[ir::Record],
     ) -> Result<(), PersistenceError> {
+        let function_data = serialize_ir_values(functions.to_vec())?;
+        let record_data = serialize_ir_values(records.to_vec())?;
+
         let transaction = self.connection.transaction()?;
         transaction.execute("DELETE FROM ir_functions", [])?;
         transaction.execute("DELETE FROM ir_records", [])?;
 
-        for function in functions {
-            let data = serde_json::to_string(function)?;
+        for (function, data) in functions.iter().zip(function_data) {
             transaction.execute(
                 "INSERT INTO ir_functions (usr, data) VALUES (?1, ?2)",
                 params![function.usr, data],
             )?;
         }
-        for record in records {
-            let data = serde_json::to_string(record)?;
+        for (record, data) in records.iter().zip(record_data) {
             transaction.execute(
                 "INSERT INTO ir_records (usr, data) VALUES (?1, ?2)",
                 params![record.usr, data],
@@ -831,23 +832,73 @@ impl ProjectStore {
         let mut functions_statement = self
             .connection
             .prepare("SELECT data FROM ir_functions ORDER BY usr")?;
-        let function_rows = functions_statement.query_map([], |row| row.get::<_, String>(0))?;
-        let mut functions = Vec::new();
-        for row in function_rows {
-            functions.push(serde_json::from_str(&row?)?);
-        }
+        let function_rows = functions_statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut records_statement = self
             .connection
             .prepare("SELECT data FROM ir_records ORDER BY usr")?;
-        let record_rows = records_statement.query_map([], |row| row.get::<_, String>(0))?;
-        let mut records = Vec::new();
-        for row in record_rows {
-            records.push(serde_json::from_str(&row?)?);
-        }
+        let record_rows = records_statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
+        let functions = deserialize_ir_values(function_rows)?;
+        let records = deserialize_ir_values(record_rows)?;
         Ok((functions, records))
     }
+}
+
+/// `ir::Expr`/`ir::Stmt` nest arbitrarily deep through `Box` — a long
+/// chained expression or `if`/`else if` ladder in real C++ (e.g. Verovio)
+/// nests deeper than `serde_json`'s default 128-level recursion limit,
+/// and than a worker thread's default stack comfortably affords for the
+/// native (de)serialization recursion. `unbounded_depth` (enabled in
+/// `Cargo.toml`) lifts the artificial 128-level cap on the read side;
+/// running on a dedicated large-stack thread covers the actual native
+/// call depth on both the read and write side.
+const IR_JSON_STACK_SIZE: usize = 64 * 1024 * 1024;
+
+fn on_large_stack<T, F>(work: F) -> Result<T, PersistenceError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, PersistenceError> + Send + 'static,
+{
+    std::thread::Builder::new()
+        .stack_size(IR_JSON_STACK_SIZE)
+        .spawn(work)
+        .map_err(PersistenceError::from)?
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+fn serialize_ir_values<T>(values: Vec<T>) -> Result<Vec<String>, PersistenceError>
+where
+    T: serde::Serialize + Send + 'static,
+{
+    on_large_stack(move || {
+        values
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PersistenceError::from)
+    })
+}
+
+fn deserialize_ir_values<T>(rows: Vec<String>) -> Result<Vec<T>, PersistenceError>
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+{
+    on_large_stack(move || {
+        rows.iter()
+            .map(|row| {
+                let mut deserializer = serde_json::Deserializer::from_str(row);
+                deserializer.disable_recursion_limit();
+                T::deserialize(&mut deserializer)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PersistenceError::from)
+    })
 }
 
 fn row_to_call_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallEdge> {
@@ -1875,6 +1926,63 @@ mod tests {
         assert_eq!(records, vec![sample_ir_record()]);
 
         let _ = fs::remove_file(&db_path);
+    }
+
+    /// Real C++ (e.g. a long chained arithmetic/boolean expression) can
+    /// nest deeper than `serde_json`'s default 128-level recursion limit;
+    /// `list_ir` round-trips such a function instead of failing to parse
+    /// its own previously-persisted `data` column back out.
+    #[test]
+    fn round_trips_a_function_with_deeply_nested_expressions() {
+        // The test harness runs each test on its own thread with a small
+        // default stack; building/cloning/comparing a chain this deep needs
+        // real headroom that's independent of the fix under test (which
+        // gives `ProjectStore` its own large-stack thread internally).
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let db_path = temp_db_path("project-ir-deep-nesting");
+                let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+                let mut function = sample_ir_function();
+                let mut expr = ir::Expr::Ref {
+                    name: "a".to_owned(),
+                    ty: ir::Type::Int,
+                    origin: sample_ir_origin(),
+                };
+                // Comfortably past serde_json's default 128-level
+                // recursion limit, but the kind of depth a long chained
+                // arithmetic expression in real C++ can reach.
+                for _ in 0..300 {
+                    expr = ir::Expr::Binary {
+                        op: ir::BinaryOp::Add,
+                        lhs: Box::new(expr),
+                        rhs: Box::new(ir::Expr::Ref {
+                            name: "b".to_owned(),
+                            ty: ir::Type::Int,
+                            origin: sample_ir_origin(),
+                        }),
+                        ty: ir::Type::Int,
+                        origin: sample_ir_origin(),
+                    };
+                }
+                function.body = vec![ir::Stmt::Return {
+                    value: Some(expr),
+                    origin: sample_ir_origin(),
+                }];
+
+                store
+                    .replace_ir(&[function.clone()], &[])
+                    .expect("persist deeply nested ir");
+
+                let (functions, _records) = store.list_ir().expect("list deeply nested ir");
+                assert_eq!(functions, vec![function]);
+
+                let _ = fs::remove_file(&db_path);
+            })
+            .expect("spawn test thread")
+            .join()
+            .expect("test thread panicked");
     }
 
     /// Unlike `type_mappings`, the IR *is* derived catalog data — a second

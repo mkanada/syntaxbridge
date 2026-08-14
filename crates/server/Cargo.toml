@@ -15,7 +15,12 @@ axum = "0.8"
 clang-sys = { version = "1.8", features = ["runtime", "clang_18_0"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `unbounded_depth`: `ProjectStore::list_ir`/`replace_ir` round-trip
+# `ir::Function`/`ir::Record`, which nest `Expr`/`Stmt` through `Box` —
+# real C++ (long chained expressions, deep conditionals) can nest past
+# serde_json's default 128-level recursion limit even though the actual
+# native call stack has room to spare; see persistence/project_store.rs.
+serde_json = { version = "1", features = ["unbounded_depth"] }
 shlex = "2"
 tokio = { version = "1", features = ["net", "rt-multi-thread", "sync"] }
 
