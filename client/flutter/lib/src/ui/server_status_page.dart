@@ -15,6 +15,7 @@ import 'functions_view.dart';
 import 'ide_theme.dart';
 import 'panel_descriptor.dart';
 import 'panel_group.dart';
+import 'pointers_view.dart';
 import 'screen_capturer.dart';
 import 'server_connection_status.dart';
 import 'source_file_viewer.dart';
@@ -46,12 +47,19 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
   // 'usages' starts closed: it opens itself, docked to the center split,
   // only once a type is actually selected (see _selectType) — "entering"
   // the split rather than reserving half the workspace from the outset.
-  final Set<String> _openPanels = {'explorer', 'types', 'functions', 'log'};
+  final Set<String> _openPanels = {
+    'explorer',
+    'types',
+    'functions',
+    'pointers',
+    'log',
+  };
   final Map<String, DockSide> _panelSides = {
     'explorer': DockSide.left,
     'types': DockSide.left,
     'usages': DockSide.center,
     'functions': DockSide.left,
+    'pointers': DockSide.left,
     'callers': DockSide.center,
     'dartOutput': DockSide.center,
     'log': DockSide.right,
@@ -69,6 +77,7 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
   Future<List<CallEdge>>? _selectedFunctionCallers;
   Future<List<CallEdge>>? _selectedFileCalls;
   Future<TranspiledPackage>? _transpiledPackage;
+  late Future<List<PointerDeclaration>> _pointers;
 
   @override
   void initState() {
@@ -76,6 +85,7 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     _status = _loadServerStatus(notify: false);
     _types = _loadTypes();
     _functions = _loadFunctions();
+    _pointers = _loadPointers();
   }
 
   void _refresh() {
@@ -455,6 +465,29 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     }
   }
 
+  Future<List<PointerDeclaration>> _loadPointers() async {
+    try {
+      final pointers = await widget.serverClient.listPointers(
+        widget.project.projectDir,
+      );
+      _addLog(
+        'Loaded ${pointers.length} pointers',
+        level: ExecutionLogLevel.success,
+        notify: false,
+      );
+      return pointers;
+    } catch (error, stackTrace) {
+      cliLog('list pointers exception: $error');
+      cliLog('list pointers stack: $stackTrace');
+      _addLog(
+        'Failed to load pointers: ${projectErrorMessage(error)}',
+        level: ExecutionLogLevel.error,
+        notify: false,
+      );
+      rethrow;
+    }
+  }
+
   Future<ServerStatus> _loadServerStatus({bool notify = true}) async {
     _addLog('Checking server connection', notify: notify);
 
@@ -740,6 +773,38 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
               onFunctionSelected: _selectFunction,
               selectedFunction: _selectedFunction,
             );
+          },
+        ),
+      ),
+      PanelDescriptor(
+        id: 'pointers',
+        title: 'Pointers',
+        icon: Icons.arrow_right_alt,
+        defaultSide: DockSide.left,
+        builder: (context) => FutureBuilder<List<PointerDeclaration>>(
+          future: _pointers,
+          builder: (context, snapshot) {
+            if (snapshot.connectionState != ConnectionState.done) {
+              return const Center(
+                child: Padding(
+                  padding: EdgeInsets.all(16),
+                  child: CircularProgressIndicator(),
+                ),
+              );
+            }
+
+            final error = snapshot.error;
+            if (error != null) {
+              return Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(
+                  'Failed to load pointers: ${projectErrorMessage(error)}',
+                  style: const TextStyle(color: IdePalette.red),
+                ),
+              );
+            }
+
+            return PointersView(pointers: snapshot.data ?? const []);
           },
         ),
       ),

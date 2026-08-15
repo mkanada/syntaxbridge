@@ -10,6 +10,7 @@ use crate::function_catalog::{
 use crate::ingest::CompilationUnit;
 use crate::ir;
 use crate::mapping::MappingDecision;
+use crate::pointer_catalog::{PointerDeclaration, PointerDeclarationKind, PointerShape};
 use crate::source_catalog::{SourceFile, SourceFileKind};
 use crate::type_catalog::{
     TypeDeclaration, TypeDeclarationKind, TypeDependency, TypeUsage, TypeUsageKind,
@@ -98,6 +99,7 @@ impl ProjectStore {
                 end_line INTEGER NOT NULL,
                 end_column INTEGER NOT NULL,
                 usr TEXT NOT NULL DEFAULT '',
+                is_static INTEGER NOT NULL DEFAULT 0,
                 is_virtual INTEGER NOT NULL,
                 is_pure_virtual INTEGER NOT NULL DEFAULT 0,
                 is_defaulted INTEGER NOT NULL DEFAULT 0,
@@ -127,6 +129,18 @@ impl ProjectStore {
             CREATE TABLE IF NOT EXISTS ir_records (
                 usr TEXT PRIMARY KEY,
                 data TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pointer_declarations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                shape TEXT NOT NULL,
+                name TEXT NOT NULL,
+                pointee_type_name TEXT NOT NULL,
+                pointee_usr TEXT NOT NULL DEFAULT '',
+                file TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                column INTEGER NOT NULL,
+                usr TEXT NOT NULL DEFAULT ''
             );",
         )?;
 
@@ -269,6 +283,86 @@ impl ProjectStore {
                 column,
                 end_line,
                 end_column,
+                usr,
+            });
+        }
+
+        Ok(declarations)
+    }
+
+    /// Replaces the full set of cataloged pointer declarations with the ones
+    /// from the latest `libclang` extraction (Parte 1 of
+    /// `docs/plans/catalogo-de-ponteiros-e-solver-tfa.md`), mirroring
+    /// `replace_type_declarations`'s "describes current state, not history"
+    /// reasoning.
+    pub fn replace_pointer_declarations(
+        &mut self,
+        declarations: &[PointerDeclaration],
+    ) -> Result<(), PersistenceError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM pointer_declarations", [])?;
+
+        for declaration in declarations {
+            transaction.execute(
+                "INSERT INTO pointer_declarations (kind, shape, name, pointee_type_name, pointee_usr, file, line, column, usr)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    declaration.kind.as_str(),
+                    declaration.shape.as_str(),
+                    declaration.name,
+                    declaration.pointee_type_name,
+                    declaration.pointee_usr,
+                    declaration.file,
+                    declaration.line,
+                    declaration.column,
+                    declaration.usr
+                ],
+            )?;
+        }
+
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn list_pointer_declarations(&self) -> Result<Vec<PointerDeclaration>, PersistenceError> {
+        let mut statement = self.connection.prepare(
+            "SELECT kind, shape, name, pointee_type_name, pointee_usr, file, line, column, usr
+             FROM pointer_declarations ORDER BY id",
+        )?;
+
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, u32>(6)?,
+                row.get::<_, u32>(7)?,
+                row.get::<_, String>(8)?,
+            ))
+        })?;
+
+        let mut declarations = Vec::new();
+        for row in rows {
+            let (kind, shape, name, pointee_type_name, pointee_usr, file, line, column, usr) = row?;
+            let (Some(kind), Some(shape)) = (
+                PointerDeclarationKind::parse(&kind),
+                PointerShape::parse(&shape),
+            ) else {
+                continue;
+            };
+
+            declarations.push(PointerDeclaration {
+                kind,
+                shape,
+                name,
+                pointee_type_name,
+                pointee_usr,
+                file,
+                line,
+                column,
                 usr,
             });
         }
@@ -552,9 +646,9 @@ impl ProjectStore {
             transaction.execute(
                 "INSERT INTO function_declarations (
                     name, kind, namespace, owning_class_usr, signature, file, line, column,
-                    end_line, end_column, usr, is_virtual, is_pure_virtual, is_defaulted,
+                    end_line, end_column, usr, is_static, is_virtual, is_pure_virtual, is_defaulted,
                     overridden_usrs_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     declaration.name,
                     declaration.kind.as_str(),
@@ -567,6 +661,7 @@ impl ProjectStore {
                     declaration.end_line,
                     declaration.end_column,
                     declaration.usr,
+                    declaration.is_static,
                     declaration.is_virtual,
                     declaration.is_pure_virtual,
                     declaration.is_defaulted,
@@ -582,7 +677,7 @@ impl ProjectStore {
     pub fn list_function_declarations(&self) -> Result<Vec<FunctionDeclaration>, PersistenceError> {
         let mut statement = self.connection.prepare(
             "SELECT name, kind, namespace, owning_class_usr, signature, file, line, column,
-                    end_line, end_column, usr, is_virtual, is_pure_virtual, is_defaulted,
+                    end_line, end_column, usr, is_static, is_virtual, is_pure_virtual, is_defaulted,
                     overridden_usrs_json
              FROM function_declarations ORDER BY id",
         )?;
@@ -603,7 +698,8 @@ impl ProjectStore {
                 row.get::<_, bool>(11)?,
                 row.get::<_, bool>(12)?,
                 row.get::<_, bool>(13)?,
-                row.get::<_, String>(14)?,
+                row.get::<_, bool>(14)?,
+                row.get::<_, String>(15)?,
             ))
         })?;
 
@@ -621,6 +717,7 @@ impl ProjectStore {
                 end_line,
                 end_column,
                 usr,
+                is_static,
                 is_virtual,
                 is_pure_virtual,
                 is_defaulted,
@@ -643,6 +740,7 @@ impl ProjectStore {
                 end_line,
                 end_column,
                 usr,
+                is_static,
                 is_virtual,
                 is_pure_virtual,
                 is_defaulted,
@@ -1019,6 +1117,12 @@ fn migrate_function_columns(connection: &Connection) -> Result<(), PersistenceEr
         "function_declarations",
         "is_defaulted",
         "is_defaulted INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        connection,
+        "function_declarations",
+        "is_static",
+        "is_static INTEGER NOT NULL DEFAULT 0",
     )
 }
 
@@ -1531,6 +1635,7 @@ mod tests {
                 end_line: 4,
                 end_column: 40,
                 usr: "c:@N@geometry@S@Shape@F@area#1#".to_owned(),
+                is_static: false,
                 is_virtual: true,
                 is_pure_virtual: false,
                 is_defaulted: false,
@@ -1551,6 +1656,7 @@ mod tests {
                 end_line: 3,
                 end_column: 1,
                 usr: "c:@F@add#I#I#".to_owned(),
+                is_static: false,
                 is_virtual: false,
                 is_pure_virtual: false,
                 is_defaulted: false,
@@ -1887,6 +1993,7 @@ mod tests {
         ir::Record {
             name: "Ponto".to_owned(),
             usr: "c:@S@Ponto".to_owned(),
+            namespace: String::new(),
             fields: vec![
                 ir::Field {
                     name: "x".to_owned(),

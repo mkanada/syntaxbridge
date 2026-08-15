@@ -1227,6 +1227,10 @@ class _FakeServerClient implements ServerClient {
   }) async => usagesByType[typeUsr] ?? const <TypeUsage>[];
 
   @override
+  Future<List<PointerDeclaration>> listPointers(String projectDir) async =>
+      const [];
+
+  @override
   Future<FunctionCatalogListing> listFunctions(String projectDir) async =>
       FunctionCatalogListing(functions: functions, callerCounts: callerCounts);
 

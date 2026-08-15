@@ -346,6 +346,7 @@ fn a_record_with_an_unsupported_field_type_has_a_throwing_constructor() {
     let record = Record {
         name: "Ponto3D".to_owned(),
         usr: "c:@S@Ponto3D".to_owned(),
+        namespace: String::new(),
         fields: vec![
             Field {
                 name: "x".to_owned(),
@@ -497,5 +498,140 @@ fn a_local_variable_with_an_unsupported_type_bails_out_the_whole_function() {
     assert!(
         source.contains("throw UnimplementedError("),
         "expected the whole function to bail out, got:\n{source}"
+    );
+}
+
+/// `mapping::pointer_options_for` case A10 (`docs/mapping-solver-cases.md`):
+/// `lower::cpp::lower_type` maps a pointer-to-known-record to
+/// `Type::Nullable`, C++'s own guarantee that it's either null or a real
+/// object. But C++ itself never requires a null check to dereference a
+/// pointer (`p->x` compiles either way), so a field/method access or a
+/// field assignment through such a value must be asserted non-null (`!`)
+/// in the emitted Dart — without it, `dart analyze` rejects the access
+/// outright (`unchecked_use_of_nullable_value`), turning a type-safety
+/// improvement into new breakage instead of less.
+#[test]
+fn field_and_method_access_through_a_nullable_pointer_gets_a_non_null_assertion() {
+    use syntax_bridge_server::ir::{Constructor, Method};
+
+    let nota_usr = "c:@S@Nota".to_owned();
+    let nota = Record {
+        name: "Nota".to_owned(),
+        usr: nota_usr.clone(),
+        namespace: String::new(),
+        fields: vec![Field {
+            name: "altura".to_owned(),
+            ty: Type::Int,
+        }],
+        static_fields: Vec::new(),
+        constructors: Vec::new(),
+        methods: Vec::new(),
+        base_class: None,
+        mixins: Vec::new(),
+        destructor: None,
+        origin: origin(2),
+    };
+    let nota_ty = || Type::Record {
+        usr: nota_usr.clone(),
+        name: "Nota".to_owned(),
+    };
+    let this_atual = || Expr::FieldAccess {
+        target: Box::new(Expr::This {
+            ty: Type::Void,
+            origin: origin(5),
+        }),
+        field: "_m_atual".to_owned(),
+        ty: Type::Nullable(Box::new(nota_ty())),
+        origin: origin(5),
+    };
+
+    let editor = Record {
+        name: "Editor".to_owned(),
+        usr: "c:@S@Editor".to_owned(),
+        namespace: String::new(),
+        fields: vec![Field {
+            name: "_m_atual".to_owned(),
+            ty: Type::Nullable(Box::new(nota_ty())),
+        }],
+        static_fields: Vec::new(),
+        constructors: vec![Constructor {
+            usr: "c:@S@Editor@F@Editor#".to_owned(),
+            constructor_index: 0,
+            params: Vec::new(),
+            body: Vec::new(),
+            origin: origin(4),
+        }],
+        methods: vec![
+            // `altura = m_atual->altura;` — a field read through the
+            // pointer, as a plain expression statement.
+            Method {
+                name: "AlturaAtual".to_owned(),
+                usr: "c:@S@Editor@F@AlturaAtual#".to_owned(),
+                params: Vec::new(),
+                return_type: Type::Int,
+                body: Some(vec![Stmt::Return {
+                    value: Some(Expr::FieldAccess {
+                        target: Box::new(this_atual()),
+                        field: "altura".to_owned(),
+                        ty: Type::Int,
+                        origin: origin(6),
+                    }),
+                    origin: origin(6),
+                }]),
+                is_static: false,
+                is_override: false,
+                origin: origin(6),
+            },
+            // `m_atual->altura = valor;` — a field write through the
+            // pointer.
+            Method {
+                name: "DefinirAltura".to_owned(),
+                usr: "c:@S@Editor@F@DefinirAltura#I#".to_owned(),
+                params: vec![Param {
+                    name: "valor".to_owned(),
+                    ty: Type::Int,
+                    default_value: None,
+                }],
+                return_type: Type::Void,
+                body: Some(vec![Stmt::FieldAssign {
+                    target: this_atual(),
+                    field: "altura".to_owned(),
+                    value: Expr::Ref {
+                        name: "valor".to_owned(),
+                        ty: Type::Int,
+                        origin: origin(7),
+                    },
+                    origin: origin(7),
+                }]),
+                is_static: false,
+                is_override: false,
+                origin: origin(7),
+            },
+        ],
+        base_class: None,
+        mixins: Vec::new(),
+        destructor: None,
+        origin: origin(3),
+    };
+
+    let module = Module {
+        records: vec![nota, editor],
+        functions: Vec::new(),
+    };
+
+    let files = emit_module(&module);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert!(
+        source.contains("return _m_atual!.altura;"),
+        "expected a non-null assertion on the field read, got:\n{source}"
+    );
+    assert!(
+        source.contains("_m_atual!.altura = valor;"),
+        "expected a non-null assertion on the field write, got:\n{source}"
+    );
+    assert!(
+        source.contains("Nota? _m_atual"),
+        "expected the field itself to keep its nullable type, got:\n{source}"
     );
 }

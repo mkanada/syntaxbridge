@@ -1,7 +1,7 @@
 id = "E13"
 nome = "Fatia real do Verovio"
 nivel = 13
-status = "esperado-falhar"
-motivo = "fatia real de include/vrv/fraction.h + src/fraction.cpp (Verovio 6.2.0) expoe 6 lacunas nao vistas por nenhum fixture sintetico: inicializacao por construtor direto (Tipo var(args);), static_cast explicito, atribuicao composta (/=), chamada de operador de usuario fora da propria classe, metodo estatico e de instancia com o mesmo nome, e a assinatura exigida por Object.== do Dart - ver NOTES.md"
-constroi = ["degrau-de-realidade", "inicializacao-por-construtor-direto", "static-cast", "atribuicao-composta", "operator-overload-fora-da-classe", "static-e-instancia-mesmo-nome"]
+status = "passa"
+motivo = "golden, dart analyze/format e oraculo comportamental passam - as 6 lacunas reveladas pela fatia real (inicializacao por construtor direto, static_cast, atribuicao composta, operador fora da classe, static+instancia mesmo nome, assinatura de Object.==) mais 3 lacunas adicionais que elas mascaravam (chamada de metodo estatico fora da classe, out-params via int&, std::gcd) foram todas corrigidas - ver NOTES.md"
+constroi = ["degrau-de-realidade", "inicializacao-por-construtor-direto", "static-cast", "atribuicao-composta", "operator-overload-fora-da-classe", "static-e-instancia-mesmo-nome", "chamada-de-metodo-estatico-fora-da-classe", "out-param-bridge", "adaptador-std-gcd"]
 passos = ["US-7", "US-8", "US-9", "US-10"]

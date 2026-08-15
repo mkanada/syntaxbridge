@@ -303,6 +303,12 @@ fn collect_referenced_usrs_in_type<'a>(ty: &'a Type, out: &mut HashSet<&'a str>)
             out.insert(usr.as_str());
         }
         Type::List(element) => collect_referenced_usrs_in_type(element, out),
+        Type::Tuple(elements) => {
+            for element in elements {
+                collect_referenced_usrs_in_type(element, out);
+            }
+        }
+        Type::Nullable(inner) => collect_referenced_usrs_in_type(inner, out),
         Type::Int | Type::Bool | Type::Double | Type::Void | Type::Str | Type::Unsupported(_) => {}
     }
 }
@@ -385,6 +391,12 @@ fn collect_referenced_usrs_in_stmt<'a>(stmt: &'a Stmt, out: &mut HashSet<&'a str
             collect_referenced_usrs_in_stmts(try_body, out);
             collect_referenced_usrs_in_stmts(finally_body, out);
         }
+        Stmt::TupleAssign { targets, value, .. } => {
+            for target in targets {
+                collect_referenced_usrs_in_expr(target, out);
+            }
+            collect_referenced_usrs_in_expr(value, out);
+        }
         Stmt::Unsupported { .. } => {}
     }
 }
@@ -448,6 +460,11 @@ fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str
             collect_referenced_usrs_in_expr(index, out);
         }
         Expr::StringByteLength { target, .. } => collect_referenced_usrs_in_expr(target, out),
+        Expr::Tuple { values, .. } => {
+            for value in values {
+                collect_referenced_usrs_in_expr(value, out);
+            }
+        }
     }
 }
 
@@ -602,7 +619,12 @@ fn emit_record(
 
     for method in &record.methods {
         source.push('\n');
-        source.push_str(&emit_method(method, used_expr_helper, used_utf8_encode));
+        source.push_str(&emit_method(
+            &record.name,
+            method,
+            used_expr_helper,
+            used_utf8_encode,
+        ));
     }
 
     source.push_str("}\n");
@@ -619,11 +641,15 @@ fn emit_record(
 fn scalar_zero_literal(ty: &Type) -> &'static str {
     match ty {
         Type::Bool => "false",
+        // A nullable field's own honest "no value yet" is `null`, not a
+        // fabricated zero of the pointee type.
+        Type::Nullable(_) => "null",
         Type::Int
         | Type::Double
         | Type::Record { .. }
         | Type::Str
         | Type::List(_)
+        | Type::Tuple(_)
         | Type::Void
         | Type::Unsupported(_) => "0",
     }
@@ -664,10 +690,23 @@ fn dart_constructor_name(record_name: &str, constructor_index: usize) -> String 
 }
 
 fn emit_method(
+    record_name: &str,
     method: &Method,
     used_expr_helper: &mut bool,
     used_utf8_encode: &mut bool,
 ) -> String {
+    // Dart requires `operator ==` to override `Object.==` exactly —
+    // `bool operator ==(Object other)`, never the receiver's own C++
+    // parameter type (`dart analyze`: `invalid_override`, confirmed
+    // empirically — E13's sixth finding). `lower::cpp` still lowers the
+    // body faithfully, comparing against a same-type `other` (e.g.
+    // `other._m_denominator`); wrapping it in an `is`-check both satisfies
+    // the signature and lets Dart's own flow analysis promote `other` back
+    // to `record_name` for the wrapped body, unchanged.
+    if method.name == "operator==" {
+        return emit_equality_operator(record_name, method, used_expr_helper, used_utf8_encode);
+    }
+
     let params = format_params(&method.params, used_expr_helper, used_utf8_encode);
     let override_prefix = if method.is_override {
         format!("{INDENT}@override\n")
@@ -697,6 +736,48 @@ fn emit_method(
     let static_keyword = if method.is_static { "static " } else { "" };
     format!(
         "{override_prefix}{INDENT}{static_keyword}{return_type} {name}({params}) {{\n{body}{INDENT}}}\n"
+    )
+}
+
+/// An operator== member always has exactly one parameter in valid C++ — see
+/// `emit_method`'s own doc comment on why this needs different emission
+/// from every other method.
+fn emit_equality_operator(
+    record_name: &str,
+    method: &Method,
+    used_expr_helper: &mut bool,
+    used_utf8_encode: &mut bool,
+) -> String {
+    let override_prefix = if method.is_override {
+        format!("{INDENT}@override\n")
+    } else {
+        String::new()
+    };
+    let Some(body_stmts) = &method.body else {
+        return format!("{override_prefix}{INDENT}bool operator ==(Object other);\n");
+    };
+    let other_name = method
+        .params
+        .first()
+        .map(|param| param.name.as_str())
+        .expect("operator== always has exactly one parameter in valid C++");
+
+    let inner_body = emit_body(
+        &method.params,
+        Some(&method.return_type),
+        body_stmts,
+        &method.origin,
+        used_expr_helper,
+        used_utf8_encode,
+        3,
+    );
+    format!(
+        "{override_prefix}{INDENT}bool operator ==(Object {other_name}) {{\n\
+         {INDENT}{INDENT}if ({other_name} is {record_name}) {{\n\
+         {inner_body}\
+         {INDENT}{INDENT}}}\n\
+         {INDENT}{INDENT}return false;\n\
+         {INDENT}}}\n"
     )
 }
 
@@ -943,6 +1024,10 @@ fn stmt_unsupported_type_spelling(stmt: &Stmt) -> Option<&str> {
             ..
         } => first_unsupported_type_in_list(try_body)
             .or_else(|| first_unsupported_type_in_list(finally_body)),
+        Stmt::TupleAssign { targets, value, .. } => targets
+            .iter()
+            .find_map(expr_unsupported_type_spelling)
+            .or_else(|| expr_unsupported_type_spelling(value)),
         Stmt::Unsupported { .. } => None,
     }
 }
@@ -987,6 +1072,7 @@ fn expr_unsupported_type_spelling(expr: &Expr) -> Option<&str> {
             .or_else(|| expr_unsupported_type_spelling(target))
             .or_else(|| expr_unsupported_type_spelling(index)),
         Expr::StringByteLength { target, .. } => expr_unsupported_type_spelling(target),
+        Expr::Tuple { values, .. } => values.iter().find_map(expr_unsupported_type_spelling),
     }
 }
 
@@ -1038,6 +1124,7 @@ fn first_unsupported_in_stmt(stmt: &Stmt) -> Option<&Stmt> {
         | Stmt::Assign { .. }
         | Stmt::FieldAssign { .. }
         | Stmt::ExprStmt { .. }
+        | Stmt::TupleAssign { .. }
         | Stmt::Throw { .. } => None,
     }
 }
@@ -1051,6 +1138,23 @@ fn emit_type(ty: &Type) -> String {
         Type::Record { name, .. } => name.clone(),
         Type::Str => "String".to_owned(),
         Type::List(element) => format!("List<{}>", emit_type(element)),
+        // A single-element Dart record needs a trailing comma
+        // (`(int,)`) to disambiguate it from a plain parenthesized
+        // expression — `lower::cpp`'s out-param bridge (`Type::Tuple`)
+        // can produce exactly one element when a function has only one
+        // by-reference out-param.
+        Type::Tuple(elements) if elements.len() == 1 => {
+            format!("({},)", emit_type(&elements[0]))
+        }
+        Type::Tuple(elements) => format!(
+            "({})",
+            elements
+                .iter()
+                .map(emit_type)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Type::Nullable(inner) => format!("{}?", emit_type(inner)),
         Type::Unsupported(spelling) => format!("dynamic /* unsupported: {spelling} */"),
     }
 }
@@ -1105,8 +1209,9 @@ fn emit_stmt(
                 )
             }
             _ => format!(
-                "{pad}{}.{field} = {};\n",
+                "{pad}{}{}.{field} = {};\n",
                 emit_expr(target, used_expr_helper, used_utf8_encode),
+                receiver_bang(target),
                 emit_expr(value, used_expr_helper, used_utf8_encode)
             ),
         },
@@ -1259,6 +1364,28 @@ fn emit_stmt(
             source.push_str(&format!("{pad}}}\n"));
             source
         }
+        Stmt::TupleAssign { targets, value, .. } => {
+            // A single-element Dart record pattern needs a trailing comma
+            // (`(a,) = expr;`) — see `emit_type`'s own `Type::Tuple` arm for
+            // why: without it, `(a)` parses as a parenthesized expression,
+            // not a destructuring assignment target.
+            let targets_text = if targets.len() == 1 {
+                format!(
+                    "{},",
+                    emit_expr(&targets[0], used_expr_helper, used_utf8_encode)
+                )
+            } else {
+                targets
+                    .iter()
+                    .map(|target| emit_expr(target, used_expr_helper, used_utf8_encode))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            format!(
+                "{pad}({targets_text}) = {};\n",
+                emit_expr(value, used_expr_helper, used_utf8_encode)
+            )
+        }
         Stmt::Unsupported { reason, origin } => format!(
             "{pad}// TODO(syntax-bridge): {reason}\n{pad}throw UnimplementedError({message});\n",
             message = dart_string_literal(&unsupported_message(reason, origin)),
@@ -1314,6 +1441,55 @@ fn emit_for_clause(
     }
 }
 
+/// `expr`'s own static type, where it carries one directly — `None` for a
+/// shape whose type is implied elsewhere (a literal, a construct/call
+/// naming its own type by `type_name`, `Tuple`, `Unsupported`) rather than
+/// stored as an `ir::Type` on the node. Used by `receiver_bang` to decide
+/// whether a receiver needs Dart's `!` — every one of those "no type"
+/// shapes is also never `Type::Nullable` (a construct call always yields a
+/// real value, a literal is never a pointer), so `None` is exactly "not
+/// nullable, no `!` needed" for that purpose without needing its own case.
+fn expr_ty(expr: &Expr) -> Option<&Type> {
+    match expr {
+        Expr::Ref { ty, .. }
+        | Expr::Binary { ty, .. }
+        | Expr::Unary { ty, .. }
+        | Expr::Convert { ty, .. }
+        | Expr::Call { ty, .. }
+        | Expr::FieldAccess { ty, .. }
+        | Expr::This { ty, .. }
+        | Expr::Index { ty, .. } => Some(ty),
+        Expr::IntLiteral { .. }
+        | Expr::DoubleLiteral { .. }
+        | Expr::BoolLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::RecordConstruct { .. }
+        | Expr::ConstructorCall { .. }
+        | Expr::StringByteLength { .. }
+        | Expr::Tuple { .. }
+        | Expr::Unsupported { .. } => None,
+    }
+}
+
+/// `"!"` when `receiver`'s own static type is `Type::Nullable` (E10/E13's
+/// pointer solver, `mapping::pointer_options_for` case A10 —
+/// `docs/mapping-solver-cases.md`), `""` otherwise. C++ itself never
+/// requires (or even offers) a null check to dereference a pointer — `p->x`
+/// compiles whether or not `p` was actually null, undefined behavior at
+/// worst — so a lowered `T*` field/call/index receiver is asserted
+/// non-null here rather than propagating Dart's null-safety requirement
+/// into a check `lower::cpp` has no C++ source construct to derive: the
+/// same "trust the source, surface a real crash instead of silently
+/// corrupting state" trade-off C++ itself already made for every one of
+/// these call sites.
+fn receiver_bang(receiver: &Expr) -> &'static str {
+    if matches!(expr_ty(receiver), Some(Type::Nullable(_))) {
+        "!"
+    } else {
+        ""
+    }
+}
+
 fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bool) -> String {
     match expr {
         Expr::IntLiteral { value, .. } => value.to_string(),
@@ -1364,16 +1540,18 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
             match target.as_deref() {
                 None | Some(Expr::This { .. }) => format!("{callee_name}({args_text})"),
                 Some(receiver) => format!(
-                    "{}.{callee_name}({args_text})",
-                    emit_expr(receiver, used_expr_helper, used_utf8_encode)
+                    "{}{}.{callee_name}({args_text})",
+                    emit_expr(receiver, used_expr_helper, used_utf8_encode),
+                    receiver_bang(receiver)
                 ),
             }
         }
         Expr::FieldAccess { target, field, .. } => match target.as_ref() {
             Expr::This { .. } => field.clone(),
             _ => format!(
-                "{}.{field}",
-                emit_expr(target, used_expr_helper, used_utf8_encode)
+                "{}{}.{field}",
+                emit_expr(target, used_expr_helper, used_utf8_encode),
+                receiver_bang(target)
             ),
         },
         Expr::RecordConstruct {
@@ -1409,8 +1587,9 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
         // (`this` outside a method) rather than panicking the emitter.
         Expr::This { .. } => "this".to_owned(),
         Expr::Index { target, index, .. } => format!(
-            "{}[{}]",
+            "{}{}[{}]",
             emit_expr(target, used_expr_helper, used_utf8_encode),
+            receiver_bang(target),
             emit_expr(index, used_expr_helper, used_utf8_encode)
         ),
         Expr::StringByteLength { target, .. } => {
@@ -1420,6 +1599,22 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
                 emit_expr(target, used_expr_helper, used_utf8_encode)
             )
         }
+        // A single-element Dart record needs a trailing comma
+        // (`(a,)`) — see `emit_type`'s own `Type::Tuple` arm.
+        Expr::Tuple { values, .. } if values.len() == 1 => {
+            format!(
+                "({},)",
+                emit_expr(&values[0], used_expr_helper, used_utf8_encode)
+            )
+        }
+        Expr::Tuple { values, .. } => format!(
+            "({})",
+            values
+                .iter()
+                .map(|value| emit_expr(value, used_expr_helper, used_utf8_encode))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Expr::Unsupported { reason, origin } => {
             *used_expr_helper = true;
             format!(

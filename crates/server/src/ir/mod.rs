@@ -63,6 +63,30 @@ pub enum Type {
     /// so a future degrau that needs `vector<double>`/`vector<Record>`
     /// doesn't have to revisit this variant's shape.
     List(Box<Type>),
+    /// A Dart record type synthesized as a bridge for C++'s "out parameter"
+    /// idiom (`void f(int &a, int &b)`) — E10 flagged the idea and
+    /// deliberately didn't build it ("nenhum fixture força essa
+    /// complexidade ainda"); E13's `Fraction::Reduce(int&, int&)` does.
+    /// Never produced from a C++ type directly (Dart has no reference types
+    /// to represent otherwise) — only synthesized by `lower::cpp`'s own
+    /// out-param bridge as the new return type of a `void`-returning
+    /// function/method that has at least one non-`const` scalar reference
+    /// parameter, one slot per such parameter, in parameter order.
+    Tuple(Vec<Type>),
+    /// `T*` where `T` is itself a type this IR already represents
+    /// (`Record`/`Str`/`List`) — `mapping::pointer_options_for`'s
+    /// `"referencia-anulavel"` case (`docs/mapping-solver-cases.md` A10):
+    /// C++'s static type system already guarantees such a pointer, whatever
+    /// it holds at runtime, is always either null or an object whose
+    /// dynamic type is `T` or one of `T`'s subtypes — a finite, statically
+    /// known set, the same guarantee Dart's own single-reference
+    /// polymorphism already relies on. Maps directly to Dart's `T?`.
+    /// `lower::cpp::lower_type` only ever produces this for a pointee it
+    /// can itself represent; a pointer to anything else (`void`, a scalar,
+    /// or an already-`Unsupported` pointee) stays `Type::Unsupported` —
+    /// `mapping::pointer_options_for`'s `"ponte-dart-ffi"` case — since
+    /// nothing rules out array/pointer-arithmetic use for those.
+    Nullable(Box<Type>),
     /// A C++ type the lowering doesn't represent yet, carrying its spelling
     /// (e.g. `"float"`) so the reason is legible instead of silently
     /// dropped.
@@ -244,6 +268,14 @@ pub enum Expr {
         target: Box<Expr>,
         origin: Origin,
     },
+    /// `(a, b)` — a Dart record value. Only ever synthesized by
+    /// `lower::cpp`'s out-param bridge (see `Type::Tuple`), as the trailing
+    /// return value of a bridged function/method's body — never lowered
+    /// from a C++ cursor directly.
+    Tuple {
+        values: Vec<Expr>,
+        origin: Origin,
+    },
     Unsupported {
         reason: String,
         origin: Origin,
@@ -268,6 +300,7 @@ impl Expr {
             | Self::This { origin, .. }
             | Self::Index { origin, .. }
             | Self::StringByteLength { origin, .. }
+            | Self::Tuple { origin, .. }
             | Self::Unsupported { origin, .. } => origin,
         }
     }
@@ -359,6 +392,17 @@ pub enum Stmt {
         finally_body: Vec<Stmt>,
         origin: Origin,
     },
+    /// `(a, b) = f(...);` — Dart's record-destructuring assignment. Only
+    /// ever synthesized by `lower::cpp`'s out-param bridge (see
+    /// `Type::Tuple`) at a call site whose callee was itself bridged:
+    /// `value` is the (now tuple-typed) call, `targets` the original
+    /// by-reference argument expressions, each receiving its matching
+    /// tuple slot back, in order.
+    TupleAssign {
+        targets: Vec<Expr>,
+        value: Expr,
+        origin: Origin,
+    },
     Unsupported {
         reason: String,
         origin: Origin,
@@ -379,6 +423,7 @@ impl Stmt {
             | Self::Throw { origin, .. }
             | Self::TryCatch { origin, .. }
             | Self::TryFinally { origin, .. }
+            | Self::TupleAssign { origin, .. }
             | Self::Unsupported { origin, .. } => origin,
         }
     }
@@ -478,6 +523,16 @@ pub struct Record {
     /// key between the type catalog and this IR, and what `Type::Record`
     /// points back to.
     pub usr: String,
+    /// The chain of enclosing C++ namespaces, joined by `::` — empty when
+    /// the record isn't namespaced. Captured for
+    /// `function_catalog::apply_record_name_disambiguation` (two distinct
+    /// records with the same bare `name` in different namespaces collide as
+    /// the same Dart class otherwise — a real occurrence in the Verovio 6.2.0
+    /// corpus, `docs/plans/diagnostico-verovio-6.2.0.md` achado 2): a
+    /// namespace-qualified rename only kicks in for a record whose bare name
+    /// actually collides with another's, so this field costs nothing for the
+    /// overwhelming majority of records that never do.
+    pub namespace: String,
     /// In declaration order — field order is part of the type's identity
     /// for `RecordConstruct`'s positional-constructor emission.
     pub fields: Vec<Field>,

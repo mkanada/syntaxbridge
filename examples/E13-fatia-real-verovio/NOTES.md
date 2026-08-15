@@ -9,11 +9,17 @@ fixture inventado. `input/src/uso.cpp` é a única parte escrita para este
 degrau — funções livres `testarX()` que exercitam a classe extraída, no
 mesmo papel que os `testarX()` de todo fixture E01–E12.
 
-**Resultado: `esperado-falhar`, e é o resultado certo.** Seis lacunas reais
-apareceram, nenhuma delas hipotética — nenhuma tinha sido vista por um
-fixture sintético em doze degraus. É exatamente o argumento do próprio plano
-(`conversao-guiada-por-exemplos.md` §6): "um degrau de realidade que falha
-vale mais do que três degraus sintéticos que passam".
+**Resultado original: `esperado-falhar`, e foi o resultado certo naquele
+momento.** Seis lacunas reais apareceram, nenhuma delas hipotética —
+nenhuma tinha sido vista por um fixture sintético em doze degraus. É
+exatamente o argumento do próprio plano (`conversao-guiada-por-exemplos.md`
+§6): "um degrau de realidade que falha vale mais do que três degraus
+sintéticos que passam".
+
+**Resultado atual: `passa`.** As seis lacunas foram corrigidas — e, ao
+corrigi-las, mais três lacunas que elas mascaravam ficaram visíveis pela
+primeira vez e também foram corrigidas. Ver "Resolução" no fim deste
+arquivo para os nove achados e a correção de cada um.
 
 ## O que foi extraído, e o que foi deliberadamente cortado
 
@@ -124,33 +130,133 @@ sem trazer o resto do subsistema de log do Verovio.
    ponte hardcoded para `Expr::Binary`, nunca passando pela emissão de
    método de classe).
 
-## Por que nenhum destes seis foi corrigido aqui
+## O que isso provou sobre o resto da escada, na primeira rodada
 
-Cada achado é, por si, do tamanho de um degrau próprio — não um ajuste de
-fixture. "Não implemente em largura": a extensão pertence a graus futuros
-dedicados (inicialização por construtor direto provavelmente generaliza o
-mesmo VarDecl parsing usado desde o E01; `static_cast`/atribuição composta
-são extensões pontuais e independentes de `lower_expr`/`lower_stmt`;
-operador-fora-da-classe e estático-vs-instância-mesmo-nome tocam
-`lower_method_call`/`apply_overload_renames`, ambos já delicados o
-suficiente para merecer atenção isolada; e a assinatura de `operator==`
-é uma decisão de *emissão*, não de *lowering*, que quando resolvida
-provavelmente generaliza para qualquer operador binário definido pelo
-usuário, não só `==`). Resolver os seis juntos, sem um fixture dedicado a
-cada um, é exatamente o tipo de mudança em largura que o método deste
-projeto pede para evitar.
-
-## O que isso prova sobre o resto da escada
-
-Nada do que já passa (E01–E12) foi contradito por este degrau — os doze
-continuam verdes depois de rodar E13 (nenhuma mudança de código foi feita
-para chegar a este resultado, só o fixture novo). O que E13 prova é mais
+Nada do que já passava (E01–E12) foi contradito por este degrau na sua
+primeira rodada — os doze continuaram verdes depois de rodar E13 pela
+primeira vez (nenhuma mudança de código foi feita para chegar àquele
+resultado, só o fixture novo). O que E13 provou naquele momento foi mais
 estreito e mais honesto: dentro do que os doze degraus decidiram cobrir
 (aritmética, controle de fluxo, classes com encapsulamento, herança,
 sobrecarga, templates de função, biblioteca padrão limitada, multi-TU,
-exceções/RAII), a tradução funciona também fora do laboratório — a classe
-inteira, exceto pelos seis pontos acima, teria traduzido corretamente. A
+exceções/RAII), a tradução funcionava também fora do laboratório — a classe
+inteira, exceto pelos seis pontos acima, já traduzia corretamente. A
 armadilha do degrau ("descobrir que valia só no laboratório") não se
 confirmou por inteiro; confirmou-se parcialmente, e de forma mensurável:
 seis lacunas específicas, cada uma nomeável, nenhuma delas um sinal de que
-o que já foi construído esteja errado.
+o que já tinha sido construído estivesse errado.
+
+## Resolução
+
+Os seis achados foram corrigidos numa sessão dedicada a fechar E13 (não
+"em largura" por acidente — cada um já era, como a seção anterior registra,
+do tamanho de um degrau próprio; foram tratados um a um, com os doze
+degraus anteriores continuamente verdes a cada passo, exatamente a
+disciplina que "não implemente em largura" pede, só que sem um PR por
+achado):
+
+1. **Inicialização por construtor direto.** Não era o `VarDecl` reportando
+   dois filhos de construtor — era um `NamespaceRef` (o `vrv::` de
+   `vrv::Fraction`) contado como candidato a inicializador junto do
+   `CallExpr` real. `lower::cpp::lower_decl_stmt` já filtrava `TypeRef`;
+   passou a filtrar `NamespaceRef` também, e o único filho restante (o
+   `CallExpr`) já caía no caminho existente de um só filho. Achado bem mais
+   simples do que a hipótese original ("`libclang` entrega dois filhos em
+   formato de inicializador") sugeria — nenhum novo caminho de construção
+   foi necessário.
+2. **`static_cast` explícito.** `CXXStaticCastExpr`/`CStyleCastExpr`
+   entraram no mesmo conjunto de "wrappers transparentes" que já tratava
+   conversão implícita (`is_transparent_wrapper`) — a lógica de comparar
+   tipo externo/interno e emitir `Expr::Convert` quando promovem `int` para
+   `double` já existia; só faltava reconhecer os dois cursor kinds do cast
+   explícito.
+3. **Atribuição composta.** `CompoundAssignOperator` ganhou
+   `lower::cpp::lower_compound_assign_stmt`, que desaçucara para
+   `alvo = alvo op valor` (a própria definição de `x op= y` em C++),
+   reaproveitando os dois formatos de alvo (`Stmt::Assign`/`FieldAssign`)
+   que a atribuição simples já tinha.
+4. **Chamada de operador fora da classe.** `a == b` é um
+   `CXXOperatorCallExpr` cujo receptor não vem como `MemberRefExpr` — vem
+   como o primeiro *argumento* da chamada (`clang_Cursor_getArgument(0)`),
+   confirmando a hipótese que `lower_method_call` já registrava.
+   `lower_method_call` passou a reconhecer as duas formas. Separadamente,
+   `lower::cpp::lower_record_operator_call` passou a traduzir uma chamada
+   desse tipo direto para `Expr::Binary` quando o operador está no
+   subconjunto que Dart também sobrecarrega (`+`, `-`, `*`, `==`, ...) — sem
+   isso, o resultado seria `a.operator+(b)`, sintaxe inválida em Dart
+   (confirmado com `dart analyze`: `undefined_getter` em `operator`).
+5. **Método estático e de instância com o mesmo nome.** `FunctionDeclaration`
+   ganhou `is_static`; `mapping::overload_options_for` passou a checar,
+   antes da regra de aridade (que tratava isso, errado, como "parâmetro
+   opcional"), se um grupo mistura declarações estáticas e de instância —
+   se sim, força renomeação (`"renomear-estatico-instancia"`).
+   `function_catalog::apply_overload_renames` renomeia só a(s) declaração(ões)
+   estática(s) (`NomeStatic`), já que o esquema de sufixo por tipo de
+   `dart_overload_name` não distingue nada quando um dos dois lados não tem
+   parâmetro nenhum.
+6. **Assinatura de `operator==`.** `emit::dart::emit_method` passou a
+   reconhecer `operator==` como caso especial
+   (`emit_equality_operator`): parâmetro sempre `Object`, corpo envolto em
+   `if (other is NomeDaClasse) { <corpo original> } return false;` — o
+   `is`-check promove `other` para o corpo original usar exatamente como
+   `lower::cpp` já tinha gerado.
+
+Corrigir os seis revelou **três lacunas adicionais**, nenhuma delas visível
+antes porque cada uma dependia de passar por um dos seis primeiros:
+
+7. **Chamada de método estático de fora da classe.**
+   `vrv::Fraction::Reduce(a, b)` sempre caiu em
+   `lower_method_call`, que exigia um receptor — e um método estático não
+   tem um. `lower_call_expr` passou a desviar uma chamada a método estático
+   para `lower_static_method_call`, nova função que trata a chamada como a
+   de uma função livre (mesma forma de argumentos que `libclang` já usa
+   para essa chamada), com o `target` sintético sendo uma `Expr::Ref` cujo
+   nome é a própria classe — que `emit::dart` já imprime como
+   `NomeDaClasse.metodo(args)`, a sintaxe Dart de chamada estática, de
+   graça.
+8. **Parâmetros de saída (`int&`).** `Reduce(int &numerador, int
+   &denominador)` só apareceu depois do achado 7 estar corrigido — antes,
+   a chamada nem chegava a ser emitida. `lower_type` sempre descartou
+   referência (correto para `const T&`, usado como otimização de
+   passagem), mas fazia o mesmo para uma referência **não-const**, que em
+   C++ é o idioma de "parâmetro de saída": a mutação dentro da função nunca
+   voltava para quem chamou, silenciosamente. Era exatamente a lacuna que
+   `examples/E10-ponteiros-union-out-params/NOTES.md` tinha identificado e
+   decidido não construir ("nenhum fixture força essa complexidade
+   ainda") — E13 força. Resolvido com uma ponte genuína: `ir::Type::Tuple`/
+   `Expr::Tuple`/`Stmt::TupleAssign` (records nativos do Dart 3),
+   `lower::cpp::apply_out_param_bridge` reescreve toda função/método `void`
+   com parâmetro de referência não-const para devolver uma tupla dos
+   valores finais, e o call site (`lower_stmt`) rescreve a chamada como
+   `(numerador, denominador) = Fraction.ReduceStatic(numerador,
+   denominador);` — a mesma forma de atribuição por padrão que Dart usa
+   para desestruturar um record.
+9. **`std::gcd`.** Só ficou visível depois do achado 3 (atribuição
+   composta) parar de derrubar `Reduce()` inteiro. Dart não tem `gcd` em
+   nenhuma biblioteca padrão top-level, mas `int` já tem o método nativo
+   (`a.gcd(b)`, confirmado com `dart analyze`/`dart run`) — bastou
+   reconhecer `std::gcd(a, b)` (`lower::cpp::lower_stdlib_free_function_call`,
+   ao lado de `lower_stdlib_operator_call`) e traduzir para uma chamada de
+   método no primeiro argumento, sem precisar de nenhum helper novo no
+   pacote gerado.
+
+Um décimo problema — não uma lacuna de tradução, mas do próprio fixture:
+`uso.cpp` nunca teve um `uso.hpp` declarando seus `testarX()`, o único
+arquivo do corpus sem esse header. Invisível enquanto o oráculo nunca era
+alcançado (os nove achados acima bloqueavam antes); `uso.hpp` foi
+adicionado seguindo a mesma convenção de todo outro degrau.
+
+## O que isso prova sobre o resto da escada
+
+Os doze degraus anteriores continuam verdes depois de todas as correções
+acima — nenhuma delas exigiu tocar um fixture já fechado, só generalizar,
+de forma honesta, uma regra que já existia (ou reconhecer uma forma de
+cursor que `libclang` já produzia e que este módulo ainda não sabia ler).
+A classe `Fraction` inteira, extraída sem modificação do Verovio 6.2.0,
+agora traduz para Dart corretamente — golden, `dart analyze`/`format`, e
+o oráculo comportamental (C++ real vs. Dart transpilado) concordam em
+todos os seis casos de `oracle/cases.json`. A armadilha do degrau
+("descobrir que valia só no laboratório") não se confirmou: o que doze
+degraus sintéticos construíram generalizou para código real, com nove
+extensões pontuais e nomeáveis — nenhuma reescrita, nenhum caso especial
+por fixture.

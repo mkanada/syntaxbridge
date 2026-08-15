@@ -365,6 +365,109 @@ class TypeCatalogListing {
   final Map<String, int> usageCounts;
 }
 
+/// Mirrors `PointerDeclarationKind` in `crates/server/src/pointer_catalog.rs`:
+/// where a declared pointer sits in the source.
+enum PointerDeclarationKind {
+  parameter,
+  field,
+  local,
+  returnType;
+
+  static PointerDeclarationKind fromJson(String? value) {
+    return switch (value) {
+      'parameter' => PointerDeclarationKind.parameter,
+      'field' => PointerDeclarationKind.field,
+      'local' => PointerDeclarationKind.local,
+      'return_type' => PointerDeclarationKind.returnType,
+      _ => PointerDeclarationKind.parameter,
+    };
+  }
+
+  /// Short label shown next to a pointer's name in the catalog.
+  String get label {
+    return switch (this) {
+      PointerDeclarationKind.parameter => 'parameter',
+      PointerDeclarationKind.field => 'field',
+      PointerDeclarationKind.local => 'local',
+      PointerDeclarationKind.returnType => 'return type',
+    };
+  }
+}
+
+/// Mirrors `PointerShape` in `crates/server/src/pointer_catalog.rs`: what a
+/// pointer points at, one level down.
+enum PointerShape {
+  scalar,
+  doublePointer,
+  functionPointer;
+
+  static PointerShape fromJson(String? value) {
+    return switch (value) {
+      'scalar' => PointerShape.scalar,
+      'double_pointer' => PointerShape.doublePointer,
+      'function_pointer' => PointerShape.functionPointer,
+      _ => PointerShape.scalar,
+    };
+  }
+
+  /// Short label shown next to a pointer's pointee type in the catalog.
+  String get label {
+    return switch (this) {
+      PointerShape.scalar => 'T*',
+      PointerShape.doublePointer => 'T**',
+      PointerShape.functionPointer => 'function pointer',
+    };
+  }
+}
+
+/// One raw C++ pointer declared in the project (Parte 1 of
+/// `docs/plans/catalogo-de-ponteiros-e-solver-tfa.md`). Mirrors
+/// `PointerDeclaration` in `crates/server/src/pointer_catalog.rs`.
+class PointerDeclaration {
+  const PointerDeclaration({
+    required this.kind,
+    required this.shape,
+    this.name = '',
+    this.pointeeTypeName = '',
+    this.pointeeUsr = '',
+    required this.file,
+    required this.line,
+    required this.column,
+    this.usr = '',
+  });
+
+  factory PointerDeclaration.fromJson(Map<String, Object?> json) {
+    return PointerDeclaration(
+      kind: PointerDeclarationKind.fromJson(json['kind'] as String?),
+      shape: PointerShape.fromJson(json['shape'] as String?),
+      name: json['name'] as String? ?? '',
+      pointeeTypeName: json['pointee_type_name'] as String? ?? '',
+      pointeeUsr: json['pointee_usr'] as String? ?? '',
+      file: json['file'] as String? ?? '',
+      line: json['line'] as int? ?? 0,
+      column: json['column'] as int? ?? 0,
+      usr: json['usr'] as String? ?? '',
+    );
+  }
+
+  final PointerDeclarationKind kind;
+  final PointerShape shape;
+
+  /// For [PointerDeclarationKind.returnType], this is the *function's* own
+  /// name — the pointer itself has none.
+  final String name;
+  final String pointeeTypeName;
+
+  /// The pointee's own `usr` ([TypeDeclaration.usr]) when it's a named type
+  /// the project's own type catalog already tracks; empty for `void`, a
+  /// scalar, or a function type.
+  final String pointeeUsr;
+  final String file;
+  final int line;
+  final int column;
+  final String usr;
+}
+
 /// Mirrors `FunctionDeclarationKind` in
 /// `crates/server/src/function_catalog.rs`.
 enum FunctionDeclarationKind {

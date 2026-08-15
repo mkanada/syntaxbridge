@@ -158,6 +158,7 @@ fn app(global_db_path: PathBuf) -> Router {
         .route("/projects/source-file", get(read_source_file_from_http))
         .route("/projects/types", get(list_types_from_http))
         .route("/projects/types/usages", get(list_type_usages_from_http))
+        .route("/projects/pointers", get(list_pointers_from_http))
         .route("/projects/functions", get(list_functions_from_http))
         .route("/projects/functions/callers", get(list_callers_from_http))
         .route(
@@ -269,6 +270,8 @@ async fn poll_project_creation_job_from_http(
             let source_catalog_total = job.progress.source_catalog.total();
             let function_catalog_completed = job.progress.function_catalog.completed();
             let function_catalog_total = job.progress.function_catalog.total();
+            let pointer_catalog_completed = job.progress.pointer_catalog.completed();
+            let pointer_catalog_total = job.progress.pointer_catalog.total();
             let phase = crate::jobs::derive_phase(
                 type_catalog_completed,
                 type_catalog_total,
@@ -276,6 +279,8 @@ async fn poll_project_creation_job_from_http(
                 source_catalog_total,
                 function_catalog_completed,
                 function_catalog_total,
+                pointer_catalog_completed,
+                pointer_catalog_total,
             );
             // Cancellation was requested but the background thread hasn't
             // reported a terminal outcome yet — distinct from `"cancelled"`
@@ -304,6 +309,10 @@ async fn poll_project_creation_job_from_http(
                     "function_catalog": {
                         "completed": function_catalog_completed,
                         "total": function_catalog_total,
+                    },
+                    "pointer_catalog": {
+                        "completed": pointer_catalog_completed,
+                        "total": pointer_catalog_total,
                     },
                 }),
             )
@@ -341,6 +350,7 @@ fn phase_str(phase: JobPhase) -> &'static str {
         JobPhase::CatalogingTypes => "cataloging_types",
         JobPhase::DiscoveringSourceFiles => "discovering_source_files",
         JobPhase::CatalogingFunctions => "cataloging_functions",
+        JobPhase::CatalogingPointers => "cataloging_pointers",
         JobPhase::Persisting => "persisting",
     }
 }
@@ -555,6 +565,30 @@ async fn list_types_from_http(Query(query): Query<ProjectDirQuery>) -> Response 
             json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!({"error":"list_types_failed","message":error.to_string()}),
+            )
+        }
+    }
+}
+
+/// Serves the pointer catalog already persisted for a project (Parte 1 of
+/// `docs/plans/catalogo-de-ponteiros-e-solver-tfa.md`), without reparsing —
+/// mirrors `list_types_from_http`.
+async fn list_pointers_from_http(Query(query): Query<ProjectDirQuery>) -> Response {
+    log_server(format_args!(
+        "listing pointers: project_dir={}",
+        query.project_dir.display()
+    ));
+
+    match tokio::task::spawn_blocking(move || project_service::list_pointers(&query.project_dir))
+        .await
+    {
+        Ok(Ok(pointers)) => json_response(StatusCode::OK, json!({ "pointers": pointers })),
+        Ok(Err(error)) => list_types_error_response(error),
+        Err(error) => {
+            log_server(format_args!("list pointers task failed: {error}"));
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":"list_pointers_failed","message":error.to_string()}),
             )
         }
     }

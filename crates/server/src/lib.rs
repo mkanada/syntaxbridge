@@ -6,6 +6,7 @@ pub mod jobs;
 pub mod lower;
 pub mod mapping;
 pub mod persistence;
+pub mod pointer_catalog;
 pub mod progress;
 pub mod project_service;
 pub mod server;

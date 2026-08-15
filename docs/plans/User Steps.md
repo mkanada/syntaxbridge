@@ -1888,7 +1888,18 @@ honesto para E01–E07 porque todo tipo evolvido até aqui só tem uma opção
 possível (nada a decidir), mas significa que o critério "tipo sem decisão
 produz falha explícita" não está de fato conectado ponta a ponta para
 *tipos* — só valeria a pena resolver quando um tipo tiver mais de uma opção
-de verdade · **Depende de:** US-4, US-5
+de verdade. **Catálogo de ponteiros:** `crates/server/src/pointer_catalog.rs`
+extrai, com `libclang`, todo ponteiro bruto declarado no projeto (parâmetro,
+campo, variável local, retorno de função — `PointerDeclarationKind`), sua
+forma (`PointerShape`: `Scalar`/`DoublePointer`/`FunctionPointer`) e, quando o
+apontado é um tipo que `type_catalog` já conhece, o `usr` desse tipo —
+persistido em `pointer_declarations` e servido por `GET /projects/pointers`,
+mesmo nível de US-2/US-3. Ainda **não é consumido** por
+`mapping::pointer_options_for`/`possible_pointee_types`, que continuam sobre a
+varredura textual (`signature.contains('*')`) e a enumeração por hierarquia de
+classes (CHA) descritas abaixo — ver
+`docs/plans/catalogo-de-ponteiros-e-solver-tfa.md`, Parte 2 · **Depende de:**
+US-4, US-5
 
 ### Objetivo do usuário
 
@@ -1954,6 +1965,19 @@ que permitam prosseguir na conversão.
   persistidas com identidade estável de tipo (ver US-3) para sobreviver a US-12.
 - **Ordem de decisão importa:** decidir tipos folha antes de tipos que dependem
   deles reduz retrabalho; o grafo de US-3 já dá essa ordem.
+- **Decisão registrada: o solver de ponteiros evolui de CHA para TFA/DFA.**
+  `possible_pointee_types` hoje é class-hierarchy analysis (CHA): sobe a
+  hierarquia do tipo apontado e enumera toda subclasse alcançável, sound mas
+  superestimado sempre que a hierarquia é maior que os usos reais, porque não
+  olha se algum código de fato atribui aquela subclasse a aquele ponteiro. A
+  direção decidida é aproximar de uma análise de fluxo de tipos (type-flow
+  analysis, no espírito de RTA/points-to), usando o grafo caller/callee que
+  `function_catalog::CallEdge`/`CallResolution` já expõe (`is_dynamic_dispatch`
+  para despacho virtual, `Unresolved` para chamada por ponteiro de função) como
+  substrato interprocedural, e os sites de atribuição do catálogo de ponteiros
+  acima como substrato intraprocedural. Plano completo, com o corpus de teste a
+  construir (`mapping-solver-fixtures/`, categoria B) e a regra de nunca
+  under-approximate: `docs/plans/catalogo-de-ponteiros-e-solver-tfa.md`.
 - **Código ponte: papel decidido (Q9), forma ainda em aberto.** O papel ficou
   definido pela resposta de Q9: código ponte é o que garante que o conjunto de
   opções de um tipo nunca seja vazio — quando nenhum mapeamento direto é viável,
@@ -2204,10 +2228,11 @@ passagem de RAII só cobre o primeiro guard de nível superior de uma função
 livre — nem guard aninhado em `if`/`while`/`for`, nem guard dentro de
 método/construtor, nem uma segunda local RAII na mesma função (que exigiria
 `try`/`finally` aninhados) — nenhum fixture força nenhum dos dois ainda,
-lacunas documentadas, não silenciosas. O E13 ("degrau de realidade" — uma
+lacunas documentadas, não silenciosas. **O E13** ("degrau de realidade" — uma
 fatia de `include/vrv/fraction.h`/`src/fraction.cpp` do Verovio 6.2.0,
 extraída e não escrita para o produto, `examples/E13-fatia-real-verovio/
-NOTES.md`) fica **`esperado-falhar`**, e de propósito: seis lacunas reais
+NOTES.md`) **fica `passa`**, depois de uma primeira rodada em que ficou
+`esperado-falhar` de propósito: seis lacunas reais
 apareceram, nenhuma vista por nenhum fixture sintético em doze degraus —
 inicialização por construtor direto (`Tipo var(args);`, em vez da forma por
 cópia que E01–E12 sempre usaram), `static_cast<T>` explícito (só a promoção
@@ -2221,11 +2246,20 @@ de instância com o mesmo nome (válido em C++ por assinatura, proibido em
 Dart — `conflicting_static_and_instance`), e a assinatura fixa que Dart
 exige de `operator==` (`Object`, não o tipo do próprio usuário —
 `invalid_override`, mesmo com o método corretamente lowered e emitido).
-Nenhum dos seis foi corrigido neste degrau — cada um é do tamanho de um
-degrau futuro próprio, não um ajuste de fixture, e "não implemente em
-largura" pede que fiquem documentados, não resolvidos às pressas juntos. Os
-doze degraus anteriores continuam verdes sem nenhuma mudança de código para
-chegar a esse resultado — só o fixture novo. No
+Cada um foi corrigido depois, um a um, com os doze degraus anteriores
+continuamente verdes a cada passo — e corrigi-los revelou mais três lacunas
+que eles mascaravam: chamada de método estático de fora da classe (nunca
+tentada antes: nenhum fixture chamava um método estático de fora de sua
+classe antes do E13), parâmetro de saída via referência não-`const`
+(`int&`, o idioma de "out param" que `examples/E10-ponteiros-union-out-
+params/NOTES.md` tinha identificado e decidido não construir — resolvido
+com uma ponte genuína via `ir::Type::Tuple`/`Expr::Tuple`/`Stmt::TupleAssign`,
+records nativos do Dart 3: a função vira `(T, T) f(...)` e o call site vira
+`(a, b) = Classe.f(a, b);`), e `std::gcd` (sem equivalente top-level em
+Dart, mas `int` já tem o método nativo `.gcd()`). Ver "Resolução" em
+`examples/E13-fatia-real-verovio/NOTES.md` para os nove achados e a
+correção de cada um. Os doze degraus anteriores continuam verdes depois de
+todas as correções. No
 cliente, `client/flutter/lib/src/ui/dart_output_view.dart`
 (painel "Dart Output" em `server_status_page.dart`, acionado pelo botão
 "Transpile" da barra de título) já mostra o Dart gerado ao lado do arquivo C++
@@ -2250,20 +2284,18 @@ fizer diferença — ver `examples/E08-templates/NOTES.md` e
 livre por enquanto), `std::string`/`std::vector` por valor (todo parâmetro
 do E05 é `const T&`, de propósito — ver
 `examples/E05-biblioteca-padrao/NOTES.md`), ponte real para ponteiro/`union`
-(`dart:ffi`) ou para o idioma de out param (E10 recusa honestamente os dois
-em vez de construir a ponte — ver
-`examples/E10-ponteiros-union-out-params/NOTES.md`), `import` entre
+(`dart:ffi` — E10 recusa honestamente em vez de construir a ponte; o outro
+idioma que E10 tinha deixado sem ponte, o de out param via referência
+não-`const`, foi resolvido pelo E13 — ver
+`examples/E10-ponteiros-union-out-params/NOTES.md` e
+`examples/E13-fatia-real-verovio/NOTES.md`), `import` entre
 arquivos para chamada de método (só `Record`/`Function` de nível superior
 são mapeados — ver `examples/E11-multi-tu/NOTES.md`), nome de `library`
 Dart derivado de `namespace` C++ (capturado desde o US-3/US-5, nunca usado
 na geração), guard RAII aninhado em `if`/`while`/`for`, dentro de
 método/construtor, ou mais de um guard na mesma função (exigiria
 `try`/`finally` aninhados — ver `examples/E12-excecoes-raii/NOTES.md`),
-múltiplos `catch`/`throw` ou `catch` sem operando, os seis achados do E13
-(inicialização por construtor direto, `static_cast` explícito, atribuição
-composta, chamada de operador de usuário fora da classe, método estático e
-de instância com o mesmo nome, assinatura de `operator==` exigida pelo Dart
-— ver `examples/E13-fatia-real-verovio/NOTES.md`), e qualquer coisa além
+múltiplos `catch`/`throw` ou `catch` sem operando, e qualquer coisa além
 do que E01–E13 cobrem (`break`/`continue`, `i++`/`--i`, construtor de
 subclasse chamando `super(...)` explicitamente) · **Depende de:** US-7
 
@@ -2483,13 +2515,20 @@ exigiu nenhuma mudança no harness — `throw`/`try`/`catch` capturado
 mesmo formato de caso já usado desde o E01; o comportamento novo (exceção
 lançada e capturada, destrutor rodando na saída do `try`/`finally`
 sintetizado) é exercitado pela própria execução real dos dois lados, não
-por nenhuma extensão do formato do oráculo. O E13 nunca chegou a exercitar o
-oráculo — o harness para no `dart analyze` (critério 2 de US-9) antes de
-rodar `oracle/cases.json`, e a fatia real de `Fraction` falha ali por seis
-razões catalogadas em `examples/E13-fatia-real-verovio/NOTES.md`; o caso do
-oráculo em si (`testarSoma`/`testarSubtracao`/etc., mesmo formato de função
-livre com retorno escalar desde o E01) nunca teve chance de rodar contra o
-Dart gerado. **Falta:** critério 1
+por nenhuma extensão do formato do oráculo. O E13, na sua primeira rodada,
+nunca chegou a exercitar o oráculo — o harness parava no `dart analyze`
+(critério 2 de US-9) antes de rodar `oracle/cases.json`, e a fatia real de
+`Fraction` falhava ali por seis razões catalogadas em
+`examples/E13-fatia-real-verovio/NOTES.md`. Depois de corrigidas (ver
+"Resolução" naquele arquivo), o oráculo passou a rodar de verdade — e um
+décimo problema apareceu só então, não de tradução mas do próprio fixture:
+`uso.cpp` era o único arquivo do corpus sem um `.hpp` declarando seus
+`testarX()`, então o driver C++ do oráculo (que só `#include`s headers, não
+`.cpp`s, para descobrir as assinaturas testadas) não compilava — corrigido
+adicionando `uso.hpp`, mesma convenção de todo outro degrau. Os seis casos
+de `oracle/cases.json` (mesmo formato de função livre com retorno escalar
+desde o E01) rodam e concordam entre C++ real e Dart transpilado. **Falta:**
+critério 1
 como declarado (associar caso↔função do catálogo, não só nome), critério 4
 (relatório de fração de funções provadas), a tabela de regras de
 equivalência por tipo de `crates/server/src/equivalence.rs` (hoje a

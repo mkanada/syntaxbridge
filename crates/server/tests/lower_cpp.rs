@@ -238,6 +238,227 @@ int primeiro_maior_que(int limite) {
     assert_eq!(origin.line, 6);
 }
 
+/// Real-world regression (`docs/plans/diagnostico-verovio-6.2.0.md` achado
+/// 2): two distinct C++ classes with the same short name in different
+/// namespaces both lower correctly on their own, but the emitter drops the
+/// namespace when naming the Dart class — so both would print as `class
+/// Ponto`, `duplicate_definition` (or worse, a name collision no one
+/// notices until `dart analyze` runs). `usa`'s two fields exist so the test
+/// can also confirm every *reference* to a renamed record — not just its
+/// own declaration — gets rewritten to match.
+const NAMESPACE_COLLISION_CPP: &str = r#"
+namespace ns1 {
+struct Ponto {
+    int x;
+};
+}
+
+namespace ns2 {
+struct Ponto {
+    double y;
+};
+}
+
+struct Usa {
+    ns1::Ponto a;
+    ns2::Ponto b;
+};
+"#;
+
+#[test]
+fn two_records_with_the_same_name_in_different_namespaces_are_disambiguated() {
+    let workspace =
+        TempWorkspace::new("lower-cpp-namespace-collision").expect("create temp workspace");
+    let unit = write_fixture(workspace.path(), NAMESPACE_COLLISION_CPP, "colisao.cpp");
+
+    let catalog = function_catalog::extract_function_catalog(&[unit], workspace.path(), None)
+        .expect("extract function catalog");
+
+    assert_eq!(
+        catalog.ir_records.len(),
+        3,
+        "expected Ponto (ns1), Ponto (ns2), Usa, got {:?}",
+        catalog
+            .ir_records
+            .iter()
+            .map(|r| &r.name)
+            .collect::<Vec<_>>()
+    );
+
+    let named_ponto: Vec<&str> = catalog
+        .ir_records
+        .iter()
+        .filter(|r| r.name == "Ponto")
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(
+        named_ponto.is_empty(),
+        "no record should still be bare-named `Ponto` after disambiguation, got {:?}",
+        catalog
+            .ir_records
+            .iter()
+            .map(|r| &r.name)
+            .collect::<Vec<_>>()
+    );
+
+    let ns1_ponto = catalog
+        .ir_records
+        .iter()
+        .find(|r| r.namespace == "ns1")
+        .expect("ns1::Ponto should still be findable by its namespace");
+    let ns2_ponto = catalog
+        .ir_records
+        .iter()
+        .find(|r| r.namespace == "ns2")
+        .expect("ns2::Ponto should still be findable by its namespace");
+    assert_ne!(
+        ns1_ponto.name, ns2_ponto.name,
+        "the two Pontos must end up with distinct Dart names"
+    );
+    assert_ne!(ns1_ponto.usr, ns2_ponto.usr);
+
+    let usa = catalog
+        .ir_records
+        .iter()
+        .find(|r| r.name == "Usa")
+        .expect("Usa record");
+    assert_eq!(usa.fields.len(), 2);
+    let Type::Record {
+        usr: a_usr,
+        name: a_name,
+    } = &usa.fields[0].ty
+    else {
+        panic!(
+            "expected Usa.a to be a Record type, got {:?}",
+            usa.fields[0].ty
+        );
+    };
+    let Type::Record {
+        usr: b_usr,
+        name: b_name,
+    } = &usa.fields[1].ty
+    else {
+        panic!(
+            "expected Usa.b to be a Record type, got {:?}",
+            usa.fields[1].ty
+        );
+    };
+    assert_eq!(
+        a_usr, &ns1_ponto.usr,
+        "Usa.a's type usr must still point at ns1::Ponto"
+    );
+    assert_eq!(
+        a_name, &ns1_ponto.name,
+        "Usa.a's type name must match ns1::Ponto's renamed Dart name, not the stale bare `Ponto`"
+    );
+    assert_eq!(b_usr, &ns2_ponto.usr);
+    assert_eq!(b_name, &ns2_ponto.name);
+}
+
+/// `mapping::pointer_options_for`'s case A10
+/// (`docs/mapping-solver-cases.md`): a pointer to a type this IR already
+/// represents (a project class, here `Nota`) has a statically finite set of
+/// possible runtime values (null, or `Nota`/a subtype of it) — the same
+/// guarantee that already makes Dart's own single-reference polymorphism
+/// sound — so it maps directly to a nullable reference (`Nota?`), not
+/// `Unsupported`. A pointer to a scalar (`int*`) has no such guarantee (it
+/// could be a single value or a buffer) and must stay `Unsupported` —
+/// case C01's own bridge answer, unchanged.
+const POINTER_TO_CLASS_CPP: &str = r#"
+class Nota {
+public:
+    int altura;
+};
+
+class Editor {
+public:
+    void Definir(Nota* nota) { m_atual = nota; }
+    Nota* Atual() { return m_atual; }
+    int* ContadorBruto() { return m_contador; }
+private:
+    Nota* m_atual;
+    int* m_contador;
+};
+"#;
+
+#[test]
+fn a_pointer_to_a_known_class_becomes_a_nullable_reference_but_a_pointer_to_a_scalar_stays_unsupported()
+ {
+    let workspace = TempWorkspace::new("lower-cpp-pointer-solver").expect("create temp workspace");
+    let unit = write_fixture(workspace.path(), POINTER_TO_CLASS_CPP, "editor.cpp");
+
+    let catalog = function_catalog::extract_function_catalog(&[unit], workspace.path(), None)
+        .expect("extract function catalog");
+
+    let editor = catalog
+        .ir_records
+        .iter()
+        .find(|r| r.name == "Editor")
+        .expect("Editor record");
+
+    let m_atual = editor
+        .fields
+        .iter()
+        .find(|f| f.name == "_m_atual")
+        .expect("m_atual field");
+    let Type::Nullable(inner) = &m_atual.ty else {
+        panic!(
+            "expected Nota* to lower to Type::Nullable, got {:?}",
+            m_atual.ty
+        );
+    };
+    assert!(
+        matches!(inner.as_ref(), Type::Record { name, .. } if name == "Nota"),
+        "expected the nullable's inner type to be the Nota record, got {inner:?}"
+    );
+
+    let m_contador = editor
+        .fields
+        .iter()
+        .find(|f| f.name == "_m_contador")
+        .expect("m_contador field");
+    assert!(
+        matches!(m_contador.ty, Type::Unsupported(_)),
+        "a pointer to a scalar has no finite-pointee guarantee and must stay Unsupported, got {:?}",
+        m_contador.ty
+    );
+
+    let definir = editor
+        .methods
+        .iter()
+        .find(|m| m.name == "Definir")
+        .expect("Definir method");
+    let Type::Nullable(param_inner) = &definir.params[0].ty else {
+        panic!(
+            "expected Definir's Nota* parameter to be Type::Nullable, got {:?}",
+            definir.params[0].ty
+        );
+    };
+    assert!(matches!(param_inner.as_ref(), Type::Record { name, .. } if name == "Nota"));
+
+    let atual = editor
+        .methods
+        .iter()
+        .find(|m| m.name == "Atual")
+        .expect("Atual method");
+    assert!(
+        matches!(atual.return_type, Type::Nullable(_)),
+        "expected Atual's Nota* return type to be Type::Nullable, got {:?}",
+        atual.return_type
+    );
+
+    let contador_bruto = editor
+        .methods
+        .iter()
+        .find(|m| m.name == "ContadorBruto")
+        .expect("ContadorBruto method");
+    assert!(
+        matches!(contador_bruto.return_type, Type::Unsupported(_)),
+        "int* has no finite-pointee guarantee and must stay Unsupported, got {:?}",
+        contador_bruto.return_type
+    );
+}
+
 struct TempWorkspace {
     path: PathBuf,
 }

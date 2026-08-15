@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::pointer_catalog::PointerDeclaration;
 use crate::source_catalog::SourceFile;
 use crate::type_catalog::{TypeDeclaration, TypeDependency};
 
@@ -40,6 +41,11 @@ pub struct CreatedProject {
     /// `project_service::create_project` alongside `type_catalog`, for the
     /// same reason `type_catalog` itself is left empty here.
     pub source_files: Vec<SourceFile>,
+    /// Every raw pointer declared across the project (Parte 1 of
+    /// `docs/plans/catalogo-de-ponteiros-e-solver-tfa.md`). Populated by
+    /// `project_service::create_project` alongside `type_catalog`, for the
+    /// same reason `type_catalog` itself is left empty here.
+    pub pointer_catalog: Vec<PointerDeclaration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -240,6 +246,7 @@ pub fn create_project(request: CreateProjectRequest) -> Result<CreatedProject, I
         type_catalog: Vec::new(),
         type_dependencies: Vec::new(),
         source_files: Vec::new(),
+        pointer_catalog: Vec::new(),
     })
 }
 

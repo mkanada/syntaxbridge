@@ -28,12 +28,14 @@ pub enum JobPhase {
     CatalogingTypes,
     DiscoveringSourceFiles,
     CatalogingFunctions,
+    CatalogingPointers,
     Persisting,
 }
 
-/// Derives the current phase from the three extraction passes' live
+/// Derives the current phase from the four extraction passes' live
 /// counters. A `total` of zero means that pass hasn't started yet (see
 /// `ExtractionProgress::set_total`).
+#[allow(clippy::too_many_arguments)]
 pub fn derive_phase(
     type_catalog_completed: usize,
     type_catalog_total: usize,
@@ -41,6 +43,8 @@ pub fn derive_phase(
     source_catalog_total: usize,
     function_catalog_completed: usize,
     function_catalog_total: usize,
+    pointer_catalog_completed: usize,
+    pointer_catalog_total: usize,
 ) -> JobPhase {
     if type_catalog_total == 0 {
         JobPhase::Ingesting
@@ -50,6 +54,8 @@ pub fn derive_phase(
         JobPhase::DiscoveringSourceFiles
     } else if function_catalog_total == 0 || function_catalog_completed < function_catalog_total {
         JobPhase::CatalogingFunctions
+    } else if pointer_catalog_total == 0 || pointer_catalog_completed < pointer_catalog_total {
+        JobPhase::CatalogingPointers
     } else {
         JobPhase::Persisting
     }
@@ -149,22 +155,25 @@ mod tests {
 
     #[test]
     fn phase_is_ingesting_before_the_type_catalog_total_is_known() {
-        assert_eq!(derive_phase(0, 0, 0, 0, 0, 0), JobPhase::Ingesting);
+        assert_eq!(derive_phase(0, 0, 0, 0, 0, 0, 0, 0), JobPhase::Ingesting);
     }
 
     #[test]
     fn phase_is_cataloging_types_while_that_pass_is_incomplete() {
-        assert_eq!(derive_phase(3, 10, 0, 0, 0, 0), JobPhase::CatalogingTypes);
+        assert_eq!(
+            derive_phase(3, 10, 0, 0, 0, 0, 0, 0),
+            JobPhase::CatalogingTypes
+        );
     }
 
     #[test]
     fn phase_is_discovering_source_files_once_types_are_done() {
         assert_eq!(
-            derive_phase(10, 10, 0, 0, 0, 0),
+            derive_phase(10, 10, 0, 0, 0, 0, 0, 0),
             JobPhase::DiscoveringSourceFiles
         );
         assert_eq!(
-            derive_phase(10, 10, 4, 10, 0, 0),
+            derive_phase(10, 10, 4, 10, 0, 0, 0, 0),
             JobPhase::DiscoveringSourceFiles
         );
     }
@@ -172,18 +181,33 @@ mod tests {
     #[test]
     fn phase_is_cataloging_functions_once_source_files_are_done() {
         assert_eq!(
-            derive_phase(10, 10, 10, 10, 0, 0),
+            derive_phase(10, 10, 10, 10, 0, 0, 0, 0),
             JobPhase::CatalogingFunctions
         );
         assert_eq!(
-            derive_phase(10, 10, 10, 10, 4, 10),
+            derive_phase(10, 10, 10, 10, 4, 10, 0, 0),
             JobPhase::CatalogingFunctions
         );
     }
 
     #[test]
+    fn phase_is_cataloging_pointers_once_functions_are_done() {
+        assert_eq!(
+            derive_phase(10, 10, 10, 10, 10, 10, 0, 0),
+            JobPhase::CatalogingPointers
+        );
+        assert_eq!(
+            derive_phase(10, 10, 10, 10, 10, 10, 4, 10),
+            JobPhase::CatalogingPointers
+        );
+    }
+
+    #[test]
     fn phase_is_persisting_once_all_passes_are_done() {
-        assert_eq!(derive_phase(10, 10, 10, 10, 10, 10), JobPhase::Persisting);
+        assert_eq!(
+            derive_phase(10, 10, 10, 10, 10, 10, 10, 10),
+            JobPhase::Persisting
+        );
     }
 
     #[test]
@@ -236,6 +260,7 @@ mod tests {
             type_catalog: Vec::new(),
             type_dependencies: Vec::new(),
             source_files: Vec::new(),
+            pointer_catalog: Vec::new(),
         }));
 
         job.cancel();
@@ -260,6 +285,7 @@ mod tests {
             type_catalog: Vec::new(),
             type_dependencies: Vec::new(),
             source_files: Vec::new(),
+            pointer_catalog: Vec::new(),
         };
 
         job.finish(Ok(project));

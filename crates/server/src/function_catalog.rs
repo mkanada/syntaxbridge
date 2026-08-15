@@ -96,6 +96,14 @@ pub struct FunctionDeclaration {
     pub end_line: u32,
     pub end_column: u32,
     pub usr: String,
+    /// Whether this is a `static` member (`Method` only — always `false`
+    /// for every other `kind`). E13: C++ lets a `static` and a non-`static`
+    /// member share a name (resolved by call-site syntax, not a real
+    /// overload); Dart forbids it outright (`conflicting_static_and_instance`)
+    /// — `mapping::overload_options_for` needs this to tell that collision
+    /// apart from an ordinary same-arity overload, which E07's
+    /// `"parametro-opcional"` decision would otherwise (wrongly) apply to it.
+    pub is_static: bool,
     pub is_virtual: bool,
     /// Whether this is a pure virtual method (`= 0`), i.e. carries no body of
     /// its own — the fact `mapping::options_for` needs to tell a genuine
@@ -298,6 +306,14 @@ pub fn extract_function_catalog_cancellable(
     // of its decisions are acted on here.
     apply_overload_renames(&mut ir_functions, &mut ir_records, &declarations, &calls);
 
+    // Verovio 6.2.0 diagnosis (`docs/plans/diagnostico-verovio-6.2.0.md`
+    // achado 2): two distinct C++ classes with the same short name in
+    // different namespaces both lower correctly, but `emit::dart` names the
+    // Dart class from the bare spelling alone — real occurrence in that
+    // corpus (two unrelated `Object`s). Runs before RAII (order doesn't
+    // matter between the two, but matches declaration order above).
+    apply_record_name_disambiguation(&mut ir_functions, &mut ir_records);
+
     // E12: RAII — see the function's own doc comment for exactly what this
     // rewrites and why it has to run after every record (with its
     // destructor, if any) is already fully lowered.
@@ -383,6 +399,22 @@ fn apply_overload_renames(
         else {
             continue;
         };
+        // E13: a static/instance name collision can't be told apart by
+        // parameter *type* the way `dart_overload_name` does for the other
+        // two ids — the instance side may take zero parameters (`Reduce()`),
+        // leaving nothing to build a distinguishing suffix from at all.
+        // Only the `static` declaration(s) get a suffix; the instance one
+        // keeps its original name (already unambiguous among *other*
+        // instance members) and is left out of `renames` entirely, matching
+        // every other id's "only insert what actually changes" shape.
+        if option.id == "renomear-estatico-instancia" {
+            for declaration in group {
+                if declaration.is_static {
+                    renames.insert(declaration.usr.clone(), format!("{name}Static"));
+                }
+            }
+            continue;
+        }
         if option.id != "renomear-por-tipo" && option.id != "renomear-const-nao-const" {
             continue;
         }
@@ -417,6 +449,336 @@ fn apply_overload_renames(
         for constructor in &mut record.constructors {
             rename_calls_in_params(&mut constructor.params, &renames);
             rename_calls_in_stmts(&mut constructor.body, &renames);
+        }
+    }
+}
+
+/// Verovio 6.2.0 diagnosis (`docs/plans/diagnostico-verovio-6.2.0.md`
+/// achado 2): two distinct records can share a bare `name` — the corpus's
+/// own case is two unrelated `Object`s in different namespaces — and
+/// `emit::dart` names the Dart class from that bare spelling alone, so both
+/// would print as `class Object`, an outright `duplicate_definition` when
+/// they land in the same file. A record whose name is unique in the whole
+/// module (the overwhelming common case) is never touched — `renames` stays
+/// empty and every walk below is a no-op.
+///
+/// The pattern (deliberately the simplest one that's still always correct,
+/// not a final design): qualify each colliding record with its own C++
+/// namespace, PascalCased and prefixed onto the original name
+/// (`ns1::Ponto` → `Ns1Ponto`). A record with no namespace keeps its bare
+/// name as its first candidate. Whatever still collides after that (two
+/// colliding records in the *same* namespace, or namespace-less on both
+/// sides) gets a stable numeric suffix in `usr` order — not pretty, but
+/// always unique and fully deterministic, which is what actually matters
+/// here: two runs of the same project must always rename the same way.
+fn apply_record_name_disambiguation(
+    ir_functions: &mut [ir::Function],
+    ir_records: &mut [ir::Record],
+) {
+    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, record) in ir_records.iter().enumerate() {
+        groups.entry(record.name.clone()).or_default().push(index);
+    }
+
+    let mut renames: HashMap<String, String> = HashMap::new();
+    for (name, indices) in &groups {
+        if indices.len() <= 1 {
+            continue;
+        }
+
+        let mut candidates: Vec<String> = indices
+            .iter()
+            .map(|&index| {
+                let record = &ir_records[index];
+                if record.namespace.is_empty() {
+                    record.name.clone()
+                } else {
+                    format!(
+                        "{}{}",
+                        pascal_case_namespace(&record.namespace),
+                        record.name
+                    )
+                }
+            })
+            .collect();
+
+        let mut seen_candidates: HashMap<String, usize> = HashMap::new();
+        for candidate in &mut candidates {
+            let count = seen_candidates.entry(candidate.clone()).or_insert(0);
+            *count += 1;
+            if *count > 1 {
+                candidate.push_str(&count.to_string());
+            }
+        }
+
+        for (&index, candidate) in indices.iter().zip(candidates.iter()) {
+            if candidate != name {
+                renames.insert(ir_records[index].usr.clone(), candidate.clone());
+            }
+        }
+    }
+
+    if renames.is_empty() {
+        return;
+    }
+
+    for function in ir_functions.iter_mut() {
+        rename_record_refs_in_type(&mut function.return_type, &renames);
+        rename_record_refs_in_params(&mut function.params, &renames);
+        rename_record_refs_in_stmts(&mut function.body, &renames);
+    }
+    for record in ir_records.iter_mut() {
+        if let Some(new_name) = renames.get(&record.usr) {
+            record.name = new_name.clone();
+        }
+        for field in record
+            .fields
+            .iter_mut()
+            .chain(record.static_fields.iter_mut())
+        {
+            rename_record_refs_in_type(&mut field.ty, &renames);
+        }
+        if let Some(base) = &mut record.base_class {
+            rename_record_refs_in_base(base, &renames);
+        }
+        for mixin in &mut record.mixins {
+            rename_record_refs_in_base(mixin, &renames);
+        }
+        for constructor in &mut record.constructors {
+            rename_record_refs_in_params(&mut constructor.params, &renames);
+            rename_record_refs_in_stmts(&mut constructor.body, &renames);
+        }
+        for method in &mut record.methods {
+            rename_record_refs_in_type(&mut method.return_type, &renames);
+            rename_record_refs_in_params(&mut method.params, &renames);
+            if let Some(body) = &mut method.body {
+                rename_record_refs_in_stmts(body, &renames);
+            }
+        }
+        if let Some(destructor) = &mut record.destructor {
+            rename_record_refs_in_stmts(destructor, &renames);
+        }
+    }
+}
+
+/// `ns1::detail::Foo` → `Ns1Detail` — the namespace-qualifying prefix
+/// `apply_record_name_disambiguation` sticks onto a colliding record's own
+/// name. Each `::`-separated segment gets its first letter uppercased; the
+/// segments are then joined with no separator, matching the capitalized,
+/// no-underscore shape every other Dart identifier in this emitter already
+/// uses (`ClassName`, not `class_name`).
+fn pascal_case_namespace(namespace: &str) -> String {
+    namespace
+        .split("::")
+        .map(|segment| {
+            let mut chars = segment.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
+fn rename_record_refs_in_type(ty: &mut ir::Type, renames: &HashMap<String, String>) {
+    match ty {
+        ir::Type::Record { usr, name } => {
+            if let Some(new_name) = renames.get(usr) {
+                *name = new_name.clone();
+            }
+        }
+        ir::Type::List(element) | ir::Type::Nullable(element) => {
+            rename_record_refs_in_type(element, renames)
+        }
+        ir::Type::Tuple(elements) => {
+            for element in elements {
+                rename_record_refs_in_type(element, renames);
+            }
+        }
+        ir::Type::Int
+        | ir::Type::Bool
+        | ir::Type::Double
+        | ir::Type::Void
+        | ir::Type::Str
+        | ir::Type::Unsupported(_) => {}
+    }
+}
+
+fn rename_record_refs_in_base(base: &mut ir::BaseClass, renames: &HashMap<String, String>) {
+    if let Some(new_name) = renames.get(&base.usr) {
+        base.name = new_name.clone();
+    }
+}
+
+fn rename_record_refs_in_params(params: &mut [ir::Param], renames: &HashMap<String, String>) {
+    for param in params {
+        rename_record_refs_in_type(&mut param.ty, renames);
+        if let Some(default_value) = &mut param.default_value {
+            rename_record_refs_in_expr(default_value, renames);
+        }
+    }
+}
+
+fn rename_record_refs_in_stmts(stmts: &mut [ir::Stmt], renames: &HashMap<String, String>) {
+    for stmt in stmts {
+        rename_record_refs_in_stmt(stmt, renames);
+    }
+}
+
+fn rename_record_refs_in_stmt(stmt: &mut ir::Stmt, renames: &HashMap<String, String>) {
+    match stmt {
+        ir::Stmt::Return { value, .. } => {
+            if let Some(expr) = value {
+                rename_record_refs_in_expr(expr, renames);
+            }
+        }
+        ir::Stmt::VarDecl { ty, init, .. } => {
+            rename_record_refs_in_type(ty, renames);
+            if let Some(expr) = init {
+                rename_record_refs_in_expr(expr, renames);
+            }
+        }
+        ir::Stmt::Assign { value, .. } => rename_record_refs_in_expr(value, renames),
+        ir::Stmt::FieldAssign { target, value, .. } => {
+            rename_record_refs_in_expr(target, renames);
+            rename_record_refs_in_expr(value, renames);
+        }
+        ir::Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            rename_record_refs_in_expr(condition, renames);
+            rename_record_refs_in_stmts(then_branch, renames);
+            rename_record_refs_in_stmts(else_branch, renames);
+        }
+        ir::Stmt::While {
+            condition, body, ..
+        } => {
+            rename_record_refs_in_expr(condition, renames);
+            rename_record_refs_in_stmts(body, renames);
+        }
+        ir::Stmt::For {
+            init,
+            condition,
+            increment,
+            body,
+            ..
+        } => {
+            if let Some(init) = init {
+                rename_record_refs_in_stmt(init, renames);
+            }
+            if let Some(condition) = condition {
+                rename_record_refs_in_expr(condition, renames);
+            }
+            if let Some(increment) = increment {
+                rename_record_refs_in_stmt(increment, renames);
+            }
+            rename_record_refs_in_stmts(body, renames);
+        }
+        ir::Stmt::ExprStmt { expr, .. } => rename_record_refs_in_expr(expr, renames),
+        ir::Stmt::Throw { value, .. } => rename_record_refs_in_expr(value, renames),
+        ir::Stmt::TryCatch {
+            try_body,
+            catch_type,
+            catch_body,
+            ..
+        } => {
+            rename_record_refs_in_stmts(try_body, renames);
+            rename_record_refs_in_type(catch_type, renames);
+            rename_record_refs_in_stmts(catch_body, renames);
+        }
+        ir::Stmt::TryFinally {
+            try_body,
+            finally_body,
+            ..
+        } => {
+            rename_record_refs_in_stmts(try_body, renames);
+            rename_record_refs_in_stmts(finally_body, renames);
+        }
+        ir::Stmt::TupleAssign { targets, value, .. } => {
+            for target in targets {
+                rename_record_refs_in_expr(target, renames);
+            }
+            rename_record_refs_in_expr(value, renames);
+        }
+        ir::Stmt::Unsupported { .. } => {}
+    }
+}
+
+fn rename_record_refs_in_expr(expr: &mut ir::Expr, renames: &HashMap<String, String>) {
+    match expr {
+        ir::Expr::IntLiteral { .. }
+        | ir::Expr::DoubleLiteral { .. }
+        | ir::Expr::BoolLiteral { .. }
+        | ir::Expr::StringLiteral { .. }
+        | ir::Expr::Unsupported { .. } => {}
+        ir::Expr::Ref { ty, .. } | ir::Expr::This { ty, .. } => {
+            rename_record_refs_in_type(ty, renames);
+        }
+        ir::Expr::Binary { lhs, rhs, ty, .. } => {
+            rename_record_refs_in_type(ty, renames);
+            rename_record_refs_in_expr(lhs, renames);
+            rename_record_refs_in_expr(rhs, renames);
+        }
+        ir::Expr::Unary { operand, ty, .. } | ir::Expr::Convert { operand, ty, .. } => {
+            rename_record_refs_in_type(ty, renames);
+            rename_record_refs_in_expr(operand, renames);
+        }
+        ir::Expr::Call {
+            target, ty, args, ..
+        } => {
+            rename_record_refs_in_type(ty, renames);
+            if let Some(target) = target {
+                rename_record_refs_in_expr(target, renames);
+            }
+            for arg in args {
+                rename_record_refs_in_expr(arg, renames);
+            }
+        }
+        ir::Expr::FieldAccess { target, ty, .. } => {
+            rename_record_refs_in_type(ty, renames);
+            rename_record_refs_in_expr(target, renames);
+        }
+        ir::Expr::RecordConstruct {
+            type_usr,
+            type_name,
+            fields,
+            ..
+        } => {
+            if let Some(new_name) = renames.get(type_usr) {
+                *type_name = new_name.clone();
+            }
+            for (_name, value) in fields {
+                rename_record_refs_in_expr(value, renames);
+            }
+        }
+        ir::Expr::ConstructorCall {
+            type_usr,
+            type_name,
+            args,
+            ..
+        } => {
+            if let Some(new_name) = renames.get(type_usr) {
+                *type_name = new_name.clone();
+            }
+            for arg in args {
+                rename_record_refs_in_expr(arg, renames);
+            }
+        }
+        ir::Expr::Index {
+            target, index, ty, ..
+        } => {
+            rename_record_refs_in_type(ty, renames);
+            rename_record_refs_in_expr(target, renames);
+            rename_record_refs_in_expr(index, renames);
+        }
+        ir::Expr::StringByteLength { target, .. } => rename_record_refs_in_expr(target, renames),
+        ir::Expr::Tuple { values, .. } => {
+            for value in values {
+                rename_record_refs_in_expr(value, renames);
+            }
         }
     }
 }
@@ -598,6 +960,12 @@ fn stmt_references_name(stmt: &ir::Stmt, name: &str) -> bool {
             finally_body,
             ..
         } => stmts_reference_name(try_body, name) || stmts_reference_name(finally_body, name),
+        ir::Stmt::TupleAssign { targets, value, .. } => {
+            targets
+                .iter()
+                .any(|target| expr_references_name(target, name))
+                || expr_references_name(value, name)
+        }
         ir::Stmt::Unsupported { .. } => false,
     }
 }
@@ -634,6 +1002,9 @@ fn expr_references_name(expr: &ir::Expr, name: &str) -> bool {
         }
         ir::Expr::Index { target, index, .. } => {
             expr_references_name(target, name) || expr_references_name(index, name)
+        }
+        ir::Expr::Tuple { values, .. } => {
+            values.iter().any(|value| expr_references_name(value, name))
         }
     }
 }
@@ -713,6 +1084,12 @@ fn replace_this_with_ref_in_stmt(stmt: &mut ir::Stmt, var_name: &str) {
             replace_this_with_ref_in_stmts(try_body, var_name);
             replace_this_with_ref_in_stmts(finally_body, var_name);
         }
+        ir::Stmt::TupleAssign { targets, value, .. } => {
+            for target in targets {
+                replace_this_with_ref_in_expr(target, var_name);
+            }
+            replace_this_with_ref_in_expr(value, var_name);
+        }
         ir::Stmt::Unsupported { .. } => {}
     }
 }
@@ -763,6 +1140,11 @@ fn replace_this_with_ref_in_expr(expr: &mut ir::Expr, var_name: &str) {
         ir::Expr::Index { target, index, .. } => {
             replace_this_with_ref_in_expr(target, var_name);
             replace_this_with_ref_in_expr(index, var_name);
+        }
+        ir::Expr::Tuple { values, .. } => {
+            for value in values {
+                replace_this_with_ref_in_expr(value, var_name);
+            }
         }
     }
 }
@@ -872,6 +1254,12 @@ fn rename_calls_in_stmt(stmt: &mut ir::Stmt, renames: &HashMap<String, String>) 
             rename_calls_in_stmts(try_body, renames);
             rename_calls_in_stmts(finally_body, renames);
         }
+        ir::Stmt::TupleAssign { targets, value, .. } => {
+            for target in targets {
+                rename_calls_in_expr(target, renames);
+            }
+            rename_calls_in_expr(value, renames);
+        }
         ir::Stmt::Unsupported { .. } => {}
     }
 }
@@ -925,6 +1313,11 @@ fn rename_calls_in_expr(expr: &mut ir::Expr, renames: &HashMap<String, String>) 
         ir::Expr::Index { target, index, .. } => {
             rename_calls_in_expr(target, renames);
             rename_calls_in_expr(index, renames);
+        }
+        ir::Expr::Tuple { values, .. } => {
+            for value in values {
+                rename_calls_in_expr(value, renames);
+            }
         }
     }
 }
@@ -1447,6 +1840,7 @@ fn describe_macro(cursor: clang_sys::CXCursor, project_root: &Path) -> Option<Fu
         end_line,
         end_column,
         usr,
+        is_static: false,
         is_virtual: false,
         is_pure_virtual: false,
         is_defaulted: false,
@@ -1489,6 +1883,8 @@ fn describe_function(
     };
     let owning_class_usr = owning_class.as_ref().map(|(usr, _name)| usr.clone());
 
+    let is_static = kind == FunctionDeclarationKind::Method
+        && unsafe { clang_sys::clang_CXXMethod_isStatic(cursor) } != 0;
     let is_virtual = unsafe { clang_sys::clang_CXXMethod_isVirtual(cursor) } != 0;
     let is_pure_virtual = unsafe { clang_sys::clang_CXXMethod_isPureVirtual(cursor) } != 0;
     let is_defaulted = unsafe { clang_sys::clang_CXXMethod_isDefaulted(cursor) } != 0;
@@ -1519,6 +1915,7 @@ fn describe_function(
         end_line,
         end_column,
         usr,
+        is_static,
         is_virtual,
         is_pure_virtual,
         is_defaulted,

@@ -691,7 +691,14 @@ fn push_usage(
 /// Strips pointers, references and array indirections off `cxtype`, then
 /// resolves what remains to the `TypeDeclaration` of its defining cursor, if
 /// any is known to this catalog.
-fn resolve_named_declaration(
+///
+/// `pub(crate)` so `pointer_catalog` can reuse it to resolve a raw pointer's
+/// pointee back to this same catalog's `usr` — the two modules disagree on
+/// what to do with the indirection itself (this catalog strips it as noise;
+/// `pointer_catalog` is the one place indirection *is* the point), but
+/// "what named type is ultimately behind this type" is the same question
+/// either way.
+pub(crate) fn resolve_named_declaration(
     cxtype: clang_sys::CXType,
     project_root: &Path,
 ) -> Option<TypeDeclaration> {

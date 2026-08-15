@@ -70,6 +70,10 @@ abstract class ServerClient {
     required String file,
   });
 
+  /// The pointer catalog already persisted for a project (Parte 1 of
+  /// `docs/plans/catalogo-de-ponteiros-e-solver-tfa.md`), without reparsing.
+  Future<List<PointerDeclaration>> listPointers(String projectDir);
+
   /// Transpiles the project's free functions and `struct`s to Dart (US-8,
   /// E01–E03 scope) and returns the emitted package. Synchronous — these
   /// examples transpile in milliseconds, so there's no job/progress

@@ -4,6 +4,7 @@
 // and the behavioral oracle have something to compare.
 
 #include "fraction.hpp"
+#include "uso.hpp"
 
 int testarSoma()
 {

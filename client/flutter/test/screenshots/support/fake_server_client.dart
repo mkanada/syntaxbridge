@@ -15,6 +15,7 @@ class ScreenshotFakeServerClient implements ServerClient {
     this.types = const <TypeDeclaration>[],
     this.usageCounts = const <String, int>{},
     this.usagesByType = const <String, List<TypeUsage>>{},
+    this.pointers = const <PointerDeclaration>[],
     this.functions = const <FunctionDeclaration>[],
     this.callerCounts = const <String, int>{},
     this.callersByFunction = const <String, List<CallEdge>>{},
@@ -32,6 +33,7 @@ class ScreenshotFakeServerClient implements ServerClient {
   final List<TypeDeclaration> types;
   final Map<String, int> usageCounts;
   final Map<String, List<TypeUsage>> usagesByType;
+  final List<PointerDeclaration> pointers;
   final List<FunctionDeclaration> functions;
   final Map<String, int> callerCounts;
   final Map<String, List<CallEdge>> callersByFunction;
@@ -129,6 +131,10 @@ class ScreenshotFakeServerClient implements ServerClient {
     required String projectDir,
     required String typeUsr,
   }) async => usagesByType[typeUsr] ?? const <TypeUsage>[];
+
+  @override
+  Future<List<PointerDeclaration>> listPointers(String projectDir) async =>
+      pointers;
 
   @override
   Future<FunctionCatalogListing> listFunctions(String projectDir) async =>

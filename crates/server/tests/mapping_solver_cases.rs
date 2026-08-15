@@ -358,6 +358,72 @@ fn b06_virtual_inheritance_diamond_gets_mixin_composition() {
     assert_eq!(options[0].consequences.len(), 2);
 }
 
+/// B07: `possible_pointee_types` today is class-hierarchy analysis (CHA) —
+/// it enumerates every subclass of the pointee's declared type, regardless
+/// of what a *specific* pointer is ever actually constructed as. `Forma`
+/// has two subclasses in this fixture (`Triangulo`, `Quadrado`), both
+/// declared in `fabrica.cpp` — CHA alone would offer `{Forma, Triangulo,
+/// Quadrado}` for *either* function's return pointer, even though each
+/// function's own body shows it only ever constructs one of them. This is
+/// the first case in the corpus that needs to go beyond CHA (see
+/// `docs/plans/catalogo-de-ponteiros-e-solver-tfa.md`).
+#[test]
+fn b07_pointer_with_a_single_construction_site_narrows_past_the_full_hierarchy() {
+    let (types, functions) = extract("B07-ponteiro-com-atribuicao-unica");
+    let facts = ProjectFacts::from_catalogs(&types, &functions);
+    let forma = find_type(&types, "Forma");
+    let pointee = mapping::PointeeShape::Known {
+        usr: forma.usr.clone(),
+        name: forma.name.clone(),
+    };
+
+    // Without an owning function to narrow against, the answer stays the
+    // full, sound CHA enumeration — narrowing is additive, never silently
+    // on by default.
+    let unnarrowed = mapping::pointer_options_for(pointee.clone(), Some(&facts), None);
+    let unnarrowed_names: Vec<&str> = unnarrowed[0]
+        .consequences
+        .iter()
+        .map(|consequence| consequence.description.as_str())
+        .collect();
+    assert_eq!(
+        unnarrowed[0].consequences.len(),
+        3,
+        "{unnarrowed:?} (expected Forma, Triangulo and Quadrado, unnarrowed)"
+    );
+    let _ = unnarrowed_names;
+
+    let fabrica_de_triangulo = find_function(&functions, "FabricaDeTriangulo");
+    let narrowed_to_triangulo =
+        mapping::pointer_options_for(pointee.clone(), Some(&facts), Some(fabrica_de_triangulo));
+    assert_eq!(
+        narrowed_to_triangulo[0].consequences.len(),
+        1,
+        "{narrowed_to_triangulo:?}"
+    );
+    assert!(
+        narrowed_to_triangulo[0].consequences[0]
+            .description
+            .contains("Triangulo"),
+        "{narrowed_to_triangulo:?}"
+    );
+
+    let fabrica_de_quadrado = find_function(&functions, "FabricaDeQuadrado");
+    let narrowed_to_quadrado =
+        mapping::pointer_options_for(pointee, Some(&facts), Some(fabrica_de_quadrado));
+    assert_eq!(
+        narrowed_to_quadrado[0].consequences.len(),
+        1,
+        "{narrowed_to_quadrado:?}"
+    );
+    assert!(
+        narrowed_to_quadrado[0].consequences[0]
+            .description
+            .contains("Quadrado"),
+        "{narrowed_to_quadrado:?}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Category C — bridge code is the only viable path
 // ---------------------------------------------------------------------

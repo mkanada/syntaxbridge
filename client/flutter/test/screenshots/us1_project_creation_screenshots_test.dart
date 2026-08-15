@@ -360,6 +360,10 @@ class _ScriptedServerClient implements ServerClient {
       throw UnimplementedError('not used by this screen');
 
   @override
+  Future<List<PointerDeclaration>> listPointers(String projectDir) =>
+      throw UnimplementedError('not used by this screen');
+
+  @override
   Future<List<TypeUsage>> listTypeUsages({
     required String projectDir,
     required String typeUsr,

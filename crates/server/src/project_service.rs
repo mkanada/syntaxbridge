@@ -10,6 +10,7 @@ use crate::function_catalog::{self, CallEdge, FunctionCatalogError, FunctionDecl
 use crate::ingest::{self, CompilationUnit, CreateProjectRequest, CreatedProject, IngestError};
 use crate::ir;
 use crate::persistence::{GlobalStore, PersistenceError, ProjectRecord, ProjectStore};
+use crate::pointer_catalog::{self, PointerCatalogError, PointerDeclaration};
 use crate::progress::{Cancellation, ExtractionProgress};
 use crate::source_catalog::{self, SourceCatalogError, SourceFile};
 use crate::transpile::{self, TranspileError, TranspiledPackage};
@@ -27,6 +28,7 @@ pub struct CreationProgress {
     pub type_catalog: ExtractionProgress,
     pub source_catalog: ExtractionProgress,
     pub function_catalog: ExtractionProgress,
+    pub pointer_catalog: ExtractionProgress,
     pub cancellation: Cancellation,
 }
 
@@ -40,6 +42,7 @@ pub enum ProjectCreationError {
     TypeCatalog(TypeCatalogError),
     SourceCatalog(SourceCatalogError),
     FunctionCatalog(FunctionCatalogError),
+    PointerCatalog(PointerCatalogError),
 }
 
 impl ProjectCreationError {
@@ -50,6 +53,7 @@ impl ProjectCreationError {
             Self::TypeCatalog(_) => false,
             Self::SourceCatalog(_) => false,
             Self::FunctionCatalog(_) => false,
+            Self::PointerCatalog(_) => false,
         }
     }
 
@@ -63,6 +67,7 @@ impl ProjectCreationError {
             Self::TypeCatalog(TypeCatalogError::Cancelled)
                 | Self::SourceCatalog(SourceCatalogError::Cancelled)
                 | Self::FunctionCatalog(FunctionCatalogError::Cancelled)
+                | Self::PointerCatalog(PointerCatalogError::Cancelled)
         )
     }
 }
@@ -75,6 +80,7 @@ impl fmt::Display for ProjectCreationError {
             Self::TypeCatalog(error) => write!(formatter, "{error}"),
             Self::SourceCatalog(error) => write!(formatter, "{error}"),
             Self::FunctionCatalog(error) => write!(formatter, "{error}"),
+            Self::PointerCatalog(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -108,6 +114,12 @@ impl From<SourceCatalogError> for ProjectCreationError {
 impl From<FunctionCatalogError> for ProjectCreationError {
     fn from(error: FunctionCatalogError) -> Self {
         Self::FunctionCatalog(error)
+    }
+}
+
+impl From<PointerCatalogError> for ProjectCreationError {
+    fn from(error: PointerCatalogError) -> Self {
+        Self::PointerCatalog(error)
     }
 }
 
@@ -146,6 +158,13 @@ pub fn create_project(
         progress.map(|progress| &progress.cancellation),
     )?;
 
+    project.pointer_catalog = pointer_catalog::extract_pointer_catalog_cancellable(
+        &project.compilation_units,
+        &project.input_source_dir,
+        progress.map(|progress| &progress.pointer_catalog),
+        progress.map(|progress| &progress.cancellation),
+    )?;
+
     let project_db_path = project.project_dir.join("project.db");
     let mut project_store = ProjectStore::open(&project_db_path)?;
     project_store.replace_compilation_units(&project.compilation_units)?;
@@ -156,6 +175,7 @@ pub fn create_project(
     project_store.replace_function_declarations(&function_catalog.declarations)?;
     project_store.replace_call_edges(&function_catalog.calls)?;
     project_store.replace_ir(&function_catalog.ir_functions, &function_catalog.ir_records)?;
+    project_store.replace_pointer_declarations(&project.pointer_catalog)?;
 
     let global_store = GlobalStore::open(global_db_path)?;
     global_store.register_project(
@@ -478,6 +498,19 @@ pub fn list_calls_in_file(project_dir: &Path, file: &str) -> Result<Vec<CallEdge
     let project_db_path = project_dir.join("project.db");
     let project_store = ProjectStore::open(&project_db_path)?;
     Ok(project_store.list_calls_in_file(file)?)
+}
+
+/// Serves the pointer catalog already persisted for a project (Parte 1 of
+/// `docs/plans/catalogo-de-ponteiros-e-solver-tfa.md`), without reparsing —
+/// mirrors `TypeCatalogListing`/`list_types`.
+pub fn list_pointers(project_dir: &Path) -> Result<Vec<PointerDeclaration>, ListTypesError> {
+    if !is_openable_project(project_dir) {
+        return Err(ListTypesError::NotFound(project_dir.to_path_buf()));
+    }
+
+    let project_db_path = project_dir.join("project.db");
+    let project_store = ProjectStore::open(&project_db_path)?;
+    Ok(project_store.list_pointer_declarations()?)
 }
 
 /// Reads a single source file's content for display, refusing to read

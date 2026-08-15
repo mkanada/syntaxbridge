@@ -7,12 +7,33 @@ C++, quais mapeamentos para Dart são oferecidos ao usuário e quais são
 recusados por inviabilizarem outro tipo do projeto (Q9 em
 `docs/plans/User Steps.md`).
 
-**Status (2026-08-13): implementado e testado contra os 22 casos.** Cada caso
-tem um teste próprio em `crates/server/tests/mapping_solver_cases.rs`, rodando
-sobre catálogos extraídos de verdade (`type_catalog`/`function_catalog` via
-`libclang`), não `TypeDeclaration`s escritos à mão. Cinco pontos de entrada,
-não um único `options_for`, porque nem toda decisão de US-7 é sobre um
-`TypeDeclaration`:
+**Status (2026-08-13): implementado e testado contra os 22 casos originais;
+A10 acrescentado em 2026-08-14; B07 acrescentado em 2026-08-15, primeiro
+caso do corpus a exercitar a evolução de CHA para TFA/DFA descrita em
+`docs/plans/catalogo-de-ponteiros-e-solver-tfa.md`.** Cada um dos 22 casos
+originais tem um teste
+próprio em `crates/server/tests/mapping_solver_cases.rs`, rodando sobre
+catálogos extraídos de verdade (`type_catalog`/`function_catalog` via
+`libclang`), não `TypeDeclaration`s escritos à mão. A10 mora em dois lugares
+mais específicos em vez de `mapping_solver_cases.rs`, por uma razão
+diferente da falta de fatos (ele usa `ProjectFacts` como qualquer outro
+caso, só que opcionalmente): três testes inline no próprio `mapping.rs`
+cobrem a decisão do solver em si —
+`a10_pointer_to_a_known_type_with_no_facts_is_a_nullable_reference_to_just_itself`
+(a versão sem catálogo que `lower::cpp::lower_type` de fato consulta),
+`a10_pointer_to_a_polymorphic_base_enumerates_every_subclass` (a enumeração
+real, por herança, com `Forma`/`Circulo`/`Quadrado` escritos à mão — o
+próprio ponto do caso é a árvore de herança, não uma extração de
+`libclang`), e `pointer_to_an_opaque_type_still_needs_a_dart_ffi_bridge`; e
+`crates/server/tests/lower_cpp.rs`
+(`a_pointer_to_a_known_class_becomes_a_nullable_reference_...`) prova a
+consulta real durante a geração sobre C++ de verdade. O fixture em
+`mapping-solver-fixtures/A10-.../` continua existindo e compila limpo
+(`-Wall -Wextra`), como todo outro caso do corpus — é material de
+referência, não a fonte de nenhum desses testes.
+
+Seis pontos de entrada, não um único `options_for`, porque nem toda decisão de
+US-7 é sobre um `TypeDeclaration`:
 
 - `mapping::options_for` — decisões por tipo (`struct`/`class`/`union`):
   herança múltipla (com e sem conflito), Regra dos Três/RAII, interface vs.
@@ -27,7 +48,20 @@ não um único `options_for`, porque nem toda decisão de US-7 é sobre um
 - `mapping::signature_options_for` — construções sem tipo de projeto próprio
   (ponteiro, inteiro de largura fixa, `float`, `setjmp`/`goto`,
   `std::thread`/`std::mutex`), detectadas na assinatura ou no texto fonte da
-  função.
+  função. Heurística textual, no nível da assinatura inteira — mantida como
+  está; `pointer_options_for` (abaixo) é o par mais preciso, no nível do
+  tipo, que a geração de verdade consulta.
+- `mapping::pointer_options_for` — caso A10: dado o que já se sabe sobre o
+  tipo apontado por um ponteiro (`PointeeShape::Known { usr, name }` ou
+  `Opaque`), devolve a lista real de tipos concretos que o ponteiro pode
+  assumir (`possible_pointee_types`, uma enumeração por herança — não uma
+  classificação binária) e decide entre referência anulável e código ponte
+  `dart:ffi`. Único dos seis pontos de entrada com `facts` opcional
+  (`Option<&ProjectFacts<'_>>`): `lower::cpp::lower_type` (geração) chama
+  com `None`, porque só tem o tipo do próprio ponteiro em mãos, não o
+  catálogo do projeto inteiro — recebe de volta o singleton `[T]`, uma
+  lista genuína, só sem os subtipos; um consumidor com o catálogo completo
+  recebe a enumeração cheia.
 - `mapping::string_usage_conflict` — varredura de projeto inteiro para o caso
   B05 (`std::string` como texto em um lugar, binário em outro).
 
@@ -117,12 +151,14 @@ arquivos. A letra em cada ID marca a *lição principal* do caso, não a única.
 | A07 | Operador sobrecarregado direto | Local | 7 (sobrecarga de operadores) |
 | A08 | `float` vs. `double` | Local | 11 (ponto flutuante) |
 | A09 | `std::vector` trivial | Local | 13 (contêineres STL) |
+| A10 | Ponteiro para classe, referência anulável | Local | 2 (ponteiros/aritmética de ponteiros) |
 | B01 | Duas classes com restrição cruzada | Global | 3 (semântica de valor/referência) |
 | B02 | Diamante com métodos conflitantes | Global | 1 (herança múltipla) |
 | B03 | Interface implementada em vários locais | Global | 1 (herança múltipla) |
 | B04 | Sobrecarga entre unidades de compilação | Global | 6 (sobrecarga) |
 | B05 | Texto em um lugar, binário em outro | Global | 12 (`char*`/`std::string`) |
 | B06 | Herança virtual com estado compartilhado | Global | 1, 3 (herança múltipla, semântica de valor/referência) |
+| B07 | Ponteiro com atribuição única | Global | 2 (ponteiros/aritmética de ponteiros) |
 | C01 | Aritmética de ponteiros | Ponte | 2 (ponteiros/aritmética de ponteiros) |
 | C02 | `setjmp`/`longjmp` | Ponte | 14 (exceções/`goto`/`setjmp`) |
 | C03 | Compilação condicional | Ponte | 15 (pré-processador) |
@@ -237,6 +273,57 @@ para `List<int>`, sem decisão nenhuma a fazer. Incluído de propósito como
 linha de base "fácil" de contêiner STL, para contrastar com B05 (o caso
 difícil de STL/`std::string`, que decide `String` vs. `Uint8List`).
 
+### A10 — Ponteiro para classe, referência anulável
+
+`mapping-solver-fixtures/A10-ponteiro-para-classe-referencia-anulavel/`
+
+Contraponto de C01: ali o ponteiro aponta para `int` e é deslocado por
+aritmética, sem opção de mapeamento de tipo que resolva — só código ponte
+(`dart:ffi`). Aqui `Nota*` aponta para um tipo que o projeto já representa
+por inteiro (`Nota`, `struct`/`class` do próprio projeto), e nunca é
+indexado/incrementado — só atribuído e comparado com `nullptr`, o idioma
+comum de "referência opcional a um único objeto".
+
+**O resultado do solver não é uma classificação binária — é a lista real de
+tipos possíveis.** `mapping::pointer_options_for` não só decide "referência
+anulável vs. ponte"; sua resposta de verdade é `possible_pointee_types`, que
+caminha pelas mesmas arestas de herança que `base_usrs_of` já lê para a
+decisão de herança múltipla do E09 (só que na direção oposta: de uma base
+para baixo, até toda classe que estende dela, transitivamente) e devolve
+cada tipo concreto encontrado, o próprio ponteiro incluído. Para `Nota`
+(sem subclasses no fixture), o conjunto é o singleton `{Nota}`; para um
+ponteiro a uma base polimórfica com subclasses reais, o conjunto lista cada
+uma delas (`options[0].consequences`, um `Consequence` por tipo — testado
+com `Forma`/`Circulo`/`Quadrado` em `mapping::tests::
+a10_pointer_to_a_polymorphic_base_enumerates_every_subclass`). O ponto do
+degrau original ("o conjunto de tipos possíveis de um ponteiro é sempre
+finito, porque o código fonte é finito") não é só a justificativa da
+decisão — é o próprio dado que o solver calcula e devolve.
+
+Por que o conjunto enumerado não muda o Dart emitido (sempre `T?`, nunca um
+tipo somado dos concretos): a garantia estática de C++ é exatamente o que
+já torna a polimorfia de referência única do Dart correta com um único tipo
+declarado — nenhuma enumeração de subtipos precisa aparecer no texto
+gerado, só na resposta do solver. `lower::cpp::lower_type` consulta o
+solver de verdade na geração (`facts: None`, já que não tem o catálogo do
+projeto inteiro em mãos — só o tipo do próprio ponteiro que acabou de
+lowerar), recebendo a versão não enriquecida (singleton `[T]`, ainda uma
+lista genuína, só sem os subtipos) — mapeando direto para uma referência
+anulável (`T?`, `Type::Nullable`, não `Type::Unsupported`). A versão
+enriquecida (com `ProjectFacts`, e portanto a enumeração real) é a que um
+consumidor no nível de decisão/UI de US-7 receberia.
+
+Nasceu do diagnóstico do Verovio 6.2.0 real
+(`docs/plans/diagnostico-verovio-6.2.0.md`, achado 5): ponteiro cru é
+onipresente em C++ orientado a objetos real, e a esmagadora maioria é
+exatamente esta forma, não a de C01. Efeito colateral encontrado só ao
+medir contra o Verovio real, também corrigido: sem uma asserção de
+não-nulo (`!`) em todo acesso de campo/método/índice por uma referência
+anulável, `dart analyze` rejeitava o próprio código que o solver deveria
+ter tornado mais seguro (`unchecked_use_of_nullable_value`) —
+`emit::dart::receiver_bang` insere o `!`, a mesma aposta que C++ já fazia
+implicitamente ao desreferenciar sem checar.
+
 ## Categoria B — global
 
 ### B01 — Duas classes com restrição cruzada
@@ -329,6 +416,36 @@ reproduzir "um único `Motor` compartilhado entre duas superclasses" exige
 composição explícita (um campo `Motor` só, referenciado pelas duas partes),
 e só combinando `anfibio.hpp` com `monitor.hpp` fica claro que a composição
 *precisa* preservar identidade, não só equivalência de valor.
+
+### B07 — Ponteiro com atribuição única
+
+`mapping-solver-fixtures/B07-ponteiro-com-atribuicao-unica/`
+
+Contraponto de A10: lá `Nota` não tinha subclasses, então a enumeração por
+hierarquia (CHA — class hierarchy analysis) e o conjunto real coincidiam
+trivialmente. Aqui `Forma` tem duas — `Triangulo` e `Quadrado`, ambas em
+`fabrica.cpp` — e CHA sozinho (subir de `Forma` e enumerar toda subclasse
+alcançável, o que `possible_pointee_types` faz hoje) devolve `{Forma,
+Triangulo, Quadrado}` para **qualquer** `Forma*`, mesmo quando o código-fonte
+mostra que um `Forma*` específico só é construído de um jeito.
+`FabricaDeTriangulo()` e `FabricaDeQuadrado()` têm a mesma assinatura
+(`Forma *`) — nada na assinatura as distingue — mas cada uma faz `return new
+Triangulo();`/`return new Quadrado();`, nunca a outra. A resposta certa para
+o ponteiro de retorno de `FabricaDeTriangulo` é `{Triangulo}`, não `{Forma,
+Triangulo, Quadrado}`; para `FabricaDeQuadrado`, `{Quadrado}`. Só combinando
+a declaração do ponteiro (`forma.hpp`, a hierarquia) com o corpo de cada
+função (`fabrica.cpp`, quem de fato constrói o quê) a resposta certa
+aparece — daí categoria B, não A: olhar só `forma.hpp` sugere (não
+contradiz) que qualquer subclasse é possível em qualquer `Forma*` do
+projeto.
+
+Esse é o primeiro caso do corpus a exigir ir além de CHA — a evolução para
+uma análise de fluxo de tipos (TFA/DFA) que `docs/plans/
+catalogo-de-ponteiros-e-solver-tfa.md` registra como direção decidida.
+`possible_pointee_types` continua sound por padrão (a enumeração por
+hierarquia nunca é removida, só estreitada quando há evidência positiva de
+construção — void/ambíguo cai de volta para o conjunto CHA completo, nunca
+para um conjunto mais estreito do que o comprovadamente correto).
 
 ## Categoria C — código ponte obrigatório
 

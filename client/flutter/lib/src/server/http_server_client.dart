@@ -194,6 +194,30 @@ class HttpServerClient implements ServerClient {
   }
 
   @override
+  Future<List<PointerDeclaration>> listPointers(String projectDir) async {
+    final url = baseUrl
+        .resolve('/projects/pointers')
+        .replace(queryParameters: {'project_dir': projectDir});
+    cliLog('HTTP GET $url');
+    final request = await _httpClient.getUrl(url);
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP GET $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException(_errorMessageFromBody(body));
+    }
+
+    final json = jsonDecode(body) as Map<String, Object?>;
+    final pointersJson =
+        json['pointers'] as List<Object?>? ?? const <Object?>[];
+    return pointersJson
+        .whereType<Map<String, Object?>>()
+        .map(PointerDeclaration.fromJson)
+        .toList();
+  }
+
+  @override
   Future<List<TypeUsage>> listTypeUsages({
     required String projectDir,
     required String typeUsr,

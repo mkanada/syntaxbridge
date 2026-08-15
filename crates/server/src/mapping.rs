@@ -596,6 +596,44 @@ pub fn overload_options_for(
         }];
     }
 
+    // E13: C++ resolves `Fraction::Reduce()` (instance) and
+    // `Fraction::Reduce(int&, int&)` (static) by call-site syntax alone —
+    // legal, no real overload at all. Dart has no such second axis: a
+    // `static` and a non-`static` member can never share a name in the same
+    // class (`conflicting_static_and_instance`). Checked *before* the arity
+    // check below, which would otherwise (wrongly) read these two as an
+    // ordinary "differs only by parameter count" overload and choose
+    // `"parametro-opcional"` — nonsensical here, since there's no single
+    // Dart member the static and instance call sites could ever share.
+    if group.iter().any(|f| f.is_static) && group.iter().any(|f| !f.is_static) {
+        let usrs: Vec<String> = group.iter().map(|f| f.usr.clone()).collect();
+        let mut consequences = call_site_consequences(&usrs, facts);
+        for function in &group {
+            consequences.push(Consequence {
+                affected_type_usr: function.usr.clone(),
+                description: format!(
+                    "precisa de um nome próprio, distinto de `{name}`: `{}` ({})",
+                    function.signature,
+                    if function.is_static {
+                        "estático"
+                    } else {
+                        "instância"
+                    }
+                ),
+            });
+        }
+        return vec![MappingOption {
+            id: "renomear-estatico-instancia".to_owned(),
+            label: "Renomear (estático vs. instância)".to_owned(),
+            description: format!(
+                "`{name}` tem uma versão estática e uma de instância — Dart proíbe um membro \
+                 estático e um de instância com o mesmo nome na mesma classe, então a versão \
+                 estática precisa de um nome distinto."
+            ),
+            consequences,
+        }];
+    }
+
     let params_without_const = |signature: &str| signature.trim_end_matches(" const").to_owned();
     let arities: HashSet<usize> = group
         .iter()
@@ -944,6 +982,223 @@ pub fn signature_options_for(function: &FunctionDeclaration) -> Vec<MappingOptio
     }]
 }
 
+/// What `lower::cpp` already knows about a pointer's pointee, before
+/// `pointer_options_for` decides how (or whether) that pointer maps to
+/// Dart. `Known` carries the pointee's own identity (`usr`/`name`) because
+/// the solver's real answer — see that function's doc comment — is the
+/// *enumerated* finite set of concrete types the pointer could hold, not
+/// just a yes/no on whether one is representable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PointeeShape {
+    /// The pointee is a type this project's own analysis can already
+    /// represent in full — this project's own `struct`/`class` (`usr`/
+    /// `name` are its own), or `std::string`/`std::vector` (E05's library
+    /// adapters, which have no project `usr` of their own to enumerate
+    /// subtypes from — treated the same as a project class with no
+    /// subclasses: the singleton set containing only itself).
+    Known { usr: String, name: String },
+    /// `void`, a scalar (`int`/`char`/`double`/...), or anything else this
+    /// project's analysis can't already represent on its own.
+    Opaque,
+}
+
+/// One concrete type a pointer could hold at runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PossiblePointee {
+    pub usr: String,
+    pub name: String,
+}
+
+/// Decides how a raw C++ pointer (`T*`) maps to Dart, given what's already
+/// known about its pointee `T` — item 2 of US-7's checklist
+/// ("ponteiros/aritmética de ponteiros"), case A10
+/// (`docs/mapping-solver-cases.md`), alongside `signature_options_for`'s
+/// existing whole-signature textual detection (kept as-is: that one flags
+/// *any* `*` in a signature as needing a bridge, a coarser, function-level
+/// heuristic).
+///
+/// The set of concrete types a `T*` pointer's value could ever hold at
+/// runtime is always finite: the C++ source that could construct one is
+/// itself finite, and C++'s own static type system already guarantees the
+/// pointer, whatever it holds, is either null or an object whose dynamic
+/// type is `T` or a subtype of `T` declared somewhere in that same finite
+/// source — there is no way for well-typed C++ to make it anything else.
+/// The solver's actual answer, when `T` is itself representable
+/// (`PointeeShape::Known`), *is* that set — `possible_pointee_types` walks
+/// `facts`' own inheritance edges (the same ones `base_usrs_of` already
+/// reads for E09's multiple-inheritance decision, just followed in the
+/// opposite direction: from a base down to every class that extends it,
+/// transitively) and returns every concrete type found, `T` itself
+/// included. `facts` is optional because the two consumers of this
+/// function sit at different points in the pipeline: `lower::cpp::lower_type`
+/// (generation) only ever has the pointee's own `ir::Type` in hand, no
+/// project-wide catalog, so it gets the correct-but-unenriched singleton
+/// `[T]`; a caller with `ProjectFacts` (US-7's own decision/description
+/// layer) gets the real, fully enumerated set. Either way the list is what
+/// makes a plain nullable Dart reference (`T?`) sound to emit: Dart's own
+/// single-reference polymorphism already covers every member of that set
+/// through the one declared type `T`, so nothing about *which* member a
+/// given pointer holds is ever a question `emit::dart` needs to answer.
+///
+/// When `T` itself isn't representable (`PointeeShape::Opaque` — `void`, a
+/// scalar, or a type this project's own analysis already gave up on), that
+/// finiteness guarantee stops helping: nothing in C++'s type system rules
+/// out treating the pointer as a buffer (`ptr[i]`, `ptr + n`) instead of a
+/// single value, and Dart has no address-arithmetic type to receive either
+/// reading without `dart:ffi` — the same bridge answer
+/// `signature_options_for` already gives case C01, unchanged here.
+/// `owning_function` is the first, deliberately narrow step past pure CHA
+/// toward the type-flow analysis `docs/plans/catalogo-de-ponteiros-e-solver-tfa.md`
+/// (Parte 2) describes: when given, and the pointer's declared type resolves
+/// to more than one possible concrete type, `pointer_options_for` also reads
+/// `owning_function`'s own source body (`ProjectFacts` already carries
+/// nothing about assignment sites — this reads straight from disk, the same
+/// textual-evidence approach `string_usage_conflict` and
+/// `signature_options_for`'s C01/C02/C03/C04 rules already use elsewhere in
+/// this module) and narrows to whichever candidates the body actually
+/// constructs (`new <Candidato>(...)`, case B07). No evidence found, or
+/// `owning_function` omitted, leaves the full CHA enumeration untouched —
+/// this narrows, it never invents a *wider* answer than CHA, and it never
+/// narrows without positive evidence (soundness: see
+/// `possible_pointee_types`'s own doc comment). What this does **not** do
+/// yet is the interprocedural half of the plan (tracing a value across the
+/// caller/callee edges `function_catalog::CallEdge` already exposes) — every
+/// case in the corpus so far only needs the owning function's own body.
+pub fn pointer_options_for(
+    pointee: PointeeShape,
+    facts: Option<&ProjectFacts<'_>>,
+    owning_function: Option<&FunctionDeclaration>,
+) -> Vec<MappingOption> {
+    let PointeeShape::Known { usr, name } = pointee else {
+        return vec![MappingOption {
+            id: "ponte-dart-ffi".to_owned(),
+            label: "Código ponte: dart:ffi".to_owned(),
+            description: "o ponteiro aponta para um tipo que este projeto não representa (void, \
+                          um escalar, ou algo que a própria análise já recusou) — nada garante \
+                          que não seja usado como buffer/aritmética de endereço, e Dart não tem \
+                          um tipo de referência que cubra esse caso sem `dart:ffi` (`Pointer<T>`)."
+                .to_owned(),
+            consequences: Vec::new(),
+        }];
+    };
+
+    let mut possible_types = match facts {
+        Some(facts) => possible_pointee_types(&usr, &name, facts),
+        None => vec![PossiblePointee { usr, name }],
+    };
+    if let Some(owning_function) = owning_function {
+        possible_types = narrow_by_construction_evidence(possible_types, owning_function);
+    }
+    let names = possible_types
+        .iter()
+        .map(|pointee| pointee.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let consequences = possible_types
+        .iter()
+        .map(|pointee| Consequence {
+            affected_type_usr: pointee.usr.clone(),
+            description: format!(
+                "`{}` é um dos tipos concretos que este ponteiro pode assumir em tempo de \
+                 execução",
+                pointee.name
+            ),
+        })
+        .collect();
+
+    vec![MappingOption {
+        id: "referencia-anulavel".to_owned(),
+        label: "Referência anulável".to_owned(),
+        description: format!(
+            "conjunto finito e conhecido de tipos possíveis: {names} — C++ garante \
+             estaticamente que o ponteiro só pode ser nulo ou um destes, o mesmo conjunto que \
+             a própria polimorfia de referência única do Dart já cobre com um único tipo \
+             declarado: mapeia direto para uma referência anulável (`T?`)."
+        ),
+        consequences,
+    }]
+}
+
+/// `usr`/`name`'s own declared type, plus every class in the project that
+/// (transitively) inherits from it — always at least `[usr/name]` itself,
+/// since a class with zero subclasses is still a finite set of exactly one.
+/// Walks `facts.declarations` looking for any declaration whose own
+/// `base_usrs_of` includes an already-found member of the set, growing the
+/// frontier until nothing new turns up — a class hierarchy is a DAG in
+/// valid C++ (no inheritance cycles), so this always terminates, bounded by
+/// `facts.declarations.len()`.
+fn possible_pointee_types(usr: &str, name: &str, facts: &ProjectFacts<'_>) -> Vec<PossiblePointee> {
+    let mut found = vec![PossiblePointee {
+        usr: usr.to_owned(),
+        name: name.to_owned(),
+    }];
+    let mut seen_usrs: HashSet<&str> = [usr].into_iter().collect();
+    let mut frontier = vec![usr.to_owned()];
+
+    while let Some(base_usr) = frontier.pop() {
+        for declaration in facts.declarations {
+            if seen_usrs.contains(declaration.usr.as_str()) {
+                continue;
+            }
+            if base_usrs_of(declaration, facts)
+                .iter()
+                .any(|base| base == &base_usr)
+            {
+                seen_usrs.insert(declaration.usr.as_str());
+                frontier.push(declaration.usr.clone());
+                found.push(PossiblePointee {
+                    usr: declaration.usr.clone(),
+                    name: declaration.name.clone(),
+                });
+            }
+        }
+    }
+
+    found
+}
+
+/// Narrows `candidates` (CHA's full enumeration) to whichever ones
+/// `owning_function`'s own body textually constructs (`new Candidato(...)`)
+/// — case B07 (`docs/mapping-solver-cases.md`). Falls back to the full,
+/// unnarrowed `candidates` whenever there's no positive evidence (empty
+/// body, or none of the candidates textually constructed): never returns a
+/// set this function isn't sure is at least as wide as the truth.
+fn narrow_by_construction_evidence(
+    candidates: Vec<PossiblePointee>,
+    owning_function: &FunctionDeclaration,
+) -> Vec<PossiblePointee> {
+    let body = read_span(
+        &owning_function.file,
+        owning_function.line,
+        owning_function.end_line,
+    );
+
+    let constructed: Vec<PossiblePointee> = candidates
+        .iter()
+        .filter(|candidate| constructs_type(&body, &candidate.name))
+        .cloned()
+        .collect();
+
+    if constructed.is_empty() {
+        candidates
+    } else {
+        constructed
+    }
+}
+
+/// Whether `body` contains a `new <type_name>` construction — a `new` token
+/// immediately followed by `type_name` as its own token, so e.g. `new
+/// Triangulo(...)` matches `Triangulo` but not `TrianguloEquilatero`.
+fn constructs_type(body: &str, type_name: &str) -> bool {
+    let tokens: Vec<&str> = body
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|token| !token.is_empty())
+        .collect();
+    tokens
+        .windows(2)
+        .any(|pair| pair[0] == "new" && pair[1] == type_name)
+}
+
 fn contains_word(text: &str, word: &str) -> bool {
     text.split(|c: char| !c.is_alphanumeric() && c != '_')
         .any(|token| token == word)
@@ -1098,6 +1353,112 @@ mod tests {
         assert_eq!(options[0].id, "uniao-com-tag");
     }
 
+    /// A10: a pointer to a type this project already represents has a
+    /// statically finite set of possible values (null, or that type/a
+    /// subtype) — resolved for real, a nullable reference, not a bridge.
+    /// No `ProjectFacts` in hand here (the `lower::cpp::lower_type` case,
+    /// which never has a project-wide catalog either) — the answer still
+    /// has to be a genuine, if unenriched, list: just the pointee itself.
+    #[test]
+    fn a10_pointer_to_a_known_type_with_no_facts_is_a_nullable_reference_to_just_itself() {
+        let options = pointer_options_for(
+            PointeeShape::Known {
+                usr: "c:@S@Nota".to_owned(),
+                name: "Nota".to_owned(),
+            },
+            None,
+            None,
+        );
+        assert_eq!(options.len(), 1, "{options:?}");
+        assert_eq!(options[0].id, "referencia-anulavel");
+        assert_eq!(options[0].consequences.len(), 1, "{options:?}");
+        assert_eq!(options[0].consequences[0].affected_type_usr, "c:@S@Nota");
+    }
+
+    /// The real payload: with `ProjectFacts` in hand, the solver walks the
+    /// project's own inheritance edges and enumerates every subclass —
+    /// `Forma` has two, `Circulo` and `Quadrado`, neither related to the
+    /// other except through `Forma`. A pointer to `Forma` can concretely be
+    /// any of the three (or null); the solver's list must name all three,
+    /// not just `Forma`.
+    #[test]
+    fn a10_pointer_to_a_polymorphic_base_enumerates_every_subclass() {
+        // `declaration()` fixes file/line/end_line the same for every call
+        // — fine for the single-declaration tests elsewhere in this module,
+        // but `base_usrs_of` matches an inheritance usage to its derived
+        // class by `(file, line range)`, so three declarations here need
+        // three distinct spans or each would spuriously look like it
+        // inherits from itself.
+        let mut forma = declaration(TypeDeclarationKind::Class, "Forma");
+        forma.file = "/project/input-source/src/forma.hpp".to_owned();
+        let mut circulo = declaration(TypeDeclarationKind::Class, "Circulo");
+        circulo.file = "/project/input-source/src/circulo.hpp".to_owned();
+        let mut quadrado = declaration(TypeDeclarationKind::Class, "Quadrado");
+        quadrado.file = "/project/input-source/src/quadrado.hpp".to_owned();
+        let usages = vec![
+            TypeUsage {
+                type_usr: forma.usr.clone(),
+                kind: TypeUsageKind::Inheritance,
+                file: circulo.file.clone(),
+                line: circulo.line,
+                column: 1,
+            },
+            TypeUsage {
+                type_usr: forma.usr.clone(),
+                kind: TypeUsageKind::Inheritance,
+                file: quadrado.file.clone(),
+                line: quadrado.line,
+                column: 1,
+            },
+        ];
+        let declarations = vec![forma.clone(), circulo, quadrado];
+        let facts = ProjectFacts {
+            declarations: &declarations,
+            usages: &usages,
+            functions: &[],
+            calls: &[],
+        };
+
+        let options = pointer_options_for(
+            PointeeShape::Known {
+                usr: forma.usr.clone(),
+                name: forma.name.clone(),
+            },
+            Some(&facts),
+            None,
+        );
+        assert_eq!(options.len(), 1, "{options:?}");
+        assert_eq!(options[0].id, "referencia-anulavel");
+        let mut names: Vec<&str> = options[0]
+            .consequences
+            .iter()
+            .map(|c| {
+                declarations
+                    .iter()
+                    .find(|d| d.usr == c.affected_type_usr)
+                    .map(|d| d.name.as_str())
+                    .unwrap_or("?")
+            })
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["Circulo", "Forma", "Quadrado"], "{options:?}");
+    }
+
+    /// C01's counterpart at the type level: a pointer to `void`/a scalar/
+    /// anything else this project can't represent has no such guarantee —
+    /// still needs `dart:ffi`.
+    #[test]
+    fn pointer_to_an_opaque_type_still_needs_a_dart_ffi_bridge() {
+        let options = pointer_options_for(PointeeShape::Opaque, None, None);
+        assert_eq!(options.len(), 1, "{options:?}");
+        assert_eq!(options[0].id, "ponte-dart-ffi");
+        assert!(
+            options[0].description.contains("dart:ffi"),
+            "{:?}",
+            options[0]
+        );
+    }
+
     fn free_function(name: &str, usr: &str, file: &str) -> FunctionDeclaration {
         FunctionDeclaration {
             name: name.to_owned(),
@@ -1111,6 +1472,7 @@ mod tests {
             end_line: 1,
             end_column: 1,
             usr: usr.to_owned(),
+            is_static: false,
             is_virtual: false,
             is_pure_virtual: false,
             is_defaulted: false,

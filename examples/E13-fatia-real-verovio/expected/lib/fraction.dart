@@ -44,29 +44,35 @@ class Fraction {
     return Fraction.ctor2(num, denom);
   }
 
-  bool operator ==(Fraction other) {
-    return _m_numerator * other._m_denominator ==
-        other._m_numerator * _m_denominator;
+  bool operator ==(Object other) {
+    if (other is Fraction) {
+      return _m_numerator * other._m_denominator ==
+          other._m_numerator * _m_denominator;
+    }
+    return false;
   }
 
   double ToDouble() {
-    return _syntaxBridgeUnsupported(
-          '/home/mauricio/rust_projects/syntax-bridge/examples/E13-fatia-real-verovio/input/src/fraction.cpp:61: unsupported expression cursor kind 124',
-        ) /
-        _m_denominator.toDouble();
+    return _m_numerator.toDouble() / _m_denominator.toDouble();
   }
 
   void Reduce() {
-    // TODO(syntax-bridge): unsupported statement cursor kind 115
-    throw UnimplementedError(
-      '/home/mauricio/rust_projects/syntax-bridge/examples/E13-fatia-real-verovio/input/src/fraction.cpp:72: unsupported statement cursor kind 115',
-    );
+    if (_m_denominator < 0) {
+      _m_numerator = -_m_numerator;
+      _m_denominator = -_m_denominator;
+    }
+    int gcdVal = _m_numerator.gcd(_m_denominator);
+    if (gcdVal != 1) {
+      _m_numerator = _m_numerator ~/ gcdVal;
+      _m_denominator = _m_denominator ~/ gcdVal;
+    }
   }
 
-  static void Reduce(int numerator, int denominator) {
+  static (int, int) ReduceStatic(int numerator, int denominator) {
     Fraction fraction = Fraction.ctor2(numerator, denominator);
     numerator = fraction.GetNumerator();
     denominator = fraction.GetDenominator();
+    return (numerator, denominator);
   }
 }
 
@@ -75,8 +81,4 @@ void LogDebug(dynamic /* unsupported: const char * */ fmt) {
   throw UnimplementedError(
     '/home/mauricio/rust_projects/syntax-bridge/examples/E13-fatia-real-verovio/input/src/fraction.cpp:20: unsupported parameter type: const char * (parameter `fmt`)',
   );
-}
-
-Never _syntaxBridgeUnsupported(String reason) {
-  throw UnimplementedError(reason);
 }
