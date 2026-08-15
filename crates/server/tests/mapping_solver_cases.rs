@@ -424,6 +424,67 @@ fn b07_pointer_with_a_single_construction_site_narrows_past_the_full_hierarchy()
     );
 }
 
+/// B08: `Obter` never constructs anything in its own body — it only
+/// forwards `FabricaDeTriangulo()`'s return value. Purely intraprocedural
+/// narrowing (B07) finds no `new` evidence in `Obter`'s own body and would
+/// fall back to the full, unnarrowed CHA set. The correct answer requires
+/// following `facts.calls` from `Obter` to `FabricaDeTriangulo`, whose own
+/// body *does* have construction evidence (`{Triangulo}`) — the first
+/// interprocedural step of `docs/plans/catalogo-de-ponteiros-e-solver-tfa.md`.
+#[test]
+fn b08_pointer_forwarded_through_a_delegating_factory_narrows_via_the_call_graph() {
+    let (types, functions) = extract("B08-fabrica-delegada");
+    let facts = ProjectFacts::from_catalogs(&types, &functions);
+    let forma = find_type(&types, "Forma");
+    let pointee = mapping::PointeeShape::Known {
+        usr: forma.usr.clone(),
+        name: forma.name.clone(),
+    };
+
+    let obter = find_function(&functions, "Obter");
+    let options = mapping::pointer_options_for(pointee, Some(&facts), Some(obter));
+    assert_eq!(options[0].consequences.len(), 1, "{options:?}");
+    assert!(
+        options[0].consequences[0].description.contains("Triangulo"),
+        "{options:?}"
+    );
+}
+
+/// B09: the first real slice of the project-wide viability solver Q9
+/// promised (`docs/plans/User Steps.md`, US-7 roteiro item 4) —
+/// `options_for(Base, ...)` alone never looks past `Base`'s own file, so it
+/// has no way to know `Carro` (in `carro.hpp`) already forces `Base` to
+/// become a Dart `mixin` (`classe-com-mixins`'s own consequence on `Base`).
+/// Combined with `standalone.cpp` directly instantiating `Base` as a plain
+/// value (a `mixin` can never be instantiated on its own in Dart), `Base`'s
+/// naive `options_for` answer ("classe-direta") is not actually feasible —
+/// `feasible_options` is what catches that, replacing it with bridge code.
+#[test]
+fn b09_mixin_forced_by_one_type_conflicts_with_direct_instantiation_in_another() {
+    let (types, functions) = extract("B09-mixin-forcado-vs-instanciacao-direta");
+    let facts = ProjectFacts::from_catalogs(&types, &functions);
+    let base = find_type(&types, "Base");
+
+    // Negative control: `options_for` alone, scoped to `Base`'s own file,
+    // has no way to see the conflict — it returns its ordinary default,
+    // exactly the naive-but-wrong answer `feasible_options` exists to
+    // replace.
+    let naive = mapping::options_for(base, &facts, &[]);
+    assert_eq!(naive.len(), 1, "{naive:?}");
+    assert_eq!(naive[0].id, "classe-direta");
+
+    let options = mapping::feasible_options(base, &facts, &[]);
+    assert_eq!(options.len(), 1, "{options:?}");
+    assert_eq!(options[0].id, "ponte-mixin-inviavel");
+    assert!(
+        options[0].description.contains("Carro") && options[0].description.contains("mixin"),
+        "{options:?}"
+    );
+    assert_eq!(options[0].consequences.len(), 1, "{options:?}");
+    let carro = find_type(&types, "Carro");
+    assert_eq!(options[0].consequences[0].affected_type_usr, carro.usr);
+}
+
 // ---------------------------------------------------------------------
 // Category C — bridge code is the only viable path
 // ---------------------------------------------------------------------

@@ -572,6 +572,42 @@ impl ProjectStore {
         Ok(())
     }
 
+    /// Every recorded type usage, project-wide — what rebuilding a full
+    /// `mapping::ProjectFacts` from the persisted store (rather than
+    /// reparsing) needs, unlike `list_type_usages_for`'s per-type filter.
+    pub fn list_type_usages(&self) -> Result<Vec<TypeUsage>, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT type_usr, kind, file, line, column FROM type_usages ORDER BY id")?;
+
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, u32>(3)?,
+                row.get::<_, u32>(4)?,
+            ))
+        })?;
+
+        let mut usages = Vec::new();
+        for row in rows {
+            let (type_usr, kind, file, line, column) = row?;
+            let Some(kind) = TypeUsageKind::parse(&kind) else {
+                continue;
+            };
+            usages.push(TypeUsage {
+                type_usr,
+                kind,
+                file,
+                line,
+                column,
+            });
+        }
+
+        Ok(usages)
+    }
+
     /// Every recorded usage of the type identified by `type_usr`, for the
     /// "click a type, see every place it's used" navigation US-4 asks for —
     /// answered straight from the persisted index, no reparsing.
@@ -789,6 +825,26 @@ impl ProjectStore {
     /// Every recorded call whose target resolves to `callee_usr` — US-5
     /// criterion 5's "from a definition, list its callers" — answered from
     /// the persisted index, no reparsing.
+    /// Every recorded call edge, project-wide — mirrors `list_type_usages`:
+    /// what rebuilding a full `mapping::ProjectFacts` from the persisted
+    /// store needs, unlike `list_callers_for`/`list_calls_in_file`'s
+    /// filtered variants.
+    pub fn list_call_edges(&self) -> Result<Vec<CallEdge>, PersistenceError> {
+        let mut statement = self.connection.prepare(
+            "SELECT caller_usr, callee_usr, is_dynamic_dispatch, unresolved_reason, file, line, column
+             FROM call_edges ORDER BY id",
+        )?;
+
+        let rows = statement.query_map([], row_to_call_edge)?;
+
+        let mut calls = Vec::new();
+        for row in rows {
+            calls.push(row?);
+        }
+
+        Ok(calls)
+    }
+
     pub fn list_callers_for(&self, callee_usr: &str) -> Result<Vec<CallEdge>, PersistenceError> {
         let mut statement = self.connection.prepare(
             "SELECT caller_usr, callee_usr, is_dynamic_dispatch, unresolved_reason, file, line, column
@@ -1583,6 +1639,15 @@ mod tests {
             ]
         );
 
+        let all_usages = store
+            .list_type_usages()
+            .expect("list every persisted usage");
+        assert_eq!(
+            all_usages,
+            sample_type_usages(),
+            "list_type_usages should return every row, unfiltered"
+        );
+
         let _ = fs::remove_file(&db_path);
     }
 
@@ -1761,6 +1826,15 @@ mod tests {
             .list_callers_for("c:@N@geometry@S@Shape@F@area#1#")
             .expect("list callers of area");
         assert_eq!(callers_of_area, vec![sample_call_edges()[0].clone()]);
+
+        let all_calls = store
+            .list_call_edges()
+            .expect("list every persisted call edge");
+        assert_eq!(
+            all_calls,
+            sample_call_edges(),
+            "list_call_edges should return every row, unfiltered"
+        );
 
         let _ = fs::remove_file(&db_path);
     }

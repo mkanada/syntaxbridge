@@ -170,6 +170,107 @@ pub fn options_for(
     vec![default_class_option(declaration, facts)]
 }
 
+/// The first real slice of the project-wide viability solver Q9 promised
+/// (US-7 roteiro item 4, `docs/plans/User Steps.md`) — not the full
+/// constraint-satisfaction solver the roteiro calls "o item mais caro" of
+/// US-7 (that stays gated on E09, per the same document), but a genuine
+/// first check that goes beyond `options_for`'s own file-scoped view.
+///
+/// `options_for(declaration, ...)` only ever reasons about `declaration`
+/// and its own direct bases; it has no way to know that some *other*
+/// type's own option already forces a shape onto `declaration` — today,
+/// concretely, `multiple_inheritance_option`'s `"classe-com-mixins"`
+/// option, which attaches a `Consequence` to every base saying it "vira
+/// mixin" (case B09, `docs/mapping-solver-cases.md`). A Dart `mixin` can
+/// never be instantiated on its own; when `declaration` is *also* directly
+/// constructed as a plain value somewhere else in the project
+/// (`TypeUsageKind::VariableDeclaration`), the two requirements can't both
+/// hold — `options_for`'s own answer for `declaration`, whatever it is, is
+/// not actually feasible. `feasible_options` re-derives that "some other
+/// type forces a mixin here" fact by calling `options_for` on every other
+/// declaration (rather than duplicating `multiple_inheritance_option`'s own
+/// matching logic), so the two never drift apart, and only overrides the
+/// default when both halves of the conflict hold — criterion 3 ("uma opção
+/// que tornaria outro tipo não convertível não é oferecida") enforced for
+/// real, for this one shape of conflict, not just described.
+pub fn feasible_options(
+    declaration: &TypeDeclaration,
+    facts: &ProjectFacts<'_>,
+    decisions: &[MappingDecision],
+) -> Vec<MappingOption> {
+    let default = options_for(declaration, facts, decisions);
+
+    let Some(forcing) = mixin_forced_on(declaration, facts) else {
+        return default;
+    };
+    if !is_directly_value_constructed(declaration, facts) {
+        return default;
+    }
+
+    vec![MappingOption {
+        id: "ponte-mixin-inviavel".to_owned(),
+        label: "Código ponte: mixin inviável".to_owned(),
+        description: format!(
+            "`{name}` precisaria virar `mixin` para satisfazer a composição de herança \
+             múltipla de `{forcing_name}` — mas `{name}` também é instanciado diretamente \
+             como valor em algum outro lugar do projeto, e um `mixin` em Dart nunca pode ser \
+             instanciado sozinho. As duas exigências não são simultaneamente satisfazíveis por \
+             uma única classe/mixin: precisa de código ponte (composição em vez de mixin, ou \
+             duas representações).",
+            name = declaration.name,
+            forcing_name = forcing.name
+        ),
+        consequences: vec![Consequence {
+            affected_type_usr: forcing.usr,
+            description: format!(
+                "`{}` não pode mais compor `{}` via `with` — `{}` precisa continuar \
+                 instanciável diretamente em algum outro lugar do projeto",
+                forcing.name, declaration.name, declaration.name
+            ),
+        }],
+    }]
+}
+
+/// The type (if any) whose own `options_for` result already forces
+/// `declaration` to become a Dart `mixin` — found by asking every other
+/// declaration what *it* would choose (reusing `options_for` itself, not a
+/// parallel copy of `multiple_inheritance_option`'s own matching logic) and
+/// checking whether that answer's own consequences name `declaration`.
+struct ForcingType {
+    usr: String,
+    name: String,
+}
+
+fn mixin_forced_on(declaration: &TypeDeclaration, facts: &ProjectFacts<'_>) -> Option<ForcingType> {
+    facts.declarations.iter().find_map(|other| {
+        if other.usr == declaration.usr {
+            return None;
+        }
+
+        let forces = options_for(other, facts, &[]).iter().any(|option| {
+            option.consequences.iter().any(|consequence| {
+                consequence.affected_type_usr == declaration.usr
+                    && consequence.description.contains("vira mixin")
+            })
+        });
+
+        forces.then(|| ForcingType {
+            usr: other.usr.clone(),
+            name: other.name.clone(),
+        })
+    })
+}
+
+/// Whether `declaration` is used as a file/namespace-scope variable's own
+/// type anywhere in the project — `TypeUsageKind::VariableDeclaration`,
+/// already extracted by `type_catalog` (US-4's usage taxonomy), reused
+/// here rather than a new textual scan.
+fn is_directly_value_constructed(declaration: &TypeDeclaration, facts: &ProjectFacts<'_>) -> bool {
+    facts.usages.iter().any(|usage| {
+        usage.type_usr == declaration.usr && usage.kind == TypeUsageKind::VariableDeclaration
+    })
+}
+
 /// Kinds `options_for` doesn't have a dedicated rule for yet: `union` always
 /// needs bridge code (Dart has no overlapping-memory type); everything else
 /// (enum, typedef, type alias, macros) falls back to the original US-7
@@ -1060,10 +1161,15 @@ pub struct PossiblePointee {
 /// `owning_function` omitted, leaves the full CHA enumeration untouched —
 /// this narrows, it never invents a *wider* answer than CHA, and it never
 /// narrows without positive evidence (soundness: see
-/// `possible_pointee_types`'s own doc comment). What this does **not** do
-/// yet is the interprocedural half of the plan (tracing a value across the
-/// caller/callee edges `function_catalog::CallEdge` already exposes) — every
-/// case in the corpus so far only needs the owning function's own body.
+/// `possible_pointee_types`'s own doc comment). When `owning_function`'s own
+/// body has no construction evidence, this also tries one interprocedural
+/// step (case B08, `docs/mapping-solver-cases.md`): if the body is a plain
+/// forward of another function's return value (`return Callee(...)`, found
+/// via `facts.calls`), the same narrowing recurses on `Callee`. Still only
+/// return-forwarding — a value arriving through a parameter, a variable
+/// assigned from outside the function, or a container, has no traceable
+/// origin here and correctly falls back to full CHA, not because of an
+/// artificial limit but for lack of evidence.
 pub fn pointer_options_for(
     pointee: PointeeShape,
     facts: Option<&ProjectFacts<'_>>,
@@ -1087,7 +1193,7 @@ pub fn pointer_options_for(
         None => vec![PossiblePointee { usr, name }],
     };
     if let Some(owning_function) = owning_function {
-        possible_types = narrow_by_construction_evidence(possible_types, owning_function);
+        possible_types = narrow_by_construction_evidence(possible_types, owning_function, facts);
     }
     let names = possible_types
         .iter()
@@ -1157,16 +1263,43 @@ fn possible_pointee_types(usr: &str, name: &str, facts: &ProjectFacts<'_>) -> Ve
     found
 }
 
-/// Narrows `candidates` (CHA's full enumeration) to whichever ones
-/// `owning_function`'s own body textually constructs (`new Candidato(...)`)
-/// — case B07 (`docs/mapping-solver-cases.md`). Falls back to the full,
-/// unnarrowed `candidates` whenever there's no positive evidence (empty
-/// body, or none of the candidates textually constructed): never returns a
-/// set this function isn't sure is at least as wide as the truth.
+/// Narrows `candidates` (CHA's full enumeration) to whichever ones there's
+/// positive evidence of, trying two things in order:
+///
+/// 1. Construction evidence in `owning_function`'s own body (`new
+///    Candidato(...)`) — case B07.
+/// 2. Failing that, one interprocedural step: if the body is a plain
+///    forward of another function's return value (`return Callee(...)`,
+///    resolved via `facts.calls`), recurse the same narrowing on `Callee`
+///    — case B08. `visited` guards against a forwarding cycle (`A` forwards
+///    `B` forwards `A`) by refusing to revisit a function's `usr`.
+///
+/// Falls back to the full, unnarrowed `candidates` whenever neither finds
+/// positive evidence: never returns a set this function isn't sure is at
+/// least as wide as the truth.
 fn narrow_by_construction_evidence(
     candidates: Vec<PossiblePointee>,
     owning_function: &FunctionDeclaration,
+    facts: Option<&ProjectFacts<'_>>,
 ) -> Vec<PossiblePointee> {
+    narrow_by_construction_evidence_visiting(
+        candidates,
+        owning_function,
+        facts,
+        &mut HashSet::new(),
+    )
+}
+
+fn narrow_by_construction_evidence_visiting(
+    candidates: Vec<PossiblePointee>,
+    owning_function: &FunctionDeclaration,
+    facts: Option<&ProjectFacts<'_>>,
+    visited: &mut HashSet<String>,
+) -> Vec<PossiblePointee> {
+    if !visited.insert(owning_function.usr.clone()) {
+        return candidates;
+    }
+
     let body = read_span(
         &owning_function.file,
         owning_function.line,
@@ -1178,12 +1311,66 @@ fn narrow_by_construction_evidence(
         .filter(|candidate| constructs_type(&body, &candidate.name))
         .cloned()
         .collect();
-
-    if constructed.is_empty() {
-        candidates
-    } else {
-        constructed
+    if !constructed.is_empty() {
+        return constructed;
     }
+
+    if let Some(facts) = facts
+        && let Some(callee) = forwarded_callee(&body, owning_function, facts)
+    {
+        let forwarded = narrow_by_construction_evidence_visiting(
+            candidates.clone(),
+            callee,
+            Some(facts),
+            visited,
+        );
+        if forwarded.len() < candidates.len() {
+            return forwarded;
+        }
+    }
+
+    candidates
+}
+
+/// The function `owning_function`'s body plainly forwards (`return
+/// Callee(...)`), if any: an edge in `facts.calls` whose `caller_usr` is
+/// `owning_function`'s own `usr`, resolved to a callee whose name the body
+/// actually returns. Confirming both the call-graph edge *and* the textual
+/// `return` pattern (rather than either alone) keeps this from mistaking an
+/// unrelated call elsewhere in the body (logging, a side effect) for the
+/// one that actually produces the returned pointer.
+fn forwarded_callee<'a>(
+    body: &str,
+    owning_function: &FunctionDeclaration,
+    facts: &ProjectFacts<'a>,
+) -> Option<&'a FunctionDeclaration> {
+    facts.calls.iter().find_map(|edge| {
+        if edge.caller_usr != owning_function.usr {
+            return None;
+        }
+        let CallResolution::Resolved { callee_usr, .. } = &edge.resolution else {
+            return None;
+        };
+        let callee = facts.functions.iter().find(|f| &f.usr == callee_usr)?;
+        if returns_via_call(body, &callee.name) {
+            Some(callee)
+        } else {
+            None
+        }
+    })
+}
+
+/// Whether `body` contains a `return <callee_name>` — a `return` token
+/// immediately followed by `callee_name` as its own token, mirroring
+/// `constructs_type`'s `new`/type-name pairing.
+fn returns_via_call(body: &str, callee_name: &str) -> bool {
+    let tokens: Vec<&str> = body
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|token| !token.is_empty())
+        .collect();
+    tokens
+        .windows(2)
+        .any(|pair| pair[0] == "return" && pair[1] == callee_name)
 }
 
 /// Whether `body` contains a `new <type_name>` construction — a `new` token

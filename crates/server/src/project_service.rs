@@ -9,6 +9,7 @@ use serde::Serialize;
 use crate::function_catalog::{self, CallEdge, FunctionCatalogError, FunctionDeclaration};
 use crate::ingest::{self, CompilationUnit, CreateProjectRequest, CreatedProject, IngestError};
 use crate::ir;
+use crate::mapping;
 use crate::persistence::{GlobalStore, PersistenceError, ProjectRecord, ProjectStore};
 use crate::pointer_catalog::{self, PointerCatalogError, PointerDeclaration};
 use crate::progress::{Cancellation, ExtractionProgress};
@@ -500,17 +501,100 @@ pub fn list_calls_in_file(project_dir: &Path, file: &str) -> Result<Vec<CallEdge
     Ok(project_store.list_calls_in_file(file)?)
 }
 
+/// One concrete type a `return_type` pointer in [`PointerCatalogListing`]
+/// can hold, per `mapping::pointer_options_for`'s narrowed answer.
+#[derive(Debug, Serialize)]
+pub struct PossibleType {
+    pub usr: String,
+    pub name: String,
+}
+
 /// Serves the pointer catalog already persisted for a project (Parte 1 of
 /// `docs/plans/catalogo-de-ponteiros-e-solver-tfa.md`), without reparsing —
 /// mirrors `TypeCatalogListing`/`list_types`.
-pub fn list_pointers(project_dir: &Path) -> Result<Vec<PointerDeclaration>, ListTypesError> {
+///
+/// `possible_types` is where the solver's narrowing (B07/B08,
+/// `docs/mapping-solver-cases.md`) actually gets used outside a test: for
+/// every `return_type` pointer whose pointee resolves to a project type,
+/// this rebuilds a full `mapping::ProjectFacts` from what's already
+/// persisted (declarations, usages, functions, calls — no reparsing) and
+/// calls `mapping::pointer_options_for` with that pointer's own owning
+/// function, keyed by the pointer's `usr` (which, for `return_type`, *is*
+/// the owning function's own `usr` — see `pointer_catalog`'s module docs).
+/// Parameter/field/local pointers are left out of `possible_types` for now:
+/// nothing in `pointer_catalog` records which function a parameter/field/
+/// local belongs to (only `return_type`'s `usr` doubles as that), so there
+/// is no owning function to narrow against yet — see the "ligar
+/// `pointer_catalog` à narrowing" item in
+/// `docs/plans/catalogo-de-ponteiros-e-solver-tfa.md`.
+#[derive(Debug, Serialize)]
+pub struct PointerCatalogListing {
+    pub pointers: Vec<PointerDeclaration>,
+    pub possible_types: HashMap<String, Vec<PossibleType>>,
+}
+
+pub fn list_pointers(project_dir: &Path) -> Result<PointerCatalogListing, ListTypesError> {
     if !is_openable_project(project_dir) {
         return Err(ListTypesError::NotFound(project_dir.to_path_buf()));
     }
 
     let project_db_path = project_dir.join("project.db");
     let project_store = ProjectStore::open(&project_db_path)?;
-    Ok(project_store.list_pointer_declarations()?)
+    let pointers = project_store.list_pointer_declarations()?;
+    let declarations = project_store.list_type_declarations()?;
+    let usages = project_store.list_type_usages()?;
+    let functions = project_store.list_function_declarations()?;
+    let calls = project_store.list_call_edges()?;
+
+    let facts = mapping::ProjectFacts {
+        declarations: &declarations,
+        usages: &usages,
+        functions: &functions,
+        calls: &calls,
+    };
+
+    let mut possible_types = HashMap::new();
+    for pointer in &pointers {
+        if pointer.kind != pointer_catalog::PointerDeclarationKind::ReturnType
+            || pointer.pointee_usr.is_empty()
+        {
+            continue;
+        }
+        let Some(owning_function) = functions.iter().find(|f| f.usr == pointer.usr) else {
+            continue;
+        };
+        let Some(pointee) = declarations.iter().find(|d| d.usr == pointer.pointee_usr) else {
+            continue;
+        };
+
+        let options = mapping::pointer_options_for(
+            mapping::PointeeShape::Known {
+                usr: pointee.usr.clone(),
+                name: pointee.name.clone(),
+            },
+            Some(&facts),
+            Some(owning_function),
+        );
+        let types = options[0]
+            .consequences
+            .iter()
+            .filter_map(|consequence| {
+                declarations
+                    .iter()
+                    .find(|declaration| declaration.usr == consequence.affected_type_usr)
+                    .map(|declaration| PossibleType {
+                        usr: declaration.usr.clone(),
+                        name: declaration.name.clone(),
+                    })
+            })
+            .collect();
+        possible_types.insert(pointer.usr.clone(), types);
+    }
+
+    Ok(PointerCatalogListing {
+        pointers,
+        possible_types,
+    })
 }
 
 /// Reads a single source file's content for display, refusing to read

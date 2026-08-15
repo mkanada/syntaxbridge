@@ -582,7 +582,7 @@ async fn list_pointers_from_http(Query(query): Query<ProjectDirQuery>) -> Respon
     match tokio::task::spawn_blocking(move || project_service::list_pointers(&query.project_dir))
         .await
     {
-        Ok(Ok(pointers)) => json_response(StatusCode::OK, json!({ "pointers": pointers })),
+        Ok(Ok(listing)) => json_response(StatusCode::OK, listing),
         Ok(Err(error)) => list_types_error_response(error),
         Err(error) => {
             log_server(format_args!("list pointers task failed: {error}"));

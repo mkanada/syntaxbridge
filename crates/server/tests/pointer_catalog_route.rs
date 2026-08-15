@@ -96,6 +96,20 @@ fn returns_the_persisted_catalog_without_reparsing() {
         .expect("callback entry");
     assert_eq!(function_pointer["shape"], "function_pointer");
     assert_eq!(function_pointer["pointee_usr"], "");
+
+    // `possible_types` rides alongside `pointers` in the same response —
+    // where the solver's narrowing (B07/B08) becomes reachable outside a
+    // test, not a separate round trip. Empty here (this fixture never
+    // persisted a function catalog to narrow against), but the key itself
+    // is part of the route's contract.
+    let possible_types = json
+        .get("possible_types")
+        .and_then(Value::as_object)
+        .expect("response includes possible_types object");
+    assert!(
+        possible_types.is_empty(),
+        "no function catalog was persisted, so nothing should have narrowed: {possible_types:?}"
+    );
 }
 
 #[test]

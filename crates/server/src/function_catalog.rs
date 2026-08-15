@@ -1649,6 +1649,7 @@ extern "C" fn visit_cursor(
                 call_seen: &mut *state.call_seen,
                 ir_functions: &mut *state.ir_functions,
                 ir_seen: &mut *state.ir_seen,
+                pending_overload: None,
             };
             unsafe {
                 clang_sys::clang_visitChildren(
@@ -1680,6 +1681,11 @@ struct CallVisitorState<'a> {
     /// `extract_function_catalog_cancellable`'s final merge.
     ir_functions: &'a mut Vec<ir::Function>,
     ir_seen: &'a mut HashSet<String>,
+    /// Set by `visit_call_site` when the immediately preceding sibling
+    /// cursor was an unresolved `CXCursor_OverloadedDeclRef` (case B04) —
+    /// consumed by the very next callback, whichever cursor that turns out
+    /// to be, to disambiguate which overload it actually calls.
+    pending_overload: Option<PendingOverload>,
 }
 
 extern "C" fn visit_call_site(
@@ -1690,11 +1696,135 @@ extern "C" fn visit_call_site(
     let state = unsafe { &mut *(data as *mut CallVisitorState<'_>) };
     let kind = unsafe { clang_sys::clang_getCursorKind(cursor) };
 
+    // B04: a call to an overloaded *free* function used as an operand of
+    // another call (here, `std::string`'s `operator+`, in
+    // `formatar(contagem) + " / " + formatar(media)`) doesn't reach this
+    // visitor as its own `CXCursor_CallExpr` at all — `libclang`'s cursor
+    // API exposes only the bare, still-unresolved callee reference
+    // (`CXCursor_OverloadedDeclRef`) as a direct child of the surrounding
+    // expression, with `clang_getCursorReferenced` on it resolving to
+    // nothing useful (itself, empty `usr`). The actual selected overload
+    // only exists in full Clang's `Sema`, not in this simplified cursor
+    // view — so it has to be re-derived here from the one thing `libclang`
+    // does expose per candidate: each candidate's own parameter types
+    // (`try_record_overloaded_call`, using the very next sibling cursor —
+    // reliably the call's own single argument, confirmed empirically for
+    // this pattern — as the disambiguating evidence).
     if kind == clang_sys::CXCursor_CallExpr {
         record_call(cursor, state);
+    } else if kind == clang_sys::CXCursor_OverloadedDeclRef {
+        state.pending_overload = pending_overload_from(cursor, state.project_root);
+        return clang_sys::CXChildVisit_Recurse;
+    } else if let Some(pending) = state.pending_overload.take() {
+        record_overloaded_call(cursor, pending, state);
     }
 
     clang_sys::CXChildVisit_Recurse
+}
+
+/// What `try_record_overloaded_call` needs about an `OverloadedDeclRef`
+/// cursor, captured immediately (rather than re-derived later) since the
+/// cursor itself is only valid for the duration of this callback.
+struct PendingOverload {
+    file: String,
+    line: u32,
+    column: u32,
+    /// One entry per candidate found by name lookup at this call site —
+    /// its own `usr` and, when it has exactly one parameter (the only
+    /// shape `try_record_overloaded_call` currently disambiguates), that
+    /// parameter's type spelling to compare against the next sibling
+    /// cursor's own type.
+    candidates: Vec<(String, Option<String>)>,
+}
+
+fn pending_overload_from(
+    cursor: clang_sys::CXCursor,
+    project_root: &Path,
+) -> Option<PendingOverload> {
+    let (file, line, column) = type_catalog::cursor_site(cursor, project_root)?;
+
+    let num_overloaded = unsafe { clang_sys::clang_getNumOverloadedDecls(cursor) };
+    if num_overloaded == 0 {
+        return None;
+    }
+
+    let mut candidates = Vec::with_capacity(num_overloaded as usize);
+    for index in 0..num_overloaded {
+        let candidate = unsafe { clang_sys::clang_getOverloadedDecl(cursor, index) };
+        let candidate_usr =
+            unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(candidate)) };
+        if candidate_usr.is_empty() {
+            continue;
+        }
+
+        let function_type = unsafe { clang_sys::clang_getCursorType(candidate) };
+        let arg_count = unsafe { clang_sys::clang_getNumArgTypes(function_type) };
+        let single_param_type = if arg_count == 1 {
+            let arg_type = unsafe { clang_sys::clang_getArgType(function_type, 0) };
+            Some(unsafe {
+                type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(arg_type))
+            })
+        } else {
+            None
+        };
+        candidates.push((candidate_usr, single_param_type));
+    }
+
+    Some(PendingOverload {
+        file,
+        line,
+        column,
+        candidates,
+    })
+}
+
+/// Resolves a pending overloaded call (case B04) using `argument_cursor` —
+/// the cursor immediately following the `OverloadedDeclRef` in traversal
+/// order, which for the one shape this handles (a single-argument call to
+/// an overloaded free function) is reliably that argument's own expression.
+/// Disambiguates by comparing `argument_cursor`'s own type spelling against
+/// each single-parameter candidate's parameter type spelling: resolves only
+/// when *exactly one* candidate matches, and otherwise records the call as
+/// unresolved rather than guessing — the same soundness rule every other
+/// heuristic in this codebase follows (never a wrong-but-confident answer).
+fn record_overloaded_call(
+    argument_cursor: clang_sys::CXCursor,
+    pending: PendingOverload,
+    state: &mut CallVisitorState<'_>,
+) {
+    let argument_type = unsafe { clang_sys::clang_getCursorType(argument_cursor) };
+    let argument_spelling = unsafe {
+        type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(argument_type))
+    };
+
+    let mut matches = pending
+        .candidates
+        .iter()
+        .filter(|(_, param_type)| param_type.as_deref() == Some(argument_spelling.as_str()));
+    let resolution = match (matches.next(), matches.next()) {
+        (Some((usr, _)), None) => CallResolution::Resolved {
+            callee_usr: usr.clone(),
+            is_dynamic_dispatch: false,
+        },
+        _ => CallResolution::Unresolved {
+            reason: format!(
+                "overloaded call with {} candidates could not be disambiguated from the \
+                 argument type alone",
+                pending.candidates.len()
+            ),
+        },
+    };
+
+    let edge = CallEdge {
+        caller_usr: state.caller_usr.to_owned(),
+        resolution,
+        file: pending.file,
+        line: pending.line,
+        column: pending.column,
+    };
+    if state.call_seen.insert(call_identity(&edge)) {
+        state.calls.push(edge);
+    }
 }
 
 /// Records one call site: whether its target is statically resolvable

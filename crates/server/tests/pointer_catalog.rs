@@ -210,6 +210,179 @@ fn create_project_catalogs_project_pointers_with_libclang() {
     }
 }
 
+const NARROWING_MAIN_CPP: &str = r#"
+#include "fachada.hpp"
+
+int main() {
+    Forma* obtido = Obter();
+    (void)obtido;
+    return 0;
+}
+"#;
+
+const NARROWING_FORMA_HPP: &str = r#"
+class Forma {
+public:
+    virtual ~Forma() = default;
+    virtual int Lados() const { return 0; }
+};
+
+class Triangulo : public Forma {
+public:
+    int Lados() const override { return 3; }
+};
+
+class Quadrado : public Forma {
+public:
+    int Lados() const override { return 4; }
+};
+"#;
+
+const NARROWING_FABRICA_HPP: &str = r#"
+#include "forma.hpp"
+
+Forma *FabricaDeTriangulo();
+"#;
+
+const NARROWING_FABRICA_CPP: &str = r#"
+#include "fabrica.hpp"
+
+Forma *FabricaDeTriangulo() { return new Triangulo(); }
+"#;
+
+const NARROWING_FACHADA_HPP: &str = r#"
+#include "forma.hpp"
+
+Forma *Obter();
+"#;
+
+const NARROWING_FACHADA_CPP: &str = r#"
+#include "fachada.hpp"
+#include "fabrica.hpp"
+
+Forma *Obter() { return FabricaDeTriangulo(); }
+"#;
+
+/// Proves the solver's narrowing (B07/B08, `docs/mapping-solver-cases.md`)
+/// is reachable through the real product path — `project_service::
+/// list_pointers` rebuilding `mapping::ProjectFacts` from what's already
+/// persisted (no reparsing) and calling `mapping::pointer_options_for` with
+/// each `return_type` pointer's own owning function — not just through the
+/// `mapping-solver-fixtures/` corpus harness. `FabricaDeTriangulo` has
+/// direct construction evidence (B07); `Obter` has none of its own and
+/// narrows only by following the call graph to `FabricaDeTriangulo` (B08).
+/// `Quadrado` exists in the project (declared in forma.hpp) but is never
+/// constructed anywhere, so a correct answer of `{Triangulo}` for both
+/// functions — not `{Forma, Triangulo, Quadrado}` — proves narrowing ran,
+/// not just CHA.
+#[test]
+fn list_pointers_narrows_return_type_pointers_using_the_persisted_call_graph() {
+    let workspace =
+        TempWorkspace::new("pointer-catalog-narrowing").expect("create temporary workspace");
+    let archive_path = workspace.path().join("fixture.tar.gz");
+    write_narrowing_fixture_tarball(workspace.path(), &archive_path)
+        .expect("create fixture archive");
+    let global_db_path = workspace.path().join("global.db");
+
+    let project = project_service::create_project(
+        CreateProjectRequest {
+            name: "pointer_narrowing_fixture".to_owned(),
+            workspace_dir: workspace.path().join("projects"),
+            archive_path,
+        },
+        &global_db_path,
+        None,
+    )
+    .expect("ingest project and extract catalogs");
+
+    let listing = project_service::list_pointers(&project.project_dir)
+        .expect("list pointers from the persisted store");
+
+    let fabrica_pointer = listing
+        .pointers
+        .iter()
+        .find(|declaration| {
+            declaration.kind == PointerDeclarationKind::ReturnType
+                && declaration.name == "FabricaDeTriangulo"
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected FabricaDeTriangulo's return-type pointer: {:?}",
+                listing.pointers
+            )
+        });
+    let fabrica_types = listing
+        .possible_types
+        .get(&fabrica_pointer.usr)
+        .unwrap_or_else(|| panic!("expected narrowed types for FabricaDeTriangulo"));
+    assert_eq!(
+        fabrica_types
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Triangulo"],
+        "{fabrica_types:?}"
+    );
+
+    let obter_pointer = listing
+        .pointers
+        .iter()
+        .find(|declaration| {
+            declaration.kind == PointerDeclarationKind::ReturnType && declaration.name == "Obter"
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected Obter's return-type pointer: {:?}",
+                listing.pointers
+            )
+        });
+    let obter_types = listing
+        .possible_types
+        .get(&obter_pointer.usr)
+        .unwrap_or_else(|| panic!("expected narrowed types for Obter"));
+    assert_eq!(
+        obter_types
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Triangulo"],
+        "{obter_types:?} (should follow the call graph to FabricaDeTriangulo, not fall back to \
+         the full CHA set {{Forma, Triangulo, Quadrado}})"
+    );
+}
+
+fn write_narrowing_fixture_tarball(workspace: &Path, archive_path: &Path) -> io::Result<()> {
+    let source_dir = workspace.join("fixture");
+    fs::create_dir_all(&source_dir)?;
+    fs::write(source_dir.join("main.cpp"), NARROWING_MAIN_CPP)?;
+    fs::write(source_dir.join("forma.hpp"), NARROWING_FORMA_HPP)?;
+    fs::write(source_dir.join("fabrica.hpp"), NARROWING_FABRICA_HPP)?;
+    fs::write(source_dir.join("fabrica.cpp"), NARROWING_FABRICA_CPP)?;
+    fs::write(source_dir.join("fachada.hpp"), NARROWING_FACHADA_HPP)?;
+    fs::write(source_dir.join("fachada.cpp"), NARROWING_FACHADA_CPP)?;
+    fs::write(
+        source_dir.join("CMakeLists.txt"),
+        r#"
+cmake_minimum_required(VERSION 3.16)
+project(syntax_bridge_pointer_narrowing_fixture LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_executable(syntax_bridge_pointer_narrowing_fixture main.cpp fabrica.cpp fachada.cpp)
+"#,
+    )?;
+
+    let output = Command::new("tar")
+        .arg("-czf")
+        .arg(archive_path)
+        .arg("-C")
+        .arg(workspace)
+        .arg("fixture")
+        .output()?;
+    assert_success(output);
+
+    Ok(())
+}
+
 fn write_fixture_tarball(workspace: &Path, archive_path: &Path) -> io::Result<()> {
     let source_dir = workspace.join("fixture");
     fs::create_dir_all(&source_dir)?;

@@ -8,9 +8,11 @@ recusados por inviabilizarem outro tipo do projeto (Q9 em
 `docs/plans/User Steps.md`).
 
 **Status (2026-08-13): implementado e testado contra os 22 casos originais;
-A10 acrescentado em 2026-08-14; B07 acrescentado em 2026-08-15, primeiro
-caso do corpus a exercitar a evolução de CHA para TFA/DFA descrita em
-`docs/plans/catalogo-de-ponteiros-e-solver-tfa.md`.** Cada um dos 22 casos
+A10 acrescentado em 2026-08-14; B07 e B08 acrescentados em 2026-08-15
+(evolução de CHA para TFA/DFA, intra e interprocedural, descrita em
+`docs/plans/catalogo-de-ponteiros-e-solver-tfa.md`); B09 acrescentado em
+2026-08-15 (primeira fatia real do solver de viabilidade global, Q9 item 4
+do roteiro de US-7 — `mapping::feasible_options`).** Cada um dos 22 casos
 originais tem um teste
 próprio em `crates/server/tests/mapping_solver_cases.rs`, rodando sobre
 catálogos extraídos de verdade (`type_catalog`/`function_catalog` via
@@ -159,6 +161,8 @@ arquivos. A letra em cada ID marca a *lição principal* do caso, não a única.
 | B05 | Texto em um lugar, binário em outro | Global | 12 (`char*`/`std::string`) |
 | B06 | Herança virtual com estado compartilhado | Global | 1, 3 (herança múltipla, semântica de valor/referência) |
 | B07 | Ponteiro com atribuição única | Global | 2 (ponteiros/aritmética de ponteiros) |
+| B08 | Fábrica delegada | Global | 2 (ponteiros/aritmética de ponteiros) |
+| B09 | Mixin forçado vs. instanciação direta | Global | 1 (herança múltipla) |
 | C01 | Aritmética de ponteiros | Ponte | 2 (ponteiros/aritmética de ponteiros) |
 | C02 | `setjmp`/`longjmp` | Ponte | 14 (exceções/`goto`/`setjmp`) |
 | C03 | Compilação condicional | Ponte | 15 (pré-processador) |
@@ -446,6 +450,71 @@ catalogo-de-ponteiros-e-solver-tfa.md` registra como direção decidida.
 hierarquia nunca é removida, só estreitada quando há evidência positiva de
 construção — void/ambíguo cai de volta para o conjunto CHA completo, nunca
 para um conjunto mais estreito do que o comprovadamente correto).
+
+### B08 — Fábrica delegada
+
+`mapping-solver-fixtures/B08-fabrica-delegada/`
+
+Continuação direta de B07: lá, a evidência de construção (`new Triangulo()`)
+estava no próprio corpo da função dona do ponteiro — a narrowing
+intraprocedural (ler só o corpo de `owning_function`) já resolvia. Aqui
+`Obter()` (em `fachada.cpp`) não constrói nada — só `return
+FabricaDeTriangulo();`, encaminhando o que outra função (em `fabrica.cpp`)
+devolve. Ler só o corpo de `Obter` não encontra nenhum `new`, e a narrowing
+puramente intraprocedural cairia de volta ao CHA completo (`{Forma,
+Triangulo, Quadrado}`) — uma resposta correta-mas-larga que B07 já tinha
+corrigido para o caso mais simples. A resposta certa exige atravessar o
+grafo de chamadas: `Obter` chama `FabricaDeTriangulo`
+(`function_catalog::CallEdge`, já extraído por US-5), e `FabricaDeTriangulo`
+por sua vez tem evidência de construção própria (`{Triangulo}`, exatamente o
+caso B07). Só combinando os dois arquivos — a chamada em `fachada.cpp` e a
+construção em `fabrica.cpp` — o solver reconhece que `Obter` também só
+devolve `Triangulo`.
+
+Esta é a primeira metade interprocedural da direção registrada em
+`docs/plans/catalogo-de-ponteiros-e-solver-tfa.md`: `narrow_by_construction_evidence`
+primeiro tenta a evidência intraprocedural de B07; sem ela, procura em
+`facts.calls` uma chamada de `owning_function` para outra função cujo
+retorno o corpo textualmente encaminha (`return Callee(...)`) e recursa a
+mesma narrowing nessa função — com proteção contra ciclo (uma função já
+visitada na cadeia não é revisitada) e sem nunca devolver um conjunto mais
+estreito que o CHA completo quando a cadeia não termina em evidência
+positiva. Só cobre encaminhamento direto de retorno (o padrão "fachada"
+deste caso) — atribuição a partir de um parâmetro, de uma variável vinda de
+fora da função, ou de um container, continuam corretamente caindo no CHA
+completo, por falta de evidência, não por limitação artificial.
+
+### B09 — Mixin forçado vs. instanciação direta
+
+`mapping-solver-fixtures/B09-mixin-forcado-vs-instanciacao-direta/`
+
+Primeira fatia real do solver de viabilidade que Q9 prometeu (item 4 do
+roteiro de US-7, `docs/plans/User Steps.md`) — não o solver de satisfação de
+restrições completo (isso continua "o item mais caro", gated em E09), mas o
+primeiro conflito de verdade entre dois arquivos que `options_for` sozinho
+não pode ver. `base.hpp` declara `Base`, um `struct`/`class` comum, sem
+nada de especial. `carro.hpp` declara `Carro : public Base, public Rodas`
+— herança múltipla sem conflito de nomes (`Fazer` vs. `Girar`), então
+`options_for(Carro, ...)` escolhe `"classe-com-mixins"` direto, e essa
+opção já anexa a `Base` a consequência "`Base` vira mixin aplicado via
+`with` em `Carro`" (o mesmo mecanismo de A01/B02, nada novo aqui).
+`standalone.cpp`, um QUARTO arquivo, declara `Base valorPadrao;` em escopo
+de arquivo — uma instância direta, por valor, de `Base`. As duas exigências
+não podem valer ao mesmo tempo: um `mixin` em Dart nunca pode ser
+instanciado sozinho (`mixin Base {}` seguido de `Base()` não compila).
+
+`options_for(Base, ...)`, olhando só `base.hpp`, não tem como ver o
+conflito — devolve `"classe-direta"`, a resposta ingênua e errada.
+`mapping::feasible_options(Base, facts, decisions)` é o que enxerga os dois
+lados: chama `options_for` em toda outra declaração do projeto (reusando a
+própria lógica de `multiple_inheritance_option`, não duplicando-a) para
+achar quem força um mixin em `Base`, cruza isso com
+`TypeUsageKind::VariableDeclaration` (US-4, já extraído por
+`type_catalog` — nenhuma extração nova) para achar a instanciação direta, e
+só então substitui a resposta ingênua por código ponte. Critério 3 ("uma
+opção que tornaria outro tipo não convertível não é oferecida") aplicado de
+verdade para esta forma de conflito — não a satisfação de restrições geral,
+só o primeiro caso concreto que a prova.
 
 ## Categoria C — código ponte obrigatório
 

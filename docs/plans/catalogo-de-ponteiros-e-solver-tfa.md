@@ -1,23 +1,76 @@
 # Prompt: catálogo de ponteiros + solver com fluxo de tipos (TFA)
 
-**Status (2026-08-15): Parte 1 e o primeiro corte da Parte 2 implementados.**
-Parte 1 completa ponta a ponta: `crates/server/src/pointer_catalog.rs`
-(extração), `pointer_declarations` em `project_store.rs` (persistência),
-`GET /projects/pointers` (rota), `PointersView` + painel dockável "Pointers"
-no cliente Flutter com teste de screenshot
-(`pointer_catalog_screenshots_test.dart`), e testes
+**Status (2026-08-15): Parte 1 completa; Parte 2 com narrowing intra e
+interprocedural (return-forwarding), já servida em produção via
+`GET /projects/pointers`.** Parte 1 ponta a ponta:
+`crates/server/src/pointer_catalog.rs` (extração), `pointer_declarations`
+em `project_store.rs` (persistência), `GET /projects/pointers` (rota),
+`PointersView` + painel dockável "Pointers" no cliente Flutter com teste de
+screenshot (`pointer_catalog_screenshots_test.dart`), e testes
 `crates/server/tests/pointer_catalog.rs`/`pointer_catalog_route.rs`. Parte 2
-tem seu primeiro caso do corpus (B07,
-`mapping-solver-fixtures/B07-ponteiro-com-atribuicao-unica/`,
-`docs/mapping-solver-cases.md`) e a narrowing correspondente em
-`mapping::pointer_options_for`/`narrow_by_construction_evidence` — evidência
-textual de construção (`new Tipo(...)`) dentro da própria função dona do
-ponteiro, sound por padrão (nunca estreita sem evidência, nunca invade o
-grafo interprocedural). **Falta:** a metade interprocedural da Parte 2 (usar
-`function_catalog::CallEdge`/`CallResolution` para rastrear um valor através
-de chamadas entre funções) — não implementada porque nenhum caso do corpus
-ainda a exige; segue o método já registrado abaixo ("Método do corpus, não
-implementação especulativa"), não construída à frente da necessidade.
+tem dois casos do corpus — B07 (evidência de construção no próprio corpo,
+`mapping-solver-fixtures/B07-ponteiro-com-atribuicao-unica/`) e B08
+(encaminhamento entre funções via `return Callee(...)`, seguindo
+`function_catalog::CallEdge`, `mapping-solver-fixtures/B08-fabrica-delegada/`)
+— e a narrowing correspondente em `mapping::pointer_options_for` /
+`narrow_by_construction_evidence`, sound por padrão em ambos os casos (nunca
+estreita sem evidência, nunca segue um ciclo de encaminhamento).
+`project_service::list_pointers` reconstrói um `mapping::ProjectFacts`
+completo a partir do que já está persistido (sem reparsear — novos métodos
+`ProjectStore::list_type_usages`/`list_call_edges`, sem filtro, para isso) e
+chama o solver de verdade para cada ponteiro de retorno, expondo o
+resultado como `possible_types` na mesma resposta de `GET /projects/pointers`
+— provado ponta a ponta em
+`list_pointers_narrows_return_type_pointers_using_the_persisted_call_graph`
+(`crates/server/tests/pointer_catalog.rs`), que ingere um projeto real com
+fábrica direta + fábrica delegada e confirma que ambas as funções narrowing
+para `{Triangulo}`, não o CHA completo `{Forma, Triangulo, Quadrado}`.
+Ainda não cobre parâmetro/campo/local (só `return_type`, ver limitação
+abaixo), e o cliente Flutter ainda não exibe `possible_types` — a UI
+continua mostrando só o catálogo bruto de Parte 1.
+
+**Avaliado e deliberadamente não construído** (revisão de 2026-08-15, contra
+os itens levantados quando a Parte 1/primeiro corte da Parte 2 ficaram
+prontos):
+
+- **Ligar `pointer_catalog` (Parte 1) à narrowing (Parte 2) exigiria uma
+  extração nova, não só reusar a existente.** A narrowing lê o
+  código-fonte direto (`read_span`); `pointer_catalog::PointerDeclaration`
+  só guarda *declarações*, não *sites de atribuição* (onde um ponteiro
+  recebe um valor). Para a narrowing consultar o catálogo em vez de
+  reler o arquivo, o catálogo precisaria de um novo tipo de fato —
+  correlacionar cada `CXXNewExpr`/`CallExpr`/`ReturnStmt` ao ponteiro que
+  recebe seu valor via `clang_getCursorSemanticParent` — que é uma
+  extração via `libclang` genuinamente nova, do tamanho de
+  `pointer_catalog.rs` inteiro de novo. B07/B08 não pedem isso: o texto
+  já resolve os dois. Construir a extração de sites de atribuição sem um
+  caso do corpus que prove que o texto não basta seria especulação —
+  o mesmo "não implementação especulativa" que motivou B07/B08 em primeiro
+  lugar. Fica registrado aqui como o próximo passo natural, não construído.
+**Atualização (2026-08-15): o solver geral de US-7 ganhou uma primeira fatia
+real, fora do escopo original de ponteiros deste plano, mas registrada
+aqui porque nasceu do mesmo método.** `mapping::feasible_options` (caso B09,
+`docs/mapping-solver-cases.md`) é o primeiro caso em que uma opção de
+`options_for` para um tipo é substituída porque *outro* tipo do projeto já
+força uma exigência incompatível — critério 3 de US-7 aplicado de verdade
+pela primeira vez, não só descrito. Continua sendo só isso: um caso, uma
+regra. O solver de satisfação de restrições completo (comparável em
+tamanho ao resto do servidor, "o item mais caro" do roteiro) continua fora
+de escopo — B09 não é esse solver, é a prova de que o mecanismo funciona
+para uma forma concreta de conflito.
+
+**Achado incidental, corrigido (2026-08-15): `function_catalog.rs` perdia
+por completo chamadas a uma função livre sobrecarregada quando o resultado
+alimentava outra chamada** (`formatar(contagem) + " / " + formatar(media)`,
+caso B04) — `libclang` expõe esse padrão como um `CXCursor_OverloadedDeclRef`
+solto, sem `CXCursor_CallExpr` ao redor, e `clang_getCursorReferenced` nele
+não resolve para nada útil. `record_overloaded_call` desambigua comparando
+o tipo do argumento (cursor seguinte, empiricamente confiável para esse
+padrão) contra o único parâmetro de cada candidato, resolvendo quando exatamente
+um bate e marcando não resolvido (nunca um palpite) quando não. Não fazia
+parte deste plano — apareceu ao investigar por que `b04_overload_rename_...`
+já estava vermelho antes desta sessão começar; corrigido porque o usuário
+pediu diretamente ("trate o b04").
 
 ## Contexto
 
