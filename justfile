@@ -88,6 +88,10 @@ rust-test *args:
 server *args:
     cargo run -p syntax-bridge-server -- {{args}}
 
+# Run the CLI on the host machine (docs/plans/interface-de-linha-de-comando.md).
+cli *args:
+    cargo run -p syntax-bridge-cli --bin syntax-bridge -- {{args}}
+
 # Run the Flutter app on Linux.
 app *args:
     cd client/flutter && flutter run -d linux {{args}}

@@ -1,0 +1,28 @@
+[package]
+name = "syntax-bridge-cli"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[lib]
+name = "syntax_bridge_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "syntax-bridge"
+path = "src/main.rs"
+
+[dependencies]
+# No HTTP client crate: the server's own JSON responses are small,
+# non-chunked (see crates/server/tests, which already talk HTTP/1.1 over a
+# raw TcpStream instead of pulling in reqwest) — a hand-rolled client keeps
+# this crate free of the vendoring cost a crates.io dependency would add.
+# No argument-parsing crate either: the command surface is small and fixed
+# (docs/plans/interface-de-linha-de-comando.md), so hand-parsing keeps the
+# same zero-new-dependency posture as the HTTP client above.
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["unbounded_depth"] }
+
+[dev-dependencies]
+# Spawns a real server for integration tests, mirroring crates/server/tests.
+syntax-bridge-server = { path = "../server" }
