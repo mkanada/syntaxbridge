@@ -162,6 +162,12 @@ pub fn emit_package(
     type_catalog: &[TypeDeclaration],
     decisions: &[MappingDecision],
 ) -> Result<TranspiledPackage, TranspileError> {
+    // Built once, outside the loop: `ProjectFacts::new` indexes the whole
+    // type catalog up front (see `mapping::ProjectFacts`'s own doc comment
+    // on why those indices exist), so constructing it per record would make
+    // this validation O(records × declarations) — reintroducing, in this
+    // loop, exactly the quadratic cost those indices were added to remove.
+    let facts = mapping::ProjectFacts::new(type_catalog);
     for record in &module.records {
         let Some(declaration) = type_catalog.iter().find(|decl| decl.usr == record.usr) else {
             continue;
@@ -169,7 +175,6 @@ pub fn emit_package(
         let Some(decision) = decisions.iter().find(|d| d.type_usr == record.usr) else {
             continue;
         };
-        let facts = mapping::ProjectFacts::new(type_catalog);
         let options = mapping::options_for(declaration, &facts, decisions);
         if !options.iter().any(|option| option.id == decision.option_id) {
             return Err(TranspileError::UnknownMappingOption {

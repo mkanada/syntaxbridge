@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use syntax_bridge_server::emit::dart::emit_module;
 use syntax_bridge_server::ir::{
-    BinaryOp, Enum, Expr, Field, Function, Module, Origin, Param, Record, Stmt, Type,
+    BinaryOp, Constructor, Enum, Expr, Field, Function, Module, Origin, Param, Record, Stmt, Type,
 };
 
 fn origin(line: u32) -> Origin {
@@ -758,5 +758,146 @@ fn field_and_method_access_through_a_nullable_pointer_gets_a_non_null_assertion(
     assert!(
         source.contains("Nota? _m_atual"),
         "expected the field itself to keep its nullable type, got:\n{source}"
+    );
+}
+
+/// A field whose type has no sound zero literal used to be emitted as
+/// `Cor c = 0;` / `Ponto p = 0;` — not a poor default but invalid Dart, so
+/// the whole package stopped compiling. An enum field takes its first
+/// constant; a record field, which has no literal at all, becomes `late`.
+#[test]
+fn a_field_without_a_sound_zero_literal_is_late_not_a_fabricated_zero() {
+    let cor = Enum {
+        name: "Cor".to_owned(),
+        usr: "c:@E@Cor".to_owned(),
+        variants: vec!["vermelho".to_owned(), "azul".to_owned()],
+        origin: origin(1),
+    };
+
+    let ponto = Record {
+        name: "Ponto".to_owned(),
+        usr: "c:@S@Ponto".to_owned(),
+        namespace: String::new(),
+        fields: vec![],
+        static_fields: vec![],
+        constructors: vec![],
+        methods: vec![],
+        base_class: None,
+        mixins: Vec::new(),
+        destructor: None,
+        origin: origin(2),
+    };
+
+    // Every field type that has to be initialized at declaration because
+    // the record owns a real constructor (E04's shape).
+    let alvo = Record {
+        name: "Alvo".to_owned(),
+        usr: "c:@S@Alvo".to_owned(),
+        namespace: String::new(),
+        fields: vec![
+            Field {
+                name: "cor".to_owned(),
+                ty: Type::Enum {
+                    name: "Cor".to_owned(),
+                    usr: "c:@E@Cor".to_owned(),
+                },
+            },
+            Field {
+                name: "origem".to_owned(),
+                ty: Type::Record {
+                    name: "Ponto".to_owned(),
+                    usr: "c:@S@Ponto".to_owned(),
+                },
+            },
+            Field {
+                name: "rotulo".to_owned(),
+                ty: Type::Str,
+            },
+            Field {
+                name: "pesos".to_owned(),
+                ty: Type::List(Box::new(Type::Int)),
+            },
+        ],
+        static_fields: vec![Field {
+            name: "padrao".to_owned(),
+            ty: Type::Enum {
+                name: "Cor".to_owned(),
+                usr: "c:@E@Cor".to_owned(),
+            },
+        }],
+        constructors: vec![Constructor {
+            usr: "c:@S@Alvo@F@Alvo#".to_owned(),
+            constructor_index: 0,
+            params: vec![],
+            body: vec![],
+            origin: origin(3),
+        }],
+        methods: vec![],
+        base_class: None,
+        mixins: Vec::new(),
+        destructor: None,
+        origin: origin(3),
+    };
+
+    let module = Module {
+        records: vec![ponto, alvo],
+        functions: Vec::new(),
+        enums: vec![cor],
+    };
+
+    let files = emit_module(&module);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert!(
+        source.contains("Cor cor = Cor.vermelho;"),
+        "an enum field should default to its first constant, got:\n{source}"
+    );
+    assert!(
+        source.contains("static Cor padrao = Cor.vermelho;"),
+        "a static enum field should too, got:\n{source}"
+    );
+    assert!(
+        source.contains("late Ponto origem;"),
+        "a record field has no valid literal default, so it must be `late`, got:\n{source}"
+    );
+    assert!(
+        source.contains("String rotulo = '';"),
+        "a string field should default to the empty string, got:\n{source}"
+    );
+    assert!(
+        source.contains("List<int> pesos = [];"),
+        "a list field should default to the empty list, got:\n{source}"
+    );
+    assert!(
+        !source.contains("= 0;"),
+        "no field of a non-numeric type may be initialized to 0, got:\n{source}"
+    );
+}
+
+/// Dart rejects an enum with no constants outright, so emitting
+/// `enum Vazio {  }` would take the whole file down with it.
+#[test]
+fn an_enum_without_constants_still_emits_parseable_dart() {
+    let module = Module {
+        records: Vec::new(),
+        functions: Vec::new(),
+        enums: vec![Enum {
+            name: "Vazio".to_owned(),
+            usr: "c:@E@Vazio".to_owned(),
+            variants: vec![],
+            origin: origin(1),
+        }],
+    };
+
+    let files = emit_module(&module);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert!(
+        !source.contains("enum Vazio {  }") && !source.contains("enum Vazio { }"),
+        "an empty Dart enum doesn't parse, got:\n{source}"
+    );
+    assert!(
+        source.contains("TODO(syntax-bridge)"),
+        "the placeholder should say why it's there, got:\n{source}"
     );
 }

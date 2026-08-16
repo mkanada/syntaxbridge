@@ -87,6 +87,16 @@ pub fn emit_module(module: &Module) -> BTreeMap<String, String> {
             .push(enum_decl);
     }
 
+    // Module-wide, not per file: a field's enum type is routinely declared
+    // in a different file from the record that holds it, and
+    // `field_default_literal` needs that enum's first constant to give the
+    // field a valid default.
+    let enums_by_usr: HashMap<&str, &Enum> = module
+        .enums
+        .iter()
+        .map(|enum_decl| (enum_decl.usr.as_str(), enum_decl))
+        .collect();
+
     let stems: BTreeSet<String> = functions_by_stem
         .keys()
         .chain(records_by_stem.keys())
@@ -130,6 +140,7 @@ pub fn emit_module(module: &Module) -> BTreeMap<String, String> {
                     &functions,
                     &mixin_usrs,
                     &usr_to_stem,
+                    &enums_by_usr,
                 ),
             )
         })
@@ -223,6 +234,7 @@ fn emit_file(
     functions: &[&Function],
     mixin_usrs: &HashSet<&str>,
     usr_to_stem: &HashMap<&str, String>,
+    enums_by_usr: &HashMap<&str, &Enum>,
 ) -> String {
     let mut used_expr_helper = false;
     // Set by `Expr::StringByteLength` (E05's UTF-8-byte-length bridge for
@@ -242,6 +254,7 @@ fn emit_file(
             mixin_usrs.contains(record.usr.as_str()),
             &mut used_expr_helper,
             &mut used_utf8_encode,
+            enums_by_usr,
         ));
     }
     for function in functions {
@@ -503,6 +516,35 @@ fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str
     }
 }
 
+/// `enum Foo { a, b, c }` — caso 4 of
+/// `docs/plans/verovio-6.2-pointer-types.md`. No fixture has forced a
+/// variant with associated data (C++'s enum has none to carry over
+/// either), so this stays the plain, no-argument Dart enum form; the real
+/// transpile pipeline reformats every file through `dart format` anyway
+/// (`transpile::transpile`), so the exact line-wrapping here isn't load
+/// bearing.
+///
+/// Dart requires an enum to declare at least one constant, so a variantless
+/// `ir::Enum` gets an explicit placeholder rather than the `enum Foo { }`
+/// that Dart rejects outright. `lower::cpp::lower_enum` already refuses to
+/// build one (`enum Vazio {};` is legal C++ but has no Dart form), so this
+/// only guards IR that didn't come from the C++ lowering pass — visible in
+/// the output if it ever happens, never a file that won't parse.
+fn emit_enum(enum_decl: &Enum) -> String {
+    if enum_decl.variants.is_empty() {
+        return format!(
+            "// TODO(syntax-bridge): `{}` declares no constants; Dart has no empty enum.\nenum {} {{ unsupportedEmptyEnum }}\n",
+            enum_decl.name, enum_decl.name
+        );
+    }
+
+    format!(
+        "enum {} {{ {} }}\n",
+        enum_decl.name,
+        enum_decl.variants.join(", ")
+    )
+}
+
 /// A POD `struct`/`class` (`record.constructors.is_empty()` — no
 /// user-declared constructor of its own) becomes a Dart class with every
 /// field declared `final`... except E03's own armadilha rules that out:
@@ -520,26 +562,12 @@ fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str
 /// own field initialization, so the E03 synthetic positional constructor
 /// would either be redundant or, worse, a second and inconsistent way to
 /// construct the same class.
-/// `enum Foo { a, b, c }` — caso 4 of
-/// `docs/plans/verovio-6.2-pointer-types.md`. No fixture has forced a
-/// variant with associated data (C++'s enum has none to carry over
-/// either), so this stays the plain, no-argument Dart enum form; the real
-/// transpile pipeline reformats every file through `dart format` anyway
-/// (`transpile::transpile`), so the exact line-wrapping here isn't load
-/// bearing.
-fn emit_enum(enum_decl: &Enum) -> String {
-    format!(
-        "enum {} {{ {} }}\n",
-        enum_decl.name,
-        enum_decl.variants.join(", ")
-    )
-}
-
 fn emit_record(
     record: &Record,
     is_mixin: bool,
     used_expr_helper: &mut bool,
     used_utf8_encode: &mut bool,
+    enums_by_usr: &HashMap<&str, &Enum>,
 ) -> String {
     // `abstract` is required the moment a class has any unimplemented
     // member — derived, not stored: a separate `Record.is_abstract` flag
@@ -604,20 +632,20 @@ fn emit_record(
                 field.name
             ));
         } else {
-            source.push_str(&format!(
-                "{INDENT}{} {} = {};\n",
-                emit_type(&field.ty),
-                field.name,
-                scalar_zero_literal(&field.ty)
+            source.push_str(&emit_field_declaration(
+                "",
+                &field.ty,
+                &field.name,
+                enums_by_usr,
             ));
         }
     }
     for field in &record.static_fields {
-        source.push_str(&format!(
-            "{INDENT}static {} {} = {};\n",
-            emit_type(&field.ty),
-            field.name,
-            scalar_zero_literal(&field.ty)
+        source.push_str(&emit_field_declaration(
+            "static ",
+            &field.ty,
+            &field.name,
+            enums_by_usr,
         ));
     }
 
@@ -681,30 +709,63 @@ fn emit_record(
     source
 }
 
-/// `0` is a valid Dart literal for both `int` and `double` fields (numeric
-/// literal coercion — the same trick `lower::cpp::default_scalar_value` uses
-/// for a record's own zero-valued fields), so both share this one branch.
-/// Only `Int`/`Double`/`Bool` ever reach here: `first_unsupported_field_reason`
-/// (which also scans `static_fields`, see below) bails the whole class out
-/// before this is called for anything else, so the fallback arm is
-/// unreachable in practice, not a silent wrong guess.
-fn scalar_zero_literal(ty: &Type) -> &'static str {
+/// One field declaration, with an initializer when the type has a sound
+/// default and `late` when it doesn't.
+///
+/// Dart's flow analysis needs a non-nullable field to be definitely
+/// assigned; `late` is how Dart itself says "assigned before first use,
+/// just not here". Reaching for it in the no-sound-default case is what
+/// keeps this honest — the alternative this replaced fabricated `0` for
+/// *every* type, which for anything but a number is not merely a wrong
+/// default but not even valid Dart (`Cor c = 0`, `Ponto p = 0`), so the
+/// package stopped compiling. A `late` field that nothing assigns throws
+/// `LateInitializationError` naming the field, at the moment it's actually
+/// read: a loud, located failure instead of a silent fake zero.
+fn emit_field_declaration(
+    prefix: &str,
+    ty: &Type,
+    name: &str,
+    enums_by_usr: &HashMap<&str, &Enum>,
+) -> String {
+    match field_default_literal(ty, enums_by_usr) {
+        Some(literal) => format!("{INDENT}{prefix}{} {name} = {literal};\n", emit_type(ty)),
+        None => format!("{INDENT}{prefix}late {} {name};\n", emit_type(ty)),
+    }
+}
+
+/// The Dart literal a field of this type can be default-initialized to, or
+/// `None` when the type has no sound default to write.
+///
+/// Where C++ default-construction has an obvious Dart equivalent, this
+/// matches it: `std::string` → `''`, `std::vector` → `[]`, `std::set`/
+/// `std::map` → `{}`. `0` covers `int` and `double` alike (numeric literal
+/// coercion — the same trick `lower::cpp::default_scalar_value` uses). An
+/// enum takes its first constant, which is what C++ value-initialization
+/// (`Cor c{}`, zero) selects for the overwhelmingly common enum whose
+/// first enumerator is 0 — and the enum must be looked up by `usr` rather
+/// than assumed, since an enum declared in another file, or one this
+/// module never declared at all, has no first constant to name.
+///
+/// `Record`/`Tuple`/`Void`/`Unsupported` return `None`: there is no
+/// literal for them that would be both valid Dart and honest about the
+/// value being absent.
+fn field_default_literal(ty: &Type, enums_by_usr: &HashMap<&str, &Enum>) -> Option<String> {
     match ty {
-        Type::Bool => "false",
+        Type::Bool => Some("false".to_owned()),
         // A nullable field's own honest "no value yet" is `null`, not a
         // fabricated zero of the pointee type.
-        Type::Nullable(_) => "null",
-        Type::Int
-        | Type::Double
-        | Type::Record { .. }
-        | Type::Enum { .. }
-        | Type::Str
-        | Type::List(_)
-        | Type::Set(_)
-        | Type::Map(_, _)
-        | Type::Tuple(_)
-        | Type::Void
-        | Type::Unsupported(_) => "0",
+        Type::Nullable(_) => Some("null".to_owned()),
+        Type::Int | Type::Double => Some("0".to_owned()),
+        Type::Str => Some("''".to_owned()),
+        Type::List(_) => Some("[]".to_owned()),
+        // Dart's `{}` is an empty set or an empty map depending on the
+        // context type, which is exactly the declared type here.
+        Type::Set(_) | Type::Map(_, _) => Some("{}".to_owned()),
+        Type::Enum { usr, name } => {
+            let first = enums_by_usr.get(usr.as_str())?.variants.first()?;
+            Some(format!("{name}.{first}"))
+        }
+        Type::Record { .. } | Type::Tuple(_) | Type::Void | Type::Unsupported(_) => None,
     }
 }
 

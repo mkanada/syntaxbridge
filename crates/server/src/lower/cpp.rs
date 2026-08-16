@@ -486,28 +486,11 @@ pub fn lower_record(cursor: clang_sys::CXCursor, project_root: &Path) -> Option<
 /// (no usable Dart type name) or one whose declaration site can't be
 /// resolved, mirroring `lower_record`'s own two early-outs.
 pub fn lower_enum(cursor: clang_sys::CXCursor, project_root: &Path) -> Option<ir::Enum> {
-    let name =
-        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(cursor)) };
-    if name.is_empty() {
-        return None;
-    }
-    let usr = unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(cursor)) };
-    if usr.is_empty() {
-        return None;
-    }
+    let (usr, name) = unsafe { enum_identity(cursor, project_root) }?;
     let (file, line, column) = type_catalog::cursor_site(cursor, project_root)?;
     let origin = ir::Origin { file, line, column };
 
-    let variants = unsafe { collect_children(cursor) }
-        .into_iter()
-        .filter(|child| {
-            (unsafe { clang_sys::clang_getCursorKind(*child) })
-                == clang_sys::CXCursor_EnumConstantDecl
-        })
-        .map(|constant| unsafe {
-            type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(constant))
-        })
-        .collect();
+    let variants = unsafe { enum_variants(cursor) };
 
     Some(ir::Enum {
         name,
@@ -515,6 +498,163 @@ pub fn lower_enum(cursor: clang_sys::CXCursor, project_root: &Path) -> Option<ir
         variants,
         origin,
     })
+}
+
+/// The one acceptance test every site that can produce a `Type::Enum`
+/// shares with `lower_enum`, returning the enum's `usr` and its *Dart*
+/// type name. Keeping it in a single function is the whole point: a
+/// `Type::Enum` that `lower_enum` would have rejected is a reference to a
+/// Dart type nothing ever declares, which `dart analyze` reports as
+/// `undefined_class` — the silent-wrong-output failure this module's
+/// "silêncio é proibido" rule exists to prevent. `None` when the enum is:
+///
+/// - anonymous, or without a `usr` — no usable Dart type name (the same
+///   two early-outs `lower_record` has);
+/// - declared outside `project_root` — `std::memory_order`,
+///   `std::launch`, a third-party header's enum. `lower_enum` only ever
+///   emits declarations for enums inside the project, so an external one
+///   can be *named* here but never *declared* anywhere;
+/// - empty (`enum Vazio {};`, legal C++) — Dart requires an enum to
+///   declare at least one constant, so there is no valid Dart enum to
+///   emit for it.
+unsafe fn enum_identity(
+    decl: clang_sys::CXCursor,
+    project_root: &Path,
+) -> Option<(String, String)> {
+    let name =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(decl)) };
+    if name.is_empty() {
+        return None;
+    }
+    let usr = unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(decl)) };
+    if usr.is_empty() {
+        return None;
+    }
+    type_catalog::cursor_site(decl, project_root)?;
+    if unsafe { enum_variants(decl) }.is_empty() {
+        return None;
+    }
+
+    Some((usr, unsafe { dart_enum_type_name(decl) }))
+}
+
+/// Every enumerator of `decl`, in source order, already under the Dart
+/// name each one is referenced by (`dart_enum_constant_name`).
+unsafe fn enum_variants(decl: clang_sys::CXCursor) -> Vec<String> {
+    unsafe { collect_children(decl) }
+        .into_iter()
+        .filter(|child| {
+            (unsafe { clang_sys::clang_getCursorKind(*child) })
+                == clang_sys::CXCursor_EnumConstantDecl
+        })
+        .map(|constant| {
+            let cpp_name = unsafe {
+                type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(constant))
+            };
+            dart_enum_constant_name(&cpp_name)
+        })
+        .collect()
+}
+
+/// The Dart type name for an enum declaration — its own spelling, prefixed
+/// with the owning record's when the enum is nested inside one.
+///
+/// `emit::dart` has no nesting to put an enum back into: it groups every
+/// declaration by *file* and emits them all at top level, so C++'s two
+/// distinct `A::Type` and `B::Type` (two classes in one header each
+/// declaring `enum Type`, which Verovio does) would both arrive as a bare
+/// top-level `enum Type` in the same `.dart` file — a duplicate
+/// definition. Qualifying here, rather than renaming after the fact only
+/// when a collision is observed, is what lets the *reference* sites
+/// (`lower_type`'s `CXType_Enum` branch and
+/// `qualified_static_member_name`) reach the identical name from the same
+/// cursor without having to know what else the file contains.
+unsafe fn dart_enum_type_name(decl: clang_sys::CXCursor) -> String {
+    let name =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(decl)) };
+    let owner = unsafe { clang_sys::clang_getCursorSemanticParent(decl) };
+    let owner_kind = unsafe { clang_sys::clang_getCursorKind(owner) };
+    if owner_kind != clang_sys::CXCursor_ClassDecl && owner_kind != clang_sys::CXCursor_StructDecl {
+        return name;
+    }
+    let owner_name =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(owner)) };
+    if owner_name.is_empty() {
+        name
+    } else {
+        // No separator, matching `function_catalog::pascal_case_namespace`'s
+        // own `Ns1Detail` shape — the house style for every other
+        // qualified Dart identifier this pipeline builds.
+        format!("{owner_name}{name}")
+    }
+}
+
+/// A C++ enumerator's name as a Dart enum constant. Every valid C++
+/// identifier is already a valid Dart one, so the only rewriting needed is
+/// for names Dart won't accept *in this position*: its true reserved words,
+/// and the members every Dart enum inherits (`index`/`values` from the enum
+/// itself, the rest from `Object`) — a constant can't shadow any of them.
+/// Dart's *built-in identifiers* (`as`, `mixin`, `static`, ...) are
+/// deliberately absent: they're barred from type names, not from ordinary
+/// identifiers like these, so renaming them would churn names for nothing.
+///
+/// Both the declaration (`enum_variants`) and every reference
+/// (`qualified_static_member_name`) resolve names through here, so the two
+/// can't disagree about whether a given enumerator was rewritten. A C++
+/// enum declaring *both* `index` and `index_` collides under this mapping —
+/// Dart then rejects the duplicate constant outright, which is the loud
+/// failure, not a silently mis-emitted program.
+fn dart_enum_constant_name(cpp_name: &str) -> String {
+    const RESERVED: &[&str] = &[
+        // Members every Dart enum already has.
+        "index",
+        "values",
+        "hashCode",
+        "runtimeType",
+        "toString",
+        "noSuchMethod",
+        // Dart's reserved words — none of these is a C++ keyword, so an
+        // ordinary C++ enumerator can land on any of them.
+        "assert",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "continue",
+        "default",
+        "do",
+        "else",
+        "enum",
+        "extends",
+        "false",
+        "final",
+        "finally",
+        "for",
+        "if",
+        "in",
+        "is",
+        "new",
+        "null",
+        "rethrow",
+        "return",
+        "super",
+        "switch",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "var",
+        "void",
+        "while",
+        "with",
+    ];
+
+    if RESERVED.contains(&cpp_name) {
+        format!("{cpp_name}_")
+    } else {
+        cpp_name.to_owned()
+    }
 }
 
 /// Every one of `cursor`'s base classes (`class Cachorro : public Animal`,
@@ -646,8 +786,26 @@ unsafe fn dart_member_name(cursor: clang_sys::CXCursor) -> String {
 /// `MemberRefExpr`, not `DeclRefExpr`, so never reaches here — a free
 /// function, a local, a parameter) is returned unqualified.
 unsafe fn qualified_static_member_name(referenced: clang_sys::CXCursor) -> String {
-    let name = unsafe { dart_member_name(referenced) };
     let referenced_kind = unsafe { clang_sys::clang_getCursorKind(referenced) };
+    // An enumerator resolves its name through `dart_enum_constant_name`,
+    // never `dart_member_name`. Clang propagates the *enum's* access
+    // specifier onto every one of its `EnumConstantDecl`s, so a nested
+    // `enum` that is private by default (`class C { enum Cor { Vermelho }; }`
+    // — ordinary C++) would otherwise have `dart_member_name` prefix an
+    // underscore here and nowhere else: the declaration, built by
+    // `enum_variants`, says `Vermelho` while this reference says
+    // `Cor._Vermelho`. Dart privacy for an enum lives on the enum *type*
+    // anyway, not on its individual constants, so there is nothing for the
+    // prefix to express in this position.
+    let name = if referenced_kind == clang_sys::CXCursor_EnumConstantDecl {
+        let cpp_name = unsafe {
+            type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced))
+        };
+        dart_enum_constant_name(&cpp_name)
+    } else {
+        unsafe { dart_member_name(referenced) }
+    };
+
     if referenced_kind != clang_sys::CXCursor_VarDecl
         && referenced_kind != clang_sys::CXCursor_EnumConstantDecl
     {
@@ -661,8 +819,14 @@ unsafe fn qualified_static_member_name(referenced: clang_sys::CXCursor) -> Strin
     {
         return name;
     }
-    let owner_name =
-        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(owner)) };
+    // For an enum owner this has to be the *same* `dart_enum_type_name` the
+    // declaration was emitted under, or a nested enum's qualifier here
+    // (`Type.`) won't match the name it was declared as (`AType`).
+    let owner_name = if owner_kind == clang_sys::CXCursor_EnumDecl {
+        unsafe { dart_enum_type_name(owner) }
+    } else {
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(owner)) }
+    };
     if owner_name.is_empty() {
         name
     } else {
@@ -854,9 +1018,15 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
             let decl = unsafe { clang_sys::clang_getTypeDeclaration(cx_type) };
             let usr =
                 unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(decl)) };
-            let name = unsafe {
-                type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(decl))
-            };
+            let name = unsafe { dart_enum_type_name(decl) };
+            // Whether this enum is one the package actually *declares* is
+            // not decided here — `lower_type` has no `project_root` to
+            // test against, and an enum reachable as a type is routinely
+            // lowered long before its own declaration is visited.
+            // `function_catalog::reject_undeclared_enum_refs` settles it
+            // afterwards, against the finished `ir_enums` list, and
+            // rewrites whatever `lower_enum` never declared (external,
+            // anonymous, or empty) back to `Unsupported`.
             if usr.is_empty() || name.is_empty() {
                 let spelling = unsafe {
                     type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(cx_type))

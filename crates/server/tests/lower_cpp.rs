@@ -489,3 +489,144 @@ impl Drop for TempWorkspace {
         let _ = fs::remove_dir_all(&self.path);
     }
 }
+
+/// Lowers `source` and emits it, returning the single Dart file — the
+/// declaration and every reference to it end up in the same text, which is
+/// the only place the two can be checked against each other.
+fn lower_and_emit(name: &str, source: &str) -> String {
+    let workspace = TempWorkspace::new(name).expect("create temporary workspace");
+    let unit = write_fixture(workspace.path(), source, "probe.cpp");
+    let catalog = function_catalog::extract_function_catalog(&[unit], workspace.path(), None)
+        .expect("extract function catalog");
+
+    let module = syntax_bridge_server::ir::Module {
+        functions: catalog.ir_functions.clone(),
+        records: catalog.ir_records.clone(),
+        enums: catalog.ir_enums.clone(),
+    };
+
+    syntax_bridge_server::emit::dart::emit_module(&module)
+        .into_values()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// An enum declared outside the project (`std::memory_order` here) is
+/// named by `lower_type` but never declared by `lower_enum`, which only
+/// emits declarations for enums inside `project_root`. Emitting the name
+/// anyway produced `void f(memory_order m)` referencing a class no file in
+/// the package defines — `dart analyze`'s `undefined_class`. It has to come
+/// back out as `Unsupported`, which bails at the use site instead.
+#[test]
+fn an_enum_declared_outside_the_project_does_not_become_an_undeclared_dart_type() {
+    let source = lower_and_emit(
+        "lower-cpp-external-enum",
+        r#"
+#include <memory>
+void f(std::memory_order m) { }
+"#,
+    );
+
+    assert!(
+        !source.contains("memory_order m"),
+        "an external enum must not be named as a Dart parameter type, got:\n{source}"
+    );
+    assert!(
+        source.contains("UnimplementedError"),
+        "the function should bail out loudly instead, got:\n{source}"
+    );
+}
+
+/// Clang propagates a nested enum's access specifier onto each of its
+/// `EnumConstantDecl`s, so a default-private `enum` inside a class had its
+/// *references* run through `dart_member_name` (which prefixes `_`) while
+/// its *declaration* used the raw spelling: `enum Cor { Vermelho }` declared,
+/// `Cor._Vermelho` referenced — an undefined enum constant.
+#[test]
+fn a_private_nested_enums_constant_is_referenced_by_the_name_it_was_declared_with() {
+    let source = lower_and_emit(
+        "lower-cpp-private-nested-enum",
+        r#"
+class C {
+    enum Cor { Vermelho, Azul };
+public:
+    Cor f() { return Vermelho; }
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("._Vermelho"),
+        "the reference must not gain a privacy underscore the declaration lacks, got:\n{source}"
+    );
+    assert!(
+        source.contains("Vermelho"),
+        "expected the enumerator to survive lowering, got:\n{source}"
+    );
+}
+
+/// `emit::dart` groups declarations by file and emits them all at top
+/// level, so two classes in one header each declaring `enum Type` (Verovio
+/// does exactly this) both arrived as a bare top-level `enum Type` in the
+/// same `.dart` file — a duplicate definition that doesn't compile.
+#[test]
+fn two_nested_enums_with_the_same_name_in_one_file_get_distinct_dart_names() {
+    let source = lower_and_emit(
+        "lower-cpp-nested-enum-collision",
+        r#"
+class A {
+public:
+    enum Type { Um, Dois };
+    Type f() { return Um; }
+};
+
+class B {
+public:
+    enum Type { Tres, Quatro };
+    Type g() { return Tres; }
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("enum Type {"),
+        "a nested enum must not be emitted under its bare name, got:\n{source}"
+    );
+    assert!(
+        source.contains("enum AType {") && source.contains("enum BType {"),
+        "expected both nested enums under owner-qualified names, got:\n{source}"
+    );
+    assert!(
+        source.contains("AType.Um") && source.contains("BType.Tres"),
+        "references must use the same qualified name the declaration got, got:\n{source}"
+    );
+}
+
+/// `index` and `values` are members every Dart enum already has, and `in`
+/// is a Dart reserved word — all three are perfectly ordinary C++
+/// enumerators, and emitting them verbatim produces an enum body Dart
+/// rejects.
+#[test]
+fn enumerators_colliding_with_dart_reserved_names_are_renamed_consistently() {
+    let source = lower_and_emit(
+        "lower-cpp-reserved-enumerators",
+        r#"
+enum Chave { index, in, normal };
+
+Chave escolher() { return index; }
+"#,
+    );
+
+    assert!(
+        source.contains("index_") && source.contains("in_"),
+        "expected the colliding enumerators to be renamed, got:\n{source}"
+    );
+    assert!(
+        source.contains("normal"),
+        "a non-colliding enumerator should keep its name, got:\n{source}"
+    );
+    assert!(
+        source.contains("Chave.index_"),
+        "the reference must use the same renamed constant, got:\n{source}"
+    );
+}

@@ -419,10 +419,18 @@ fn record_pointer(
     };
 
     let pointee = unsafe { clang_sys::clang_getPointeeType(cxtype) };
-    let shape = pointer_shape(pointee);
+    let desugared_pointee = unsafe { desugar_typedefs(pointee) };
+    // `shape` reads the *desugared* pointee, the same type `pointee_usr`
+    // below resolves through. Taking it from the sugared one instead let a
+    // typedef that hides a pointer (`typedef Objeto* ObjetoPtr`, then
+    // `ObjetoPtr*`) report `Scalar` while `pointee_usr` — which unwinds
+    // every indirection via `strip_indirections` — pointed at `Objeto`:
+    // together, a description of an `Objeto?` that the declaration
+    // (`Objeto**`) never had. `pointee_type_name` deliberately keeps the
+    // sugared spelling: it's what the user wrote and what the UI shows.
+    let shape = pointer_shape(desugared_pointee);
     let pointee_type_name =
         unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(pointee)) };
-    let desugared_pointee = unsafe { desugar_typedefs(pointee) };
     let pointee_usr =
         type_catalog::resolve_named_declaration(desugared_pointee, state.project_root)
             .map(|declaration| declaration.usr)

@@ -366,6 +366,11 @@ pub(crate) fn finish_function_catalog(partials: Vec<FunctionCatalogPartial>) -> 
     // matter between the two, but matches declaration order above).
     apply_record_name_disambiguation(&mut ir_functions, &mut ir_records);
 
+    // Has to run after the loop above, when `ir_enums` is finally complete:
+    // only then is "no declaration for this usr" a settled fact rather than
+    // an enum that a later translation unit still might contribute.
+    reject_undeclared_enum_refs(&mut ir_functions, &mut ir_records, &ir_enums);
+
     // E12: RAII — see the function's own doc comment for exactly what this
     // rewrites and why it has to run after every record (with its
     // destructor, if any) is already fully lowered.
@@ -685,168 +690,329 @@ fn rename_record_refs_in_params(params: &mut [ir::Param], renames: &HashMap<Stri
     }
 }
 
-fn rename_record_refs_in_stmts(stmts: &mut [ir::Stmt], renames: &HashMap<String, String>) {
-    for stmt in stmts {
-        rename_record_refs_in_stmt(stmt, renames);
-    }
-}
-
-fn rename_record_refs_in_stmt(stmt: &mut ir::Stmt, renames: &HashMap<String, String>) {
-    match stmt {
-        ir::Stmt::Return { value, .. } => {
-            if let Some(expr) = value {
-                rename_record_refs_in_expr(expr, renames);
-            }
-        }
-        ir::Stmt::VarDecl { ty, init, .. } => {
-            rename_record_refs_in_type(ty, renames);
-            if let Some(expr) = init {
-                rename_record_refs_in_expr(expr, renames);
-            }
-        }
-        ir::Stmt::Assign { value, .. } => rename_record_refs_in_expr(value, renames),
-        ir::Stmt::FieldAssign { target, value, .. } => {
-            rename_record_refs_in_expr(target, renames);
-            rename_record_refs_in_expr(value, renames);
-        }
-        ir::Stmt::If {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            rename_record_refs_in_expr(condition, renames);
-            rename_record_refs_in_stmts(then_branch, renames);
-            rename_record_refs_in_stmts(else_branch, renames);
-        }
-        ir::Stmt::While {
-            condition, body, ..
-        } => {
-            rename_record_refs_in_expr(condition, renames);
-            rename_record_refs_in_stmts(body, renames);
-        }
-        ir::Stmt::For {
-            init,
-            condition,
-            increment,
-            body,
-            ..
-        } => {
-            if let Some(init) = init {
-                rename_record_refs_in_stmt(init, renames);
-            }
-            if let Some(condition) = condition {
-                rename_record_refs_in_expr(condition, renames);
-            }
-            if let Some(increment) = increment {
-                rename_record_refs_in_stmt(increment, renames);
-            }
-            rename_record_refs_in_stmts(body, renames);
-        }
-        ir::Stmt::ExprStmt { expr, .. } => rename_record_refs_in_expr(expr, renames),
-        ir::Stmt::Throw { value, .. } => rename_record_refs_in_expr(value, renames),
-        ir::Stmt::TryCatch {
-            try_body,
-            catch_type,
-            catch_body,
-            ..
-        } => {
-            rename_record_refs_in_stmts(try_body, renames);
-            rename_record_refs_in_type(catch_type, renames);
-            rename_record_refs_in_stmts(catch_body, renames);
-        }
-        ir::Stmt::TryFinally {
-            try_body,
-            finally_body,
-            ..
-        } => {
-            rename_record_refs_in_stmts(try_body, renames);
-            rename_record_refs_in_stmts(finally_body, renames);
-        }
-        ir::Stmt::TupleAssign { targets, value, .. } => {
-            for target in targets {
-                rename_record_refs_in_expr(target, renames);
-            }
-            rename_record_refs_in_expr(value, renames);
-        }
-        ir::Stmt::Unsupported { .. } => {}
-    }
-}
-
 fn rename_record_refs_in_expr(expr: &mut ir::Expr, renames: &HashMap<String, String>) {
-    match expr {
-        ir::Expr::IntLiteral { .. }
-        | ir::Expr::DoubleLiteral { .. }
-        | ir::Expr::BoolLiteral { .. }
-        | ir::Expr::StringLiteral { .. }
-        | ir::Expr::Unsupported { .. } => {}
-        ir::Expr::Ref { ty, .. } | ir::Expr::This { ty, .. } => {
-            rename_record_refs_in_type(ty, renames);
-        }
-        ir::Expr::Binary { lhs, rhs, ty, .. } => {
-            rename_record_refs_in_type(ty, renames);
-            rename_record_refs_in_expr(lhs, renames);
-            rename_record_refs_in_expr(rhs, renames);
-        }
-        ir::Expr::Unary { operand, ty, .. } | ir::Expr::Convert { operand, ty, .. } => {
-            rename_record_refs_in_type(ty, renames);
-            rename_record_refs_in_expr(operand, renames);
-        }
-        ir::Expr::Call {
-            target, ty, args, ..
-        } => {
-            rename_record_refs_in_type(ty, renames);
-            if let Some(target) = target {
-                rename_record_refs_in_expr(target, renames);
+    IrRefVisitor {
+        on_type: &mut |ty: &mut ir::Type| {
+            if let ir::Type::Record { usr, name } = ty
+                && let Some(new_name) = renames.get(usr)
+            {
+                *name = new_name.clone();
             }
-            for arg in args {
-                rename_record_refs_in_expr(arg, renames);
-            }
-        }
-        ir::Expr::FieldAccess { target, ty, .. } => {
-            rename_record_refs_in_type(ty, renames);
-            rename_record_refs_in_expr(target, renames);
-        }
-        ir::Expr::RecordConstruct {
-            type_usr,
-            type_name,
-            fields,
-            ..
-        } => {
+        },
+        on_record_construct: &mut |type_usr: &str, type_name: &mut String| {
             if let Some(new_name) = renames.get(type_usr) {
                 *type_name = new_name.clone();
             }
-            for (_name, value) in fields {
-                rename_record_refs_in_expr(value, renames);
+        },
+    }
+    .visit_expr(expr);
+}
+
+/// Rewrites every `Type::Enum` whose `usr` no `ir::Enum` in this catalog
+/// declares back into `Type::Unsupported`.
+///
+/// `lower::cpp::lower_type` mints a `Type::Enum` from nothing but the
+/// cursor in front of it — it has no `project_root` to test against, and
+/// an enum is routinely used as a type long before its own declaration is
+/// visited, so it can't tell a project enum from `std::memory_order` or
+/// from an empty `enum Vazio {};` that Dart can't represent at all.
+/// `lower::cpp::lower_enum` applies all of those tests and simply doesn't
+/// emit a declaration for an enum that fails one. Reconciling the two here,
+/// against the finished list, is what keeps the pair honest: a `Type::Enum`
+/// naming a type no file declares emits Dart that references an undefined
+/// class, which `dart analyze` rejects — the silently-broken output that
+/// `Unsupported` (a loud `UnimplementedError` at the use site) exists to
+/// replace.
+fn reject_undeclared_enum_refs(
+    ir_functions: &mut [ir::Function],
+    ir_records: &mut [ir::Record],
+    ir_enums: &[ir::Enum],
+) {
+    let declared: HashSet<&str> = ir_enums.iter().map(|decl| decl.usr.as_str()).collect();
+
+    let mut reject = |ty: &mut ir::Type| {
+        if let ir::Type::Enum { usr, name } = ty
+            && !declared.contains(usr.as_str())
+        {
+            *ty = ir::Type::Unsupported(name.clone());
+        }
+    };
+
+    for function in ir_functions.iter_mut() {
+        reject(&mut function.return_type);
+        reject_in_params(&mut function.params, &mut reject);
+        reject_in_stmts(&mut function.body, &mut reject);
+    }
+
+    for record in ir_records.iter_mut() {
+        for field in record
+            .fields
+            .iter_mut()
+            .chain(record.static_fields.iter_mut())
+        {
+            reject(&mut field.ty);
+        }
+        for constructor in &mut record.constructors {
+            reject_in_params(&mut constructor.params, &mut reject);
+            reject_in_stmts(&mut constructor.body, &mut reject);
+        }
+        for method in &mut record.methods {
+            reject(&mut method.return_type);
+            reject_in_params(&mut method.params, &mut reject);
+            if let Some(body) = &mut method.body {
+                reject_in_stmts(body, &mut reject);
             }
         }
-        ir::Expr::ConstructorCall {
-            type_usr,
-            type_name,
-            args,
-            ..
-        } => {
-            if let Some(new_name) = renames.get(type_usr) {
-                *type_name = new_name.clone();
-            }
-            for arg in args {
-                rename_record_refs_in_expr(arg, renames);
-            }
+        if let Some(destructor) = &mut record.destructor {
+            reject_in_stmts(destructor, &mut reject);
         }
-        ir::Expr::Index {
-            target, index, ty, ..
-        } => {
-            rename_record_refs_in_type(ty, renames);
-            rename_record_refs_in_expr(target, renames);
-            rename_record_refs_in_expr(index, renames);
+    }
+}
+
+fn reject_in_params(params: &mut [ir::Param], reject: &mut dyn FnMut(&mut ir::Type)) {
+    for param in params {
+        reject(&mut param.ty);
+        if let Some(default_value) = &mut param.default_value {
+            IrRefVisitor {
+                on_type: reject,
+                on_record_construct: &mut |_usr: &str, _name: &mut String| {},
+            }
+            .visit_expr(default_value);
         }
-        ir::Expr::StringByteLength { target, .. } => rename_record_refs_in_expr(target, renames),
-        ir::Expr::Tuple { values, .. } => {
-            for value in values {
-                rename_record_refs_in_expr(value, renames);
+    }
+}
+
+fn reject_in_stmts(stmts: &mut [ir::Stmt], reject: &mut dyn FnMut(&mut ir::Type)) {
+    IrRefVisitor {
+        on_type: reject,
+        on_record_construct: &mut |_usr: &str, _name: &mut String| {},
+    }
+    .visit_stmts(stmts);
+}
+
+/// The two things a post-pass can want to rewrite as it walks a lowered
+/// body: every `ir::Type` that appears anywhere in it, and the
+/// `type_usr`/`type_name` pair a `RecordConstruct`/`ConstructorCall`
+/// carries out-of-band (a construction site names its Dart class in a
+/// `String`, not in an `ir::Type`, so a type-only visitor would miss it).
+///
+/// One traversal serves every such pass. Each one that spelled out its own
+/// walk would be a second place that has to stay exhaustive as `ir::Stmt`
+/// and `ir::Expr` grow — and a pass that silently skips a variant produces
+/// exactly the half-rewritten IR these passes exist to prevent.
+struct IrRefVisitor<'a> {
+    on_type: &'a mut dyn FnMut(&mut ir::Type),
+    on_record_construct: &'a mut dyn FnMut(&str, &mut String),
+}
+
+impl IrRefVisitor<'_> {
+    fn visit_stmts(&mut self, stmts: &mut [ir::Stmt]) {
+        for stmt in stmts {
+            self.visit_stmt(stmt);
+        }
+    }
+
+    fn visit_stmt(&mut self, stmt: &mut ir::Stmt) {
+        match stmt {
+            ir::Stmt::Return { value, .. } => {
+                if let Some(expr) = value {
+                    self.visit_expr(expr);
+                }
+            }
+            ir::Stmt::VarDecl { ty, init, .. } => {
+                self.visit_type(ty);
+                if let Some(expr) = init {
+                    self.visit_expr(expr);
+                }
+            }
+            ir::Stmt::Assign { value, .. } => self.visit_expr(value),
+            ir::Stmt::FieldAssign { target, value, .. } => {
+                self.visit_expr(target);
+                self.visit_expr(value);
+            }
+            ir::Stmt::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.visit_expr(condition);
+                self.visit_stmts(then_branch);
+                self.visit_stmts(else_branch);
+            }
+            ir::Stmt::While {
+                condition, body, ..
+            } => {
+                self.visit_expr(condition);
+                self.visit_stmts(body);
+            }
+            ir::Stmt::For {
+                init,
+                condition,
+                increment,
+                body,
+                ..
+            } => {
+                if let Some(init) = init {
+                    self.visit_stmt(init);
+                }
+                if let Some(condition) = condition {
+                    self.visit_expr(condition);
+                }
+                if let Some(increment) = increment {
+                    self.visit_stmt(increment);
+                }
+                self.visit_stmts(body);
+            }
+            ir::Stmt::ExprStmt { expr, .. } => self.visit_expr(expr),
+            ir::Stmt::Throw { value, .. } => self.visit_expr(value),
+            ir::Stmt::TryCatch {
+                try_body,
+                catch_type,
+                catch_body,
+                ..
+            } => {
+                self.visit_stmts(try_body);
+                self.visit_type(catch_type);
+                self.visit_stmts(catch_body);
+            }
+            ir::Stmt::TryFinally {
+                try_body,
+                finally_body,
+                ..
+            } => {
+                self.visit_stmts(try_body);
+                self.visit_stmts(finally_body);
+            }
+            ir::Stmt::TupleAssign { targets, value, .. } => {
+                for target in targets {
+                    self.visit_expr(target);
+                }
+                self.visit_expr(value);
+            }
+            ir::Stmt::Unsupported { .. } => {}
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &mut ir::Expr) {
+        match expr {
+            ir::Expr::IntLiteral { .. }
+            | ir::Expr::DoubleLiteral { .. }
+            | ir::Expr::BoolLiteral { .. }
+            | ir::Expr::StringLiteral { .. }
+            | ir::Expr::Unsupported { .. } => {}
+            ir::Expr::Ref { ty, .. } | ir::Expr::This { ty, .. } => {
+                self.visit_type(ty);
+            }
+            ir::Expr::Binary { lhs, rhs, ty, .. } => {
+                self.visit_type(ty);
+                self.visit_expr(lhs);
+                self.visit_expr(rhs);
+            }
+            ir::Expr::Unary { operand, ty, .. } | ir::Expr::Convert { operand, ty, .. } => {
+                self.visit_type(ty);
+                self.visit_expr(operand);
+            }
+            ir::Expr::Call {
+                target, ty, args, ..
+            } => {
+                self.visit_type(ty);
+                if let Some(target) = target {
+                    self.visit_expr(target);
+                }
+                for arg in args {
+                    self.visit_expr(arg);
+                }
+            }
+            ir::Expr::FieldAccess { target, ty, .. } => {
+                self.visit_type(ty);
+                self.visit_expr(target);
+            }
+            ir::Expr::RecordConstruct {
+                type_usr,
+                type_name,
+                fields,
+                ..
+            } => {
+                (self.on_record_construct)(type_usr, type_name);
+                for (_name, value) in fields {
+                    self.visit_expr(value);
+                }
+            }
+            ir::Expr::ConstructorCall {
+                type_usr,
+                type_name,
+                args,
+                ..
+            } => {
+                (self.on_record_construct)(type_usr, type_name);
+                for arg in args {
+                    self.visit_expr(arg);
+                }
+            }
+            ir::Expr::Index {
+                target, index, ty, ..
+            } => {
+                self.visit_type(ty);
+                self.visit_expr(target);
+                self.visit_expr(index);
+            }
+            ir::Expr::StringByteLength { target, .. } => self.visit_expr(target),
+            ir::Expr::Tuple { values, .. } => {
+                for value in values {
+                    self.visit_expr(value);
+                }
             }
         }
     }
+
+    /// Composite element types are visited before the node that holds
+    /// them, so a visitor that *replaces* a node (`reject_undeclared_enum_refs`
+    /// turning an `Enum` into an `Unsupported`) can't drop children that
+    /// were never offered to it.
+    fn visit_type(&mut self, ty: &mut ir::Type) {
+        match ty {
+            ir::Type::List(element) | ir::Type::Set(element) | ir::Type::Nullable(element) => {
+                self.visit_type(element)
+            }
+            ir::Type::Map(key, value) => {
+                self.visit_type(key);
+                self.visit_type(value);
+            }
+            ir::Type::Tuple(elements) => {
+                for element in elements {
+                    self.visit_type(element);
+                }
+            }
+            ir::Type::Int
+            | ir::Type::Bool
+            | ir::Type::Double
+            | ir::Type::Void
+            | ir::Type::Str
+            | ir::Type::Record { .. }
+            | ir::Type::Enum { .. }
+            | ir::Type::Unsupported(_) => {}
+        }
+        (self.on_type)(ty);
+    }
+}
+
+fn rename_record_refs_in_stmts(stmts: &mut [ir::Stmt], renames: &HashMap<String, String>) {
+    IrRefVisitor {
+        on_type: &mut |ty: &mut ir::Type| {
+            if let ir::Type::Record { usr, name } = ty
+                && let Some(new_name) = renames.get(usr)
+            {
+                *name = new_name.clone();
+            }
+        },
+        on_record_construct: &mut |type_usr: &str, type_name: &mut String| {
+            if let Some(new_name) = renames.get(type_usr) {
+                *type_name = new_name.clone();
+            }
+        },
+    }
+    .visit_stmts(stmts);
 }
 
 fn rename_calls_in_params(params: &mut [ir::Param], renames: &HashMap<String, String>) {

@@ -213,6 +213,64 @@ fn pointee_usr_desugars_through_a_typedef_of_an_anonymous_struct() {
     );
 }
 
+const TYPEDEF_OF_POINTER_CPP: &str = r#"
+struct Objeto {
+    int valor;
+};
+
+typedef Objeto* ObjetoPtr;
+
+void Preencher(ObjetoPtr* slot);
+"#;
+
+/// `shape` and `pointee_usr` have to be read off the *same* type. Once
+/// `record_pointer` started desugaring typedefs to fill in `pointee_usr`
+/// (caso 2), a typedef that hides a pointer — `typedef Objeto* ObjetoPtr`,
+/// then `ObjetoPtr*` — made the two disagree: `pointer_shape` saw the
+/// undesugared `ObjetoPtr` (a `CXType_Typedef`, so `Scalar`) while
+/// `pointee_usr` resolved through `strip_indirections` all the way to
+/// `Objeto`. The pair then reads as "a scalar pointer to `Objeto`", which
+/// is what `project_service::list_pointers` narrows to a plain `Objeto?` —
+/// but the declaration is really `Objeto**`, a double pointer that case
+/// A10's reasoning doesn't cover. Both fields must come from the desugared
+/// pointee so the catalog can't describe a shape the declaration doesn't
+/// have.
+#[test]
+fn pointer_shape_and_pointee_usr_agree_through_a_typedef_of_a_pointer() {
+    let workspace =
+        TempWorkspace::new("pointer-catalog-typedef-pointer").expect("create workspace");
+    let project_root = workspace.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project dir");
+
+    let file_path = project_root.join("objeto.cpp");
+    fs::write(&file_path, TYPEDEF_OF_POINTER_CPP).expect("write objeto.cpp");
+
+    let unit = CompilationUnit {
+        directory: project_root.display().to_string(),
+        file: file_path.display().to_string(),
+        command: None,
+        arguments: vec!["clang++".to_owned(), "-std=c++17".to_owned()],
+    };
+
+    let pointers =
+        pointer_catalog::extract_pointer_catalog(std::slice::from_ref(&unit), &project_root, None)
+            .expect("extract pointer catalog");
+
+    let slot = pointers
+        .iter()
+        .find(|declaration| {
+            declaration.kind == PointerDeclarationKind::Parameter && declaration.name == "slot"
+        })
+        .unwrap_or_else(|| panic!("expected the `slot` parameter among {pointers:#?}"));
+
+    assert_eq!(
+        slot.shape,
+        PointerShape::DoublePointer,
+        "`ObjetoPtr*` is `Objeto**` once the typedef is unwound, so it must not be \
+         reported as a scalar pointer that `list_pointers` would narrow to `Objeto?`"
+    );
+}
+
 const TYPEDEF_OF_SCALAR_CPP: &str = r#"
 typedef unsigned char Byte;
 
