@@ -16,6 +16,8 @@ use std::ffi::{CStr, CString};
 use std::fmt;
 use std::os::raw::{c_int, c_uint, c_void};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -603,7 +605,7 @@ pub(crate) fn build_clang_args(unit: &CompilationUnit) -> Vec<String> {
         Vec::new()
     };
 
-    let mut args = Vec::with_capacity(tokens.len());
+    let mut args = Vec::with_capacity(tokens.len() + 1);
     let mut tokens = tokens.into_iter().skip(1).peekable();
 
     while let Some(token) = tokens.next() {
@@ -621,7 +623,47 @@ pub(crate) fn build_clang_args(unit: &CompilationUnit) -> Vec<String> {
         args.push(token);
     }
 
+    if let Some(resource_dir) = clang_resource_dir() {
+        args.push(format!("-resource-dir={resource_dir}"));
+    }
+
     args
+}
+
+/// `libclang`'s own autodetection of its resource directory (builtin
+/// headers like `stddef.h`, transitively needed by system headers such as
+/// `wchar.h`) can fail when `clang_parseTranslationUnit` is called directly
+/// through the C API instead of through the `clang`/`clang++` driver binary
+/// — confirmed under the Flatpak `llvm21` SDK extension, where the parse
+/// doesn't hard-error but silently degrades (implicit-cast wrapper cursors
+/// gain extra children, types collapse to `<dependent type>`), which then
+/// surfaced downstream as `lower::cpp` reporting nonsensical cursor shapes.
+/// Asking the same `clang++` the project's `cmake` configure step already
+/// relies on (see `AGENTS.md`'s toolchain list) removes the autodetection
+/// step entirely, and stays correct across toolchain versions since it asks
+/// that exact toolchain rather than hardcoding a path. Cached after the
+/// first successful call so every compilation unit doesn't pay a fresh
+/// process spawn.
+fn clang_resource_dir() -> Option<&'static str> {
+    static RESOURCE_DIR: OnceLock<Option<String>> = OnceLock::new();
+    RESOURCE_DIR
+        .get_or_init(|| {
+            let output = Command::new("clang++")
+                .arg("-print-resource-dir")
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let dir = String::from_utf8(output.stdout).ok()?;
+            let dir = dir.trim();
+            if dir.is_empty() || !Path::new(dir).is_dir() {
+                None
+            } else {
+                Some(dir.to_owned())
+            }
+        })
+        .as_deref()
 }
 
 extern "C" fn visit_cursor(
@@ -1080,4 +1122,50 @@ pub(crate) fn load_libclang() -> Result<(), String> {
     }
 
     clang_sys::load()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `libclang`'s own autodetection of its resource directory (builtin
+    /// headers like `stddef.h`, transitively needed by system headers such
+    /// as `wchar.h`) can fail when `clang_parseTranslationUnit` is called
+    /// directly through the C API instead of through the `clang`/`clang++`
+    /// driver binary — confirmed under the Flatpak `llvm21` SDK extension:
+    /// the parse doesn't hard-error, it silently degrades (implicit-cast
+    /// wrapper cursors gain extra children, types collapse to `<dependent
+    /// type>`), which surfaced as `lower::cpp` reporting nonsensical cursor
+    /// shapes that looked like a clang-version AST incompatibility but
+    /// wasn't one. Passing `-resource-dir` explicitly removes the
+    /// autodetection step entirely.
+    #[test]
+    fn build_clang_args_includes_an_explicit_resource_dir() {
+        let unit = CompilationUnit {
+            directory: ".".to_owned(),
+            file: "main.cpp".to_owned(),
+            command: None,
+            arguments: vec![
+                "clang++".to_owned(),
+                "-std=c++17".to_owned(),
+                "-c".to_owned(),
+                "main.cpp".to_owned(),
+                "-o".to_owned(),
+                "main.o".to_owned(),
+            ],
+        };
+
+        let args = build_clang_args(&unit);
+
+        let resource_dir = args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("-resource-dir="))
+            .unwrap_or_else(|| {
+                panic!("build_clang_args should append an explicit -resource-dir, got: {args:?}")
+            });
+        assert!(
+            Path::new(resource_dir).is_dir(),
+            "-resource-dir={resource_dir} does not point at a real directory"
+        );
+    }
 }
