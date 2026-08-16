@@ -154,6 +154,17 @@ pub struct CallEdge {
     pub column: u32,
 }
 
+/// One worker's local (not yet cross-chunk deduplicated) results — shared
+/// between `parse_chunk`'s return type, `finish_function_catalog`'s
+/// parameter, and `extraction::WorkerPartials`, which all merge the same
+/// four-tuple shape.
+pub(crate) type FunctionCatalogPartial = (
+    Vec<FunctionDeclaration>,
+    Vec<CallEdge>,
+    Vec<ir::Function>,
+    Vec<ir::Record>,
+);
+
 #[derive(Debug, Clone, Default)]
 pub struct FunctionCatalog {
     pub declarations: Vec<FunctionDeclaration>,
@@ -264,6 +275,29 @@ pub fn extract_function_catalog_cancellable(
         return Err(FunctionCatalogError::Cancelled);
     }
 
+    let catalog = finish_function_catalog(partials);
+
+    log_function_catalog(format_args!(
+        "extract_function_catalog: done in {:.2}s, {} declarations, {} calls, {} ir functions, {} ir records",
+        extraction_started.elapsed().as_secs_f64(),
+        catalog.declarations.len(),
+        catalog.calls.len(),
+        catalog.ir_functions.len(),
+        catalog.ir_records.len()
+    ));
+
+    Ok(catalog)
+}
+
+/// Merges every worker's local partials into the final `FunctionCatalog`,
+/// including the post-merge passes (overload renaming, record-name
+/// disambiguation, RAII scope guards) that only make sense once every
+/// translation unit's declarations/calls/IR are all in one place — factored
+/// out of `extract_function_catalog_cancellable` so
+/// `extraction::extract_project_catalogs_cancellable` (which drives its own
+/// workers directly, sharing a parse with `pointer_catalog`) can reuse the
+/// exact same merge and post-processing behavior.
+pub(crate) fn finish_function_catalog(partials: Vec<FunctionCatalogPartial>) -> FunctionCatalog {
     let mut seen = HashSet::new();
     let mut declarations = Vec::new();
     let mut call_seen = HashSet::new();
@@ -319,21 +353,12 @@ pub fn extract_function_catalog_cancellable(
     // destructor, if any) is already fully lowered.
     apply_raii_scope_guards(&mut ir_functions, &ir_records);
 
-    log_function_catalog(format_args!(
-        "extract_function_catalog: done in {:.2}s, {} declarations, {} calls, {} ir functions, {} ir records",
-        extraction_started.elapsed().as_secs_f64(),
-        declarations.len(),
-        calls.len(),
-        ir_functions.len(),
-        ir_records.len()
-    ));
-
-    Ok(FunctionCatalog {
+    FunctionCatalog {
         declarations,
         calls,
         ir_functions,
         ir_records,
-    })
+    }
 }
 
 /// After every function/method is lowered with its original C++ name,
@@ -388,6 +413,24 @@ fn apply_overload_renames(
             .push(declaration);
     }
 
+    // Indexed by `usr` once, up front — `find_ir_params` used to rescan all
+    // of `ir_functions`/every record's `methods` per renamed declaration,
+    // which adds up across every multi-member overload group. Built (and
+    // dropped) before `ir_functions`/`ir_records` are mutated below, so it
+    // doesn't conflict with the `&mut` borrows the rename-application loop
+    // needs.
+    let mut ir_functions_by_usr: HashMap<&str, &[ir::Param]> =
+        HashMap::with_capacity(ir_functions.len());
+    for function in ir_functions.iter() {
+        ir_functions_by_usr.insert(function.usr.as_str(), function.params.as_slice());
+    }
+    let mut ir_methods_by_usr: HashMap<&str, &[ir::Param]> = HashMap::new();
+    for record in ir_records.iter() {
+        for method in &record.methods {
+            ir_methods_by_usr.insert(method.usr.as_str(), method.params.as_slice());
+        }
+    }
+
     let mut renames: HashMap<String, String> = HashMap::new();
     for ((owning_class_usr, name), group) in &groups {
         if group.len() <= 1 {
@@ -419,7 +462,11 @@ fn apply_overload_renames(
             continue;
         }
         for declaration in group {
-            if let Some(params) = find_ir_params(ir_functions, ir_records, &declaration.usr) {
+            let params = ir_functions_by_usr
+                .get(declaration.usr.as_str())
+                .or_else(|| ir_methods_by_usr.get(declaration.usr.as_str()))
+                .copied();
+            if let Some(params) = params {
                 renames.insert(declaration.usr.clone(), dart_overload_name(name, params));
             }
         }
@@ -1149,20 +1196,6 @@ fn replace_this_with_ref_in_expr(expr: &mut ir::Expr, var_name: &str) {
     }
 }
 
-fn find_ir_params<'a>(
-    ir_functions: &'a [ir::Function],
-    ir_records: &'a [ir::Record],
-    usr: &str,
-) -> Option<&'a [ir::Param]> {
-    if let Some(function) = ir_functions.iter().find(|function| function.usr == usr) {
-        return Some(&function.params);
-    }
-    ir_records
-        .iter()
-        .find_map(|record| record.methods.iter().find(|method| method.usr == usr))
-        .map(|method| method.params.as_slice())
-}
-
 /// The deterministic name a renamed overload gets — appends every
 /// parameter's Dart type name, capitalized, to the original C++ name
 /// (`formatarValor` + `[Int]` params → `formatarValorInt`). Computed the
@@ -1328,12 +1361,7 @@ fn parse_chunk(
     project_root: &Path,
     progress: Option<&ExtractionProgress>,
     cancellation: Option<&Cancellation>,
-) -> (
-    Vec<FunctionDeclaration>,
-    Vec<CallEdge>,
-    Vec<ir::Function>,
-    Vec<ir::Record>,
-) {
+) -> FunctionCatalogPartial {
     // Each worker thread needs its own load: see
     // `type_catalog::parse_chunk` for why the calling thread's
     // `load_libclang()` doesn't cover this one.
@@ -1411,7 +1439,7 @@ fn timestamp_millis() -> u128 {
         .as_millis()
 }
 
-struct VisitorState<'a> {
+pub(crate) struct VisitorState<'a> {
     project_root: &'a Path,
     declarations: &'a mut Vec<FunctionDeclaration>,
     seen: &'a mut HashSet<String>,
@@ -1425,6 +1453,31 @@ struct VisitorState<'a> {
     /// is handled separately, by the final merge in
     /// `extract_function_catalog_cancellable`.
     ir_seen: &'a mut HashSet<String>,
+}
+
+impl<'a> VisitorState<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        project_root: &'a Path,
+        declarations: &'a mut Vec<FunctionDeclaration>,
+        seen: &'a mut HashSet<String>,
+        calls: &'a mut Vec<CallEdge>,
+        call_seen: &'a mut HashSet<(String, CallResolution, String, u32, u32)>,
+        ir_functions: &'a mut Vec<ir::Function>,
+        ir_records: &'a mut Vec<ir::Record>,
+        ir_seen: &'a mut HashSet<String>,
+    ) -> Self {
+        Self {
+            project_root,
+            declarations,
+            seen,
+            calls,
+            call_seen,
+            ir_functions,
+            ir_records,
+            ir_seen,
+        }
+    }
 }
 
 fn call_identity(call: &CallEdge) -> (String, CallResolution, String, u32, u32) {
@@ -1461,9 +1514,34 @@ unsafe fn visit_translation_unit(
     unit: &CompilationUnit,
     state: &mut VisitorState<'_>,
 ) {
-    let Ok(file) = CString::new(unit.file.as_str()) else {
-        return;
-    };
+    unsafe {
+        let Some(translation_unit) = parse_translation_unit(index, unit) else {
+            return;
+        };
+        visit_parsed_translation_unit(translation_unit, state);
+        clang_sys::clang_disposeTranslationUnit(translation_unit);
+    }
+}
+
+/// The flags this module needs — no `CXTranslationUnit_SkipFunctionBodies`
+/// (see module docs): the call graph lives inside bodies.
+/// `DetailedPreprocessingRecord` is kept so function-like macros are still
+/// visited. Shared as-is with `pointer_catalog::visit_parsed_translation_unit`
+/// by `extraction::extract_project_catalogs_cancellable`, which parses each
+/// translation unit once per body-visibility requirement rather than once
+/// per catalog; `pointer_catalog`'s own standalone parse uses `None` (no
+/// flags), a subset this superset is safe for (see that module's own
+/// `visit_parsed_translation_unit` doc comment).
+pub(crate) const PARSE_FLAGS: clang_sys::CXTranslationUnit_Flags =
+    clang_sys::CXTranslationUnit_DetailedPreprocessingRecord;
+
+/// Parses `unit` with `PARSE_FLAGS`, returning `None` on failure (mirrors
+/// `type_catalog::parse_translation_unit`).
+pub(crate) unsafe fn parse_translation_unit(
+    index: clang_sys::CXIndex,
+    unit: &CompilationUnit,
+) -> Option<clang_sys::CXTranslationUnit> {
+    let file = CString::new(unit.file.as_str()).ok()?;
 
     let args = type_catalog::build_clang_args(unit);
     let arg_cstrings: Vec<CString> = args
@@ -1473,11 +1551,6 @@ unsafe fn visit_translation_unit(
     let arg_ptrs: Vec<*const std::os::raw::c_char> =
         arg_cstrings.iter().map(|arg| arg.as_ptr()).collect();
 
-    // No `CXTranslationUnit_SkipFunctionBodies` here (see module docs): the
-    // call graph lives inside bodies. `DetailedPreprocessingRecord` is kept
-    // so function-like macros are still visited.
-    let flags = clang_sys::CXTranslationUnit_DetailedPreprocessingRecord;
-
     unsafe {
         let translation_unit = clang_sys::clang_parseTranslationUnit(
             index,
@@ -1486,21 +1559,31 @@ unsafe fn visit_translation_unit(
             arg_ptrs.len() as c_int,
             std::ptr::null_mut(),
             0,
-            flags,
+            PARSE_FLAGS,
         );
 
         if translation_unit.is_null() {
-            return;
+            None
+        } else {
+            Some(translation_unit)
         }
+    }
+}
 
+/// Walks an already-parsed translation unit (mirrors
+/// `type_catalog::visit_parsed_translation_unit`) — lets a caller sharing
+/// one parse across catalogs call this without also disposing it.
+pub(crate) unsafe fn visit_parsed_translation_unit(
+    translation_unit: clang_sys::CXTranslationUnit,
+    state: &mut VisitorState<'_>,
+) {
+    unsafe {
         let root_cursor = clang_sys::clang_getTranslationUnitCursor(translation_unit);
         clang_sys::clang_visitChildren(
             root_cursor,
             visit_cursor,
             state as *mut VisitorState<'_> as *mut c_void,
         );
-
-        clang_sys::clang_disposeTranslationUnit(translation_unit);
     }
 }
 

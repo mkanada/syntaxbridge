@@ -17,7 +17,7 @@
 //! `#ifdef`), uma varredura textual da assinatura/corpo/arquivo fonte —
 //! sempre documentada como heurística, nunca apresentada como certeza.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 
 use serde::{Deserialize, Serialize};
@@ -891,6 +891,20 @@ fn count_parameters(signature: &str) -> usize {
 /// to it. Deduplicated by caller `usr` (a caller with two call sites to the
 /// same renamed group would otherwise get two identical consequences).
 fn call_site_consequences(usrs: &[String], facts: &ProjectFacts<'_>) -> Vec<Consequence> {
+    // Indexed by `usr` once, up front — a project with many overload groups
+    // otherwise re-scans every function in `facts.functions` (`.find()`) for
+    // every resolved call in `facts.calls`, which turned this function
+    // O(calls × functions) per group, and this is called once per
+    // multi-member overload group. `.entry(...).or_insert(...)` keeps
+    // `.find()`'s "first match wins" result for a `usr` that (unexpectedly)
+    // appears more than once.
+    let mut functions_by_usr = HashMap::with_capacity(facts.functions.len());
+    for function in facts.functions {
+        functions_by_usr
+            .entry(function.usr.as_str())
+            .or_insert(function);
+    }
+
     let mut seen = HashSet::new();
     let mut consequences = Vec::new();
     for edge in facts.calls {
@@ -900,7 +914,7 @@ fn call_site_consequences(usrs: &[String], facts: &ProjectFacts<'_>) -> Vec<Cons
         if !usrs.iter().any(|usr| usr == callee_usr) {
             continue;
         }
-        let Some(caller) = facts.functions.iter().find(|f| f.usr == edge.caller_usr) else {
+        let Some(&caller) = functions_by_usr.get(edge.caller_usr.as_str()) else {
             continue;
         };
         if !seen.insert(caller.usr.clone()) {

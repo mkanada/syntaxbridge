@@ -6,7 +6,7 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
-use syntax_bridge_server::ingest::{CreateProjectRequest, create_project};
+use syntax_bridge_server::ingest::{CreateProjectRequest, IngestError, create_project};
 use syntax_bridge_server::persistence::GlobalStore;
 use syntax_bridge_server::project_service::{self, CreationProgress};
 use syntax_bridge_server::server::SyntaxBridgeServer;
@@ -62,6 +62,36 @@ fn creates_project_from_tarball_and_lists_cmake_compilation_units() {
             .is_some_and(|command| !command.is_empty())
             || !unit.arguments.is_empty(),
         "compilation unit should include the compiler invocation: {unit:#?}"
+    );
+}
+
+/// `extract_archive` validates every tar entry (`validate_tar_entries`)
+/// before extracting anything, specifically to reject path-traversal
+/// members like this one — a regression guard for the ingest performance
+/// work that collapses the archive's separate listing and extraction passes
+/// into one decompression, so that change can't accidentally start
+/// extracting before validating.
+#[test]
+fn rejects_a_tarball_with_a_path_traversal_entry_without_extracting_it() {
+    let workspace = TempWorkspace::new("ingest-unsafe-tar").expect("create temporary workspace");
+    let archive_path = workspace.path().join("evil.tar.gz");
+    write_path_traversal_tarball(workspace.path(), &archive_path)
+        .expect("create malicious archive");
+
+    let result = create_project(CreateProjectRequest {
+        name: "counter".to_owned(),
+        workspace_dir: workspace.path().join("projects"),
+        archive_path,
+    });
+
+    assert!(
+        matches!(result, Err(IngestError::UnsafeArchiveEntry(_))),
+        "expected the path-traversal entry to be rejected: {result:?}"
+    );
+
+    assert!(
+        !workspace.path().join("evil.txt").exists(),
+        "a path-traversal entry must never be written outside the project directory"
     );
 }
 
@@ -1008,6 +1038,29 @@ fn write_cmake_fixture_tarball(workspace: &Path, archive_path: &Path) -> io::Res
         .arg("-C")
         .arg(workspace)
         .arg("fixture")
+        .output()?;
+    assert_success(output);
+
+    Ok(())
+}
+
+fn write_path_traversal_tarball(workspace: &Path, archive_path: &Path) -> io::Result<()> {
+    let payload_dir = workspace.join("payload");
+    fs::create_dir_all(&payload_dir)?;
+    fs::write(payload_dir.join("evil.txt"), b"pwned")?;
+
+    // `--transform` rewrites the stored member name to `../evil.txt` at
+    // archive-creation time, since `tar -c` itself won't accept a `..`
+    // path directly — this is how a hostile archive (crafted by hand, not
+    // through this codebase's own `tar`) would encode a traversal entry.
+    let output = Command::new("tar")
+        .arg("-czf")
+        .arg(archive_path)
+        .arg("--transform")
+        .arg("s,^,../,")
+        .arg("-C")
+        .arg(&payload_dir)
+        .arg("evil.txt")
         .output()?;
     assert_success(output);
 

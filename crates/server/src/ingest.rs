@@ -3,7 +3,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -274,19 +274,7 @@ fn extract_archive(archive_path: &Path, destination: &Path) -> Result<(), Ingest
     match archive_kind(archive_path) {
         Some(ArchiveKind::TarGz) => {
             log_ingest(format_args!("archive kind: tar.gz"));
-            validate_tar_entries(archive_path)?;
-            assert_success(
-                "tar",
-                Command::new("tar")
-                    .arg("-xzf")
-                    .arg(archive_path)
-                    .arg("-C")
-                    .arg(destination)
-                    .arg("--no-same-owner")
-                    .arg("--no-same-permissions")
-                    .output()?,
-            )
-            .map(|_| ())
+            extract_tar_gz(archive_path, destination)
         }
         Some(ArchiveKind::Zip) => {
             log_ingest(format_args!("archive kind: zip"));
@@ -309,12 +297,71 @@ fn extract_archive(archive_path: &Path, destination: &Path) -> Result<(), Ingest
     }
 }
 
+/// Extracts a `.tar.gz` by gunzipping it once into a scratch plain-`.tar`
+/// file alongside `destination`, then listing (`validate_tar_entries`) and
+/// extracting from that. `tar -tzf` (list) and `tar -xzf` (extract) each
+/// separately gunzip the whole archive to do their job — since gzip is a
+/// single sequential deflate stream with no index to skip through, listing
+/// costs as much decompression as extracting does, so running both against
+/// the original `.gz` paid for that decompression twice. The list-before-
+/// extract order itself is unchanged: `validate_tar_entries` still runs
+/// before anything is written to `destination`, rejecting a path-traversal
+/// entry (`rejects_a_tarball_with_a_path_traversal_entry_without_extracting_it`
+/// in `tests/project_ingest.rs`) exactly as before.
+fn extract_tar_gz(archive_path: &Path, destination: &Path) -> Result<(), IngestError> {
+    let scratch_tar_path = destination
+        .parent()
+        .unwrap_or(destination)
+        .join(".ingest-decompressed.tar");
+
+    decompress_gzip(archive_path, &scratch_tar_path)?;
+
+    let result = (|| -> Result<(), IngestError> {
+        validate_tar_entries(&scratch_tar_path)?;
+        assert_success(
+            "tar",
+            Command::new("tar")
+                .arg("-xf")
+                .arg(&scratch_tar_path)
+                .arg("-C")
+                .arg(destination)
+                .arg("--no-same-owner")
+                .arg("--no-same-permissions")
+                .output()?,
+        )
+        .map(|_| ())
+    })();
+
+    let _ = fs::remove_file(&scratch_tar_path);
+    result
+}
+
+/// Streams `archive_path`'s gzip output straight into `scratch_tar_path`
+/// (via a real file descriptor, not an in-memory `Output.stdout` buffer)
+/// rather than buffering the whole decompressed archive in process memory.
+fn decompress_gzip(archive_path: &Path, scratch_tar_path: &Path) -> Result<(), IngestError> {
+    log_ingest(format_args!(
+        "decompressing tar.gz: archive={} scratch={}",
+        archive_path.display(),
+        scratch_tar_path.display()
+    ));
+    let scratch_file = fs::File::create(scratch_tar_path)?;
+    let child = Command::new("gzip")
+        .arg("-dc")
+        .arg(archive_path)
+        .stdout(Stdio::from(scratch_file))
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let output = child.wait_with_output()?;
+    assert_success("gzip", output).map(|_| ())
+}
+
 fn validate_tar_entries(archive_path: &Path) -> Result<(), IngestError> {
     log_ingest(format_args!(
         "validating tar entries: {}",
         archive_path.display()
     ));
-    let output = Command::new("tar").arg("-tzf").arg(archive_path).output()?;
+    let output = Command::new("tar").arg("-tf").arg(archive_path).output()?;
     assert_success("tar", output).and_then(validate_archive_listing)
 }
 

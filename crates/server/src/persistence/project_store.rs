@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, Transaction, params};
 
 use crate::function_catalog::{
     CallEdge, CallResolution, FunctionDeclaration, FunctionDeclarationKind,
@@ -24,6 +24,28 @@ pub struct ProjectStore {
     connection: Connection,
 }
 
+/// Every derived catalog produced by one ingest, borrowed together for
+/// [`ProjectStore::replace_all`].
+pub struct ProjectCatalogs<'a> {
+    pub compilation_units: &'a [CompilationUnit],
+    pub type_declarations: &'a [TypeDeclaration],
+    pub type_dependencies: &'a [TypeDependency],
+    pub type_usages: &'a [TypeUsage],
+    pub source_files: &'a [SourceFile],
+    pub function_declarations: &'a [FunctionDeclaration],
+    pub call_edges: &'a [CallEdge],
+    pub ir_functions: &'a [ir::Function],
+    pub ir_records: &'a [ir::Record],
+    pub pointer_declarations: &'a [PointerDeclaration],
+}
+
+/// Bumped whenever `migrate_type_columns`/`migrate_function_columns` gains a
+/// new column to add. Guards those migrations behind `PRAGMA user_version`
+/// (checked once per `open`) so a database already at the current version
+/// skips the `PRAGMA table_info` probing entirely instead of re-running it on
+/// every open — including the read-only routes that call `open` per request.
+const SCHEMA_VERSION: i32 = 1;
+
 impl ProjectStore {
     pub fn open(path: &Path) -> Result<Self, PersistenceError> {
         if let Some(parent) = path.parent() {
@@ -31,6 +53,13 @@ impl ProjectStore {
         }
 
         let connection = Connection::open(path)?;
+        // WAL lets readers (the HTTP listing routes) proceed without
+        // blocking on a writer (an in-progress ingest), and pairs with
+        // `synchronous=NORMAL` per SQLite's own guidance: still durable
+        // against application crashes, just without an `fsync` on every
+        // single commit the way the default `FULL` setting demands.
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.pragma_update(None, "synchronous", "NORMAL")?;
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS compilation_units (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -144,8 +173,13 @@ impl ProjectStore {
             );",
         )?;
 
-        migrate_type_columns(&connection)?;
-        migrate_function_columns(&connection)?;
+        let current_version: i32 =
+            connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if current_version < SCHEMA_VERSION {
+            migrate_type_columns(&connection)?;
+            migrate_function_columns(&connection)?;
+            connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
 
         Ok(Self { connection })
     }
@@ -158,17 +192,7 @@ impl ProjectStore {
         units: &[CompilationUnit],
     ) -> Result<(), PersistenceError> {
         let transaction = self.connection.transaction()?;
-        transaction.execute("DELETE FROM compilation_units", [])?;
-
-        for unit in units {
-            let arguments_json = serde_json::to_string(&unit.arguments)?;
-            transaction.execute(
-                "INSERT INTO compilation_units (directory, file, command, arguments_json)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![unit.directory, unit.file, unit.command, arguments_json],
-            )?;
-        }
-
+        replace_compilation_units_tx(&transaction, units)?;
         transaction.commit()?;
         Ok(())
     }
@@ -218,31 +242,7 @@ impl ProjectStore {
         declarations: &[TypeDeclaration],
     ) -> Result<(), PersistenceError> {
         let transaction = self.connection.transaction()?;
-        transaction.execute("DELETE FROM type_declarations", [])?;
-
-        for declaration in declarations {
-            transaction.execute(
-                "INSERT INTO type_declarations (name, kind, namespace, file, line, column, end_line, end_column, usr)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    declaration.name,
-                    declaration.kind.as_str(),
-                    declaration.namespace,
-                    declaration.file,
-                    declaration.line,
-                    declaration.column,
-                    declaration.end_line,
-                    declaration.end_column,
-                    declaration.usr
-                ],
-            )?;
-        }
-
-        transaction.execute(
-            "DELETE FROM type_mappings WHERE type_usr NOT IN (SELECT usr FROM type_declarations)",
-            [],
-        )?;
-
+        replace_type_declarations_tx(&transaction, declarations)?;
         transaction.commit()?;
         Ok(())
     }
@@ -300,26 +300,7 @@ impl ProjectStore {
         declarations: &[PointerDeclaration],
     ) -> Result<(), PersistenceError> {
         let transaction = self.connection.transaction()?;
-        transaction.execute("DELETE FROM pointer_declarations", [])?;
-
-        for declaration in declarations {
-            transaction.execute(
-                "INSERT INTO pointer_declarations (kind, shape, name, pointee_type_name, pointee_usr, file, line, column, usr)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    declaration.kind.as_str(),
-                    declaration.shape.as_str(),
-                    declaration.name,
-                    declaration.pointee_type_name,
-                    declaration.pointee_usr,
-                    declaration.file,
-                    declaration.line,
-                    declaration.column,
-                    declaration.usr
-                ],
-            )?;
-        }
-
+        replace_pointer_declarations_tx(&transaction, declarations)?;
         transaction.commit()?;
         Ok(())
     }
@@ -383,37 +364,7 @@ impl ProjectStore {
         dependencies: &[TypeDependency],
     ) -> Result<(), PersistenceError> {
         let transaction = self.connection.transaction()?;
-        transaction.execute("DELETE FROM type_dependencies", [])?;
-
-        for dependency in dependencies {
-            transaction.execute(
-                "INSERT INTO type_dependencies (
-                    caller_name, caller_kind, caller_namespace, caller_file, caller_line, caller_column, caller_end_line, caller_end_column, caller_usr,
-                    callee_name, callee_kind, callee_namespace, callee_file, callee_line, callee_column, callee_end_line, callee_end_column, callee_usr
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
-                params![
-                    dependency.caller.name,
-                    dependency.caller.kind.as_str(),
-                    dependency.caller.namespace,
-                    dependency.caller.file,
-                    dependency.caller.line,
-                    dependency.caller.column,
-                    dependency.caller.end_line,
-                    dependency.caller.end_column,
-                    dependency.caller.usr,
-                    dependency.callee.name,
-                    dependency.callee.kind.as_str(),
-                    dependency.callee.namespace,
-                    dependency.callee.file,
-                    dependency.callee.line,
-                    dependency.callee.column,
-                    dependency.callee.end_line,
-                    dependency.callee.end_column,
-                    dependency.callee.usr,
-                ],
-            )?;
-        }
-
+        replace_type_dependencies_tx(&transaction, dependencies)?;
         transaction.commit()?;
         Ok(())
     }
@@ -512,15 +463,7 @@ impl ProjectStore {
     /// state of the source tree rather than an append-only history.
     pub fn replace_source_files(&mut self, files: &[SourceFile]) -> Result<(), PersistenceError> {
         let transaction = self.connection.transaction()?;
-        transaction.execute("DELETE FROM source_files", [])?;
-
-        for file in files {
-            transaction.execute(
-                "INSERT INTO source_files (path, kind) VALUES (?1, ?2)",
-                params![file.path, file.kind.as_str()],
-            )?;
-        }
-
+        replace_source_files_tx(&transaction, files)?;
         transaction.commit()?;
         Ok(())
     }
@@ -552,22 +495,7 @@ impl ProjectStore {
     /// current state of the source tree rather than an append-only history.
     pub fn replace_type_usages(&mut self, usages: &[TypeUsage]) -> Result<(), PersistenceError> {
         let transaction = self.connection.transaction()?;
-        transaction.execute("DELETE FROM type_usages", [])?;
-
-        for usage in usages {
-            transaction.execute(
-                "INSERT INTO type_usages (type_usr, kind, file, line, column)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    usage.type_usr,
-                    usage.kind.as_str(),
-                    usage.file,
-                    usage.line,
-                    usage.column
-                ],
-            )?;
-        }
-
+        replace_type_usages_tx(&transaction, usages)?;
         transaction.commit()?;
         Ok(())
     }
@@ -675,37 +603,7 @@ impl ProjectStore {
         declarations: &[FunctionDeclaration],
     ) -> Result<(), PersistenceError> {
         let transaction = self.connection.transaction()?;
-        transaction.execute("DELETE FROM function_declarations", [])?;
-
-        for declaration in declarations {
-            let overridden_usrs_json = serde_json::to_string(&declaration.overridden_usrs)?;
-            transaction.execute(
-                "INSERT INTO function_declarations (
-                    name, kind, namespace, owning_class_usr, signature, file, line, column,
-                    end_line, end_column, usr, is_static, is_virtual, is_pure_virtual, is_defaulted,
-                    overridden_usrs_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-                params![
-                    declaration.name,
-                    declaration.kind.as_str(),
-                    declaration.namespace,
-                    declaration.owning_class_usr,
-                    declaration.signature,
-                    declaration.file,
-                    declaration.line,
-                    declaration.column,
-                    declaration.end_line,
-                    declaration.end_column,
-                    declaration.usr,
-                    declaration.is_static,
-                    declaration.is_virtual,
-                    declaration.is_pure_virtual,
-                    declaration.is_defaulted,
-                    overridden_usrs_json,
-                ],
-            )?;
-        }
-
+        replace_function_declarations_tx(&transaction, declarations)?;
         transaction.commit()?;
         Ok(())
     }
@@ -791,33 +689,7 @@ impl ProjectStore {
     /// latest `libclang` extraction, mirroring `replace_type_usages`.
     pub fn replace_call_edges(&mut self, calls: &[CallEdge]) -> Result<(), PersistenceError> {
         let transaction = self.connection.transaction()?;
-        transaction.execute("DELETE FROM call_edges", [])?;
-
-        for call in calls {
-            let (callee_usr, is_dynamic_dispatch, unresolved_reason) = match &call.resolution {
-                CallResolution::Resolved {
-                    callee_usr,
-                    is_dynamic_dispatch,
-                } => (Some(callee_usr.clone()), Some(*is_dynamic_dispatch), None),
-                CallResolution::Unresolved { reason } => (None, None, Some(reason.clone())),
-            };
-
-            transaction.execute(
-                "INSERT INTO call_edges (
-                    caller_usr, callee_usr, is_dynamic_dispatch, unresolved_reason, file, line, column
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    call.caller_usr,
-                    callee_usr,
-                    is_dynamic_dispatch,
-                    unresolved_reason,
-                    call.file,
-                    call.line,
-                    call.column,
-                ],
-            )?;
-        }
-
+        replace_call_edges_tx(&transaction, calls)?;
         transaction.commit()?;
         Ok(())
     }
@@ -958,26 +830,29 @@ impl ProjectStore {
         functions: &[ir::Function],
         records: &[ir::Record],
     ) -> Result<(), PersistenceError> {
-        let function_data = serialize_ir_values(functions.to_vec())?;
-        let record_data = serialize_ir_values(records.to_vec())?;
-
         let transaction = self.connection.transaction()?;
-        transaction.execute("DELETE FROM ir_functions", [])?;
-        transaction.execute("DELETE FROM ir_records", [])?;
+        replace_ir_tx(&transaction, functions, records)?;
+        transaction.commit()?;
+        Ok(())
+    }
 
-        for (function, data) in functions.iter().zip(function_data) {
-            transaction.execute(
-                "INSERT INTO ir_functions (usr, data) VALUES (?1, ?2)",
-                params![function.usr, data],
-            )?;
-        }
-        for (record, data) in records.iter().zip(record_data) {
-            transaction.execute(
-                "INSERT INTO ir_records (usr, data) VALUES (?1, ?2)",
-                params![record.usr, data],
-            )?;
-        }
-
+    /// Replaces every derived catalog table in one transaction, so a fresh
+    /// ingest either lands as a whole or (on any failure partway through)
+    /// leaves the previous project state fully intact rather than a mix of
+    /// old and new tables. Used by `project_service::create_project`; the
+    /// individual `replace_*` methods above remain for callers (mainly
+    /// tests) that only need to seed a single table.
+    pub fn replace_all(&mut self, catalogs: &ProjectCatalogs<'_>) -> Result<(), PersistenceError> {
+        let transaction = self.connection.transaction()?;
+        replace_compilation_units_tx(&transaction, catalogs.compilation_units)?;
+        replace_type_declarations_tx(&transaction, catalogs.type_declarations)?;
+        replace_type_dependencies_tx(&transaction, catalogs.type_dependencies)?;
+        replace_type_usages_tx(&transaction, catalogs.type_usages)?;
+        replace_source_files_tx(&transaction, catalogs.source_files)?;
+        replace_function_declarations_tx(&transaction, catalogs.function_declarations)?;
+        replace_call_edges_tx(&transaction, catalogs.call_edges)?;
+        replace_ir_tx(&transaction, catalogs.ir_functions, catalogs.ir_records)?;
+        replace_pointer_declarations_tx(&transaction, catalogs.pointer_declarations)?;
         transaction.commit()?;
         Ok(())
     }
@@ -1001,6 +876,270 @@ impl ProjectStore {
         let records = deserialize_ir_values(record_rows)?;
         Ok((functions, records))
     }
+}
+
+/// Row-insertion bodies shared between each `replace_*` method (which opens
+/// its own transaction, for standalone callers) and `ProjectStore::replace_all`
+/// (which runs all of them inside a single transaction). Each prepares its
+/// `INSERT` statement once and reuses it across every row, instead of the
+/// per-row `Connection::execute` the individual methods used before, which
+/// reparsed the same SQL text once per row.
+fn replace_compilation_units_tx(
+    transaction: &Transaction,
+    units: &[CompilationUnit],
+) -> Result<(), PersistenceError> {
+    transaction.execute("DELETE FROM compilation_units", [])?;
+
+    let mut statement = transaction.prepare(
+        "INSERT INTO compilation_units (directory, file, command, arguments_json)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for unit in units {
+        let arguments_json = serde_json::to_string(&unit.arguments)?;
+        statement.execute(params![
+            unit.directory,
+            unit.file,
+            unit.command,
+            arguments_json
+        ])?;
+    }
+
+    Ok(())
+}
+
+fn replace_type_declarations_tx(
+    transaction: &Transaction,
+    declarations: &[TypeDeclaration],
+) -> Result<(), PersistenceError> {
+    transaction.execute("DELETE FROM type_declarations", [])?;
+
+    let mut statement = transaction.prepare(
+        "INSERT INTO type_declarations (name, kind, namespace, file, line, column, end_line, end_column, usr)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
+    for declaration in declarations {
+        statement.execute(params![
+            declaration.name,
+            declaration.kind.as_str(),
+            declaration.namespace,
+            declaration.file,
+            declaration.line,
+            declaration.column,
+            declaration.end_line,
+            declaration.end_column,
+            declaration.usr
+        ])?;
+    }
+    drop(statement);
+
+    transaction.execute(
+        "DELETE FROM type_mappings WHERE type_usr NOT IN (SELECT usr FROM type_declarations)",
+        [],
+    )?;
+
+    Ok(())
+}
+
+fn replace_pointer_declarations_tx(
+    transaction: &Transaction,
+    declarations: &[PointerDeclaration],
+) -> Result<(), PersistenceError> {
+    transaction.execute("DELETE FROM pointer_declarations", [])?;
+
+    let mut statement = transaction.prepare(
+        "INSERT INTO pointer_declarations (kind, shape, name, pointee_type_name, pointee_usr, file, line, column, usr)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
+    for declaration in declarations {
+        statement.execute(params![
+            declaration.kind.as_str(),
+            declaration.shape.as_str(),
+            declaration.name,
+            declaration.pointee_type_name,
+            declaration.pointee_usr,
+            declaration.file,
+            declaration.line,
+            declaration.column,
+            declaration.usr
+        ])?;
+    }
+
+    Ok(())
+}
+
+fn replace_type_dependencies_tx(
+    transaction: &Transaction,
+    dependencies: &[TypeDependency],
+) -> Result<(), PersistenceError> {
+    transaction.execute("DELETE FROM type_dependencies", [])?;
+
+    let mut statement = transaction.prepare(
+        "INSERT INTO type_dependencies (
+            caller_name, caller_kind, caller_namespace, caller_file, caller_line, caller_column, caller_end_line, caller_end_column, caller_usr,
+            callee_name, callee_kind, callee_namespace, callee_file, callee_line, callee_column, callee_end_line, callee_end_column, callee_usr
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+    )?;
+    for dependency in dependencies {
+        statement.execute(params![
+            dependency.caller.name,
+            dependency.caller.kind.as_str(),
+            dependency.caller.namespace,
+            dependency.caller.file,
+            dependency.caller.line,
+            dependency.caller.column,
+            dependency.caller.end_line,
+            dependency.caller.end_column,
+            dependency.caller.usr,
+            dependency.callee.name,
+            dependency.callee.kind.as_str(),
+            dependency.callee.namespace,
+            dependency.callee.file,
+            dependency.callee.line,
+            dependency.callee.column,
+            dependency.callee.end_line,
+            dependency.callee.end_column,
+            dependency.callee.usr,
+        ])?;
+    }
+
+    Ok(())
+}
+
+fn replace_source_files_tx(
+    transaction: &Transaction,
+    files: &[SourceFile],
+) -> Result<(), PersistenceError> {
+    transaction.execute("DELETE FROM source_files", [])?;
+
+    let mut statement =
+        transaction.prepare("INSERT INTO source_files (path, kind) VALUES (?1, ?2)")?;
+    for file in files {
+        statement.execute(params![file.path, file.kind.as_str()])?;
+    }
+
+    Ok(())
+}
+
+fn replace_type_usages_tx(
+    transaction: &Transaction,
+    usages: &[TypeUsage],
+) -> Result<(), PersistenceError> {
+    transaction.execute("DELETE FROM type_usages", [])?;
+
+    let mut statement = transaction.prepare(
+        "INSERT INTO type_usages (type_usr, kind, file, line, column)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for usage in usages {
+        statement.execute(params![
+            usage.type_usr,
+            usage.kind.as_str(),
+            usage.file,
+            usage.line,
+            usage.column
+        ])?;
+    }
+
+    Ok(())
+}
+
+fn replace_function_declarations_tx(
+    transaction: &Transaction,
+    declarations: &[FunctionDeclaration],
+) -> Result<(), PersistenceError> {
+    transaction.execute("DELETE FROM function_declarations", [])?;
+
+    let mut statement = transaction.prepare(
+        "INSERT INTO function_declarations (
+            name, kind, namespace, owning_class_usr, signature, file, line, column,
+            end_line, end_column, usr, is_static, is_virtual, is_pure_virtual, is_defaulted,
+            overridden_usrs_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+    )?;
+    for declaration in declarations {
+        let overridden_usrs_json = serde_json::to_string(&declaration.overridden_usrs)?;
+        statement.execute(params![
+            declaration.name,
+            declaration.kind.as_str(),
+            declaration.namespace,
+            declaration.owning_class_usr,
+            declaration.signature,
+            declaration.file,
+            declaration.line,
+            declaration.column,
+            declaration.end_line,
+            declaration.end_column,
+            declaration.usr,
+            declaration.is_static,
+            declaration.is_virtual,
+            declaration.is_pure_virtual,
+            declaration.is_defaulted,
+            overridden_usrs_json,
+        ])?;
+    }
+
+    Ok(())
+}
+
+fn replace_call_edges_tx(
+    transaction: &Transaction,
+    calls: &[CallEdge],
+) -> Result<(), PersistenceError> {
+    transaction.execute("DELETE FROM call_edges", [])?;
+
+    let mut statement = transaction.prepare(
+        "INSERT INTO call_edges (
+            caller_usr, callee_usr, is_dynamic_dispatch, unresolved_reason, file, line, column
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    for call in calls {
+        let (callee_usr, is_dynamic_dispatch, unresolved_reason) = match &call.resolution {
+            CallResolution::Resolved {
+                callee_usr,
+                is_dynamic_dispatch,
+            } => (Some(callee_usr.clone()), Some(*is_dynamic_dispatch), None),
+            CallResolution::Unresolved { reason } => (None, None, Some(reason.clone())),
+        };
+
+        statement.execute(params![
+            call.caller_usr,
+            callee_usr,
+            is_dynamic_dispatch,
+            unresolved_reason,
+            call.file,
+            call.line,
+            call.column,
+        ])?;
+    }
+
+    Ok(())
+}
+
+fn replace_ir_tx(
+    transaction: &Transaction,
+    functions: &[ir::Function],
+    records: &[ir::Record],
+) -> Result<(), PersistenceError> {
+    let function_data = serialize_ir_values(functions.to_vec())?;
+    let record_data = serialize_ir_values(records.to_vec())?;
+
+    transaction.execute("DELETE FROM ir_functions", [])?;
+    transaction.execute("DELETE FROM ir_records", [])?;
+
+    let mut function_statement =
+        transaction.prepare("INSERT INTO ir_functions (usr, data) VALUES (?1, ?2)")?;
+    for (function, data) in functions.iter().zip(function_data) {
+        function_statement.execute(params![function.usr, data])?;
+    }
+    drop(function_statement);
+
+    let mut record_statement =
+        transaction.prepare("INSERT INTO ir_records (usr, data) VALUES (?1, ?2)")?;
+    for (record, data) in records.iter().zip(record_data) {
+        record_statement.execute(params![record.usr, data])?;
+    }
+
+    Ok(())
 }
 
 /// `ir::Expr`/`ir::Stmt` nest arbitrarily deep through `Box` — a long
@@ -2184,6 +2323,76 @@ mod tests {
         let (functions, records) = store.list_ir().expect("list ir");
         assert!(functions.is_empty());
         assert!(records.is_empty());
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    /// `replace_all` runs every table's replacement inside one transaction,
+    /// so a failure partway through (here, two IR functions sharing a `usr`,
+    /// which `ir_functions.usr`'s `PRIMARY KEY` rejects) must roll back
+    /// everything already written in the same call — not leave the tables
+    /// that happened to run earlier (compilation units, type declarations)
+    /// persisted while only `ir_functions` fails. Before `replace_all`
+    /// existed, each `replace_*` committed independently, so this exact
+    /// scenario would have left the earlier tables populated.
+    #[test]
+    fn replace_all_is_atomic_across_every_table() {
+        let db_path = temp_db_path("project-replace-all-atomic");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+        let duplicate_ir_functions = vec![sample_ir_function(), sample_ir_function()];
+
+        let result = store.replace_all(&ProjectCatalogs {
+            compilation_units: &sample_units(),
+            type_declarations: &sample_type_declarations(),
+            type_dependencies: &[],
+            type_usages: &[],
+            source_files: &[],
+            function_declarations: &[],
+            call_edges: &[],
+            ir_functions: &duplicate_ir_functions,
+            ir_records: &[],
+            pointer_declarations: &[],
+        });
+
+        assert!(
+            result.is_err(),
+            "expected two ir functions sharing a usr to violate ir_functions' PRIMARY KEY"
+        );
+
+        let units = store
+            .list_compilation_units()
+            .expect("list compilation units");
+        assert!(
+            units.is_empty(),
+            "compilation units from the failed replace_all should have rolled back: {units:?}"
+        );
+
+        let declarations = store
+            .list_type_declarations()
+            .expect("list type declarations");
+        assert!(
+            declarations.is_empty(),
+            "type declarations from the failed replace_all should have rolled back: {declarations:?}"
+        );
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    /// `ProjectStore::open` sets `journal_mode=WAL` so ingest's write-heavy
+    /// `replace_all` doesn't block the HTTP listing routes' concurrent
+    /// reads — asserted directly since it's an SQLite connection setting,
+    /// not something any round-trip test above would otherwise catch.
+    #[test]
+    fn opens_the_database_in_wal_mode() {
+        let db_path = temp_db_path("project-wal-mode");
+        let store = ProjectStore::open(&db_path).expect("open project store");
+
+        let mode: String = store
+            .connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("read journal_mode");
+        assert_eq!(mode.to_lowercase(), "wal");
 
         let _ = fs::remove_file(&db_path);
     }

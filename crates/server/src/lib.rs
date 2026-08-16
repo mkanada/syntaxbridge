@@ -1,4 +1,5 @@
 pub mod emit;
+pub mod extraction;
 pub mod function_catalog;
 pub mod ingest;
 pub mod ir;

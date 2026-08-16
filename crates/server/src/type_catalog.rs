@@ -301,6 +301,27 @@ pub fn extract_type_catalog_cancellable(
         return Err(TypeCatalogError::Cancelled);
     }
 
+    let catalog = finish_type_catalog(partials);
+
+    log_type_catalog(format_args!(
+        "extract_type_catalog: done in {:.2}s, {} declarations, {} dependencies, {} usages",
+        extraction_started.elapsed().as_secs_f64(),
+        catalog.declarations.len(),
+        catalog.dependencies.len(),
+        catalog.usages.len()
+    ));
+
+    Ok(catalog)
+}
+
+/// Merges every worker's local (not yet cross-chunk deduplicated) partial
+/// results into one project-wide `TypeCatalog` — factored out of
+/// `extract_type_catalog_cancellable` so `extraction::extract_project_catalogs_cancellable`
+/// (which drives its own workers directly, sharing a parse with
+/// `source_catalog`) can reuse the exact same merge/dedup behavior.
+pub(crate) fn finish_type_catalog(
+    partials: Vec<(Vec<TypeDeclaration>, Vec<TypeDependency>, Vec<TypeUsage>)>,
+) -> TypeCatalog {
     let mut seen = HashSet::new();
     let mut declarations = Vec::new();
     let mut dependency_seen = HashSet::new();
@@ -331,19 +352,11 @@ pub fn extract_type_catalog_cancellable(
         }
     }
 
-    log_type_catalog(format_args!(
-        "extract_type_catalog: done in {:.2}s, {} declarations, {} dependencies, {} usages",
-        extraction_started.elapsed().as_secs_f64(),
-        declarations.len(),
-        dependencies.len(),
-        usages.len()
-    ));
-
-    Ok(TypeCatalog {
+    TypeCatalog {
         declarations,
         dependencies,
         usages,
-    })
+    }
 }
 
 /// Parses `chunk`'s compilation units with a `CXIndex` private to this
@@ -432,7 +445,7 @@ fn timestamp_millis() -> u128 {
         .as_millis()
 }
 
-struct VisitorState<'a> {
+pub(crate) struct VisitorState<'a> {
     project_root: &'a Path,
     declarations: &'a mut Vec<TypeDeclaration>,
     seen: &'a mut HashSet<String>,
@@ -440,6 +453,28 @@ struct VisitorState<'a> {
     dependency_seen: &'a mut HashSet<(TypeDeclaration, TypeDeclaration)>,
     usages: &'a mut Vec<TypeUsage>,
     usage_seen: &'a mut HashSet<(String, TypeUsageKind, String, u32, u32)>,
+}
+
+impl<'a> VisitorState<'a> {
+    pub(crate) fn new(
+        project_root: &'a Path,
+        declarations: &'a mut Vec<TypeDeclaration>,
+        seen: &'a mut HashSet<String>,
+        dependencies: &'a mut Vec<TypeDependency>,
+        dependency_seen: &'a mut HashSet<(TypeDeclaration, TypeDeclaration)>,
+        usages: &'a mut Vec<TypeUsage>,
+        usage_seen: &'a mut HashSet<(String, TypeUsageKind, String, u32, u32)>,
+    ) -> Self {
+        Self {
+            project_root,
+            declarations,
+            seen,
+            dependencies,
+            dependency_seen,
+            usages,
+            usage_seen,
+        }
+    }
 }
 
 /// The key used to deduplicate a `TypeUsage` across translation units (the
@@ -476,9 +511,37 @@ unsafe fn visit_translation_unit(
     unit: &CompilationUnit,
     state: &mut VisitorState<'_>,
 ) {
-    let Ok(file) = CString::new(unit.file.as_str()) else {
-        return;
-    };
+    unsafe {
+        let Some(translation_unit) = parse_translation_unit(index, unit) else {
+            return;
+        };
+        visit_parsed_translation_unit(translation_unit, state);
+        clang_sys::clang_disposeTranslationUnit(translation_unit);
+    }
+}
+
+/// The flags used to parse a translation unit for this module's own
+/// purposes — declarations/dependencies/usages, never function bodies — and
+/// shared as-is with `source_catalog::collect_inclusions_from_parsed` by
+/// `extraction::extract_project_catalogs_cancellable`, which parses each
+/// translation unit once per body-visibility requirement rather than once
+/// per catalog. `source_catalog`'s own standalone parse uses a narrower flag
+/// set (no `DetailedPreprocessingRecord`); reusing this superset for it under
+/// the shared driver is safe since `clang_getInclusions` reads a
+/// translation unit's own inclusion table, unaffected by that flag.
+pub(crate) const PARSE_FLAGS: clang_sys::CXTranslationUnit_Flags =
+    clang_sys::CXTranslationUnit_DetailedPreprocessingRecord
+        | clang_sys::CXTranslationUnit_SkipFunctionBodies;
+
+/// Parses `unit` with `PARSE_FLAGS`, returning `None` (rather than a null
+/// translation unit) on failure — the caller decides what "no result for
+/// this compilation unit" means (skip and continue, same as before this was
+/// split out of `visit_translation_unit`).
+pub(crate) unsafe fn parse_translation_unit(
+    index: clang_sys::CXIndex,
+    unit: &CompilationUnit,
+) -> Option<clang_sys::CXTranslationUnit> {
+    let file = CString::new(unit.file.as_str()).ok()?;
 
     let args = build_clang_args(unit);
     let arg_cstrings: Vec<CString> = args
@@ -488,9 +551,6 @@ unsafe fn visit_translation_unit(
     let arg_ptrs: Vec<*const std::os::raw::c_char> =
         arg_cstrings.iter().map(|arg| arg.as_ptr()).collect();
 
-    let flags = clang_sys::CXTranslationUnit_DetailedPreprocessingRecord
-        | clang_sys::CXTranslationUnit_SkipFunctionBodies;
-
     unsafe {
         let translation_unit = clang_sys::clang_parseTranslationUnit(
             index,
@@ -499,21 +559,32 @@ unsafe fn visit_translation_unit(
             arg_ptrs.len() as c_int,
             std::ptr::null_mut(),
             0,
-            flags,
+            PARSE_FLAGS,
         );
 
         if translation_unit.is_null() {
-            return;
+            None
+        } else {
+            Some(translation_unit)
         }
+    }
+}
 
+/// Walks an already-parsed translation unit — the half of
+/// `visit_translation_unit` that doesn't own the translation unit's
+/// lifetime, so a caller sharing one parse across catalogs (`extraction`)
+/// can call this without also disposing it.
+pub(crate) unsafe fn visit_parsed_translation_unit(
+    translation_unit: clang_sys::CXTranslationUnit,
+    state: &mut VisitorState<'_>,
+) {
+    unsafe {
         let root_cursor = clang_sys::clang_getTranslationUnitCursor(translation_unit);
         clang_sys::clang_visitChildren(
             root_cursor,
             visit_cursor,
             state as *mut VisitorState<'_> as *mut c_void,
         );
-
-        clang_sys::clang_disposeTranslationUnit(translation_unit);
     }
 }
 

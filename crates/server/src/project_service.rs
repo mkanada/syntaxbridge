@@ -6,16 +6,19 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::function_catalog::{self, CallEdge, FunctionCatalogError, FunctionDeclaration};
+use crate::extraction::{self, ExtractionError};
+use crate::function_catalog::{CallEdge, FunctionDeclaration};
 use crate::ingest::{self, CompilationUnit, CreateProjectRequest, CreatedProject, IngestError};
 use crate::ir;
 use crate::mapping;
-use crate::persistence::{GlobalStore, PersistenceError, ProjectRecord, ProjectStore};
-use crate::pointer_catalog::{self, PointerCatalogError, PointerDeclaration};
+use crate::persistence::{
+    GlobalStore, PersistenceError, ProjectCatalogs, ProjectRecord, ProjectStore,
+};
+use crate::pointer_catalog::{self, PointerDeclaration};
 use crate::progress::{Cancellation, ExtractionProgress};
-use crate::source_catalog::{self, SourceCatalogError, SourceFile};
+use crate::source_catalog::SourceFile;
 use crate::transpile::{self, TranspileError, TranspiledPackage};
-use crate::type_catalog::{self, TypeCatalogError, TypeDeclaration, TypeUsage};
+use crate::type_catalog::{TypeDeclaration, TypeUsage};
 
 /// Live progress trackers for `create_project`'s three `libclang` passes, so
 /// a caller running it in the background (`jobs.rs`) can report real
@@ -40,10 +43,11 @@ pub const DEFAULT_TARGET_LANGUAGE: &str = "dart";
 pub enum ProjectCreationError {
     Ingest(IngestError),
     Persistence(PersistenceError),
-    TypeCatalog(TypeCatalogError),
-    SourceCatalog(SourceCatalogError),
-    FunctionCatalog(FunctionCatalogError),
-    PointerCatalog(PointerCatalogError),
+    /// Covers all four `libclang` catalogs (types, source files, functions,
+    /// pointers) — extracted together by `extraction::extract_project_catalogs_cancellable`
+    /// rather than as four independent passes, so a failure in any of them
+    /// surfaces through this one variant instead of one per catalog.
+    Extraction(ExtractionError),
 }
 
 impl ProjectCreationError {
@@ -51,10 +55,7 @@ impl ProjectCreationError {
         match self {
             Self::Ingest(error) => error.is_client_error(),
             Self::Persistence(_) => false,
-            Self::TypeCatalog(_) => false,
-            Self::SourceCatalog(_) => false,
-            Self::FunctionCatalog(_) => false,
-            Self::PointerCatalog(_) => false,
+            Self::Extraction(_) => false,
         }
     }
 
@@ -63,13 +64,7 @@ impl ProjectCreationError {
     /// instead of `"failed"` — cancelling isn't an error the user needs a
     /// message about.
     pub fn is_cancelled(&self) -> bool {
-        matches!(
-            self,
-            Self::TypeCatalog(TypeCatalogError::Cancelled)
-                | Self::SourceCatalog(SourceCatalogError::Cancelled)
-                | Self::FunctionCatalog(FunctionCatalogError::Cancelled)
-                | Self::PointerCatalog(PointerCatalogError::Cancelled)
-        )
+        matches!(self, Self::Extraction(ExtractionError::Cancelled))
     }
 }
 
@@ -78,10 +73,7 @@ impl fmt::Display for ProjectCreationError {
         match self {
             Self::Ingest(error) => write!(formatter, "{error}"),
             Self::Persistence(error) => write!(formatter, "{error}"),
-            Self::TypeCatalog(error) => write!(formatter, "{error}"),
-            Self::SourceCatalog(error) => write!(formatter, "{error}"),
-            Self::FunctionCatalog(error) => write!(formatter, "{error}"),
-            Self::PointerCatalog(error) => write!(formatter, "{error}"),
+            Self::Extraction(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -100,27 +92,9 @@ impl From<PersistenceError> for ProjectCreationError {
     }
 }
 
-impl From<TypeCatalogError> for ProjectCreationError {
-    fn from(error: TypeCatalogError) -> Self {
-        Self::TypeCatalog(error)
-    }
-}
-
-impl From<SourceCatalogError> for ProjectCreationError {
-    fn from(error: SourceCatalogError) -> Self {
-        Self::SourceCatalog(error)
-    }
-}
-
-impl From<FunctionCatalogError> for ProjectCreationError {
-    fn from(error: FunctionCatalogError) -> Self {
-        Self::FunctionCatalog(error)
-    }
-}
-
-impl From<PointerCatalogError> for ProjectCreationError {
-    fn from(error: PointerCatalogError) -> Self {
-        Self::PointerCatalog(error)
+impl From<ExtractionError> for ProjectCreationError {
+    fn from(error: ExtractionError) -> Self {
+        Self::Extraction(error)
     }
 }
 
@@ -135,48 +109,36 @@ pub fn create_project(
 ) -> Result<CreatedProject, ProjectCreationError> {
     let mut project = ingest::create_project(request)?;
 
-    let catalog = type_catalog::extract_type_catalog_cancellable(
+    let extracted = extraction::extract_project_catalogs_cancellable(
         &project.compilation_units,
         &project.input_source_dir,
         progress.map(|progress| &progress.type_catalog),
-        progress.map(|progress| &progress.cancellation),
-    )?;
-    project.type_catalog = catalog.declarations;
-    project.type_dependencies = catalog.dependencies;
-    let type_usages = catalog.usages;
-
-    project.source_files = source_catalog::extract_source_files_cancellable(
-        &project.compilation_units,
-        &project.input_source_dir,
         progress.map(|progress| &progress.source_catalog),
-        progress.map(|progress| &progress.cancellation),
-    )?;
-
-    let function_catalog = function_catalog::extract_function_catalog_cancellable(
-        &project.compilation_units,
-        &project.input_source_dir,
         progress.map(|progress| &progress.function_catalog),
-        progress.map(|progress| &progress.cancellation),
-    )?;
-
-    project.pointer_catalog = pointer_catalog::extract_pointer_catalog_cancellable(
-        &project.compilation_units,
-        &project.input_source_dir,
         progress.map(|progress| &progress.pointer_catalog),
         progress.map(|progress| &progress.cancellation),
     )?;
+    project.type_catalog = extracted.type_catalog.declarations;
+    project.type_dependencies = extracted.type_catalog.dependencies;
+    let type_usages = extracted.type_catalog.usages;
+    project.source_files = extracted.source_files;
+    let function_catalog = extracted.function_catalog;
+    project.pointer_catalog = extracted.pointer_catalog;
 
     let project_db_path = project.project_dir.join("project.db");
     let mut project_store = ProjectStore::open(&project_db_path)?;
-    project_store.replace_compilation_units(&project.compilation_units)?;
-    project_store.replace_type_declarations(&project.type_catalog)?;
-    project_store.replace_type_dependencies(&project.type_dependencies)?;
-    project_store.replace_type_usages(&type_usages)?;
-    project_store.replace_source_files(&project.source_files)?;
-    project_store.replace_function_declarations(&function_catalog.declarations)?;
-    project_store.replace_call_edges(&function_catalog.calls)?;
-    project_store.replace_ir(&function_catalog.ir_functions, &function_catalog.ir_records)?;
-    project_store.replace_pointer_declarations(&project.pointer_catalog)?;
+    project_store.replace_all(&ProjectCatalogs {
+        compilation_units: &project.compilation_units,
+        type_declarations: &project.type_catalog,
+        type_dependencies: &project.type_dependencies,
+        type_usages: &type_usages,
+        source_files: &project.source_files,
+        function_declarations: &function_catalog.declarations,
+        call_edges: &function_catalog.calls,
+        ir_functions: &function_catalog.ir_functions,
+        ir_records: &function_catalog.ir_records,
+        pointer_declarations: &project.pointer_catalog,
+    })?;
 
     let global_store = GlobalStore::open(global_db_path)?;
     global_store.register_project(
@@ -553,6 +515,23 @@ pub fn list_pointers(project_dir: &Path) -> Result<PointerCatalogListing, ListTy
         calls: &calls,
     };
 
+    // Indexed by `usr` once, up front, instead of the `.iter().find()` scans
+    // this loop used to run per pointer (and per consequence within it) —
+    // `.entry(...).or_insert(...)` keeps the same "first match wins" result
+    // a linear `.find()` over possibly-duplicate `usr`s would have returned.
+    let mut functions_by_usr = HashMap::with_capacity(functions.len());
+    for function in &functions {
+        functions_by_usr
+            .entry(function.usr.as_str())
+            .or_insert(function);
+    }
+    let mut declarations_by_usr = HashMap::with_capacity(declarations.len());
+    for declaration in &declarations {
+        declarations_by_usr
+            .entry(declaration.usr.as_str())
+            .or_insert(declaration);
+    }
+
     let mut possible_types = HashMap::new();
     for pointer in &pointers {
         if pointer.kind != pointer_catalog::PointerDeclarationKind::ReturnType
@@ -560,10 +539,10 @@ pub fn list_pointers(project_dir: &Path) -> Result<PointerCatalogListing, ListTy
         {
             continue;
         }
-        let Some(owning_function) = functions.iter().find(|f| f.usr == pointer.usr) else {
+        let Some(&owning_function) = functions_by_usr.get(pointer.usr.as_str()) else {
             continue;
         };
-        let Some(pointee) = declarations.iter().find(|d| d.usr == pointer.pointee_usr) else {
+        let Some(&pointee) = declarations_by_usr.get(pointer.pointee_usr.as_str()) else {
             continue;
         };
 
@@ -579,9 +558,8 @@ pub fn list_pointers(project_dir: &Path) -> Result<PointerCatalogListing, ListTy
             .consequences
             .iter()
             .filter_map(|consequence| {
-                declarations
-                    .iter()
-                    .find(|declaration| declaration.usr == consequence.affected_type_usr)
+                declarations_by_usr
+                    .get(consequence.affected_type_usr.as_str())
                     .map(|declaration| PossibleType {
                         usr: declaration.usr.clone(),
                         name: declaration.name.clone(),

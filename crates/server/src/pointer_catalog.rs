@@ -218,6 +218,17 @@ pub fn extract_pointer_catalog_cancellable(
         return Err(PointerCatalogError::Cancelled);
     }
 
+    Ok(finish_pointer_catalog(partials))
+}
+
+/// Merges every worker's local partials into the final deduplicated
+/// pointer catalog — factored out of `extract_pointer_catalog_cancellable`
+/// so `extraction::extract_project_catalogs_cancellable` (which drives its
+/// own workers directly, sharing a parse with `function_catalog`) can reuse
+/// the exact same merge behavior.
+pub(crate) fn finish_pointer_catalog(
+    partials: Vec<Vec<PointerDeclaration>>,
+) -> Vec<PointerDeclaration> {
     let mut seen = HashSet::new();
     let mut declarations = Vec::new();
     for partial in partials {
@@ -228,7 +239,7 @@ pub fn extract_pointer_catalog_cancellable(
         }
     }
 
-    Ok(declarations)
+    declarations
 }
 
 fn parse_chunk(
@@ -276,19 +287,19 @@ unsafe fn visit_translation_unit(
     project_root: &Path,
     declarations: &mut Vec<PointerDeclaration>,
 ) {
-    let Ok(file) = CString::new(unit.file.as_str()) else {
-        return;
-    };
-
-    let args = type_catalog::build_clang_args(unit);
-    let arg_cstrings: Vec<CString> = args
-        .iter()
-        .filter_map(|arg| CString::new(arg.as_str()).ok())
-        .collect();
-    let arg_ptrs: Vec<*const std::os::raw::c_char> =
-        arg_cstrings.iter().map(|arg| arg.as_ptr()).collect();
-
     unsafe {
+        let Ok(file) = CString::new(unit.file.as_str()) else {
+            return;
+        };
+
+        let args = type_catalog::build_clang_args(unit);
+        let arg_cstrings: Vec<CString> = args
+            .iter()
+            .filter_map(|arg| CString::new(arg.as_str()).ok())
+            .collect();
+        let arg_ptrs: Vec<*const std::os::raw::c_char> =
+            arg_cstrings.iter().map(|arg| arg.as_ptr()).collect();
+
         let translation_unit = clang_sys::clang_parseTranslationUnit(
             index,
             file.as_ptr(),
@@ -303,18 +314,38 @@ unsafe fn visit_translation_unit(
             return;
         }
 
-        let mut state = VisitorState {
-            project_root,
-            declarations,
-        };
+        visit_parsed_translation_unit(translation_unit, project_root, declarations);
+
+        clang_sys::clang_disposeTranslationUnit(translation_unit);
+    }
+}
+
+/// Walks an already-parsed translation unit (mirrors
+/// `type_catalog`/`function_catalog`'s own `visit_parsed_translation_unit`)
+/// — lets `extraction::extract_project_catalogs_cancellable` call this
+/// against the translation unit it already parsed for `function_catalog`
+/// (with `function_catalog::PARSE_FLAGS`) instead of reparsing with this
+/// module's own `CXTranslationUnit_None`. Visiting a cursor kind this
+/// module's `visit_cursor` doesn't recognize (the handful
+/// `DetailedPreprocessingRecord` adds — macro/inclusion-directive cursors,
+/// never nested inside a function body) is a no-op for it, same as any
+/// other cursor kind it already ignores.
+pub(crate) unsafe fn visit_parsed_translation_unit(
+    translation_unit: clang_sys::CXTranslationUnit,
+    project_root: &Path,
+    declarations: &mut Vec<PointerDeclaration>,
+) {
+    let mut state = VisitorState {
+        project_root,
+        declarations,
+    };
+    unsafe {
         let root_cursor = clang_sys::clang_getTranslationUnitCursor(translation_unit);
         clang_sys::clang_visitChildren(
             root_cursor,
             visit_cursor,
             &mut state as *mut VisitorState<'_> as *mut c_void,
         );
-
-        clang_sys::clang_disposeTranslationUnit(translation_unit);
     }
 }
 

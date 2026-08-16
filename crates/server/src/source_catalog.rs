@@ -144,6 +144,18 @@ pub fn extract_source_files_cancellable(
         return Err(SourceCatalogError::Cancelled);
     }
 
+    Ok(finish_source_files(translation_units, headers))
+}
+
+/// Merges the translation-unit paths and discovered headers into the final
+/// sorted `SourceFile` list — factored out of `extract_source_files_cancellable`
+/// so `extraction::extract_project_catalogs_cancellable` (which drives its
+/// own workers directly, sharing a parse with `type_catalog`) can reuse the
+/// exact same merge behavior.
+pub(crate) fn finish_source_files(
+    translation_units: BTreeSet<String>,
+    mut headers: BTreeSet<String>,
+) -> Vec<SourceFile> {
     for translation_unit in &translation_units {
         headers.remove(translation_unit);
     }
@@ -161,7 +173,7 @@ pub fn extract_source_files_cancellable(
         .collect();
     files.sort_by(|left, right| left.path.cmp(&right.path));
 
-    Ok(files)
+    files
 }
 
 /// Parses `chunk`'s compilation units with a `CXIndex` private to this
@@ -246,17 +258,35 @@ unsafe fn collect_inclusions(
             return;
         }
 
-        let mut state = InclusionState {
-            project_root,
-            headers,
-        };
+        collect_inclusions_from_parsed(translation_unit, project_root, headers);
+
+        clang_sys::clang_disposeTranslationUnit(translation_unit);
+    }
+}
+
+/// The half of `collect_inclusions` that doesn't own the translation unit's
+/// lifetime, so `extraction::extract_project_catalogs_cancellable` can call
+/// it against a translation unit `type_catalog` already parsed (with
+/// `type_catalog::PARSE_FLAGS`, a superset of this module's own
+/// `SkipFunctionBodies`-only flags) instead of reparsing.
+/// `clang_getInclusions` reads a translation unit's inclusion table
+/// directly, unaffected by the extra `DetailedPreprocessingRecord` flag
+/// that superset adds.
+pub(crate) unsafe fn collect_inclusions_from_parsed(
+    translation_unit: clang_sys::CXTranslationUnit,
+    project_root: &Path,
+    headers: &mut BTreeSet<String>,
+) {
+    let mut state = InclusionState {
+        project_root,
+        headers,
+    };
+    unsafe {
         clang_sys::clang_getInclusions(
             translation_unit,
             inclusion_visitor,
             &mut state as *mut InclusionState<'_> as *mut c_void,
         );
-
-        clang_sys::clang_disposeTranslationUnit(translation_unit);
     }
 }
 
@@ -279,7 +309,7 @@ extern "C" fn inclusion_visitor(
     }
 }
 
-fn canonicalize_within(file_name: &str, project_root: &Path) -> Option<String> {
+pub(crate) fn canonicalize_within(file_name: &str, project_root: &Path) -> Option<String> {
     let path = PathBuf::from(file_name);
     let canonical = path.canonicalize().unwrap_or(path);
     if canonical.starts_with(project_root) {

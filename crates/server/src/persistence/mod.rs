@@ -2,7 +2,7 @@ mod global_store;
 mod project_store;
 
 pub use global_store::{GlobalStore, ProjectRecord};
-pub use project_store::ProjectStore;
+pub use project_store::{ProjectCatalogs, ProjectStore};
 
 use std::env;
 use std::fmt;

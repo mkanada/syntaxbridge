@@ -84,6 +84,11 @@ rust-clippy:
 rust-test *args:
     cargo test --workspace {{args}}
 
+# Run the ingestion performance baseline (crates/server/benches/extraction.rs)
+# on the host machine.
+bench *args:
+    cargo bench -p syntax-bridge-server --bench extraction {{args}}
+
 # Run the server on the host machine.
 server *args:
     cargo run -p syntax-bridge-server -- {{args}}

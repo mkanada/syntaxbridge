@@ -29,3 +29,12 @@ tokio = { version = "1", features = ["net", "rt-multi-thread", "sync"] }
 # tree-sitter using the same parser library it can later use at runtime.
 tree-sitter = "0.25"
 tree-sitter-cpp = "0.23"
+# Ingestion performance baseline (`benches/extraction.rs`): measures each of
+# the four `libclang` extraction passes so a future change (e.g. folding
+# them into one parse) has a real before/after number instead of an
+# `#[ignore]`d diagnosis test's `eprintln!` timing.
+criterion = "0.5"
+
+[[bench]]
+name = "extraction"
+harness = false
