@@ -12,6 +12,7 @@ pub mod functions;
 pub mod init;
 pub mod pointers;
 pub mod projects;
+pub mod status;
 pub mod transpile;
 pub mod types;
 

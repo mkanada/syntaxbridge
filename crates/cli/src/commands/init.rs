@@ -6,6 +6,8 @@
 //! leaves `running`/`cancelling`, printing a line each time the reported
 //! phase changes instead of a generic spinner — the phase is already
 //! computed server-side (`jobs::derive_phase`), so surfacing it is free.
+//! Prints the job id itself before the first poll, so it can be copied into
+//! `sb status <job-id>` from another terminal (see `commands::status`).
 
 use std::path::Path;
 use std::thread;
@@ -60,6 +62,7 @@ pub fn run(
     mut on_progress: impl FnMut(&str),
 ) -> Result<Value, CommandError> {
     let job_id = request_create(client, name, workspace_dir, archive_path)?;
+    on_progress(&announce_job_id(&job_id));
 
     let mut last_phase: Option<String> = None;
     loop {
@@ -74,6 +77,13 @@ pub fn run(
         }
         thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// Printed once, right after the job is created — the only handle a
+/// separate `sb status <job-id>` invocation (in another terminal, while
+/// this one is still blocked polling) has to find this job.
+fn announce_job_id(job_id: &str) -> String {
+    format!("job {job_id}\n")
 }
 
 /// Pure: given the previously-announced phase and a poll response, decides
@@ -125,6 +135,11 @@ pub fn render_outcome(json_mode: bool, body: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn announce_job_id_prints_the_job_id_on_its_own_line() {
+        assert_eq!(announce_job_id("job-1"), "job job-1\n");
+    }
 
     #[test]
     fn describe_progress_reports_the_first_phase_seen() {

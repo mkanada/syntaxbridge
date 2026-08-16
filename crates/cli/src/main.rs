@@ -71,6 +71,10 @@ fn run(
             .map(|body| commands::projects::render_forget(json, &body, &path))
             .map_err(|e| e.to_string()),
 
+        Command::Status { job_id } => commands::status::request_status(client, &job_id)
+            .map(|body| commands::status::render_status(json, &body))
+            .map_err(|e| e.to_string()),
+
         Command::Files => with_project(project_override, |project_dir| {
             commands::files::request_files(client, project_dir)
                 .map(|body| commands::files::render_files(json, &body))
@@ -260,6 +264,7 @@ FORA DE UM PROJETO:
   open <path>                                       Abre/registra um projeto existente
   projects                                           Lista projetos recentes
   projects forget <path>                             Remove um projeto da lista de recentes
+  status <job-id>                                     Consulta o progresso de um job (ex.: de outro terminal enquanto `init` roda)
 
 DENTRO DE UM PROJETO (resolvido a partir do diretório atual, como o git faz com .git):
   files                                              Lista os arquivos-fonte

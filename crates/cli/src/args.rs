@@ -31,6 +31,9 @@ pub enum Command {
     ProjectsForget {
         path: PathBuf,
     },
+    Status {
+        job_id: String,
+    },
     Files,
     Cat {
         file: String,
@@ -199,6 +202,11 @@ fn parse_command(rest: &[String]) -> Result<Command, String> {
             None => Ok(Command::ProjectsList),
             Some(other) => Err(format!("subcomando desconhecido para projects: {other}")),
         },
+        "status" => {
+            let job_id = cursor.expect("o id de um job (ex.: job-1)")?.to_owned();
+            cursor.expect_end()?;
+            Ok(Command::Status { job_id })
+        }
         "files" => {
             cursor.expect_end()?;
             Ok(Command::Files)
@@ -369,6 +377,16 @@ mod tests {
                 .command,
             Command::ProjectsForget {
                 path: PathBuf::from("/tmp/x")
+            }
+        );
+    }
+
+    #[test]
+    fn parses_status_with_a_job_id() {
+        assert_eq!(
+            parse(&args(&["status", "job-1"])).unwrap().command,
+            Command::Status {
+                job_id: "job-1".to_owned()
             }
         );
     }

@@ -169,6 +169,7 @@ pede rota nova, exceto onde marcado.
 | `sb projects forget <path>` | `DELETE /projects` |
 | `sb init <archive> [--name] [--workspace <dir>]` | `POST /projects`, depois poll em `GET /projects/jobs/{id}` até `succeeded`/`failed` |
 | `sb open <path>` | `POST /projects/open` — registra/abre um projeto que já existe em outro lugar (ex.: criado pela UI) |
+| `sb status <job-id>` | `GET /projects/jobs/{id}`, uma única consulta (sem polling) — para acompanhar de outro terminal/processo uma ingestão que `sb init` já iniciou em outro lugar |
 
 **Dentro de um projeto (path resolvido por cwd, ver acima):**
 
@@ -237,6 +238,19 @@ grandes — ver `jobs.rs`/`JobRegistry`/`JobPhase`). A CLI precisa fazer
 polling em `GET /projects/jobs/{job_id}` e renderizar uma barra de
 progresso por fase, não só "processando..." genérico — a informação de
 fase já existe no servidor (`JobPhase`), seria desperdício não expô-la.
+
+`sb init` só cobre acompanhar o progresso de dentro do próprio processo que
+disparou a criação — ele bloqueia o terminal até o job terminar. Para
+acompanhar de outro lugar (outro terminal, um script separado), `sb init`
+agora imprime o `job_id` como a primeira linha de saída (`commands::init::
+announce_job_id`), e `sb status <job-id>` (`commands::status`) faz uma
+única consulta a `GET /projects/jobs/{id}` — sem loop de polling, no
+espírito "one-shot" de `git status` — mostrando a fase atual, os contadores
+`completed`/`total` de cada uma das quatro passadas de extração, e uma
+fração agregada aproximada (soma dos `completed`/`total` das passadas que
+já reportaram um total conhecido — ver `overall_progress`). Estados
+terminais (`succeeded`/`cancelled`/`failed`) reaproveitam
+`commands::init::render_outcome`, já que o corpo JSON é o mesmo.
 
 ## Onde isso mora no código
 
