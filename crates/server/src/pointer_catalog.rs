@@ -422,9 +422,11 @@ fn record_pointer(
     let shape = pointer_shape(pointee);
     let pointee_type_name =
         unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(pointee)) };
-    let pointee_usr = type_catalog::resolve_named_declaration(cxtype, state.project_root)
-        .map(|declaration| declaration.usr)
-        .unwrap_or_default();
+    let desugared_pointee = unsafe { desugar_typedefs(pointee) };
+    let pointee_usr =
+        type_catalog::resolve_named_declaration(desugared_pointee, state.project_root)
+            .map(|declaration| declaration.usr)
+            .unwrap_or_default();
 
     let name =
         unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(cursor)) };
@@ -441,6 +443,35 @@ fn record_pointer(
         column,
         usr,
     });
+}
+
+/// Follows a chain of `typedef`s down to the type they ultimately name —
+/// the same desugaring `lower::cpp::lower_type`'s `CXType_Typedef` branch
+/// already performs for real code generation, applied here to whichever
+/// type `resolve_named_declaration` is about to resolve. Without this, a
+/// pointer to the classic C idiom `typedef struct { ... } Nome;` (Verovio
+/// 6.2.0's embedded miniz vendor: `mz_zip_archive`, `tdefl_compressor`, ...)
+/// resolves `pointee_usr` to the typedef's own declaration (kind
+/// `Typedef`) instead of the anonymous struct it names — `type_catalog`
+/// itself never catalogs a `usr` for that typedef identity as a struct, so
+/// `project_service::list_pointers`'s `declarations_by_usr` lookup misses
+/// it and the pointer is silently left out of the trivial/nullable
+/// narrowing it actually qualifies for
+/// (`docs/plans/verovio-6.2-pointer-types.md` caso 2). Bounded at 16 hops:
+/// typedef chains can't cycle in valid C++, so this is defensive, not a
+/// real limit — the same reasoning `mapping::possible_pointee_types` uses
+/// for its own inheritance walk.
+unsafe fn desugar_typedefs(mut cxtype: clang_sys::CXType) -> clang_sys::CXType {
+    for _ in 0..16 {
+        let decl = unsafe { clang_sys::clang_getTypeDeclaration(cxtype) };
+        if unsafe { clang_sys::clang_Cursor_isNull(decl) } != 0
+            || unsafe { clang_sys::clang_getCursorKind(decl) } != clang_sys::CXCursor_TypedefDecl
+        {
+            return cxtype;
+        }
+        cxtype = unsafe { clang_sys::clang_getTypedefDeclUnderlyingType(decl) };
+    }
+    cxtype
 }
 
 fn pointer_shape(pointee: clang_sys::CXType) -> PointerShape {

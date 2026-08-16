@@ -246,7 +246,11 @@ fn parse_units(
     let mut calls = Vec::new();
     let mut ir_functions = Vec::new();
     let mut ir_records = Vec::new();
+    let mut ir_record_seen = HashSet::new();
+    let mut ir_member_seen = HashSet::new();
     let mut ir_seen = HashSet::new();
+    let mut ir_enums = Vec::new();
+    let mut ir_enum_seen = HashSet::new();
     let mut pointer_declarations = Vec::new();
 
     unsafe {
@@ -312,7 +316,11 @@ fn parse_units(
                     &mut call_seen,
                     &mut ir_functions,
                     &mut ir_records,
+                    &mut ir_record_seen,
+                    &mut ir_member_seen,
                     &mut ir_seen,
+                    &mut ir_enums,
+                    &mut ir_enum_seen,
                 );
                 function_catalog::visit_parsed_translation_unit(
                     translation_unit,
@@ -346,7 +354,13 @@ fn parse_units(
         type_catalog: (type_declarations, type_dependencies, type_usages),
         translation_units,
         headers,
-        function_catalog: (function_declarations, calls, ir_functions, ir_records),
+        function_catalog: (
+            function_declarations,
+            calls,
+            ir_functions,
+            ir_records,
+            ir_enums,
+        ),
         pointer_catalog: pointer_declarations,
     }
 }

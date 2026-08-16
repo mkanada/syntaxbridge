@@ -77,6 +77,7 @@ fn transpiling_the_real_verovio_6_2_0_project_reports_coverage() {
     let module = Module {
         functions: catalog.ir_functions,
         records: catalog.ir_records,
+        enums: catalog.ir_enums,
     };
     let files = dart::emit_module(&module);
     eprintln!("[diagnosis] emitted {} Dart files", files.len());

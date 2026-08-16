@@ -76,9 +76,6 @@ class Fraction {
   }
 }
 
-void LogDebug(dynamic /* unsupported: const char * */ fmt) {
-  // TODO(syntax-bridge): unsupported parameter type: const char * (parameter `fmt`)
-  throw UnimplementedError(
-    '/home/mauricio/rust_projects/syntax-bridge/examples/E13-fatia-real-verovio/input/src/fraction.cpp:20: unsupported parameter type: const char * (parameter `fmt`)',
-  );
+void LogDebug(String? fmt) {
+  fmt;
 }

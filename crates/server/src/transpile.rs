@@ -143,6 +143,7 @@ pub fn transpile_with_mappings(
     let module = Module {
         functions: catalog.ir_functions,
         records: catalog.ir_records,
+        enums: catalog.ir_enums,
     };
 
     emit_package(&module, package_name, type_catalog, decisions)

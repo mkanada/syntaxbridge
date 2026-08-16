@@ -36,8 +36,14 @@ pub struct ProjectCatalogs<'a> {
     pub call_edges: &'a [CallEdge],
     pub ir_functions: &'a [ir::Function],
     pub ir_records: &'a [ir::Record],
+    pub ir_enums: &'a [ir::Enum],
     pub pointer_declarations: &'a [PointerDeclaration],
 }
+
+/// [`ProjectStore::list_ir`]'s return shape — named so clippy's
+/// `type_complexity` lint doesn't flag the three-way tuple, mirroring
+/// `function_catalog::FunctionCatalogPartial`'s own reason for existing.
+pub type PersistedIr = (Vec<ir::Function>, Vec<ir::Record>, Vec<ir::Enum>);
 
 /// Bumped whenever `migrate_type_columns`/`migrate_function_columns` gains a
 /// new column to add. Guards those migrations behind `PRAGMA user_version`
@@ -156,6 +162,10 @@ impl ProjectStore {
                 data TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS ir_records (
+                usr TEXT PRIMARY KEY,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ir_enums (
                 usr TEXT PRIMARY KEY,
                 data TEXT NOT NULL
             );
@@ -829,9 +839,10 @@ impl ProjectStore {
         &mut self,
         functions: &[ir::Function],
         records: &[ir::Record],
+        enums: &[ir::Enum],
     ) -> Result<(), PersistenceError> {
         let transaction = self.connection.transaction()?;
-        replace_ir_tx(&transaction, functions, records)?;
+        replace_ir_tx(&transaction, functions, records, enums)?;
         transaction.commit()?;
         Ok(())
     }
@@ -851,13 +862,18 @@ impl ProjectStore {
         replace_source_files_tx(&transaction, catalogs.source_files)?;
         replace_function_declarations_tx(&transaction, catalogs.function_declarations)?;
         replace_call_edges_tx(&transaction, catalogs.call_edges)?;
-        replace_ir_tx(&transaction, catalogs.ir_functions, catalogs.ir_records)?;
+        replace_ir_tx(
+            &transaction,
+            catalogs.ir_functions,
+            catalogs.ir_records,
+            catalogs.ir_enums,
+        )?;
         replace_pointer_declarations_tx(&transaction, catalogs.pointer_declarations)?;
         transaction.commit()?;
         Ok(())
     }
 
-    pub fn list_ir(&self) -> Result<(Vec<ir::Function>, Vec<ir::Record>), PersistenceError> {
+    pub fn list_ir(&self) -> Result<PersistedIr, PersistenceError> {
         let mut functions_statement = self
             .connection
             .prepare("SELECT data FROM ir_functions ORDER BY usr")?;
@@ -872,9 +888,17 @@ impl ProjectStore {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
+        let mut enums_statement = self
+            .connection
+            .prepare("SELECT data FROM ir_enums ORDER BY usr")?;
+        let enum_rows = enums_statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
         let functions = deserialize_ir_values(function_rows)?;
         let records = deserialize_ir_values(record_rows)?;
-        Ok((functions, records))
+        let enums = deserialize_ir_values(enum_rows)?;
+        Ok((functions, records, enums))
     }
 }
 
@@ -1119,12 +1143,15 @@ fn replace_ir_tx(
     transaction: &Transaction,
     functions: &[ir::Function],
     records: &[ir::Record],
+    enums: &[ir::Enum],
 ) -> Result<(), PersistenceError> {
     let function_data = serialize_ir_values(functions.to_vec())?;
     let record_data = serialize_ir_values(records.to_vec())?;
+    let enum_data = serialize_ir_values(enums.to_vec())?;
 
     transaction.execute("DELETE FROM ir_functions", [])?;
     transaction.execute("DELETE FROM ir_records", [])?;
+    transaction.execute("DELETE FROM ir_enums", [])?;
 
     let mut function_statement =
         transaction.prepare("INSERT INTO ir_functions (usr, data) VALUES (?1, ?2)")?;
@@ -1137,6 +1164,13 @@ fn replace_ir_tx(
         transaction.prepare("INSERT INTO ir_records (usr, data) VALUES (?1, ?2)")?;
     for (record, data) in records.iter().zip(record_data) {
         record_statement.execute(params![record.usr, data])?;
+    }
+    drop(record_statement);
+
+    let mut enum_statement =
+        transaction.prepare("INSERT INTO ir_enums (usr, data) VALUES (?1, ?2)")?;
+    for (enum_decl, data) in enums.iter().zip(enum_data) {
+        enum_statement.execute(params![enum_decl.usr, data])?;
     }
 
     Ok(())
@@ -2227,6 +2261,35 @@ mod tests {
         }
     }
 
+    fn sample_ir_enum() -> ir::Enum {
+        ir::Enum {
+            name: "Cor".to_owned(),
+            usr: "c:@E@Cor".to_owned(),
+            variants: vec!["Vermelho".to_owned(), "Verde".to_owned(), "Azul".to_owned()],
+            origin: sample_ir_origin(),
+        }
+    }
+
+    /// Caso 4 of `docs/plans/verovio-6.2-pointer-types.md` — `ir_enums`
+    /// round-trips the same way `ir_functions`/`ir_records` already do
+    /// (`round_trips_ir_functions_and_records`, just above this one in the
+    /// file once added), the same reason: `project_service::transpile_project`
+    /// reads persisted IR back out on every request rather than reparsing.
+    #[test]
+    fn round_trips_ir_enums() {
+        let db_path = temp_db_path("project-ir-enum-round-trip");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+        store
+            .replace_ir(&[], &[], &[sample_ir_enum()])
+            .expect("persist ir");
+
+        let (_functions, _records, enums) = store.list_ir().expect("list ir");
+        assert_eq!(enums, vec![sample_ir_enum()]);
+
+        let _ = fs::remove_file(&db_path);
+    }
+
     /// `project_service::transpile_project` reuses this instead of
     /// reparsing every compilation unit with `libclang` on every request
     /// (the same waste `list_types`/`list_functions` already avoid for
@@ -2238,10 +2301,10 @@ mod tests {
         let mut store = ProjectStore::open(&db_path).expect("open project store");
 
         store
-            .replace_ir(&[sample_ir_function()], &[sample_ir_record()])
+            .replace_ir(&[sample_ir_function()], &[sample_ir_record()], &[])
             .expect("persist ir");
 
-        let (functions, records) = store.list_ir().expect("list ir");
+        let (functions, records, _enums) = store.list_ir().expect("list ir");
         assert_eq!(functions, vec![sample_ir_function()]);
         assert_eq!(records, vec![sample_ir_record()]);
 
@@ -2292,10 +2355,10 @@ mod tests {
                 }];
 
                 store
-                    .replace_ir(&[function.clone()], &[])
+                    .replace_ir(&[function.clone()], &[], &[])
                     .expect("persist deeply nested ir");
 
-                let (functions, _records) = store.list_ir().expect("list deeply nested ir");
+                let (functions, _records, _enums) = store.list_ir().expect("list deeply nested ir");
                 assert_eq!(functions, vec![function]);
 
                 let _ = fs::remove_file(&db_path);
@@ -2314,13 +2377,13 @@ mod tests {
         let mut store = ProjectStore::open(&db_path).expect("open project store");
 
         store
-            .replace_ir(&[sample_ir_function()], &[sample_ir_record()])
+            .replace_ir(&[sample_ir_function()], &[sample_ir_record()], &[])
             .expect("persist initial ir");
         store
-            .replace_ir(&[], &[])
+            .replace_ir(&[], &[], &[])
             .expect("replace with an empty ir");
 
-        let (functions, records) = store.list_ir().expect("list ir");
+        let (functions, records, _enums) = store.list_ir().expect("list ir");
         assert!(functions.is_empty());
         assert!(records.is_empty());
 
@@ -2352,6 +2415,7 @@ mod tests {
             call_edges: &[],
             ir_functions: &duplicate_ir_functions,
             ir_records: &[],
+            ir_enums: &[],
             pointer_declarations: &[],
         });
 

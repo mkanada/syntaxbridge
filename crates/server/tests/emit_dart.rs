@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use syntax_bridge_server::emit::dart::emit_module;
 use syntax_bridge_server::ir::{
-    BinaryOp, Expr, Field, Function, Module, Origin, Param, Record, Stmt, Type,
+    BinaryOp, Enum, Expr, Field, Function, Module, Origin, Param, Record, Stmt, Type,
 };
 
 fn origin(line: u32) -> Origin {
@@ -61,6 +61,7 @@ fn emits_a_free_function_returning_a_binary_expression() {
     let module = Module {
         records: Vec::new(),
         functions: vec![soma_function()],
+        enums: Vec::new(),
     };
 
     let files = emit_module(&module);
@@ -73,11 +74,124 @@ fn emits_a_free_function_returning_a_binary_expression() {
     assert_eq!(files["lib/aritmetica.dart"], expected);
 }
 
+/// `Type::Nullable(Type::Str)` — `lower::cpp::lower_type`'s new case 3
+/// answer (`docs/plans/verovio-6.2-pointer-types.md`) for a raw
+/// `char*`/`const char*`. `emit_type`'s `Nullable` arm is already generic
+/// (`format!("{}?", emit_type(inner))`), so this only needs to confirm
+/// `Str` inside it prints `String?` rather than assume it from reading the
+/// code.
+#[test]
+fn a_nullable_str_return_type_emits_as_a_nullable_dart_string() {
+    let rotulo = Function {
+        name: "Rotulo".to_owned(),
+        usr: "c:@F@Rotulo#".to_owned(),
+        params: Vec::new(),
+        return_type: Type::Nullable(Box::new(Type::Str)),
+        body: vec![Stmt::Return {
+            value: None,
+            origin: origin(2),
+        }],
+        origin: origin(2),
+    };
+    let module = Module {
+        records: Vec::new(),
+        functions: vec![rotulo],
+        enums: Vec::new(),
+    };
+
+    let files = emit_module(&module);
+    assert!(
+        files
+            .values()
+            .any(|source| source.contains("String? Rotulo(")),
+        "expected a `String? Rotulo(...)` signature, got:\n{files:?}"
+    );
+}
+
+/// `Type::Set`/`Type::Map` — caso 5 of
+/// `docs/plans/verovio-6.2-pointer-types.md`, the same "prove the generic
+/// arm actually does the right thing" reasoning as the `Nullable(Str)`
+/// test just above.
+#[test]
+fn set_and_map_types_emit_as_their_dart_core_equivalents() {
+    let membros = Function {
+        name: "Membros".to_owned(),
+        usr: "c:@F@Membros#".to_owned(),
+        params: Vec::new(),
+        return_type: Type::Set(Box::new(Type::Int)),
+        body: vec![Stmt::Return {
+            value: None,
+            origin: origin(2),
+        }],
+        origin: origin(2),
+    };
+    let opcoes = Function {
+        name: "Opcoes".to_owned(),
+        usr: "c:@F@Opcoes#".to_owned(),
+        params: Vec::new(),
+        return_type: Type::Map(Box::new(Type::Str), Box::new(Type::Int)),
+        body: vec![Stmt::Return {
+            value: None,
+            origin: origin(3),
+        }],
+        origin: origin(3),
+    };
+    let module = Module {
+        records: Vec::new(),
+        functions: vec![membros, opcoes],
+        enums: Vec::new(),
+    };
+
+    let files = emit_module(&module);
+    assert!(
+        files
+            .values()
+            .any(|source| source.contains("Set<int> Membros(")),
+        "expected a `Set<int> Membros(...)` signature, got:\n{files:?}"
+    );
+    assert!(
+        files
+            .values()
+            .any(|source| source.contains("Map<String, int> Opcoes(")),
+        "expected a `Map<String, int> Opcoes(...)` signature, got:\n{files:?}"
+    );
+}
+
+/// Caso 4 of `docs/plans/verovio-6.2-pointer-types.md`: `Module::enums`
+/// actually reaches Dart source, not just `Type::Enum`'s type-annotation
+/// text (already covered indirectly by every `Type::Enum` match arm) —
+/// without this, a function returning/taking an enum would reference a
+/// Dart type that's never declared anywhere in the emitted package,
+/// `dart analyze`'s `undefined_class` territory.
+#[test]
+fn an_enum_emits_as_a_plain_dart_enum_declaration() {
+    let cor = Enum {
+        name: "Cor".to_owned(),
+        usr: "c:@E@Cor".to_owned(),
+        variants: vec!["Vermelho".to_owned(), "Verde".to_owned(), "Azul".to_owned()],
+        origin: origin(2),
+    };
+    let module = Module {
+        records: Vec::new(),
+        functions: Vec::new(),
+        enums: vec![cor],
+    };
+
+    let files = emit_module(&module);
+    assert!(
+        files
+            .values()
+            .any(|source| source.contains("enum Cor { Vermelho, Verde, Azul }")),
+        "expected a plain `enum Cor {{ ... }}` declaration, got:\n{files:?}"
+    );
+}
+
 #[test]
 fn transpiling_twice_produces_byte_identical_output() {
     let module = Module {
         records: Vec::new(),
         functions: vec![soma_function()],
+        enums: Vec::new(),
     };
 
     let first = emit_module(&module);
@@ -109,6 +223,7 @@ fn an_unsupported_statement_becomes_a_todo_comment_and_a_throw() {
     let module = Module {
         records: Vec::new(),
         functions: vec![function],
+        enums: Vec::new(),
     };
 
     let files = emit_module(&module);
@@ -155,6 +270,7 @@ fn an_unsupported_message_escapes_dollar_signs_so_dart_never_interpolates_it() {
     let module = Module {
         records: Vec::new(),
         functions: vec![function],
+        enums: Vec::new(),
     };
 
     let files = emit_module(&module);
@@ -189,6 +305,7 @@ fn an_unsupported_expression_calls_a_never_returning_helper_that_still_type_chec
     let module = Module {
         records: Vec::new(),
         functions: vec![function],
+        enums: Vec::new(),
     };
 
     let files = emit_module(&module);
@@ -211,6 +328,7 @@ fn the_unsupported_helper_is_omitted_when_nothing_needs_it() {
     let module = Module {
         records: Vec::new(),
         functions: vec![soma_function()],
+        enums: Vec::new(),
     };
 
     let files = emit_module(&module);
@@ -238,6 +356,7 @@ fn functions_from_different_source_files_land_in_different_dart_files() {
     let module = Module {
         records: Vec::new(),
         functions: vec![soma_function(), second],
+        enums: Vec::new(),
     };
 
     let files: BTreeMap<String, String> = emit_module(&module);
@@ -283,6 +402,7 @@ fn a_function_with_an_unsupported_parameter_type_throws_instead_of_running_its_b
     let module = Module {
         records: Vec::new(),
         functions: vec![function],
+        enums: Vec::new(),
     };
 
     let files = emit_module(&module);
@@ -322,6 +442,7 @@ fn a_function_with_an_unsupported_return_type_throws_instead_of_running_its_body
     let module = Module {
         records: Vec::new(),
         functions: vec![function],
+        enums: Vec::new(),
     };
 
     let files = emit_module(&module);
@@ -368,6 +489,7 @@ fn a_record_with_an_unsupported_field_type_has_a_throwing_constructor() {
     let module = Module {
         records: vec![record],
         functions: vec![],
+        enums: Vec::new(),
     };
 
     let files = emit_module(&module);
@@ -433,6 +555,7 @@ fn a_binary_expression_with_an_unsupported_result_type_bails_out_the_whole_funct
     let module = Module {
         records: Vec::new(),
         functions: vec![function],
+        enums: Vec::new(),
     };
 
     let files = emit_module(&module);
@@ -486,6 +609,7 @@ fn a_local_variable_with_an_unsupported_type_bails_out_the_whole_function() {
     let module = Module {
         records: Vec::new(),
         functions: vec![function],
+        enums: Vec::new(),
     };
 
     let files = emit_module(&module);
@@ -617,6 +741,7 @@ fn field_and_method_access_through_a_nullable_pointer_gets_a_non_null_assertion(
     let module = Module {
         records: vec![nota, editor],
         functions: Vec::new(),
+        enums: Vec::new(),
     };
 
     let files = emit_module(&module);

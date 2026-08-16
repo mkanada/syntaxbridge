@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use crate::ir::{
-    BinaryOp, Constructor, Expr, Function, Method, Module, Origin, Param, Record, Stmt, Type,
+    BinaryOp, Constructor, Enum, Expr, Function, Method, Module, Origin, Param, Record, Stmt, Type,
     UnaryOp,
 };
 
@@ -59,6 +59,9 @@ pub fn emit_module(module: &Module) -> BTreeMap<String, String> {
     for function in &module.functions {
         usr_to_stem.insert(function.usr.as_str(), file_stem(&function.origin.file));
     }
+    for enum_decl in &module.enums {
+        usr_to_stem.insert(enum_decl.usr.as_str(), file_stem(&enum_decl.origin.file));
+    }
 
     let mut functions_by_stem: BTreeMap<String, Vec<&Function>> = BTreeMap::new();
     for function in &module.functions {
@@ -76,15 +79,32 @@ pub fn emit_module(module: &Module) -> BTreeMap<String, String> {
             .push(record);
     }
 
+    let mut enums_by_stem: BTreeMap<String, Vec<&Enum>> = BTreeMap::new();
+    for enum_decl in &module.enums {
+        enums_by_stem
+            .entry(file_stem(&enum_decl.origin.file))
+            .or_default()
+            .push(enum_decl);
+    }
+
     let stems: BTreeSet<String> = functions_by_stem
         .keys()
         .chain(records_by_stem.keys())
+        .chain(enums_by_stem.keys())
         .cloned()
         .collect();
 
     stems
         .into_iter()
         .map(|stem| {
+            let mut enums = enums_by_stem.remove(&stem).unwrap_or_default();
+            enums.sort_by(|a, b| {
+                a.origin
+                    .line
+                    .cmp(&b.origin.line)
+                    .then_with(|| a.name.cmp(&b.name))
+            });
+
             let mut records = records_by_stem.remove(&stem).unwrap_or_default();
             records.sort_by(|a, b| {
                 a.origin
@@ -103,7 +123,14 @@ pub fn emit_module(module: &Module) -> BTreeMap<String, String> {
 
             (
                 format!("lib/{stem}.dart"),
-                emit_file(&stem, &records, &functions, &mixin_usrs, &usr_to_stem),
+                emit_file(
+                    &stem,
+                    &enums,
+                    &records,
+                    &functions,
+                    &mixin_usrs,
+                    &usr_to_stem,
+                ),
             )
         })
         .collect()
@@ -191,6 +218,7 @@ fn fold_diacritic(ch: char) -> char {
 /// if it ever mattered.
 fn emit_file(
     stem: &str,
+    enums: &[&Enum],
     records: &[&Record],
     functions: &[&Function],
     mixin_usrs: &HashSet<&str>,
@@ -205,6 +233,9 @@ fn emit_file(
     // function.
     let mut used_utf8_encode = false;
     let mut sections: Vec<String> = Vec::new();
+    for enum_decl in enums {
+        sections.push(emit_enum(enum_decl));
+    }
     for record in records {
         sections.push(emit_record(
             record,
@@ -299,10 +330,14 @@ fn collect_referenced_usrs_in_record<'a>(record: &'a Record, out: &mut HashSet<&
 
 fn collect_referenced_usrs_in_type<'a>(ty: &'a Type, out: &mut HashSet<&'a str>) {
     match ty {
-        Type::Record { usr, .. } => {
+        Type::Record { usr, .. } | Type::Enum { usr, .. } => {
             out.insert(usr.as_str());
         }
-        Type::List(element) => collect_referenced_usrs_in_type(element, out),
+        Type::List(element) | Type::Set(element) => collect_referenced_usrs_in_type(element, out),
+        Type::Map(key, value) => {
+            collect_referenced_usrs_in_type(key, out);
+            collect_referenced_usrs_in_type(value, out);
+        }
         Type::Tuple(elements) => {
             for element in elements {
                 collect_referenced_usrs_in_type(element, out);
@@ -485,6 +520,21 @@ fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str
 /// own field initialization, so the E03 synthetic positional constructor
 /// would either be redundant or, worse, a second and inconsistent way to
 /// construct the same class.
+/// `enum Foo { a, b, c }` — caso 4 of
+/// `docs/plans/verovio-6.2-pointer-types.md`. No fixture has forced a
+/// variant with associated data (C++'s enum has none to carry over
+/// either), so this stays the plain, no-argument Dart enum form; the real
+/// transpile pipeline reformats every file through `dart format` anyway
+/// (`transpile::transpile`), so the exact line-wrapping here isn't load
+/// bearing.
+fn emit_enum(enum_decl: &Enum) -> String {
+    format!(
+        "enum {} {{ {} }}\n",
+        enum_decl.name,
+        enum_decl.variants.join(", ")
+    )
+}
+
 fn emit_record(
     record: &Record,
     is_mixin: bool,
@@ -647,8 +697,11 @@ fn scalar_zero_literal(ty: &Type) -> &'static str {
         Type::Int
         | Type::Double
         | Type::Record { .. }
+        | Type::Enum { .. }
         | Type::Str
         | Type::List(_)
+        | Type::Set(_)
+        | Type::Map(_, _)
         | Type::Tuple(_)
         | Type::Void
         | Type::Unsupported(_) => "0",
@@ -1135,9 +1188,11 @@ fn emit_type(ty: &Type) -> String {
         Type::Bool => "bool".to_owned(),
         Type::Double => "double".to_owned(),
         Type::Void => "void".to_owned(),
-        Type::Record { name, .. } => name.clone(),
+        Type::Record { name, .. } | Type::Enum { name, .. } => name.clone(),
         Type::Str => "String".to_owned(),
         Type::List(element) => format!("List<{}>", emit_type(element)),
+        Type::Set(element) => format!("Set<{}>", emit_type(element)),
+        Type::Map(key, value) => format!("Map<{}, {}>", emit_type(key), emit_type(value)),
         // A single-element Dart record needs a trailing comma
         // (`(int,)`) to disambiguate it from a plain parenthesized
         // expression — `lower::cpp`'s out-param bridge (`Type::Tuple`)

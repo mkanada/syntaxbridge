@@ -199,6 +199,87 @@ fn extract_function_catalog_lists_every_callable_with_full_signature() {
     }
 }
 
+/// A worker's `parse_chunk` reuses one `ir_records: Vec<ir::Record>` across
+/// every compilation unit it processes (see
+/// `docs/plans/verovio-6.2-pointer-types.md`'s duplicate-definition
+/// investigation): a class fully defined in a header, reached from more than
+/// one translation unit in the same worker's chunk, must still end up with
+/// exactly one `ir::Record` carrying exactly one copy of each method — not
+/// one record per translation unit that included the header, nor a method
+/// list re-appended once per inclusion. `unit_count` is derived from
+/// `available_parallelism` (`2 * workers + 1`) specifically so this
+/// reproduces regardless of how many cores the test happens to run on: it
+/// guarantees `chunk_size >= 3` (`div_ceil((2p+1), p) == 3` for any `p >=
+/// 1`), so at least one worker is guaranteed to parse more than one
+/// translation unit that includes the shared header.
+#[test]
+fn extract_function_catalog_does_not_duplicate_a_records_methods_across_a_workers_chunk() {
+    let workspace =
+        TempWorkspace::new("function-catalog-chunk-dedup").expect("create temporary workspace");
+    let project_root = workspace.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project dir");
+
+    fs::write(
+        project_root.join("shared.h"),
+        r#"
+#pragma once
+class Plain {
+public:
+    int GetValue() const { return m_value; }
+    void SetValue(int v) { m_value = v; }
+private:
+    int m_value = 0;
+};
+"#,
+    )
+    .expect("write shared.h");
+
+    let worker_count = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let unit_count = 2 * worker_count + 1;
+
+    let units: Vec<CompilationUnit> = (0..unit_count)
+        .map(|index| {
+            let file_name = format!("unit{index}.cpp");
+            fs::write(project_root.join(&file_name), "#include \"shared.h\"\n")
+                .expect("write translation unit");
+            CompilationUnit {
+                directory: project_root.display().to_string(),
+                file: project_root.join(&file_name).display().to_string(),
+                command: None,
+                arguments: vec!["clang++".to_owned(), "-std=c++17".to_owned()],
+            }
+        })
+        .collect();
+
+    let catalog = function_catalog::extract_function_catalog(&units, &project_root, None)
+        .expect("extract function catalog");
+
+    let plain_records: Vec<_> = catalog
+        .ir_records
+        .iter()
+        .filter(|record| record.name == "Plain")
+        .collect();
+    assert_eq!(
+        plain_records.len(),
+        1,
+        "expected exactly one Plain record across all workers: {plain_records:#?}"
+    );
+
+    let method_names: Vec<&str> = plain_records[0]
+        .methods
+        .iter()
+        .map(|method| method.name.as_str())
+        .collect();
+    assert_eq!(
+        method_names,
+        vec!["GetValue", "SetValue"],
+        "expected each method exactly once, not once per translation unit in a worker's chunk: \
+         {method_names:?}"
+    );
+}
+
 /// Criterion 3: a virtual call through a reference to the base class is
 /// recorded and marked as dynamic dispatch. Criterion 5: callers of a
 /// function can be listed from its definition. Criterion 6: a call that

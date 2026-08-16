@@ -137,6 +137,7 @@ pub fn create_project(
         call_edges: &function_catalog.calls,
         ir_functions: &function_catalog.ir_functions,
         ir_records: &function_catalog.ir_records,
+        ir_enums: &function_catalog.ir_enums,
         pointer_declarations: &project.pointer_catalog,
     })?;
 
@@ -508,12 +509,7 @@ pub fn list_pointers(project_dir: &Path) -> Result<PointerCatalogListing, ListTy
     let functions = project_store.list_function_declarations()?;
     let calls = project_store.list_call_edges()?;
 
-    let facts = mapping::ProjectFacts {
-        declarations: &declarations,
-        usages: &usages,
-        functions: &functions,
-        calls: &calls,
-    };
+    let facts = mapping::ProjectFacts::new_full(&declarations, &usages, &functions, &calls);
 
     // Indexed by `usr` once, up front, instead of the `.iter().find()` scans
     // this loop used to run per pointer (and per consequence within it) —
@@ -534,6 +530,23 @@ pub fn list_pointers(project_dir: &Path) -> Result<PointerCatalogListing, ListTy
 
     let mut possible_types = HashMap::new();
     for pointer in &pointers {
+        // Deterministic, so it applies to every pointer kind (not just
+        // `ReturnType`) and needs no `ProjectFacts` at all — see
+        // `scalar_pointee_dart_type`'s doc comment for why this is
+        // narrower than "any scalar pointee".
+        if let Some(dart_type) = mapping::scalar_pointee_dart_type(&pointer.pointee_type_name)
+            && !pointer.usr.is_empty()
+        {
+            possible_types.insert(
+                pointer.usr.clone(),
+                vec![PossibleType {
+                    usr: String::new(),
+                    name: dart_type.to_owned(),
+                }],
+            );
+            continue;
+        }
+
         if pointer.kind != pointer_catalog::PointerDeclarationKind::ReturnType
             || pointer.pointee_usr.is_empty()
         {
@@ -672,7 +685,7 @@ pub fn transpile_project(project_dir: &Path) -> Result<TranspiledPackage, Transp
         .and_then(|name| name.to_str())
         .unwrap_or("syntax_bridge_output");
 
-    let (ir_functions, ir_records) = project_store.list_ir()?;
+    let (ir_functions, ir_records, ir_enums) = project_store.list_ir()?;
     let package =
         if ir_functions.is_empty() && ir_records.is_empty() && !compilation_units.is_empty() {
             transpile::transpile_with_mappings(
@@ -686,6 +699,7 @@ pub fn transpile_project(project_dir: &Path) -> Result<TranspiledPackage, Transp
             let module = ir::Module {
                 functions: ir_functions,
                 records: ir_records,
+                enums: ir_enums,
             };
             transpile::emit_package(&module, package_name, &type_catalog, &type_mappings)?
         };

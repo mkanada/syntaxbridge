@@ -129,6 +129,140 @@ fn extracts_every_pointer_declaration_across_the_defined_taxonomy() {
     );
 }
 
+const TYPEDEF_OF_ANONYMOUS_STRUCT_CPP: &str = r#"
+typedef struct {
+    int valor;
+} Alca;
+
+Alca* Criar();
+void Usar(Alca* alca);
+"#;
+
+/// Verovio 6.2.0's embedded miniz vendor declares several opaque handles
+/// (`mz_zip_archive`, `tdefl_compressor`, ...) with the classic C idiom
+/// `typedef struct { ... } Nome;` — the struct itself is anonymous, named
+/// only through the typedef. `type_catalog::resolve_named_declaration`
+/// (used by `record_pointer` to fill in `pointee_usr`) stops at the first
+/// named declaration it finds, which for a typedef'd pointee is the
+/// typedef itself (kind `Typedef`) — not the anonymous struct it aliases.
+/// `docs/plans/verovio-6.2-pointer-types.md` caso 2 found this makes the
+/// pointer catalog under-report ~230 pointers as "an unresolved typedef"
+/// even though `lower::cpp::lower_type` already desugars through the
+/// typedef and treats the pointer as an ordinary nullable class reference
+/// (`crates/server/tests/lower_cpp.rs`'s
+/// `a_pointer_to_a_typedef_of_an_anonymous_struct_becomes_a_nullable_reference`
+/// pins that half). This pins the catalog's own `pointee_usr` to land on
+/// the *same* struct `type_catalog` already catalogs under the typedef's
+/// name (`c:@SA@Alca`-shaped usr) — not the typedef's own usr — so
+/// `project_service::list_pointers`'s `declarations_by_usr` lookup finds
+/// it.
+#[test]
+fn pointee_usr_desugars_through_a_typedef_of_an_anonymous_struct() {
+    let workspace =
+        TempWorkspace::new("pointer-catalog-typedef-anon-struct").expect("create workspace");
+    let project_root = workspace.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project dir");
+
+    let file_path = project_root.join("alca.cpp");
+    fs::write(&file_path, TYPEDEF_OF_ANONYMOUS_STRUCT_CPP).expect("write alca.cpp");
+
+    let unit = CompilationUnit {
+        directory: project_root.display().to_string(),
+        file: file_path.display().to_string(),
+        command: None,
+        arguments: vec!["clang++".to_owned(), "-std=c++17".to_owned()],
+    };
+
+    let type_catalog =
+        type_catalog::extract_type_catalog(std::slice::from_ref(&unit), &project_root, None)
+            .expect("extract type catalog");
+    let alca_struct = type_catalog
+        .declarations
+        .iter()
+        .find(|declaration| {
+            declaration.name == "Alca"
+                && declaration.kind == type_catalog::TypeDeclarationKind::Struct
+        })
+        .unwrap_or_else(|| {
+            panic!("expected the anonymous struct behind Alca in type catalog: {type_catalog:#?}")
+        });
+    assert!(!alca_struct.usr.is_empty(), "expected Alca to carry a usr");
+
+    let pointers =
+        pointer_catalog::extract_pointer_catalog(std::slice::from_ref(&unit), &project_root, None)
+            .expect("extract pointer catalog");
+
+    let find = |kind: PointerDeclarationKind, name: &str| -> PointerDeclaration {
+        pointers
+            .iter()
+            .find(|declaration| declaration.kind == kind && declaration.name == name)
+            .unwrap_or_else(|| panic!("expected {kind:?} {name:?} among {pointers:#?}"))
+            .clone()
+    };
+
+    let return_type = find(PointerDeclarationKind::ReturnType, "Criar");
+    assert_eq!(
+        return_type.pointee_usr, alca_struct.usr,
+        "Criar's return type should desugar to the anonymous struct's own usr, not the typedef's"
+    );
+
+    let parameter = find(PointerDeclarationKind::Parameter, "alca");
+    assert_eq!(
+        parameter.pointee_usr, alca_struct.usr,
+        "Usar's parameter should desugar to the anonymous struct's own usr, not the typedef's"
+    );
+}
+
+const TYPEDEF_OF_SCALAR_CPP: &str = r#"
+typedef unsigned char Byte;
+
+Byte* Buffer();
+"#;
+
+/// The other direction of the same fix: desugaring through a typedef must
+/// not manufacture a `usr` for a pointee that turns out to be a scalar
+/// once fully unwound (`mz_uint8` in Verovio 6.2.0's miniz vendor is
+/// exactly this — `typedef unsigned char mz_uint8;`). Before the caso-2
+/// fix, `mz_uint8*` already carried a non-empty `pointee_usr` (the
+/// typedef's own, kind `Typedef`) — and `project_service::list_pointers`
+/// doesn't check `kind` at all, so it would have been narrowed as if it
+/// were a trivial class pointer. Desugaring correctly lands on `unsigned
+/// char`, a builtin with no declaration for `type_catalog` to resolve, so
+/// `pointee_usr` must end up empty here — the same "stays unmapped"
+/// outcome `list_pointers_maps_c_string_pointers_to_dart_string` already
+/// requires for a raw `unsigned char*`.
+#[test]
+fn pointee_usr_stays_empty_when_a_typedef_desugars_to_a_scalar() {
+    let workspace = TempWorkspace::new("pointer-catalog-typedef-scalar").expect("create workspace");
+    let project_root = workspace.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project dir");
+
+    let file_path = project_root.join("byte.cpp");
+    fs::write(&file_path, TYPEDEF_OF_SCALAR_CPP).expect("write byte.cpp");
+
+    let unit = CompilationUnit {
+        directory: project_root.display().to_string(),
+        file: file_path.display().to_string(),
+        command: None,
+        arguments: vec!["clang++".to_owned(), "-std=c++17".to_owned()],
+    };
+
+    let pointers =
+        pointer_catalog::extract_pointer_catalog(std::slice::from_ref(&unit), &project_root, None)
+            .expect("extract pointer catalog");
+
+    let return_type = pointers
+        .iter()
+        .find(|declaration| {
+            declaration.kind == PointerDeclarationKind::ReturnType && declaration.name == "Buffer"
+        })
+        .unwrap_or_else(|| panic!("expected Buffer's return-type pointer: {pointers:#?}"));
+    assert!(
+        return_type.pointee_usr.is_empty(),
+        "a typedef that desugars to a scalar must not resolve to a usr: {return_type:#?}"
+    );
+}
+
 const PROJECT_MAIN_CPP: &str = r#"
 #include "types.h"
 
@@ -349,6 +483,105 @@ fn list_pointers_narrows_return_type_pointers_using_the_persisted_call_graph() {
         "{obter_types:?} (should follow the call graph to FabricaDeTriangulo, not fall back to \
          the full CHA set {{Forma, Triangulo, Quadrado}})"
     );
+}
+
+const C_STRING_MAIN_CPP: &str = r#"
+struct Forma {
+    int lados;
+};
+
+void nomeia(const char* nome, char* saida, unsigned char* bytes, Forma* forma) {
+    (void)nome;
+    (void)saida;
+    (void)bytes;
+    (void)forma;
+}
+"#;
+
+/// The mapping this test guards for: `char*`/`const char*` are C's idiom
+/// for a NUL-terminated text buffer, with a deterministic Dart equivalent
+/// (`String`) — no class hierarchy to narrow, no bridge decision to
+/// present. `unsigned char*` and `Forma*` sit in the same function
+/// signature specifically to prove the rule doesn't overreach: a raw byte
+/// buffer isn't text (Q9 forbids offering a mapping that isn't globally
+/// viable), and a pointer to a project type keeps going through the
+/// existing CHA/narrowing path untouched.
+#[test]
+fn list_pointers_maps_c_string_pointers_to_dart_string() {
+    let workspace = TempWorkspace::new("pointer-catalog-c-string").expect("create workspace");
+    let archive_path = workspace.path().join("fixture.tar.gz");
+    write_c_string_fixture_tarball(workspace.path(), &archive_path).expect("create fixture");
+    let global_db_path = workspace.path().join("global.db");
+
+    let project = project_service::create_project(
+        CreateProjectRequest {
+            name: "c_string_pointer_fixture".to_owned(),
+            workspace_dir: workspace.path().join("projects"),
+            archive_path,
+        },
+        &global_db_path,
+        None,
+    )
+    .expect("ingest project and extract catalogs");
+
+    let listing = project_service::list_pointers(&project.project_dir)
+        .expect("list pointers from the persisted store");
+
+    let find = |name: &str| -> PointerDeclaration {
+        listing
+            .pointers
+            .iter()
+            .find(|declaration| declaration.name == name)
+            .unwrap_or_else(|| panic!("expected pointer {name:?} among {:?}", listing.pointers))
+            .clone()
+    };
+
+    let names_for = |pointer: &PointerDeclaration| -> Vec<String> {
+        listing
+            .possible_types
+            .get(&pointer.usr)
+            .map(|types| types.iter().map(|t| t.name.clone()).collect())
+            .unwrap_or_default()
+    };
+
+    assert_eq!(names_for(&find("nome")), vec!["String"]);
+    assert_eq!(names_for(&find("saida")), vec!["String"]);
+    assert!(
+        names_for(&find("bytes")).is_empty(),
+        "unsigned char* is as often a byte buffer as text — must stay unmapped"
+    );
+    assert!(
+        names_for(&find("forma")).is_empty(),
+        "a project type's pointer parameter isn't narrowed today (only return_type is) — \
+         must not be mistaken for a String either"
+    );
+}
+
+fn write_c_string_fixture_tarball(workspace: &Path, archive_path: &Path) -> io::Result<()> {
+    let source_dir = workspace.join("fixture");
+    fs::create_dir_all(&source_dir)?;
+    fs::write(source_dir.join("main.cpp"), C_STRING_MAIN_CPP)?;
+    fs::write(
+        source_dir.join("CMakeLists.txt"),
+        r#"
+cmake_minimum_required(VERSION 3.16)
+project(syntax_bridge_c_string_pointer_fixture LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_executable(syntax_bridge_c_string_pointer_fixture main.cpp)
+"#,
+    )?;
+
+    let output = Command::new("tar")
+        .arg("-czf")
+        .arg(archive_path)
+        .arg("-C")
+        .arg(workspace)
+        .arg("fixture")
+        .output()?;
+    assert_success(output);
+
+    Ok(())
 }
 
 fn write_narrowing_fixture_tarball(workspace: &Path, archive_path: &Path) -> io::Result<()> {

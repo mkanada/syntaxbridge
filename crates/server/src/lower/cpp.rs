@@ -45,7 +45,13 @@ pub fn overload_type_suffix(ty: &ir::Type) -> String {
         ir::Type::Void => "Void".to_owned(),
         ir::Type::Str => "String".to_owned(),
         ir::Type::List(element) => format!("List{}", overload_type_suffix(element)),
-        ir::Type::Record { name, .. } => name.clone(),
+        ir::Type::Set(element) => format!("Set{}", overload_type_suffix(element)),
+        ir::Type::Map(key, value) => format!(
+            "Map{}{}",
+            overload_type_suffix(key),
+            overload_type_suffix(value)
+        ),
+        ir::Type::Record { name, .. } | ir::Type::Enum { name, .. } => name.clone(),
         ir::Type::Tuple(elements) => elements.iter().map(overload_type_suffix).collect(),
         ir::Type::Nullable(inner) => format!("Nullable{}", overload_type_suffix(inner)),
         ir::Type::Unsupported(_) => "Unsupported".to_owned(),
@@ -473,6 +479,44 @@ pub fn lower_record(cursor: clang_sys::CXCursor, project_root: &Path) -> Option<
     })
 }
 
+/// Lowers an `enum`/`enum class` *definition* cursor to `ir::Enum` — the
+/// same shape as `lower_record`, one level simpler (no fields/methods/base
+/// classes, just an ordered list of enumerator names). Caso 4 of
+/// `docs/plans/verovio-6.2-pointer-types.md`. `None` for an anonymous enum
+/// (no usable Dart type name) or one whose declaration site can't be
+/// resolved, mirroring `lower_record`'s own two early-outs.
+pub fn lower_enum(cursor: clang_sys::CXCursor, project_root: &Path) -> Option<ir::Enum> {
+    let name =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(cursor)) };
+    if name.is_empty() {
+        return None;
+    }
+    let usr = unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(cursor)) };
+    if usr.is_empty() {
+        return None;
+    }
+    let (file, line, column) = type_catalog::cursor_site(cursor, project_root)?;
+    let origin = ir::Origin { file, line, column };
+
+    let variants = unsafe { collect_children(cursor) }
+        .into_iter()
+        .filter(|child| {
+            (unsafe { clang_sys::clang_getCursorKind(*child) })
+                == clang_sys::CXCursor_EnumConstantDecl
+        })
+        .map(|constant| unsafe {
+            type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(constant))
+        })
+        .collect();
+
+    Some(ir::Enum {
+        name,
+        usr,
+        variants,
+        origin,
+    })
+}
+
 /// Every one of `cursor`'s base classes (`class Cachorro : public Animal`,
 /// E06; `class PatoDaguaVoador : public Voador, public Nadador`, E09), in
 /// declaration order, resolved to each base's own USR/name. The caller
@@ -581,28 +625,40 @@ unsafe fn dart_member_name(cursor: clang_sys::CXCursor) -> String {
     }
 }
 
-/// `dart_member_name`, qualified with `ClassName.` when `referenced` is a
-/// `static` data member (E12 — reading a class's static counter from a free
-/// function, `Guarda::contadorAberto`/bare `contadorAberto` from inside a
-/// method both resolve here). Bare access to a static member only compiles
-/// in Dart *inside* the declaring class's own body (unlike C++, which
-/// allows the qualified form everywhere); always qualifying is correct in
-/// both places, so this doesn't need to know whether the reference is
-/// inside or outside the class to decide — `lower_expr`'s own `DeclRefExpr`
-/// case has no such "current class" context to give it anyway. A static
-/// data member is a `CXCursor_VarDecl` child of the class (confirmed
-/// already, by the same distinction `record_static_fields_of` uses against
-/// `CXCursor_FieldDecl`); anything else (a non-static field is always
-/// reached through a `MemberRefExpr`, not `DeclRefExpr`, so never reaches
-/// here — a free function, a local, a parameter) is returned unqualified.
+/// `dart_member_name`, qualified with `ClassName.`/`EnumName.` when
+/// `referenced` is a `static` data member (E12 — reading a class's static
+/// counter from a free function, `Guarda::contadorAberto`/bare
+/// `contadorAberto` from inside a method both resolve here) or an
+/// enumerator (caso 4 of `docs/plans/verovio-6.2-pointer-types.md` —
+/// `data_STAFFREL::STAFFREL_before`/bare `STAFFREL_before` from an
+/// unscoped enum both resolve here too, same reasoning: C++ allows the
+/// qualified form for both scoped and unscoped enums even where the bare
+/// form also compiles, so always qualifying is correct regardless of which
+/// spelling the source used). Bare access to a static member/enumerator
+/// only compiles in Dart *inside* the declaring type's own body (Dart enum
+/// values always need `EnumName.` qualification, full stop) — always
+/// qualifying is correct in every context, so this doesn't need to know
+/// where the reference sits to decide — `lower_expr`'s own `DeclRefExpr`
+/// case has no such context to give it anyway. A static data member is a
+/// `CXCursor_VarDecl` child of the class (confirmed already, by the same
+/// distinction `record_static_fields_of` uses against `CXCursor_FieldDecl`);
+/// anything else (a non-static field is always reached through a
+/// `MemberRefExpr`, not `DeclRefExpr`, so never reaches here — a free
+/// function, a local, a parameter) is returned unqualified.
 unsafe fn qualified_static_member_name(referenced: clang_sys::CXCursor) -> String {
     let name = unsafe { dart_member_name(referenced) };
-    if unsafe { clang_sys::clang_getCursorKind(referenced) } != clang_sys::CXCursor_VarDecl {
+    let referenced_kind = unsafe { clang_sys::clang_getCursorKind(referenced) };
+    if referenced_kind != clang_sys::CXCursor_VarDecl
+        && referenced_kind != clang_sys::CXCursor_EnumConstantDecl
+    {
         return name;
     }
     let owner = unsafe { clang_sys::clang_getCursorSemanticParent(referenced) };
     let owner_kind = unsafe { clang_sys::clang_getCursorKind(owner) };
-    if owner_kind != clang_sys::CXCursor_ClassDecl && owner_kind != clang_sys::CXCursor_StructDecl {
+    if owner_kind != clang_sys::CXCursor_ClassDecl
+        && owner_kind != clang_sys::CXCursor_StructDecl
+        && owner_kind != clang_sys::CXCursor_EnumDecl
+    {
         return name;
     }
     let owner_name =
@@ -708,7 +764,26 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
     // keeps case C01's own answer, unchanged: `Type::Unsupported`, honest
     // about still needing `dart:ffi`.
     if cx_type.kind == clang_sys::CXType_Pointer {
-        let pointee_ty = lower_type(unsafe { clang_sys::clang_getPointeeType(cx_type) });
+        let mut pointee_ty = lower_type(unsafe { clang_sys::clang_getPointeeType(cx_type) });
+        // `char`/`const char` — the raw-pointer sibling of E05's
+        // `std::string` adapter. `mapping::scalar_pointee_dart_type`
+        // already decided these two spellings map to Dart `String`
+        // (`docs/plans/verovio-6.2-pointer-types.md` caso 3), but that
+        // decision only reached the pointer *catalog*'s display
+        // (`project_service::list_pointers`), never `lower_type` itself —
+        // a raw C string fell through the generic scalar catch-all to
+        // `Unsupported` like `int`/`bool`/`void`. A C string has the same
+        // finite-and-nullable guarantee as a pointer to any other
+        // IR-known pointee (it's either null or a real byte string, never
+        // legitimately something else), so folding it into `Type::Str` —
+        // the same representation `std::string` already uses — lets it
+        // fall through the ordinary `Known` branch just below instead of
+        // needing a parallel case.
+        if let ir::Type::Unsupported(spelling) = &pointee_ty
+            && mapping::scalar_pointee_dart_type(spelling).is_some()
+        {
+            pointee_ty = ir::Type::Str;
+        }
         // `lower_type` has no project-wide catalog in hand (only the
         // pointee it just lowered), so `facts: None` — `pointer_options_for`
         // still answers correctly with the unenriched singleton set `[T]`;
@@ -719,10 +794,12 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
         // `possible_pointee_types` needs to report "just this one, no
         // subclasses to find" for them.
         let shape = match &pointee_ty {
-            ir::Type::Record { usr, name } => mapping::PointeeShape::Known {
-                usr: usr.clone(),
-                name: name.clone(),
-            },
+            ir::Type::Record { usr, name } | ir::Type::Enum { usr, name } => {
+                mapping::PointeeShape::Known {
+                    usr: usr.clone(),
+                    name: name.clone(),
+                }
+            }
             ir::Type::Str => mapping::PointeeShape::Known {
                 usr: "std::string".to_owned(),
                 name: "String".to_owned(),
@@ -730,6 +807,14 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
             ir::Type::List(_) => mapping::PointeeShape::Known {
                 usr: "std::vector".to_owned(),
                 name: "List".to_owned(),
+            },
+            ir::Type::Set(_) => mapping::PointeeShape::Known {
+                usr: "std::set".to_owned(),
+                name: "Set".to_owned(),
+            },
+            ir::Type::Map(_, _) => mapping::PointeeShape::Known {
+                usr: "std::map".to_owned(),
+                name: "Map".to_owned(),
             },
             _ => mapping::PointeeShape::Opaque,
         };
@@ -759,6 +844,28 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
         clang_sys::CXType_Bool => ir::Type::Bool,
         clang_sys::CXType_Double => ir::Type::Double,
         clang_sys::CXType_Void => ir::Type::Void,
+        // Caso 4 of `docs/plans/verovio-6.2-pointer-types.md`: an
+        // `enum`/`enum class` use, mirroring the `CXType_Record` branch
+        // below but simpler — `clang_getTypeDeclaration` on an enum type
+        // always resolves directly to its own `EnumDecl` (no
+        // stdlib-template-name/union special-casing needed, and no
+        // `Unexposed` sharing, unlike `Record`).
+        clang_sys::CXType_Enum => {
+            let decl = unsafe { clang_sys::clang_getTypeDeclaration(cx_type) };
+            let usr =
+                unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(decl)) };
+            let name = unsafe {
+                type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(decl))
+            };
+            if usr.is_empty() || name.is_empty() {
+                let spelling = unsafe {
+                    type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(cx_type))
+                };
+                ir::Type::Unsupported(spelling)
+            } else {
+                ir::Type::Enum { usr, name }
+            }
+        }
         // `libclang` reports a template specialization like
         // `basic_string<char>`/`vector<int>` as `CXType_Unexposed`
         // (confirmed empirically, not assumed — every stdlib type in E05's
@@ -797,7 +904,12 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
             }
             match unsafe { stdlib_template_name(decl) }.as_deref() {
                 Some("basic_string") => return ir::Type::Str,
-                Some("vector") => {
+                // `std::list<T>` shares `Type::List`'s shape with
+                // `std::vector<T>` — see that variant's doc comment for why
+                // this is a deliberate reuse (caso 5,
+                // `docs/plans/verovio-6.2-pointer-types.md`), not an
+                // oversight.
+                Some("vector") | Some("list") => {
                     let element =
                         if unsafe { clang_sys::clang_Type_getNumTemplateArguments(cx_type) } >= 1 {
                             lower_type(unsafe {
@@ -805,10 +917,42 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
                             })
                         } else {
                             ir::Type::Unsupported(
-                                "std::vector with no element type argument".to_owned(),
+                                "std::vector/list with no element type argument".to_owned(),
                             )
                         };
                     return ir::Type::List(Box::new(element));
+                }
+                Some("set") => {
+                    let element = if unsafe {
+                        clang_sys::clang_Type_getNumTemplateArguments(cx_type)
+                    } >= 1
+                    {
+                        lower_type(unsafe {
+                            clang_sys::clang_Type_getTemplateArgumentAsType(cx_type, 0)
+                        })
+                    } else {
+                        ir::Type::Unsupported("std::set with no element type argument".to_owned())
+                    };
+                    return ir::Type::Set(Box::new(element));
+                }
+                Some("map") => {
+                    let arg_count =
+                        unsafe { clang_sys::clang_Type_getNumTemplateArguments(cx_type) };
+                    let key = if arg_count >= 1 {
+                        lower_type(unsafe {
+                            clang_sys::clang_Type_getTemplateArgumentAsType(cx_type, 0)
+                        })
+                    } else {
+                        ir::Type::Unsupported("std::map with no key type argument".to_owned())
+                    };
+                    let value = if arg_count >= 2 {
+                        lower_type(unsafe {
+                            clang_sys::clang_Type_getTemplateArgumentAsType(cx_type, 1)
+                        })
+                    } else {
+                        ir::Type::Unsupported("std::map with no value type argument".to_owned())
+                    };
+                    return ir::Type::Map(Box::new(key), Box::new(value));
                 }
                 _ => {}
             }
@@ -1094,16 +1238,20 @@ fn is_known_expression_kind(kind: clang_sys::CXCursorKind) -> bool {
             // `(void)fmt;` (E13's `LogDebug` stub, the idiomatic C++ way to
             // silence an unused-parameter warning) — a `CStyleCastExpr` used
             // directly as a statement. Routing it through `Stmt::ExprStmt`
-            // instead of `Stmt::Unsupported` matters even though `lower_expr`
-            // can't represent a cast-to-`void` of a pointer either way
-            // (`Type::Unsupported`, no pointer support since E01): an
-            // `ExprStmt` wrapping an unrepresentable *expression* only
-            // throws at that one call site if actually reached, while a bare
+            // instead of `Stmt::Unsupported` matters regardless of whether
+            // `lower_expr` can represent the cast's operand: an `ExprStmt`
+            // wrapping an expression `lower_expr` can't handle only throws
+            // at that one call site if actually reached, while a bare
             // `Stmt::Unsupported` bails the *whole enclosing function* out
             // (`emit::dart::first_unsupported_in_list`) on the theory that a
             // statement shape it can't even recognize might have declared
             // state later code depends on — not a concern here, since the
             // statement shape itself (a cast) is perfectly well understood.
+            // (`lower_expr`'s own cast-to-`void` branch discards the operand
+            // outright when it *can* represent it — caso 3 of
+            // `docs/plans/verovio-6.2-pointer-types.md` made that the common
+            // case for `(void)fmt;` once `const char*` stopped being
+            // `Unsupported`.)
             | clang_sys::CXCursor_CXXStaticCastExpr
             | clang_sys::CXCursor_CStyleCastExpr
     )
@@ -1475,8 +1623,11 @@ fn default_scalar_value(ty: &ir::Type, origin: &ir::Origin) -> ir::Expr {
             origin: origin.clone(),
         },
         ir::Type::Record { .. }
+        | ir::Type::Enum { .. }
         | ir::Type::Str
         | ir::Type::List(_)
+        | ir::Type::Set(_)
+        | ir::Type::Map(_, _)
         | ir::Type::Tuple(_)
         | ir::Type::Nullable(_)
         | ir::Type::Void
@@ -1629,9 +1780,11 @@ fn compound_assign_op(kind: clang_sys::CXBinaryOperatorKind) -> Option<ir::Binar
 /// promotion does, just with an extra `CXXStaticCastExpr`/`CStyleCastExpr`
 /// layer on top whose own type already matches that chain's outer type) —
 /// the outer/child type comparison below already turns a real numeric
-/// mismatch into `Expr::Convert` and leaves a same-type cast (or one this
-/// module can't represent, like a pointer discarded via `(void)`) exactly as
-/// honest as any other unrecognized conversion, `Expr::Unsupported` rather
+/// mismatch into `Expr::Convert`, a cast to `void` into an outright discard
+/// of the operand (any representable value can be safely thrown away; C++
+/// only reaches a `void` target through an explicit cast, never an implicit
+/// conversion), and leaves anything else this module can't represent exactly
+/// as honest as any other unrecognized conversion, `Expr::Unsupported` rather
 /// than silently dropped.
 fn is_transparent_wrapper(kind: clang_sys::CXCursorKind) -> bool {
     matches!(
@@ -1721,6 +1874,23 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
                     ty: ir::Type::Double,
                     origin,
                 }
+            } else if outer_ty == ir::Type::Void {
+                // `(void)fmt;` (E13's `LogDebug` stub) — C++'s idiom for
+                // "evaluate this and deliberately discard the result",
+                // almost always used to silence an unused-parameter/
+                // unused-variable warning. This used to be unreachable in
+                // practice: every pointee this module could lower always
+                // hit `Type::Unsupported` before caso 3
+                // (`docs/plans/verovio-6.2-pointer-types.md`) taught
+                // `char`/`const char*` to become `Type::Nullable(Type::Str)`,
+                // so `outer_ty`/`child_ty` were never both representable at
+                // once here. Now that a cast-to-`void` operand genuinely
+                // can be representable, discarding is exactly as sound as
+                // the same-type unwrap just above — the value is legitimate,
+                // C++ itself never lets you implicitly convert *to* `void`
+                // (only an explicit cast reaches this branch), and Dart is
+                // happy to evaluate `inner` as a bare expression statement.
+                inner
             } else if matches!(child_ty, ir::Type::Record { .. })
                 && matches!(outer_ty, ir::Type::Record { .. })
             {

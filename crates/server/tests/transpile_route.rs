@@ -167,7 +167,7 @@ fn transpile_route_reuses_persisted_ir_instead_of_reparsing() {
         origin,
     };
     store
-        .replace_ir(&[persisted_function], &[])
+        .replace_ir(&[persisted_function], &[], &[])
         .expect("persist ir");
 
     let server = SyntaxBridgeServer::bind("127.0.0.1:0")

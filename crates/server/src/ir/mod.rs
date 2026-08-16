@@ -50,6 +50,13 @@ pub enum Type {
         usr: String,
         name: String,
     },
+    /// A C++ `enum`/`enum class` — `usr`/`name` mirror `Record`'s own
+    /// fields, join key into `Module::enums`. Caso 4 of
+    /// `docs/plans/verovio-6.2-pointer-types.md`.
+    Enum {
+        usr: String,
+        name: String,
+    },
     /// `std::string`/`std::basic_string<char, ...>` — E05's library adapter,
     /// not a `Record`: it's never `lower_record`'d (its fields are libstdc++
     /// internals, not something a Dart class should expose), and its methods
@@ -62,7 +69,29 @@ pub enum Type {
     /// the element type is still carried generally (not hardcoded to `Int`)
     /// so a future degrau that needs `vector<double>`/`vector<Record>`
     /// doesn't have to revisit this variant's shape.
+    ///
+    /// `std::list<T>` also lowers to this variant, not a distinct one:
+    /// `docs/plans/verovio-6.2-pointer-types.md` caso 5 found Verovio's
+    /// `ListOfObjects`/`ListOfConstObjects` (`typedef std::list<...>`)
+    /// among the pointer catalog's "should be trivial" bucket, and the
+    /// difference that actually matters for a raw `T*` pointee's mapping —
+    /// whether the pointee is a type this IR can already represent at
+    /// all — doesn't depend on `std::vector` vs `std::list`'s different
+    /// (and, for this product, not yet emitted-into-Dart) performance
+    /// characteristics. Both become Dart's `List<T>`, same gap E01's `int`
+    /// overflow already accepted for a narrower but analogous reason: a
+    /// working, analyzable program first, not a perf-preserving one.
     List(Box<Type>),
+    /// `std::set<T>` — Dart's `Set<T>` is a direct, no-adapter-needed
+    /// match (unlike `std::list`, no Dart core type shares `std::vector`'s
+    /// shape closely enough to reuse `List`). Added alongside `Map` for
+    /// caso 5 of `docs/plans/verovio-6.2-pointer-types.md`
+    /// (`SetOfConstObjects` in Verovio 6.2.0).
+    Set(Box<Type>),
+    /// `std::map<K, V>` — Dart's `Map<K, V>`, same reasoning as `Set`.
+    /// Caso 5 of `docs/plans/verovio-6.2-pointer-types.md`
+    /// (`MapOfStrOptions` in Verovio 6.2.0).
+    Map(Box<Type>, Box<Type>),
     /// A Dart record type synthesized as a bridge for C++'s "out parameter"
     /// idiom (`void f(int &a, int &b)`) — E10 flagged the idea and
     /// deliberately didn't build it ("nenhum fixture força essa
@@ -589,8 +618,32 @@ pub struct BaseClass {
     pub name: String,
 }
 
+/// One `enum`/`enum class` declaration — `usr`/`name` are the join key into
+/// `Type::Enum`, the same relationship `Record`/`Type::Record` already have.
+/// Caso 4 of `docs/plans/verovio-6.2-pointer-types.md`: a C++ enum has the
+/// same statically-finite-set-of-values guarantee a `struct`/`class` has
+/// (`mapping::pointer_options_for`'s case A10 reasoning applies unchanged),
+/// but nothing in this IR could represent an enum *at all* before this —
+/// not as a value, not as a pointee — so `lower::cpp::lower_type` always
+/// fell through to `Type::Unsupported` for one, regardless of whether a
+/// pointer was involved.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Enum {
+    pub name: String,
+    pub usr: String,
+    /// Enumerator names, source order. `enum class Foo { A, B };` and
+    /// unscoped `enum Foo { A, B };` both lower here the same way — Dart's
+    /// `enum Foo { a, b }` has no unscoped/scoped distinction to preserve,
+    /// and every enumerator this IR ever sees is already schema-qualified
+    /// by `qualified_static_member_name` at the reference site
+    /// (`EnumName.enumerator`), not by how it was declared.
+    pub variants: Vec<String>,
+    pub origin: Origin,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Module {
     pub functions: Vec<Function>,
     pub records: Vec<Record>,
+    pub enums: Vec<Enum>,
 }

@@ -163,6 +163,7 @@ pub(crate) type FunctionCatalogPartial = (
     Vec<CallEdge>,
     Vec<ir::Function>,
     Vec<ir::Record>,
+    Vec<ir::Enum>,
 );
 
 #[derive(Debug, Clone, Default)]
@@ -178,6 +179,9 @@ pub struct FunctionCatalog {
     /// IR of every `struct`/`class` *definition*, lowered the same way —
     /// E03 scope (`docs/plans/primeiro-corte-e01-e03.md` §7 PR5).
     pub ir_records: Vec<ir::Record>,
+    /// IR of every `enum`/`enum class` *definition* — caso 4 of
+    /// `docs/plans/verovio-6.2-pointer-types.md`, mirrors `ir_records`.
+    pub ir_enums: Vec<ir::Enum>,
 }
 
 #[derive(Debug)]
@@ -306,8 +310,16 @@ pub(crate) fn finish_function_catalog(partials: Vec<FunctionCatalogPartial>) -> 
     let mut ir_functions = Vec::new();
     let mut ir_record_seen = HashSet::new();
     let mut ir_records = Vec::new();
+    let mut ir_enum_seen = HashSet::new();
+    let mut ir_enums = Vec::new();
 
-    for (partial_declarations, partial_calls, partial_ir_functions, partial_ir_records) in partials
+    for (
+        partial_declarations,
+        partial_calls,
+        partial_ir_functions,
+        partial_ir_records,
+        partial_ir_enums,
+    ) in partials
     {
         for declaration in partial_declarations {
             if seen.insert(declaration_identity(&declaration)) {
@@ -330,6 +342,12 @@ pub(crate) fn finish_function_catalog(partials: Vec<FunctionCatalogPartial>) -> 
         for record in partial_ir_records {
             if ir_record_seen.insert(record.usr.clone()) {
                 ir_records.push(record);
+            }
+        }
+
+        for enum_decl in partial_ir_enums {
+            if ir_enum_seen.insert(enum_decl.usr.clone()) {
+                ir_enums.push(enum_decl);
             }
         }
     }
@@ -358,6 +376,7 @@ pub(crate) fn finish_function_catalog(partials: Vec<FunctionCatalogPartial>) -> 
         calls,
         ir_functions,
         ir_records,
+        ir_enums,
     }
 }
 
@@ -389,12 +408,7 @@ fn apply_overload_renames(
     declarations: &[FunctionDeclaration],
     calls: &[CallEdge],
 ) {
-    let facts = mapping::ProjectFacts {
-        declarations: &[],
-        usages: &[],
-        functions: declarations,
-        calls,
-    };
+    let facts = mapping::ProjectFacts::new_full(&[], &[], declarations, calls);
 
     let mut groups: BTreeMap<(Option<String>, String), Vec<&FunctionDeclaration>> = BTreeMap::new();
     for declaration in declarations {
@@ -634,8 +648,12 @@ fn rename_record_refs_in_type(ty: &mut ir::Type, renames: &HashMap<String, Strin
                 *name = new_name.clone();
             }
         }
-        ir::Type::List(element) | ir::Type::Nullable(element) => {
+        ir::Type::List(element) | ir::Type::Set(element) | ir::Type::Nullable(element) => {
             rename_record_refs_in_type(element, renames)
+        }
+        ir::Type::Map(key, value) => {
+            rename_record_refs_in_type(key, renames);
+            rename_record_refs_in_type(value, renames);
         }
         ir::Type::Tuple(elements) => {
             for element in elements {
@@ -647,6 +665,7 @@ fn rename_record_refs_in_type(ty: &mut ir::Type, renames: &HashMap<String, Strin
         | ir::Type::Double
         | ir::Type::Void
         | ir::Type::Str
+        | ir::Type::Enum { .. }
         | ir::Type::Unsupported(_) => {}
     }
 }
@@ -1376,7 +1395,11 @@ fn parse_chunk(
     let mut calls = Vec::new();
     let mut ir_functions = Vec::new();
     let mut ir_records = Vec::new();
+    let mut ir_record_seen = HashSet::new();
+    let mut ir_member_seen = HashSet::new();
     let mut ir_seen = HashSet::new();
+    let mut ir_enums = Vec::new();
+    let mut ir_enum_seen = HashSet::new();
 
     unsafe {
         let index = clang_sys::clang_createIndex(0, 0);
@@ -1397,7 +1420,11 @@ fn parse_chunk(
                 call_seen: &mut call_seen,
                 ir_functions: &mut ir_functions,
                 ir_records: &mut ir_records,
+                ir_record_seen: &mut ir_record_seen,
+                ir_member_seen: &mut ir_member_seen,
                 ir_seen: &mut ir_seen,
+                ir_enums: &mut ir_enums,
+                ir_enum_seen: &mut ir_enum_seen,
             };
 
             log_function_catalog(format_args!(
@@ -1422,7 +1449,7 @@ fn parse_chunk(
         clang_sys::clang_disposeIndex(index);
     }
 
-    (declarations, calls, ir_functions, ir_records)
+    (declarations, calls, ir_functions, ir_records, ir_enums)
 }
 
 fn log_function_catalog(args: fmt::Arguments<'_>) {
@@ -1447,12 +1474,37 @@ pub(crate) struct VisitorState<'a> {
     call_seen: &'a mut HashSet<(String, CallResolution, String, u32, u32)>,
     ir_functions: &'a mut Vec<ir::Function>,
     ir_records: &'a mut Vec<ir::Record>,
+    /// Dedupes record *creation* within one worker's traversal — a class
+    /// fully defined in a header is reparsed once per translation unit that
+    /// includes it (include guards only prevent re-inclusion within a
+    /// single TU), so without this, `visit_cursor`'s class-definition
+    /// branch would push a fresh, empty `ir::Record` for every one of those
+    /// re-parses, and every later `.iter_mut().find(|r| &r.usr ==
+    /// owner_usr)` attach (method/constructor/destructor) would keep
+    /// hitting the *first* one — multiplying its `methods` list once per
+    /// re-parse instead of leaving the duplicates empty. Mirrors
+    /// `ir_enum_seen` just below. The cross-worker case (the same class
+    /// reached by TUs in two different workers' chunks) is handled
+    /// separately, by the whole-record dedup in `finish_function_catalog`.
+    ir_record_seen: &'a mut HashSet<String>,
+    /// Dedupes method/constructor *attachment* within one worker's
+    /// traversal, keyed by the member's own `usr` — the same re-parse that
+    /// makes `ir_record_seen` necessary (a class fully defined in a header,
+    /// reached from more than one translation unit in this worker's chunk)
+    /// also re-visits every inline method's definition cursor once per
+    /// re-parse. `ir_record_seen` alone only stops the record itself from
+    /// being duplicated; without this, the one surviving record would still
+    /// receive the same method/constructor appended once per translation
+    /// unit that included the header.
+    ir_member_seen: &'a mut HashSet<String>,
     /// E08: dedupes monomorphized-function synthesis within one worker's
     /// traversal (`CallVisitorState.ir_functions`/`ir_seen` borrow these
     /// same two) — the cross-worker/explicit-specialization duplicate case
     /// is handled separately, by the final merge in
     /// `extract_function_catalog_cancellable`.
     ir_seen: &'a mut HashSet<String>,
+    ir_enums: &'a mut Vec<ir::Enum>,
+    ir_enum_seen: &'a mut HashSet<String>,
 }
 
 impl<'a> VisitorState<'a> {
@@ -1465,7 +1517,11 @@ impl<'a> VisitorState<'a> {
         call_seen: &'a mut HashSet<(String, CallResolution, String, u32, u32)>,
         ir_functions: &'a mut Vec<ir::Function>,
         ir_records: &'a mut Vec<ir::Record>,
+        ir_record_seen: &'a mut HashSet<String>,
+        ir_member_seen: &'a mut HashSet<String>,
         ir_seen: &'a mut HashSet<String>,
+        ir_enums: &'a mut Vec<ir::Enum>,
+        ir_enum_seen: &'a mut HashSet<String>,
     ) -> Self {
         Self {
             project_root,
@@ -1475,7 +1531,11 @@ impl<'a> VisitorState<'a> {
             call_seen,
             ir_functions,
             ir_records,
+            ir_record_seen,
+            ir_member_seen,
             ir_seen,
+            ir_enums,
+            ir_enum_seen,
         }
     }
 }
@@ -1607,14 +1667,38 @@ extern "C" fn visit_cursor(
 
     // E03 scope: struct/class *definitions* become IR records, lowered on
     // this same already-parsed cursor. Falls through to `Recurse` below
-    // (not returned early) — the generic walk still needs to descend into
-    // the record's own body to reach any inline method definitions the
-    // existing `function_declaration_kind_for` handling already covers.
+    // (not returned early, and regardless of `ir_record_seen` below) — the
+    // generic walk still needs to descend into the record's own body to
+    // reach any inline method definitions the existing
+    // `function_declaration_kind_for` handling already covers, so a later
+    // method/constructor/destructor cursor can still find this record (via
+    // `ir_record_seen`'s first push, possibly from an earlier translation
+    // unit in this same worker's chunk) to attach itself to. `ir_record_seen`
+    // guards only the `push` itself: without it, a class fully defined in a
+    // header gets pushed once per translation unit that includes it, and
+    // every later attach keeps hitting the *first* (`.find`'s first match),
+    // multiplying its `methods` once per re-parse instead of leaving the
+    // duplicates empty.
     if (kind == clang_sys::CXCursor_StructDecl || kind == clang_sys::CXCursor_ClassDecl)
         && unsafe { clang_sys::clang_isCursorDefinition(cursor) } != 0
         && let Some(record) = lower::cpp::lower_record(cursor, state.project_root)
+        && state.ir_record_seen.insert(record.usr.clone())
     {
         state.ir_records.push(record);
+    }
+
+    // Caso 4 of `docs/plans/verovio-6.2-pointer-types.md`: an `enum`/`enum
+    // class` definition, lowered the same way a `struct`/`class` is just
+    // above. `ir_enum_seen` dedupes within this one worker's traversal
+    // (the same header commonly reparsed by every TU that includes it) —
+    // the cross-worker case is handled by `finish_function_catalog`'s own
+    // merge, same as `ir_records`.
+    if kind == clang_sys::CXCursor_EnumDecl
+        && unsafe { clang_sys::clang_isCursorDefinition(cursor) } != 0
+        && let Some(enum_decl) = lower::cpp::lower_enum(cursor, state.project_root)
+        && state.ir_enum_seen.insert(enum_decl.usr.clone())
+    {
+        state.ir_enums.push(enum_decl);
     }
 
     // A pure virtual method (`= 0`) never has a body, so
@@ -1689,6 +1773,7 @@ extern "C" fn visit_cursor(
         // entirely), never for one of the project's own.
         if let Some(owner_usr) = &owning_class_usr {
             if declared_kind == FunctionDeclarationKind::Method
+                && state.ir_member_seen.insert(caller_usr.clone())
                 && let Some(method_ir) =
                     lower::cpp::lower_method(cursor, &caller_usr, state.project_root)
                 && let Some(record) = state.ir_records.iter_mut().find(|r| &r.usr == owner_usr)
@@ -1696,6 +1781,7 @@ extern "C" fn visit_cursor(
                 record.methods.push(method_ir);
             }
             if declared_kind == FunctionDeclarationKind::Constructor
+                && state.ir_member_seen.insert(caller_usr.clone())
                 && let Some(constructor_ir) =
                     lower::cpp::lower_constructor(cursor, state.project_root)
                 && let Some(record) = state.ir_records.iter_mut().find(|r| &r.usr == owner_usr)

@@ -76,12 +76,26 @@ pub struct MappingDecision {
 /// fixtures never have more than one base class or one method, so nothing
 /// the rules below check ever fires for them, and behavior is unchanged
 /// from before this module grew these fields.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ProjectFacts<'a> {
     pub declarations: &'a [TypeDeclaration],
     pub usages: &'a [TypeUsage],
     pub functions: &'a [FunctionDeclaration],
     pub calls: &'a [CallEdge],
+    /// Every index below is derived entirely from the four slices above and
+    /// computed exactly once, here at construction — never inside a loop
+    /// that runs per pointer/declaration. Before this existed,
+    /// `base_usrs_of` rescanned all of `usages` and the CHA walk in
+    /// `possible_pointee_types` rescanned all of `declarations` for *every*
+    /// pointer being narrowed; on a real project (Verovio 6.2.0: 1,099
+    /// return-type pointers, 29,173 usages, 179,011 call edges) that was
+    /// tens of billions of redundant comparisons — the route never
+    /// returned in practice. See `docs/plans/diagnostico-verovio-6.2.0.md`
+    /// for the numbers this diagnosis produced.
+    bases_by_decl_usr: HashMap<&'a str, Vec<&'a str>>,
+    subclasses_by_base_usr: HashMap<&'a str, Vec<&'a TypeDeclaration>>,
+    calls_by_caller_usr: HashMap<&'a str, Vec<&'a CallEdge>>,
+    functions_by_usr: HashMap<&'a str, &'a FunctionDeclaration>,
 }
 
 impl<'a> ProjectFacts<'a> {
@@ -90,20 +104,89 @@ impl<'a> ProjectFacts<'a> {
     /// `&[TypeDeclaration]` in hand (see that module's doc comment on
     /// `options_for`'s call site).
     pub fn new(declarations: &'a [TypeDeclaration]) -> Self {
-        Self {
-            declarations,
-            usages: &[],
-            functions: &[],
-            calls: &[],
-        }
+        Self::new_full(declarations, &[], &[], &[])
     }
 
     pub fn from_catalogs(types: &'a TypeCatalog, functions: &'a FunctionCatalog) -> Self {
+        Self::new_full(
+            &types.declarations,
+            &types.usages,
+            &functions.declarations,
+            &functions.calls,
+        )
+    }
+
+    /// The general constructor — every field indexed once, up front. The
+    /// two convenience constructors above and every direct caller that used
+    /// to build this struct as a literal now go through this instead, so
+    /// there is exactly one place the indices can be computed wrong.
+    pub fn new_full(
+        declarations: &'a [TypeDeclaration],
+        usages: &'a [TypeUsage],
+        functions: &'a [FunctionDeclaration],
+        calls: &'a [CallEdge],
+    ) -> Self {
+        let mut declarations_by_file: HashMap<&str, Vec<&TypeDeclaration>> = HashMap::new();
+        for declaration in declarations {
+            declarations_by_file
+                .entry(declaration.file.as_str())
+                .or_default()
+                .push(declaration);
+        }
+
+        // Same containment rule `base_usrs_of` always checked (an
+        // `Inheritance` usage lies within the declaring type's own
+        // file/line span), just run once per usage instead of once per
+        // (pointer, declaration) pair — declarations are grouped by file
+        // first so this only compares against declarations that could
+        // possibly contain the usage, not the whole project.
+        let mut bases_by_decl_usr: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut subclasses_by_base_usr: HashMap<&str, Vec<&TypeDeclaration>> = HashMap::new();
+        for usage in usages {
+            if usage.kind != TypeUsageKind::Inheritance {
+                continue;
+            }
+            let Some(candidates) = declarations_by_file.get(usage.file.as_str()) else {
+                continue;
+            };
+            for declaration in candidates {
+                if usage.line >= declaration.line && usage.line <= declaration.end_line {
+                    bases_by_decl_usr
+                        .entry(declaration.usr.as_str())
+                        .or_default()
+                        .push(usage.type_usr.as_str());
+                    subclasses_by_base_usr
+                        .entry(usage.type_usr.as_str())
+                        .or_default()
+                        .push(declaration);
+                }
+            }
+        }
+
+        let mut calls_by_caller_usr: HashMap<&str, Vec<&CallEdge>> = HashMap::new();
+        for edge in calls {
+            calls_by_caller_usr
+                .entry(edge.caller_usr.as_str())
+                .or_default()
+                .push(edge);
+        }
+
+        let mut functions_by_usr: HashMap<&str, &FunctionDeclaration> = HashMap::new();
+        for function in functions {
+            functions_by_usr
+                .entry(function.usr.as_str())
+                .or_insert(function);
+        }
+
         Self {
-            declarations: &types.declarations,
-            usages: &types.usages,
-            functions: &functions.declarations,
-            calls: &functions.calls,
+            declarations,
+            usages,
+            functions,
+            calls,
+            bases_by_decl_usr,
+            subclasses_by_base_usr,
+            calls_by_caller_usr,
+            functions_by_usr,
         }
     }
 }
@@ -574,16 +657,10 @@ fn default_class_option(declaration: &TypeDeclaration, facts: &ProjectFacts<'_>)
 
 fn base_usrs_of(declaration: &TypeDeclaration, facts: &ProjectFacts<'_>) -> Vec<String> {
     facts
-        .usages
-        .iter()
-        .filter(|usage| {
-            usage.kind == TypeUsageKind::Inheritance
-                && usage.file == declaration.file
-                && usage.line >= declaration.line
-                && usage.line <= declaration.end_line
-        })
-        .map(|usage| usage.type_usr.clone())
-        .collect()
+        .bases_by_decl_usr
+        .get(declaration.usr.as_str())
+        .map(|bases| bases.iter().map(|base| (*base).to_owned()).collect())
+        .unwrap_or_default()
 }
 
 fn methods_of<'a>(
@@ -735,7 +812,6 @@ pub fn overload_options_for(
         }];
     }
 
-    let params_without_const = |signature: &str| signature.trim_end_matches(" const").to_owned();
     let arities: HashSet<usize> = group
         .iter()
         .map(|f| count_parameters(&f.signature))
@@ -745,9 +821,13 @@ pub fn overload_options_for(
 
     if group.len() == 2 {
         let (a, b) = (group[0], group[1]);
-        let same_params = params_without_const(&a.signature) == params_without_const(&b.signature)
-            || a.signature.trim_end() == format!("{} const", b.signature.trim_end())
-            || b.signature.trim_end() == format!("{} const", a.signature.trim_end());
+        // Only the parameter list decides "same parameters" — the return
+        // type is excluded on purpose: a const/non-const pair's return type
+        // is often itself covariant-qualified (`T*` vs `const T*`, e.g.
+        // Verovio's `Accid::GetOffsetInterface`), which a naive whole-
+        // signature comparison (previously: strip a trailing `" const"` and
+        // compare the rest) would wrongly read as "different parameters".
+        let same_params = parameter_list_text(&a.signature) == parameter_list_text(&b.signature);
         let one_const_one_not =
             a.signature.trim_end().ends_with("const") != b.signature.trim_end().ends_with("const");
         if same_params && one_const_one_not {
@@ -867,17 +947,26 @@ fn operator_option(
     }
 }
 
-fn count_parameters(signature: &str) -> usize {
+/// The parameter list's own text, between the outermost `(`/`)` — excludes
+/// the return type prefix and any trailing `const` qualifier, so this is
+/// what "same parameters" (`overload_options_for`'s `same_params`) and
+/// "how many parameters" (`count_parameters` below) both actually mean to
+/// compare, regardless of what differs outside the parens.
+fn parameter_list_text(signature: &str) -> &str {
     let Some(open) = signature.find('(') else {
-        return 0;
+        return "";
     };
     let Some(close) = signature.rfind(')') else {
-        return 0;
+        return "";
     };
     if close <= open {
-        return 0;
+        return "";
     }
-    let inner = signature[open + 1..close].trim();
+    signature[open + 1..close].trim()
+}
+
+fn count_parameters(signature: &str) -> usize {
+    let inner = parameter_list_text(signature);
     if inner.is_empty() {
         0
     } else {
@@ -1097,6 +1186,31 @@ pub fn signature_options_for(function: &FunctionDeclaration) -> Vec<MappingOptio
     }]
 }
 
+/// The Dart type that fully represents `pointee_type_name` on its own —
+/// deterministic, so this isn't a "choice" the way `pointer_options_for`'s
+/// class-hierarchy narrowing is (no `MappingOption`/consequences, nothing
+/// to decide). Currently only C's idiom for a NUL-terminated text buffer:
+/// `char*`/`const char*` → `String` (converted at the `dart:ffi` boundary
+/// via `Pointer<Utf8>`).
+///
+/// Deliberately narrow: `unsigned char`/`signed char` are excluded even
+/// though `libclang` treats them as distinct from plain `char` — in C++
+/// those two are at least as often a raw byte buffer as text, so assuming
+/// `String` for them would be exactly the kind of mapping Q9 forbids
+/// offering when it isn't globally viable (`docs/plans/User Steps.md`).
+/// `char_t`-style project typedefs are excluded for the same reason: this
+/// only ever sees `libclang`'s *written* pointee spelling, not its
+/// canonical type, so a typedef that could resolve to `char` or `wchar_t`
+/// depending on a build flag (e.g. pugixml's `PUGIXML_CHAR`) can't be told
+/// apart from here — resolving that would need the canonical type
+/// captured during extraction (`pointer_catalog.rs`), not guessed from text.
+pub fn scalar_pointee_dart_type(pointee_type_name: &str) -> Option<&'static str> {
+    match pointee_type_name {
+        "char" | "const char" => Some("String"),
+        _ => None,
+    }
+}
+
 /// What `lower::cpp` already knows about a pointer's pointee, before
 /// `pointer_options_for` decides how (or whether) that pointer maps to
 /// Dart. `Known` carries the pointee's own identity (`usr`/`name`) because
@@ -1256,21 +1370,19 @@ fn possible_pointee_types(usr: &str, name: &str, facts: &ProjectFacts<'_>) -> Ve
     let mut frontier = vec![usr.to_owned()];
 
     while let Some(base_usr) = frontier.pop() {
-        for declaration in facts.declarations {
+        let Some(subclasses) = facts.subclasses_by_base_usr.get(base_usr.as_str()) else {
+            continue;
+        };
+        for declaration in subclasses {
             if seen_usrs.contains(declaration.usr.as_str()) {
                 continue;
             }
-            if base_usrs_of(declaration, facts)
-                .iter()
-                .any(|base| base == &base_usr)
-            {
-                seen_usrs.insert(declaration.usr.as_str());
-                frontier.push(declaration.usr.clone());
-                found.push(PossiblePointee {
-                    usr: declaration.usr.clone(),
-                    name: declaration.name.clone(),
-                });
-            }
+            seen_usrs.insert(declaration.usr.as_str());
+            frontier.push(declaration.usr.clone());
+            found.push(PossiblePointee {
+                usr: declaration.usr.clone(),
+                name: declaration.name.clone(),
+            });
         }
     }
 
@@ -1358,14 +1470,14 @@ fn forwarded_callee<'a>(
     owning_function: &FunctionDeclaration,
     facts: &ProjectFacts<'a>,
 ) -> Option<&'a FunctionDeclaration> {
-    facts.calls.iter().find_map(|edge| {
-        if edge.caller_usr != owning_function.usr {
-            return None;
-        }
+    let edges = facts
+        .calls_by_caller_usr
+        .get(owning_function.usr.as_str())?;
+    edges.iter().find_map(|edge| {
         let CallResolution::Resolved { callee_usr, .. } = &edge.resolution else {
             return None;
         };
-        let callee = facts.functions.iter().find(|f| &f.usr == callee_usr)?;
+        let callee = *facts.functions_by_usr.get(callee_usr.as_str())?;
         if returns_via_call(body, &callee.name) {
             Some(callee)
         } else {
@@ -1576,6 +1688,83 @@ mod tests {
         assert_eq!(options[0].consequences[0].affected_type_usr, "c:@S@Nota");
     }
 
+    fn function_declaration(
+        usr: &str,
+        owning_class_usr: &str,
+        signature: &str,
+    ) -> FunctionDeclaration {
+        FunctionDeclaration {
+            name: "get".to_owned(),
+            kind: FunctionDeclarationKind::Method,
+            namespace: String::new(),
+            owning_class_usr: Some(owning_class_usr.to_owned()),
+            signature: signature.to_owned(),
+            file: "/project/input-source/src/accid.hpp".to_owned(),
+            line: 3,
+            column: 8,
+            end_line: 3,
+            end_column: 40,
+            usr: usr.to_owned(),
+            is_static: false,
+            is_virtual: false,
+            is_pure_virtual: false,
+            is_defaulted: false,
+            overridden_usrs: Vec::new(),
+        }
+    }
+
+    /// Verovio 6.2.0 (`Accid::GetOffsetInterface`/`GetPositionInterface`,
+    /// `docs/plans/verovio-6.2-pointer-types.md`'s duplicate-definition
+    /// investigation): a const/non-const overload pair whose return type is
+    /// also covariant-qualified (`OffsetInterface *` vs `const
+    /// OffsetInterface *`) must still be recognized as "same parameters,
+    /// differs only by const-ness" — case A05 (`a05_const_vs_non_const...`,
+    /// `mapping-solver-fixtures/A05-const-e-nao-const-overload/`) only
+    /// covers a pair whose return type is identical either way, which isn't
+    /// enough to catch a `same_params` check that (before this test)
+    /// compared the whole signature string including its return-type
+    /// prefix, rather than just the parameter list.
+    #[test]
+    fn overload_options_for_recognizes_const_vs_non_const_even_with_a_covariant_return_type() {
+        let functions = vec![
+            function_declaration(
+                "c:@S@Accid@F@get#1",
+                "c:@S@Accid",
+                "OffsetInterface *Accid::get()",
+            ),
+            function_declaration(
+                "c:@S@Accid@F@get#2",
+                "c:@S@Accid",
+                "const OffsetInterface *Accid::get() const",
+            ),
+        ];
+        let facts = ProjectFacts::new_full(&[], &[], &functions, &[]);
+
+        let options = overload_options_for(Some("c:@S@Accid"), "get", &facts);
+        assert_eq!(options.len(), 1, "{options:?}");
+        assert_eq!(options[0].id, "renomear-const-nao-const", "{options:?}");
+    }
+
+    #[test]
+    fn scalar_pointee_dart_type_maps_char_and_const_char_to_string() {
+        assert_eq!(scalar_pointee_dart_type("char"), Some("String"));
+        assert_eq!(scalar_pointee_dart_type("const char"), Some("String"));
+    }
+
+    /// Deliberately excluded (see `scalar_pointee_dart_type`'s doc
+    /// comment): `unsigned`/`signed char` are as often a byte buffer as
+    /// text, and a bare typedef name can't be told apart from a project
+    /// type or another scalar without the pointee's canonical type, which
+    /// this function never sees.
+    #[test]
+    fn scalar_pointee_dart_type_stays_none_for_anything_not_unambiguously_text() {
+        assert_eq!(scalar_pointee_dart_type("unsigned char"), None);
+        assert_eq!(scalar_pointee_dart_type("signed char"), None);
+        assert_eq!(scalar_pointee_dart_type("char_t"), None);
+        assert_eq!(scalar_pointee_dart_type("void"), None);
+        assert_eq!(scalar_pointee_dart_type("Forma"), None);
+    }
+
     /// The real payload: with `ProjectFacts` in hand, the solver walks the
     /// project's own inheritance edges and enumerates every subclass —
     /// `Forma` has two, `Circulo` and `Quadrado`, neither related to the
@@ -1613,12 +1802,7 @@ mod tests {
             },
         ];
         let declarations = vec![forma.clone(), circulo, quadrado];
-        let facts = ProjectFacts {
-            declarations: &declarations,
-            usages: &usages,
-            functions: &[],
-            calls: &[],
-        };
+        let facts = ProjectFacts::new_full(&declarations, &usages, &[], &[]);
 
         let options = pointer_options_for(
             PointeeShape::Known {
@@ -1709,12 +1893,7 @@ mod tests {
             resolved_call(&caller_a.usr, &template.usr),
             resolved_call(&caller_b.usr, &template.usr),
         ];
-        let facts = ProjectFacts {
-            declarations: &[],
-            usages: &[],
-            functions: &functions,
-            calls: &calls,
-        };
+        let facts = ProjectFacts::new_full(&[], &[], &functions, &calls);
 
         let options = template_options_for(&template, &facts);
         assert_eq!(options.len(), 1, "{options:?}");
