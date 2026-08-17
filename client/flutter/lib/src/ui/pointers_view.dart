@@ -29,16 +29,48 @@ class _PointersViewState extends State<PointersView> {
   bool _ascending = true;
   final Set<PointerDeclarationKind> _hiddenKinds = {};
 
+  /// Filtered and sorted once per actual change, not on every `build()`.
+  /// A project's pointer catalog can hold tens of thousands of entries
+  /// (Verovio has ~16k), and re-filtering/re-sorting that on every rebuild —
+  /// including ones unrelated to this widget, like a host panel being
+  /// resized — is what crashed the app while this tab was open.
+  late List<PointerDeclaration> _visible;
+
+  @override
+  void initState() {
+    super.initState();
+    _visible = _computeVisible();
+  }
+
+  @override
+  void didUpdateWidget(covariant PointersView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.pointers != widget.pointers) {
+      _visible = _computeVisible();
+    }
+  }
+
+  List<PointerDeclaration> _computeVisible() {
+    final visible = widget.pointers
+        .where((pointer) => !_hiddenKinds.contains(pointer.kind))
+        .toList();
+    _sort(visible);
+    return visible;
+  }
+
+  void _recompute() {
+    setState(() {
+      _visible = _computeVisible();
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     final presentKinds = [
       for (final kind in PointerDeclarationKind.values)
         if (widget.pointers.any((pointer) => pointer.kind == kind)) kind,
     ];
-    final visible = widget.pointers
-        .where((pointer) => !_hiddenKinds.contains(pointer.kind))
-        .toList();
-    _sort(visible);
+    final visible = _visible;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -74,13 +106,14 @@ class _PointersViewState extends State<PointersView> {
                 FilterChip(
                   label: Text(kind.label),
                   selected: !_hiddenKinds.contains(kind),
-                  onSelected: (selected) => setState(() {
+                  onSelected: (selected) {
                     if (selected) {
                       _hiddenKinds.remove(kind);
                     } else {
                       _hiddenKinds.add(kind);
                     }
-                  }),
+                    _recompute();
+                  },
                 ),
             ],
           ),
@@ -95,7 +128,12 @@ class _PointersViewState extends State<PointersView> {
                     style: TextStyle(color: IdePalette.muted),
                   ),
                 )
-              : ListView(children: _rows(visible)),
+              : ListView.separated(
+                  itemCount: visible.length,
+                  separatorBuilder: (context, index) =>
+                      const Divider(height: 1),
+                  itemBuilder: (context, index) => _row(visible[index]),
+                ),
         ),
       ],
     );
@@ -107,14 +145,15 @@ class _PointersViewState extends State<PointersView> {
     final bool active = _sortField == field;
 
     return TextButton.icon(
-      onPressed: () => setState(() {
+      onPressed: () {
         if (_sortField == field) {
           _ascending = !_ascending;
         } else {
           _sortField = field;
           _ascending = true;
         }
-      }),
+        _recompute();
+      },
       icon: Icon(
         _ascending ? Icons.arrow_upward : Icons.arrow_downward,
         size: 14,
@@ -138,42 +177,37 @@ class _PointersViewState extends State<PointersView> {
     });
   }
 
-  List<Widget> _rows(List<PointerDeclaration> declarations) {
-    return [
-      for (final pointer in declarations) ...[
-        ListTile(
-          contentPadding: EdgeInsets.zero,
-          leading: const Icon(Icons.arrow_right_alt),
-          title: Text(
-            pointer.name.isEmpty ? '(unnamed)' : pointer.name,
-            overflow: TextOverflow.ellipsis,
-          ),
-          subtitle: Text(
-            '${pointer.pointeeTypeName}${_shapeSuffix(pointer.shape)}',
-            overflow: TextOverflow.ellipsis,
-          ),
-          trailing: SizedBox(
-            width: 120,
-            child: Wrap(
-              alignment: WrapAlignment.end,
-              crossAxisAlignment: WrapCrossAlignment.center,
-              spacing: 8,
-              children: [
-                Text(
-                  pointer.shape.label,
-                  style: const TextStyle(color: IdePalette.muted, fontSize: 12),
-                ),
-                Text(
-                  pointer.kind.label,
-                  style: const TextStyle(color: IdePalette.muted, fontSize: 12),
-                ),
-              ],
+  Widget _row(PointerDeclaration pointer) {
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      leading: const Icon(Icons.arrow_right_alt),
+      title: Text(
+        pointer.name.isEmpty ? '(unnamed)' : pointer.name,
+        overflow: TextOverflow.ellipsis,
+      ),
+      subtitle: Text(
+        '${pointer.pointeeTypeName}${_shapeSuffix(pointer.shape)}',
+        overflow: TextOverflow.ellipsis,
+      ),
+      trailing: SizedBox(
+        width: 120,
+        child: Wrap(
+          alignment: WrapAlignment.end,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          spacing: 8,
+          children: [
+            Text(
+              pointer.shape.label,
+              style: const TextStyle(color: IdePalette.muted, fontSize: 12),
             ),
-          ),
+            Text(
+              pointer.kind.label,
+              style: const TextStyle(color: IdePalette.muted, fontSize: 12),
+            ),
+          ],
         ),
-        const Divider(height: 1),
-      ],
-    ];
+      ),
+    );
   }
 }
 

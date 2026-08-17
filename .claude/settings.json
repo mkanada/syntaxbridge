@@ -17,7 +17,19 @@
       "Bash(cargo build *)",
       "Bash(just flutter-test)",
       "Bash(just flutter-test *)",
-      "Bash(just flutter-analyze)"
+      "Bash(just flutter-analyze)",
+      "Bash(scripts/test-in-flatpak.sh)",
+      "Bash(scripts/test-in-flatpak.sh *)",
+      "Bash(just lint)",
+      "Bash(just check)",
+      "Bash(just fmt-check)",
+      "Bash(just --list)",
+      "Bash(just examples)",
+      "Bash(just test-host)",
+      "Bash(flatpak info *)",
+      "Bash(cargo bench *)",
+      "Bash(cargo metadata *)",
+      "Bash(just --dry-run *)"
     ]
   }
 }
