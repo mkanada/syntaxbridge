@@ -15,3 +15,4 @@ pub mod source_catalog;
 pub mod toolchain;
 pub mod transpile;
 pub mod type_catalog;
+pub mod validate;

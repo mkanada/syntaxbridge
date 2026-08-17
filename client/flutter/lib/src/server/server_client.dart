@@ -80,4 +80,10 @@ abstract class ServerClient {
   /// mechanism here yet (mirrors the server route's own design, see
   /// `docs/plans/primeiro-corte-e01-e03.md`).
   Future<TranspiledPackage> transpileProject(String projectDir);
+
+  /// Transpiles the project the same way [transpileProject] does, then runs
+  /// `dart analyze` against the result and returns every diagnostic,
+  /// translated back to its C++ origin where one could be located (US-9,
+  /// criterion 3).
+  Future<List<DartDiagnostic>> validateProject(String projectDir);
 }

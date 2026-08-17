@@ -335,6 +335,30 @@ class HttpServerClient implements ServerClient {
     return TranspiledPackage.fromJson(jsonDecode(body) as Map<String, Object?>);
   }
 
+  @override
+  Future<List<DartDiagnostic>> validateProject(String projectDir) async {
+    final url = baseUrl
+        .resolve('/projects/validate')
+        .replace(queryParameters: {'project_dir': projectDir});
+    cliLog('HTTP POST $url');
+    final request = await _httpClient.postUrl(url);
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP POST $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException(_errorMessageFromBody(body));
+    }
+
+    final json = jsonDecode(body) as Map<String, Object?>;
+    final diagnosticsJson =
+        json['diagnostics'] as List<Object?>? ?? const <Object?>[];
+    return diagnosticsJson
+        .whereType<Map<String, Object?>>()
+        .map(DartDiagnostic.fromJson)
+        .toList();
+  }
+
   String _errorMessageFromBody(String body) {
     try {
       final json = jsonDecode(body);

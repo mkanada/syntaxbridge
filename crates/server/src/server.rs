@@ -166,6 +166,7 @@ fn app(global_db_path: PathBuf) -> Router {
             get(list_calls_in_file_from_http),
         )
         .route("/projects/transpile", post(transpile_project_from_http))
+        .route("/projects/validate", post(validate_project_from_http))
         .with_state(state)
 }
 
@@ -756,6 +757,47 @@ fn transpile_project_error_response(error: project_service::TranspileProjectErro
     json_response(
         status,
         json!({"error":"transpile_failed","message":error.to_string()}),
+    )
+}
+
+/// Transpiles a project the same way `POST /projects/transpile` does, then
+/// runs `dart analyze` against the result and returns every diagnostic
+/// translated back to its C++ origin where one could be located (US-9,
+/// criterion 3 — `validate::dart::analyze_package`'s own doc comment has the
+/// granularity that translation resolves at).
+async fn validate_project_from_http(Query(query): Query<ProjectDirQuery>) -> Response {
+    log_server(format_args!(
+        "validating project: project_dir={}",
+        query.project_dir.display()
+    ));
+
+    match tokio::task::spawn_blocking(move || project_service::validate_project(&query.project_dir))
+        .await
+    {
+        Ok(Ok(diagnostics)) => json_response(StatusCode::OK, json!({ "diagnostics": diagnostics })),
+        Ok(Err(error)) => validate_project_error_response(error),
+        Err(error) => {
+            log_server(format_args!("validate task failed: {error}"));
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":"validate_failed","message":error.to_string()}),
+            )
+        }
+    }
+}
+
+fn validate_project_error_response(error: project_service::ValidateProjectError) -> Response {
+    let status = if error.is_client_error() {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    log_server(format_args!(
+        "validate failed: status={status} error={error:?}"
+    ));
+    json_response(
+        status,
+        json!({"error":"validate_failed","message":error.to_string()}),
     )
 }
 

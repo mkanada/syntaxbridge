@@ -388,4 +388,8 @@ class _ScriptedServerClient implements ServerClient {
   @override
   Future<TranspiledPackage> transpileProject(String projectDir) =>
       throw UnimplementedError('not used by this screen');
+
+  @override
+  Future<List<DartDiagnostic>> validateProject(String projectDir) =>
+      throw UnimplementedError('not used by this screen');
 }

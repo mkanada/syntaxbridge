@@ -8,6 +8,7 @@ import '../server/server_client.dart';
 import 'accordion_panel_group.dart';
 import 'callers_view.dart';
 import 'dart_output_view.dart';
+import 'diagnostics_view.dart';
 import 'dockable_panel.dart';
 import 'execution_log.dart';
 import 'execution_log_view.dart';
@@ -62,6 +63,7 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     'pointers': DockSide.left,
     'callers': DockSide.center,
     'dartOutput': DockSide.center,
+    'validation': DockSide.center,
     'log': DockSide.right,
   };
   final _screenshotBoundaryKey = GlobalKey();
@@ -77,6 +79,7 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
   Future<List<CallEdge>>? _selectedFunctionCallers;
   Future<List<CallEdge>>? _selectedFileCalls;
   Future<TranspiledPackage>? _transpiledPackage;
+  Future<List<DartDiagnostic>>? _diagnostics;
   late Future<List<PointerDeclaration>> _pointers;
 
   @override
@@ -154,6 +157,65 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
       );
       rethrow;
     }
+  }
+
+  /// Transpiles the project and runs `dart analyze` against the result
+  /// (US-9), opening the Validation panel — mirrors [_transpileProject]'s
+  /// "open the panel only once there's something to show" shape.
+  void _validateProject() {
+    _addLog('Validating project');
+    setState(() {
+      _openPanels.add('validation');
+      _panelSides['validation'] = DockSide.center;
+      _diagnostics = _loadDiagnostics();
+    });
+  }
+
+  Future<List<DartDiagnostic>> _loadDiagnostics() async {
+    try {
+      final diagnostics = await widget.serverClient.validateProject(
+        widget.project.projectDir,
+      );
+      final errors = diagnostics
+          .where((d) => d.severity == DartDiagnosticSeverity.error)
+          .length;
+      _addLog(
+        'Validated: ${diagnostics.length} diagnostic(s), $errors error(s)',
+        level: errors > 0 ? ExecutionLogLevel.error : ExecutionLogLevel.success,
+      );
+      return diagnostics;
+    } catch (error, stackTrace) {
+      cliLog('validate project exception: $error');
+      cliLog('validate project stack: $stackTrace');
+      _addLog(
+        'Failed to validate project: ${projectErrorMessage(error)}',
+        level: ExecutionLogLevel.error,
+      );
+      rethrow;
+    }
+  }
+
+  /// Jumps the main source viewer to the C++ declaration a `dart analyze`
+  /// diagnostic was translated back to (US-9) — same navigation shape as
+  /// [_selectUsage]/[_selectCallTarget]. Only called for a diagnostic whose
+  /// [DartDiagnostic.origin] is non-null (`DiagnosticsView` doesn't make the
+  /// others clickable at all).
+  void _selectDiagnostic(DartDiagnostic diagnostic) {
+    final origin = diagnostic.origin;
+    if (origin == null) {
+      return;
+    }
+
+    final sourceFile = widget.project.sourceFiles.firstWhere(
+      (file) => file.path == origin.file,
+      orElse: () => SourceFile(path: origin.file, kind: SourceFileKind.header),
+    );
+
+    _selectSourceFile(
+      sourceFile,
+      highlightStartLine: origin.line,
+      highlightEndLine: origin.line,
+    );
   }
 
   void _selectSourceFile(
@@ -568,6 +630,7 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
               onRefresh: _refresh,
               onCaptureScreen: _captureScreen,
               onTranspile: _transpileProject,
+              onValidate: _validateProject,
               panels: descriptors,
               openPanelIds: _openPanels,
               onTogglePanel: _togglePanel,
@@ -872,6 +935,18 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
         ),
       ),
       PanelDescriptor(
+        id: 'validation',
+        title: 'Validation',
+        icon: Icons.fact_check_outlined,
+        // Splits side by side with the source viewer by default, same as
+        // the Dart Output panel it complements.
+        defaultSide: DockSide.center,
+        builder: (context) => DiagnosticsView(
+          diagnostics: _diagnostics,
+          onDiagnosticSelected: _selectDiagnostic,
+        ),
+      ),
+      PanelDescriptor(
         id: 'log',
         title: 'Execution log',
         icon: Icons.receipt_long_outlined,
@@ -1115,6 +1190,7 @@ class _TitleBar extends StatelessWidget {
     required this.onRefresh,
     required this.onCaptureScreen,
     required this.onTranspile,
+    required this.onValidate,
     required this.panels,
     required this.openPanelIds,
     required this.onTogglePanel,
@@ -1123,6 +1199,7 @@ class _TitleBar extends StatelessWidget {
   final VoidCallback onRefresh;
   final VoidCallback onCaptureScreen;
   final VoidCallback onTranspile;
+  final VoidCallback onValidate;
 
   /// Every registered panel, open or closed — what the Panels menu lists.
   final List<PanelDescriptor> panels;
@@ -1170,6 +1247,11 @@ class _TitleBar extends StatelessWidget {
             icon: Icons.code,
             tooltip: 'Transpile',
             onPressed: onTranspile,
+          ),
+          IdeToolbarIcon(
+            icon: Icons.fact_check_outlined,
+            tooltip: 'Validate',
+            onPressed: onValidate,
           ),
           IdeToolbarIcon(
             icon: Icons.refresh_rounded,

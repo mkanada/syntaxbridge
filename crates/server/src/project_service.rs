@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::extraction::{self, ExtractionError};
-use crate::function_catalog::{CallEdge, FunctionDeclaration};
+use crate::function_catalog::{self, CallEdge, FunctionDeclaration};
 use crate::ingest::{self, CompilationUnit, CreateProjectRequest, CreatedProject, IngestError};
 use crate::ir;
 use crate::mapping;
@@ -19,6 +19,7 @@ use crate::progress::{Cancellation, ExtractionProgress};
 use crate::source_catalog::SourceFile;
 use crate::transpile::{self, TranspileError, TranspiledPackage};
 use crate::type_catalog::{TypeDeclaration, TypeUsage};
+use crate::validate::dart::{self as validate_dart, DartDiagnostic};
 
 /// Live progress trackers for `create_project`'s three `libclang` passes, so
 /// a caller running it in the background (`jobs.rs`) can report real
@@ -670,6 +671,18 @@ impl From<TranspileError> for TranspileProjectError {
 /// compilation units) so an old project doesn't silently transpile into an
 /// empty package.
 pub fn transpile_project(project_dir: &Path) -> Result<TranspiledPackage, TranspileProjectError> {
+    Ok(build_transpiled_package(project_dir)?.1)
+}
+
+/// Shared by [`transpile_project`] and [`validate_project`]: builds the same
+/// [`ir::Module`]/[`TranspiledPackage`] pair and writes the package under
+/// `<project_dir>/transpiled/` — `validate_project` needs the `Module` too
+/// (to translate `dart analyze` diagnostics back to C++ origins,
+/// `validate::dart::analyze_package`), which plain `transpile_project`
+/// discards, but both must build it exactly the same way.
+fn build_transpiled_package(
+    project_dir: &Path,
+) -> Result<(ir::Module, TranspiledPackage), TranspileProjectError> {
     if !is_openable_project(project_dir) {
         return Err(TranspileProjectError::NotFound(project_dir.to_path_buf()));
     }
@@ -686,24 +699,70 @@ pub fn transpile_project(project_dir: &Path) -> Result<TranspiledPackage, Transp
         .unwrap_or("syntax_bridge_output");
 
     let (ir_functions, ir_records, ir_enums) = project_store.list_ir()?;
-    let package =
-        if ir_functions.is_empty() && ir_records.is_empty() && !compilation_units.is_empty() {
-            transpile::transpile_with_mappings(
-                &compilation_units,
-                &input_source_dir,
-                package_name,
-                &type_catalog,
-                &type_mappings,
-            )?
-        } else {
-            let module = ir::Module {
-                functions: ir_functions,
-                records: ir_records,
-                enums: ir_enums,
-            };
-            transpile::emit_package(&module, package_name, &type_catalog, &type_mappings)?
-        };
+    let module = if ir_functions.is_empty()
+        && ir_records.is_empty()
+        && !compilation_units.is_empty()
+    {
+        let catalog =
+            function_catalog::extract_function_catalog(&compilation_units, &input_source_dir, None)
+                .map_err(TranspileError::from)?;
+        ir::Module {
+            functions: catalog.ir_functions,
+            records: catalog.ir_records,
+            enums: catalog.ir_enums,
+        }
+    } else {
+        ir::Module {
+            functions: ir_functions,
+            records: ir_records,
+            enums: ir_enums,
+        }
+    };
+    let package = transpile::emit_package(&module, package_name, &type_catalog, &type_mappings)?;
     transpile::write_package(&package, &project_dir.join("transpiled"))?;
 
-    Ok(package)
+    Ok((module, package))
+}
+
+#[derive(Debug)]
+pub enum ValidateProjectError {
+    Transpile(TranspileProjectError),
+    Validate(validate_dart::ValidateError),
+}
+
+impl ValidateProjectError {
+    pub fn is_client_error(&self) -> bool {
+        match self {
+            Self::Transpile(error) => error.is_client_error(),
+            Self::Validate(_) => false,
+        }
+    }
+}
+
+impl fmt::Display for ValidateProjectError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transpile(error) => write!(formatter, "{error}"),
+            Self::Validate(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for ValidateProjectError {}
+
+impl From<TranspileProjectError> for ValidateProjectError {
+    fn from(error: TranspileProjectError) -> Self {
+        Self::Transpile(error)
+    }
+}
+
+/// Transpiles a project (same package `POST /projects/transpile` would
+/// write) and runs `dart analyze` against it, translating every diagnostic
+/// back to the C++ declaration it came from (US-9, criterion 3) —
+/// `validate::dart::analyze_package`'s own doc comment has the granularity
+/// that translation resolves at.
+pub fn validate_project(project_dir: &Path) -> Result<Vec<DartDiagnostic>, ValidateProjectError> {
+    let (module, package) = build_transpiled_package(project_dir)?;
+    validate_dart::analyze_package(&module, &package, &project_dir.join("transpiled"))
+        .map_err(ValidateProjectError::Validate)
 }

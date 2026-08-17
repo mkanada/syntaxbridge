@@ -653,6 +653,53 @@ void main() {
     },
   );
 
+  testWidgets(
+    'validates the project and navigates to a diagnostic\'s C++ origin',
+    (tester) async {
+      const cppPath = '/tmp/projects/counter/input-source/src/aritmetica.cpp';
+      final fakeClient = _FakeServerClient(
+        const ServerStatus(service: 'syntax-bridge-server', status: 'ok'),
+        project: const CreatedProject(
+          name: 'counter',
+          projectDir: '/tmp/projects/counter',
+          inputSourceDir: '/tmp/projects/counter/input-source',
+          compilationUnits: [],
+          sourceFiles: [
+            SourceFile(path: cppPath, kind: SourceFileKind.translationUnit),
+          ],
+        ),
+        sourceFileContent:
+            'int soma(int a, int b) {\n    return a + naoexiste;\n}',
+        diagnostics: const [
+          DartDiagnostic(
+            severity: DartDiagnosticSeverity.error,
+            message: "Undefined name 'naoexiste'.",
+            dartFile: 'lib/aritmetica.dart',
+            dartLine: 2,
+            origin: CppOrigin(file: cppPath, line: 2, column: 14),
+          ),
+        ],
+      );
+
+      await tester.pumpWidget(SyntaxBridgeApp(serverClient: fakeClient));
+      await tester.pumpAndSettle();
+      await _skipToIde(tester);
+
+      await tester.tap(find.byTooltip('Validate'));
+      await tester.pumpAndSettle();
+
+      expect(fakeClient.validateProjectDir, '/tmp/projects/counter');
+      expect(find.text('1 error'), findsOneWidget);
+      expect(find.text("Undefined name 'naoexiste'."), findsOneWidget);
+
+      await tester.ensureVisible(find.text("Undefined name 'naoexiste'."));
+      await tester.tap(find.text("Undefined name 'naoexiste'."));
+      await tester.pumpAndSettle();
+
+      expect(find.text('    return a + naoexiste;'), findsOneWidget);
+    },
+  );
+
   testWidgets('opens path pickers for workspace and source archive', (
     tester,
   ) async {
@@ -1116,6 +1163,7 @@ class _FakeServerClient implements ServerClient {
     this.callersByFunction = const <String, List<CallEdge>>{},
     this.callsByFile = const <String, List<CallEdge>>{},
     this.transpiledPackage,
+    this.diagnostics = const <DartDiagnostic>[],
   });
 
   final ServerStatus status;
@@ -1133,11 +1181,13 @@ class _FakeServerClient implements ServerClient {
   final Map<String, List<CallEdge>> callersByFunction;
   final Map<String, List<CallEdge>> callsByFile;
   final TranspiledPackage? transpiledPackage;
+  final List<DartDiagnostic> diagnostics;
   String? createdProjectName;
   String? readSourceFilePath;
   String? openedProjectDir;
   String? forgottenProjectDir;
   String? transpileProjectDir;
+  String? validateProjectDir;
   late List<RecentProject> _remainingProjects = recentProjects;
 
   @override
@@ -1251,6 +1301,12 @@ class _FakeServerClient implements ServerClient {
     transpileProjectDir = projectDir;
     return transpiledPackage ??
         const TranspiledPackage(packageName: 'output', files: {});
+  }
+
+  @override
+  Future<List<DartDiagnostic>> validateProject(String projectDir) async {
+    validateProjectDir = projectDir;
+    return diagnostics;
   }
 }
 

@@ -21,6 +21,7 @@ class ScreenshotFakeServerClient implements ServerClient {
     this.callersByFunction = const <String, List<CallEdge>>{},
     this.callsByFile = const <String, List<CallEdge>>{},
     this.transpiledPackage,
+    this.diagnostics = const <DartDiagnostic>[],
   });
 
   final ServerStatus status;
@@ -39,11 +40,13 @@ class ScreenshotFakeServerClient implements ServerClient {
   final Map<String, List<CallEdge>> callersByFunction;
   final Map<String, List<CallEdge>> callsByFile;
   final TranspiledPackage? transpiledPackage;
+  final List<DartDiagnostic> diagnostics;
   String? createdProjectName;
   String? readSourceFilePath;
   String? openedProjectDir;
   String? forgottenProjectDir;
   String? transpileProjectDir;
+  String? validateProjectDir;
   late List<RecentProject> _remainingProjects = recentProjects;
 
   @override
@@ -157,6 +160,12 @@ class ScreenshotFakeServerClient implements ServerClient {
     transpileProjectDir = projectDir;
     return transpiledPackage ??
         const TranspiledPackage(packageName: 'output', files: {});
+  }
+
+  @override
+  Future<List<DartDiagnostic>> validateProject(String projectDir) async {
+    validateProjectDir = projectDir;
+    return diagnostics;
   }
 }
 

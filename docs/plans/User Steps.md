@@ -38,7 +38,7 @@ verificáveis, e não como intenções.
 | US-6 | Isolamento e caracterização comportamental (**opcional para o usuário**) | planejado (fase A destravada; fase B fora da v1) | US-5 |
 | US-7 | Mapeamento de tipos C++ → Dart | planejado | US-4, US-5 |
 | US-8 | Geração do código Dart | planejado | US-7 |
-| US-9 | Validação estática do Dart gerado | planejado | US-8 |
+| US-9 | Validação estática do Dart gerado | parcial (granularidade de declaração, não de instrução) | US-8 |
 | US-10 | Prova de equivalência comportamental | planejado | US-8 (+ oráculo) |
 | US-11 | Exportação do projeto convertido | planejado | US-9, US-10 |
 | US-12 | Re-ingestão preservando decisões | planejado | US-7 |
@@ -2379,19 +2379,65 @@ oráculo, UI, e então um degrau por vez.
 
 ## US-9 — Validação estática do Dart gerado
 
-**Status:** parcial — critérios 1 e 2 satisfeitos, mas não como passo
-independente: `transpile::transpile` (`crates/server/src/transpile.rs`) já
-encana todo `.dart` emitido pelo `dart format --output=show` (lendo de
-stdin) antes de devolver o pacote — não por replicar à mão a heurística de
-quebra de linha do `dart_style` (tentativa inicial que quebrou em
+**Status:** parcial — critérios 1 e 2 já vinham satisfeitos (ver histórico
+abaixo); critério 3 agora também, com a rota e o painel próprios.
+`transpile::transpile` (`crates/server/src/transpile.rs`) já encana todo
+`.dart` emitido pelo `dart format --output=show` (lendo de stdin) antes de
+devolver o pacote — não por replicar à mão a heurística de quebra de linha do
+`dart_style` (tentativa inicial que quebrou em
 `dart format --set-exit-if-changed`, ver
 `examples/E01-funcao-aritmetica/NOTES.md`), mas invocando o formatador real.
 `tests/transpile.rs` roda `dart analyze`/`dart format --set-exit-if-changed`
 de verdade sobre o pacote escrito em disco, inclusive para um caso com nó
-`Unsupported`. **Falta:** critério 3 inteiro (tradução de diagnóstico para
-arquivo/linha C++ de origem — `DartDiagnostic`), a rota
-`POST /projects/validate` como endpoint próprio, e o painel de diagnósticos
-na UI · **Depende de:** US-8
+`Unsupported`. **Resolvido: critério 3**, a tradução de diagnóstico para
+arquivo/linha C++ de origem —
+`crates/server/src/validate/dart.rs` (`DartDiagnostic { severity, message,
+dart_file, dart_line, origin: Option<ir::Origin> }`, `analyze_package`)
+roda `dart analyze --format=json` sobre o pacote já escrito e traduz cada
+achado de volta à declaração C++ de origem via `locate_origin`. **A
+granularidade é a declaração de topo (função livre, ou `class`/`mixin`, ou
+`enum`) inteira, não a instrução exata** — decisão deliberada, não uma
+lacuna silenciosa: um mapa linha-a-linha pré-formatação não sobrevive ao
+reflow de `dart format` (que roda sobre o arquivo inteiro e pode mover
+qualquer linha), então `locate_origin` localiza cada declaração pelo próprio
+texto já formatado — o mesmo que `dart analyze` de fato consultou — via um
+cursor sequencial que nunca casa a declaração errada (busca na mesma ordem
+de emissão de `emit::dart::emit_file`: enums, depois records, depois
+funções). Quando nenhuma declaração é localizada (uma linha de `import`, ou
+o helper sintético `_syntaxBridgeUnsupported`), `origin` é `None` — nunca um
+palpite. Provado por 6 testes unitários em `validate/dart.rs` (função pura,
+sem tocar o toolchain) e por `tests/validate_dart.rs`, que roda o `dart
+analyze` real sobre um `TranspiledPackage` deliberadamente quebrado — a
+mesma receita que o roteiro abaixo pedia ("um pacote Dart com erro
+deliberado, cuja origem o teste conhece"), sem depender de nenhuma
+construção C++ que o produto ainda mistraduza (não existe uma, hoje —
+`emit::dart` nunca emite Dart inválido). **Resolvido: rota e UI.**
+`POST /projects/validate` (`project_service::validate_project`,
+`server.rs`) transpila o projeto (mesmo caminho de
+`POST /projects/transpile`, via `build_transpiled_package` compartilhado) e
+devolve `{"diagnostics": [DartDiagnostic]}`; provado por
+`tests/validate_route.rs`, inclusive o caso "IR persistida reutilizada" nos
+mesmos moldes de `transpile_route.rs`. Painel "Validation"
+(`client/flutter/lib/src/ui/diagnostics_view.dart`) ao lado do "Dart
+Output", aberto pelo botão "Validate" da toolbar; clicar num diagnóstico com
+origem resolvida navega ao C++ (mesma mecânica de `_selectUsage`/
+`_selectCallTarget`), testado em `diagnostics_view_test.dart` e
+ponta-a-ponta em `app_test.dart`. Capturas em
+`docs/screenshots/README.md` (`us9-validation-diagnostics`,
+`us9-validation-clean`). **Decisão registrada (roteiro item 3): avisos
+informam, erros não bloqueiam** — a rota devolve todo diagnóstico
+(`ERROR`/`WARNING`/`INFO`), sem filtrar nem impedir nenhuma ação posterior;
+a UI só usa a severidade para peso visual (erros primeiro, em vermelho),
+mesmo espírito de "nunca bloquear por prova incompleta" que `AGENTS.md` já
+aplica a US-6. **Falta:** granularidade por método/instrução dentro de uma
+classe (hoje todo o corpo de uma `class` resolve para a origem da própria
+declaração da classe); `dart format --set-exit-if-changed` não é chamado por
+este módulo (comportamento já coberto por `transpile::emit_package`, que
+formata antes de qualquer validação — nada aqui verifica de novo, então uma
+regressão nesse contrato não apareceria como um `DartDiagnostic`); e a
+suíte deste passo ainda não rodou dentro do Flatpak (rodou no host, com o
+mesmo Dart SDK 3.12.2 do manifesto — ver "Condições de testabilidade")
+· **Depende de:** US-8
 
 ### Objetivo do usuário
 
@@ -2411,10 +2457,15 @@ apontando de volta para o C++ de origem.
 
 ### Critérios de aceitação (testáveis)
 
-1. O pacote gerado para o fixture passa em `dart analyze` sem erros.
-2. O código gerado já está no formato de `dart format` (formatar não produz
-   diferença).
-3. Um erro do analisador é apresentado com o arquivo e a linha C++ de origem.
+1. **Satisfeito.** O pacote gerado para o fixture passa em `dart analyze` sem
+   erros — `tests/transpile.rs`.
+2. **Satisfeito.** O código gerado já está no formato de `dart format`
+   (formatar não produz diferença) — `tests/transpile.rs`.
+3. **Satisfeito.** Um erro do analisador é apresentado com o arquivo e a
+   linha C++ de origem, na granularidade descrita acima —
+   `validate::dart::analyze_package`/`locate_origin`, provado por
+   `tests/validate_dart.rs` (subprocesso `dart analyze` real) e
+   `tests/validate_route.rs` (rota HTTP completa).
 
 ### Condições de testabilidade
 
@@ -2424,27 +2475,30 @@ apontando de volta para o C++ de origem.
 - Versão do SDK fixada, senão a saída do analisador varia entre máquinas.
   Satisfeita: 3.12.2, por URL de release com `sha256`.
 
-### Roteiro de implementação (para um agente)
+### Roteiro de implementação (para um agente) — concluído
 
-O passo mais barato dos que faltam: as duas ferramentas existem, a versão está
-fixada, e o contrato é a saída delas.
+Os cinco itens abaixo foram todos implementados numa única sessão; mantidos
+aqui, marcados, como registro de como o passo foi feito (a "receita padrão"
+da introdução não cobria rota+UI de validação, então este roteiro próprio
+seguiu valendo até o fim).
 
-1. **`crates/server/src/validate/dart.rs`:** invoca `dart analyze --format=json`
-   e `dart format --output=none --set-exit-if-changed` sobre o pacote gerado,
-   e traduz a saída para `DartDiagnostic { severity, message, dart_file,
-   dart_line, origin: Option<CppOrigin> }`.
-2. **A tradução para a origem C++ é o trabalho real** (critério 3), e ela só
-   funciona se US-8 tiver emitido a rastreabilidade. Teste primeiro: um pacote
-   Dart com erro deliberado, cuja origem o teste conhece, afirmando que o
-   diagnóstico aponta para o arquivo e a linha C++ certos.
-3. **Avisos informam, erros bloqueiam** — decisão a tomar por escrito no
-   primeiro commit; recomendo essa, por ser a que não impede o usuário de
-   avançar com Dart válido porém imperfeito.
-4. **Rota** `POST /projects/validate` e painel de diagnósticos na UI, com
-   clique levando ao C++ de origem — reaproveitando `SourceFileViewer` e a
-   mesma mecânica de navegação de US-4/US-5.
-5. Nos testes, invocar `dart` pela receita do `justfile` dentro do Flatpak
-   (`just test`), para que a versão exercitada seja a do manifesto.
+1. ✅ **`crates/server/src/validate/dart.rs`:** invoca `dart analyze
+   --format=json` sobre o pacote já escrito (`dart format` não é chamado de
+   novo aqui — ver "Falta" acima) e traduz a saída para `DartDiagnostic
+   { severity, message, dart_file, dart_line, origin: Option<ir::Origin> }`.
+2. ✅ **Tradução para a origem C++** (critério 3) — `locate_origin`, testada
+   primeiro por um pacote Dart com erro deliberado
+   (`tests/validate_dart.rs`), exatamente como pedido aqui.
+3. ✅ **Avisos informam, erros não bloqueiam** — registrado no doc comment de
+   `DiagnosticsView` (`client/flutter/lib/src/ui/diagnostics_view.dart`): a
+   rota devolve todo diagnóstico sem filtrar, a UI só usa a severidade para
+   peso visual.
+4. ✅ **Rota** `POST /projects/validate` (`project_service::validate_project`)
+   e painel "Validation" na UI, clique levando ao C++ de origem via
+   `SourceFileViewer`/mesma mecânica de US-4/US-5 (`_selectDiagnostic` em
+   `server_status_page.dart`).
+5. ⚠️ **Pendente:** a suíte deste passo rodou no host (mesmo Dart SDK 3.12.2
+   do manifesto), não ainda dentro do Flatpak via `just test`.
 
 ---
 

@@ -826,3 +826,76 @@ class TranspiledPackage {
   /// file contents.
   final Map<String, String> files;
 }
+
+/// Where a piece of generated Dart came from in the original C++. Mirrors
+/// `ir::Origin` in `crates/server/src/ir/mod.rs`.
+class CppOrigin {
+  const CppOrigin({
+    required this.file,
+    required this.line,
+    required this.column,
+  });
+
+  factory CppOrigin.fromJson(Map<String, Object?> json) {
+    return CppOrigin(
+      file: json['file'] as String? ?? '',
+      line: (json['line'] as num?)?.toInt() ?? 0,
+      column: (json['column'] as num?)?.toInt() ?? 0,
+    );
+  }
+
+  final String file;
+  final int line;
+  final int column;
+}
+
+/// Severity of a `dart analyze` finding. Mirrors
+/// `validate::dart::Severity` in `crates/server/src/validate/dart.rs`.
+enum DartDiagnosticSeverity {
+  error,
+  warning,
+  info;
+
+  static DartDiagnosticSeverity fromJson(String? value) {
+    switch (value) {
+      case 'error':
+        return DartDiagnosticSeverity.error;
+      case 'warning':
+        return DartDiagnosticSeverity.warning;
+      default:
+        return DartDiagnosticSeverity.info;
+    }
+  }
+}
+
+/// One `dart analyze` finding against the transpiled package (US-9), with
+/// its C++ origin when one could be located. Mirrors
+/// `validate::dart::DartDiagnostic` in `crates/server/src/validate/dart.rs`
+/// — see that type's doc comment for the granularity `origin` resolves at
+/// (a whole top-level declaration, not the exact statement).
+class DartDiagnostic {
+  const DartDiagnostic({
+    required this.severity,
+    required this.message,
+    required this.dartFile,
+    required this.dartLine,
+    required this.origin,
+  });
+
+  factory DartDiagnostic.fromJson(Map<String, Object?> json) {
+    final originJson = json['origin'] as Map<String, Object?>?;
+    return DartDiagnostic(
+      severity: DartDiagnosticSeverity.fromJson(json['severity'] as String?),
+      message: json['message'] as String? ?? '',
+      dartFile: json['dart_file'] as String? ?? '',
+      dartLine: (json['dart_line'] as num?)?.toInt() ?? 0,
+      origin: originJson == null ? null : CppOrigin.fromJson(originJson),
+    );
+  }
+
+  final DartDiagnosticSeverity severity;
+  final String message;
+  final String dartFile;
+  final int dartLine;
+  final CppOrigin? origin;
+}

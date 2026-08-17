@@ -40,11 +40,7 @@ pub fn emit_module(module: &Module) -> BTreeMap<String, String> {
     // constructor at all, unlike the ordinary synthetic positional one E03
     // gives every other record with fields — see `Record::mixins`'s doc
     // comment).
-    let mixin_usrs: HashSet<&str> = module
-        .records
-        .iter()
-        .flat_map(|record| record.mixins.iter().map(|base| base.usr.as_str()))
-        .collect();
+    let mixin_usrs = mixin_usrs(module);
 
     // E11: which file *declares* each top-level record/function — the other
     // half of what a file needs to know before it can print its own
@@ -147,7 +143,21 @@ pub fn emit_module(module: &Module) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn file_stem(path: &str) -> String {
+/// Every record `usr` used as a mixin (E09) somewhere in `module`, computed
+/// module-wide rather than per-file — a mixin and the class that uses it
+/// could land in different files. Shared with `crate::validate::dart`, which
+/// needs the same `class`-vs-`mixin` keyword this module already derives
+/// from it, to build a matching declaration marker without recomputing this
+/// itself and risking the two disagreeing.
+pub(crate) fn mixin_usrs(module: &Module) -> HashSet<&str> {
+    module
+        .records
+        .iter()
+        .flat_map(|record| record.mixins.iter().map(|base| base.usr.as_str()))
+        .collect()
+}
+
+pub(crate) fn file_stem(path: &str) -> String {
     let stem = Path::new(path)
         .file_stem()
         .and_then(|stem| stem.to_str())
