@@ -630,3 +630,163 @@ Chave escolher() { return index; }
         "the reference must use the same renamed constant, got:\n{source}"
     );
 }
+
+/// Diagnostic finding (`verovio_6_2_0_transpile_diagnosis`, Verovio's own
+/// `accid.cpp`): a functor's `operator()` was emitted with its literal C++
+/// name — `bool operator()(...)` — which `dart format` rejects outright
+/// (`Expected an identifier`, confirmed empirically). Dart's own idiom for a
+/// callable object is a plain method named `call`; `obj(args)` already
+/// dispatches to it automatically, so this bridge preserves call-site syntax
+/// too, not just the declaration.
+#[test]
+fn operator_call_declared_on_a_record_bridges_to_darts_call_method() {
+    let source = lower_and_emit(
+        "lower-cpp-operator-call",
+        r#"
+class Comparador {
+public:
+    bool operator()(int a, int b) {
+        return a < b;
+    }
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("operator()"),
+        "the raw C++ spelling must never reach Dart, got:\n{source}"
+    );
+    assert!(
+        source.contains("bool call(int a, int b) {"),
+        "expected the functor to bridge to Dart's own `call` method, got:\n{source}"
+    );
+}
+
+/// `operator<` (and the rest of Dart's own overloadable comparison/
+/// arithmetic set) has a direct, same-arity Dart equivalent — unlike
+/// `operator==`, which needs a coerced `Object` parameter, this needs no
+/// special body handling at all, just the `operator <name>` declaration
+/// syntax instead of `<name>` printed as a bare (invalid) identifier.
+#[test]
+fn an_operator_in_darts_overloadable_set_declares_as_a_real_dart_operator() {
+    let source = lower_and_emit(
+        "lower-cpp-operator-lt",
+        r#"
+class Ponto {
+public:
+    int x;
+    bool operator<(int limite) const {
+        return x < limite;
+    }
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("bool operator<(int limite)"),
+        "the raw C++ spelling must never be printed as a bare identifier, got:\n{source}"
+    );
+    assert!(
+        source.contains("bool operator <(int limite) {"),
+        "expected Dart's own operator-declaration syntax, got:\n{source}"
+    );
+}
+
+/// `operator++` has no Dart equivalent at all (Dart never lets a type
+/// customize `++`/`--`). Emitting it under its literal C++ name is invalid
+/// Dart syntax the same way `operator()` was — the fix bridges it to a
+/// synthesized, always-valid method name and bails the body out loudly
+/// (`// TODO(syntax-bridge)` + `throw UnimplementedError`, "silêncio é
+/// proibido") instead of pretending the translation succeeded.
+#[test]
+fn an_operator_with_no_dart_equivalent_bridges_to_a_named_method_instead_of_breaking_syntax() {
+    let source = lower_and_emit(
+        "lower-cpp-operator-increment",
+        r#"
+class Contador {
+public:
+    int valor;
+    void operator++() {
+        valor = valor + 1;
+    }
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("operator++("),
+        "the raw C++ spelling must never be printed as a Dart declaration, got:\n{source}"
+    );
+    assert!(
+        source.contains("void increment() {"),
+        "expected a synthesized, always-valid bridge name, got:\n{source}"
+    );
+    assert!(
+        source.contains("TODO(syntax-bridge)") && source.contains("UnimplementedError"),
+        "the body must bail out loudly instead of silently dropping the semantics, got:\n{source}"
+    );
+}
+
+/// A *free* operator overload with no Dart equivalent (`operator<<`, C++'s
+/// idiomatic stream-insertion overload) reaches the same call-lowering path
+/// as `std::string`'s `operator+`/`operator==` (E13) but isn't one of the
+/// ones that path recognizes — before this fix, the fallback built an
+/// ordinary `Expr::Call` naming the callee `operator<<`, and `emit::dart`
+/// printed it verbatim: `operator<<(a, 2)`, a bare invalid Dart identifier
+/// used as a call target.
+#[test]
+fn a_free_operator_overload_with_no_dart_equivalent_becomes_unsupported_instead_of_an_invalid_call()
+ {
+    let source = lower_and_emit(
+        "lower-cpp-free-operator-shl",
+        r#"
+struct Foo {
+    int x;
+};
+
+Foo operator<<(Foo a, int deslocamento) {
+    Foo resultado;
+    resultado.x = a.x << deslocamento;
+    return resultado;
+}
+
+Foo usa(Foo a) {
+    return a << 2;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("operator<<("),
+        "the raw C++ operator spelling must never be printed as a call target, got:\n{source}"
+    );
+}
+
+/// Verovio's `-VRV_UNSET` (a macro expanding to `(-2147483647)`, so the
+/// surface expression is a double unary minus) was emitted as `--2147483647`
+/// — `dart format` reads `--` as the prefix-decrement token and rejects
+/// decrementing a literal (`Missing selector such as '.identifier'`,
+/// confirmed empirically). Two adjacent `-` characters with no separator
+/// between them always merge into that token, regardless of how deeply
+/// nested the two `Expr::Unary` nodes are — parenthesizing the inner one is
+/// the general fix, not a special case for this one macro.
+#[test]
+fn nested_unary_minus_is_parenthesized_so_it_never_merges_into_a_decrement_token() {
+    let source = lower_and_emit(
+        "lower-cpp-nested-unary-minus",
+        r#"
+int f() {
+    return -(-2147483647);
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("--2147483647"),
+        "the two unary minuses must never merge into a decrement token, got:\n{source}"
+    );
+    assert!(
+        source.contains("-(-2147483647)"),
+        "expected the inner negation parenthesized, got:\n{source}"
+    );
+}

@@ -2492,6 +2492,22 @@ unsafe fn lower_call_expr(
         return special;
     }
 
+    // Every free operator overload this function actually knows how to
+    // translate is handled by one of the two `lower_stdlib_*` calls above;
+    // reaching here with a `callee_name` that isn't a plain identifier means
+    // an operator neither one recognizes (`operator<<`, or C++20's `<=>`
+    // rewritten-candidate machinery calling `std::__cmp_cat`'s `operator<`,
+    // both confirmed on the real Verovio 6.2.0 corpus). `emit::dart` prints
+    // a `Call`'s `callee_name` as a bare identifier — `operator<<(a, 2)` —
+    // which `dart format` rejects outright, so this must bail out here
+    // rather than build a `Call` no emitter step downstream could catch.
+    if !is_plain_dart_identifier(&callee_name) {
+        return ir::Expr::Unsupported {
+            reason: format!("unsupported free operator overload: {callee_name}"),
+            origin,
+        };
+    }
+
     let args = match unsafe { lower_call_arguments(cursor, project_root) } {
         Some(args) => args,
         None => {
@@ -2511,6 +2527,21 @@ unsafe fn lower_call_expr(
         ty,
         origin,
     }
+}
+
+/// Whether `name` could ever be printed as a bare Dart call target
+/// (`{name}(args)`) — a real identifier, not an operator token like
+/// `operator<<` or `operator<=>`. Used as the last-resort guard on every
+/// generic `Call`-construction fallback in this module: a call target this
+/// rejects has no valid literal spelling in Dart, so it must become
+/// `Expr::Unsupported` instead of a `Call` `emit::dart` would print verbatim.
+fn is_plain_dart_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Lowers every argument of a call cursor (`clang_Cursor_getArgument`
@@ -2899,6 +2930,27 @@ unsafe fn lower_method_call(
     }
     let callee_name =
         unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced)) };
+    // A functor call (`pred(a, b)`) reaches this same operator-syntax
+    // branch as `a == b` (E13) does — `emit::dart`'s own bridge for the
+    // *declaration* of `operator()` renames it to Dart's `call` method
+    // (`emit::dart::emit_method`), so the call site has to agree, or the
+    // two would name different methods.
+    let callee_name = if callee_name == "operator()" {
+        "call".to_owned()
+    } else {
+        callee_name
+    };
+    // Any other operator-syntax call this module doesn't specifically
+    // recognize (`lower_record_operator_call` already intercepted the ones
+    // Dart maps directly) has no bare-identifier spelling `emit::dart` could
+    // print as a call target — same guard as the free-function fallback
+    // above, and for the same reason.
+    if !is_plain_dart_identifier(&callee_name) {
+        return ir::Expr::Unsupported {
+            reason: format!("unsupported operator method call: {callee_name}"),
+            origin,
+        };
+    }
     let args = match unsafe { lower_call_arguments_skipping(call_cursor, arg_skip, project_root) } {
         Some(args) => args,
         None => {

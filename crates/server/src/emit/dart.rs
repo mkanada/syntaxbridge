@@ -831,6 +831,49 @@ fn emit_method(
         return emit_equality_operator(record_name, method, used_expr_helper, used_utf8_encode);
     }
 
+    // Every other C++ operator overload printed under its own literal name
+    // is invalid Dart syntax — `bool operator()(...)`, `bool operator<(...)`
+    // (there's no bare `<name>` identifier in Dart at all; `dart format`
+    // rejects it, confirmed empirically on Verovio 6.2.0's real `accid.cpp`,
+    // the diagnostic finding that drove this fix). Three cases, in order of
+    // how directly Dart can represent them:
+    if method.name == "operator()" {
+        // Dart's own callable-object idiom: a plain method named `call`
+        // makes `obj(args)` dispatch to it automatically — this bridge
+        // preserves the call-site syntax too, not just the declaration.
+        return emit_method_named("call", method, used_expr_helper, used_utf8_encode);
+    }
+    if let Some(symbol) = direct_dart_operator_symbol(&method.name, method.params.len()) {
+        // Same arity, same meaning, Dart's own `operator <symbol>` syntax —
+        // no special body handling needed, unlike `==`.
+        return emit_method_named(
+            &format!("operator {symbol}"),
+            method,
+            used_expr_helper,
+            used_utf8_encode,
+        );
+    }
+    if method.name.starts_with("operator") {
+        // No Dart equivalent exists (`operator<<`, `operator++`, a
+        // conversion operator, ...). Declaring it under a synthesized,
+        // always-valid name keeps the file parseable; the body still bails
+        // out loudly instead of pretending the translation succeeded
+        // ("silêncio é proibido").
+        return emit_unsupported_operator(method, used_expr_helper, used_utf8_encode);
+    }
+
+    emit_method_named(&method.name, method, used_expr_helper, used_utf8_encode)
+}
+
+/// The generic method-emission shape every ordinary method, and every
+/// operator bridge (`call`, `operator <symbol>`), share — `dart_name` is
+/// whatever `emit_method` decided to print instead of `method.name`.
+fn emit_method_named(
+    dart_name: &str,
+    method: &Method,
+    used_expr_helper: &mut bool,
+    used_utf8_encode: &mut bool,
+) -> String {
     let params = format_params(&method.params, used_expr_helper, used_utf8_encode);
     let override_prefix = if method.is_override {
         format!("{INDENT}@override\n")
@@ -838,14 +881,13 @@ fn emit_method(
         String::new()
     };
     let return_type = emit_type(&method.return_type);
-    let name = &method.name;
 
     // A pure virtual method (`body: None`, E06's abstract-method case) has
     // no implementation to print — Dart's own abstract-member syntax is a
     // signature with no body at all, not empty braces (`{}` would mean "does
     // nothing", not "not implemented").
     let Some(body_stmts) = &method.body else {
-        return format!("{override_prefix}{INDENT}{return_type} {name}({params});\n");
+        return format!("{override_prefix}{INDENT}{return_type} {dart_name}({params});\n");
     };
 
     let body = emit_body(
@@ -859,8 +901,94 @@ fn emit_method(
     );
     let static_keyword = if method.is_static { "static " } else { "" };
     format!(
-        "{override_prefix}{INDENT}{static_keyword}{return_type} {name}({params}) {{\n{body}{INDENT}}}\n"
+        "{override_prefix}{INDENT}{static_keyword}{return_type} {dart_name}({params}) {{\n{body}{INDENT}}}\n"
     )
+}
+
+/// Dart's fixed set of user-overloadable operators that also have a C++
+/// operator of the same spelling and the same arity — `unary-`'s arity (0
+/// params) disambiguates it from binary `-` (1 param) exactly the way C++
+/// itself does, so no separate "unary" spelling is needed here, just the
+/// arity check.
+const DIRECT_DART_OPERATOR_ARITIES: &[(&str, &[usize])] = &[
+    ("+", &[1]),
+    ("-", &[0, 1]),
+    ("*", &[1]),
+    ("/", &[1]),
+    ("<", &[1]),
+    ("<=", &[1]),
+    (">", &[1]),
+    (">=", &[1]),
+    ("[]", &[1]),
+    ("[]=", &[2]),
+];
+
+fn direct_dart_operator_symbol(method_name: &str, arity: usize) -> Option<&'static str> {
+    let symbol = method_name.strip_prefix("operator")?;
+    DIRECT_DART_OPERATOR_ARITIES
+        .iter()
+        .find(|(candidate, arities)| *candidate == symbol && arities.contains(&arity))
+        .map(|(candidate, _)| *candidate)
+}
+
+/// A C++ operator overload with no Dart equivalent at all — `operator<<`,
+/// `operator++`/`--` (Dart never lets a type customize those), a compound
+/// assignment (`operator+=`), a conversion operator, or anything else not in
+/// `DIRECT_DART_OPERATOR_ARITIES`. The declaration still needs a valid Dart
+/// identifier in its place (a small, fixed, C++-wide vocabulary — not a
+/// per-project or per-fixture table), and the body bails out with the same
+/// `Stmt::Unsupported` rendering every other unrepresentable construct uses,
+/// instead of either guessing a translation or dropping the member silently.
+fn emit_unsupported_operator(
+    method: &Method,
+    used_expr_helper: &mut bool,
+    used_utf8_encode: &mut bool,
+) -> String {
+    let bridge_name = bridge_name_for_unsupported_operator(&method.name, method.params.len());
+    let params = format_params(&method.params, used_expr_helper, used_utf8_encode);
+    let return_type = emit_type(&method.return_type);
+
+    if method.body.is_none() {
+        return format!("{INDENT}{return_type} {bridge_name}({params});\n");
+    }
+
+    let bailout = Stmt::Unsupported {
+        reason: format!(
+            "`{}` has no Dart operator equivalent; bridged to a named method (`{bridge_name}`)",
+            method.name
+        ),
+        origin: method.origin.clone(),
+    };
+    let body = emit_stmt(&bailout, 2, used_expr_helper, used_utf8_encode);
+    format!("{INDENT}{return_type} {bridge_name}({params}) {{\n{body}{INDENT}}}\n")
+}
+
+fn bridge_name_for_unsupported_operator(method_name: &str, arity: usize) -> &'static str {
+    let symbol = method_name.strip_prefix("operator").unwrap_or(method_name);
+    match symbol {
+        "<<" => "streamInsert",
+        ">>" => "streamExtract",
+        "->" => "arrow",
+        "!" => "logicalNot",
+        "~" => "bitwiseNot",
+        "++" if arity == 0 => "increment",
+        "++" => "incrementPostfix",
+        "--" if arity == 0 => "decrement",
+        "--" => "decrementPostfix",
+        "+=" => "addAssign",
+        "-=" => "subtractAssign",
+        "*=" => "multiplyAssign",
+        "/=" => "divideAssign",
+        "%=" => "moduloAssign",
+        "%" => "modulo",
+        "&" => "bitwiseAnd",
+        "|" => "bitwiseOr",
+        "^" => "bitwiseXor",
+        "&&" => "logicalAnd",
+        "||" => "logicalOr",
+        "," => "comma",
+        _ => "unsupportedOperator",
+    }
 }
 
 /// An operator== member always has exactly one parameter in valid C++ — see
@@ -989,10 +1117,24 @@ fn emit_function(
         1,
     );
 
+    // Dart has no free-standing operators at all — every operator is an
+    // instance method — so a *free* C++ operator function (the conventional
+    // home for a class's `operator<<` stream-insertion overload) can never
+    // become a real Dart `operator` declaration the way a method sometimes
+    // can (`emit_method`'s `direct_dart_operator_symbol`). Its body is
+    // ordinary, translatable code, though — only the name is the problem —
+    // so, unlike the method-side bridge, this is a plain rename, not a body
+    // bailout: the same small, C++-wide symbol table
+    // (`bridge_name_for_unsupported_operator`), not a per-project one.
+    let name = if function.name.starts_with("operator") {
+        bridge_name_for_unsupported_operator(&function.name, function.params.len())
+    } else {
+        &function.name
+    };
+
     format!(
         "{return_type} {name}({params}) {{\n{body}}}\n",
         return_type = emit_type(&function.return_type),
-        name = function.name,
     )
 }
 
@@ -1632,11 +1774,21 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
             emit_expr(rhs, used_expr_helper, used_utf8_encode)
         ),
         Expr::Unary { op, operand, .. } => {
-            format!(
-                "{}{}",
-                emit_unary_op(*op),
-                emit_expr(operand, used_expr_helper, used_utf8_encode)
-            )
+            let op_text = emit_unary_op(*op);
+            let operand_text = emit_expr(operand, used_expr_helper, used_utf8_encode);
+            // A nested unary minus (Verovio's `-VRV_UNSET`, a macro expanding
+            // to `(-2147483647)`) would otherwise print as `--2147483647` —
+            // two adjacent `-` characters with nothing between them merge
+            // into Dart's prefix-decrement token, which can't apply to a
+            // literal (`dart format`: "Missing selector", confirmed
+            // empirically). Parenthesizing whenever the operand's own text
+            // starts with the same character keeps the two tokens apart
+            // regardless of how deep the nesting goes.
+            if operand_text.starts_with(op_text) {
+                format!("{op_text}({operand_text})")
+            } else {
+                format!("{op_text}{operand_text}")
+            }
         }
         // The only promotion `lower::cpp` currently constructs a `Convert`
         // node for is int → double (see the IR's own doc comment) — Dart
