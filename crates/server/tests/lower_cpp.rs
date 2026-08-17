@@ -602,6 +602,64 @@ public:
     );
 }
 
+/// Diagnostic finding (`verovio_6_2_0_transpile_diagnosis`, achado 8,
+/// Verovio's own `beam.h`): an anonymous top-level `enum { ... };` was
+/// declared under libclang's own debug spelling for the anonymous cursor
+/// (`"(unnamed enum at <file>:<line>:<col>)"`), which is not a valid Dart
+/// identifier — `dart format` rejected the whole file at that line.
+#[test]
+fn an_anonymous_enum_is_never_declared_under_libclangs_debug_spelling() {
+    let source = lower_and_emit(
+        "lower-cpp-anonymous-enum",
+        r#"
+enum { PARTIAL_NONE, PARTIAL_THROUGH, PARTIAL_RIGHT, PARTIAL_LEFT };
+
+void f() {}
+"#,
+    );
+
+    assert!(
+        !source.to_lowercase().contains("unnamed enum")
+            && !source.to_lowercase().contains("anonymous enum"),
+        "an anonymous enum must never leak libclang's debug spelling into a \
+         Dart identifier, got:\n{source}"
+    );
+    assert!(
+        !source.contains("enum ("),
+        "an anonymous enum has no valid Dart name and must not be declared \
+         at all, got:\n{source}"
+    );
+}
+
+/// Diagnostic finding (`verovio_6_2_0_transpile_diagnosis`, achado 9,
+/// Verovio's own `FloatingObject::IsCloserToStaffThan`): a C++ parameter
+/// with no name (legal in a declaration, common in an interface signature
+/// that never uses it) was emitted with no Dart identifier at all —
+/// `dart format` rejected the file at the empty parameter slot.
+#[test]
+fn an_unnamed_parameter_gets_a_synthesized_positional_dart_name() {
+    let source = lower_and_emit(
+        "lower-cpp-unnamed-parameter",
+        r#"
+class C {
+public:
+    bool F(int, bool named) { return named; }
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("int , bool named"),
+        "an unnamed parameter must not be emitted with no Dart identifier \
+         at all, got:\n{source}"
+    );
+    assert!(
+        source.contains("int arg0, bool named"),
+        "an unnamed parameter should get a synthesized positional Dart \
+         name, got:\n{source}"
+    );
+}
+
 /// `index` and `values` are members every Dart enum already has, and `in`
 /// is a Dart reserved word — all three are perfectly ordinary C++
 /// enumerators, and emitting them verbatim produces an enum body Dart

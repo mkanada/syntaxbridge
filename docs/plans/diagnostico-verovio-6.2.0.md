@@ -64,44 +64,41 @@ achado 2 (ver abaixo), os erros do `dart analyze` caem para 154.632 — a
 tabela acima fica como registro histórico do estado inicial, não é
 atualizada a cada achado corrigido.
 
-## Medição mais recente (2026-08-17)
+## Medição mais recente (2026-08-17, após achados 8 e 9)
 
 A partir desta rodada, `just verovio-diagnosis` grava o snapshot bruto da
 última execução em `.diagnosis/verovio-6.2.0.{json,md}` (gitignored,
 sobrescrito a cada rodada — ver `crates/server/tests/verovio_6_2_0_transpile_diagnosis.rs`),
 para consultar o estado atual sem reler este histórico nem rodar de novo
-(~5min). Esta seção resume a rodada mais recente, com todos os achados
-abaixo já aplicados até onde estão marcados como corrigidos/parcialmente
-corrigidos, mais o achado 3 (`operator()`, commit `e849c51`):
+(~5min). Esta seção resume a rodada mais recente — a segunda medição deste
+mesmo dia, agora com os achados 8 e 9 (ver seções abaixo) também
+corrigidos:
 
-| Métrica | Valor | Linha de base (primeira rodada) |
-| --- | --- | --- |
-| Unidades de compilação | 298 | 298 |
-| Funções livres lowered | 513 | 513 |
-| Classes/structs lowered | 1345 | 1345 |
-| Arquivos `.dart` emitidos | 301 | 296 |
-| Linhas emitidas | 63.821 | 677.708 |
-| Linhas stub (expressão + statement) | 10.640 + 1.199 ≈ **18,6%** | 20.800 + 70.850 ≈ 13,5% |
-| Arquivos que não parseiam | **16 / 301 (5%)** | 67 / 296 (23%) |
-| Erros do `dart analyze` | **7.909** | 154.636 |
-| Avisos do `dart analyze` | 10.191 | 19.754 |
-| Tempo de extração `libclang` | 322,7s | ~300s |
+| Métrica | Valor | Medição anterior (mesmo dia) | Linha de base (primeira rodada) |
+| --- | --- | --- | --- |
+| Unidades de compilação | 298 | 298 | 298 |
+| Funções livres lowered | 513 | 513 | 513 |
+| Classes/structs lowered | 1345 | 1345 | 1345 |
+| Arquivos `.dart` emitidos | 300 | 301 | 296 |
+| Linhas emitidas | 63.756 | 63.821 | 677.708 |
+| Linhas stub (expressão + statement) | 10.633 + 1.208 ≈ 18,6% | 10.640 + 1.199 ≈ 18,6% | 20.800 + 70.850 ≈ 13,5% |
+| Arquivos que não parseiam | **7 / 300 (2%)** | 16 / 301 (5%) | 67 / 296 (23%) |
+| Erros do `dart analyze` | **5.089** | 7.909 | 154.636 |
+| Avisos do `dart analyze` | 10.190 | 10.191 | 19.754 |
+| Tempo de extração `libclang` | 321,7s | 322,7s | ~300s |
 
-A queda de 677.708 para 63.821 linhas emitidas não é (só) efeito dos achados
-abaixo — o commit `76a5395` ("Corrige a emissao de enums e o custo
-quadratico reintroduzido em emit_package", 2026-08-16, já mesclado antes
-desta medição) corrigiu uma regressão de custo quadrático em
-`emit_package` que multiplicava linhas emitidas; a primeira rodada deste
-documento foi medida com essa regressão ainda presente, então a comparação
-direta de "linhas emitidas" entre as duas colunas acima superestima o
-efeito dos achados 1–6. A contagem de TUs/funções/records (vinda da
-extração `libclang`, não do emissor) não muda entre as duas colunas — sinal
-de que a extração nunca foi afetada, só a emissão.
-
-`duplicate_definition` — o achado dominante da primeira rodada (85% dos
-erros) — caiu para **514** nesta medição, batendo exatamente com o número
-já registrado no achado 1 abaixo; não é mais o maior contribuinte. Ver
-"Veredito" e "Recomendação" atualizados a seguir para o que domina agora.
+Os achados 8 e 9 sozinhos derrubaram 9 dos 16 arquivos que ainda não
+parseiam (16/301 → 7/300) e quase 36% dos erros do `dart analyze`
+(7.909 → 5.089, −2.820) — bem mais que os dois arquivos de reprodução
+mínima citados nas seções abaixo sugeririam: ambos os padrões (enum
+anônimo, parâmetro sem nome) são comuns o bastante no Verovio para
+aparecer espalhados por muitos arquivos diferentes, não só nos dois
+citados como repro. Note que `not_enough_positional_arguments` (118) e
+`extra_positional_arguments` (97) aparecem como regras novas nesta
+medição — esperado: arquivos que antes nem chegavam a parsear (por causa
+dos achados 8/9) agora expõem chamadas cujo número de argumentos o
+`dart analyze` só consegue checar depois que a assinatura chamada
+realmente parseia.
 
 ## Veredito
 
@@ -120,11 +117,16 @@ saída em cascata.
 **Na primeira rodada, 85% dos erros do `dart analyze` (132.023 de 154.636)
 eram `duplicate_definition`**, e a causa raiz desse achado dominante foi
 isolada com uma reprodução mínima, não é hipótese (achado 1 abaixo). Com os
-achados 1 (parcial), 2, 3 (parcial) e 6 já aplicados, esse não é mais o
-achado dominante: na medição mais recente, o maior contribuinte é
-`receiver_of_type_never` (3.786 de 7.909, ~48%), seguido por `unused_field`
-(2.096), `undefined_method` (2.066) e `dead_code` (1.993) — nenhum desses
-quatro tem reprodução mínima isolada ainda (ver "Recomendação").
+achados 1 (parcial), 2, 3 (parcial), 6, 8 e 9 já aplicados, esse não é mais
+o achado dominante — `duplicate_definition` caiu para 135 nesta medição
+(era 514 na medição anterior do mesmo dia, antes dos achados 8/9; ver
+"Recomendação" para a hipótese de por que corrigir arquivos que antes nem
+parseavam também reduziu isso). O maior contribuinte na regra do
+`dart analyze` (soma de erro + aviso por regra, não separado por
+severidade) segue sendo `receiver_of_type_never` (3.786), seguido por
+`unused_field` (2.096), `undefined_method` (2.049) e `dead_code` (1.993) —
+nenhum desses quatro tem reprodução mínima isolada ainda (ver
+"Recomendação").
 
 ## Achados
 
@@ -428,43 +430,71 @@ Nenhum dos treze degraus tem essa forma (um record com papel duplo); é o
 mesmo tipo de tensão que motivou o achado 2 (nome sem namespace), mas na
 dimensão "papel na herança", não "nome" — potencial achado 7.
 
-### 8. Enum anônimo do C++ vira identificador Dart inválido
+### 8. Enum anônimo do C++ vira identificador Dart inválido — **corrigido**
 
 Achado novo (2026-08-17, encontrado na medição mais recente, entre os 16
 arquivos que ainda não parseiam). `enum { PARTIAL_NONE, PARTIAL_THROUGH,
 PARTIAL_RIGHT, PARTIAL_LEFT };` (C++ sem nome de tag, comum como campo
-anônimo de struct) sai como:
+anônimo de struct) saía como:
 
 ```dart
 enum (unnamed enum at .../vrv/beam.h:25:1) { PARTIAL_NONE, PARTIAL_THROUGH, PARTIAL_RIGHT, PARTIAL_LEFT }
 ```
 
-O texto descritivo que o extrator usa internamente para identificar um enum
-sem nome (`"(unnamed enum at <arquivo>:<linha>:<coluna>)"`, útil como chave
-de diagnóstico/log) está vazando direto para a posição de identificador
-Dart, em vez de virar um nome sintetizado válido (ex.: derivado do nome do
-campo que o usa, ou um `AnonymousEnumN` determinístico por posição). Erro de
-*parse*, mesma severidade do achado 3. Reprodução mínima: `include/vrv/beam.h:25`
-no Verovio 6.2.0 real; `lib/beam.dart` é um dos 16 arquivos inválidos desta
-rodada.
+O texto descritivo que este libclang usa para um `enum` sem nome
+(`"(unnamed enum at <arquivo>:<linha>:<coluna>)"`) não é `""` como o código
+assumia — `clang_getCursorSpelling` retorna esse texto explicativo em vez
+de string vazia para um enum anônimo, então o guard `name.is_empty()` já
+existente em `enum_identity`/`lower_type`'s `CXType_Enum` nunca disparava.
+Erro de *parse*, mesma severidade do achado 3.
 
-### 9. Parâmetro C++ sem nome quebra a assinatura Dart emitida
+**Corrigido** (`crates/server/src/lower/cpp.rs`, `dart_enum_type_name`):
+trocado o teste de vazio por `clang_Cursor_isAnonymous`, a API do libclang
+que responde a pergunta certa independente de versão/wording — a mesma
+função já é usada tanto por `enum_identity` (declaração) quanto pelo
+branch `CXType_Enum` de `lower_type` (referência de tipo), então os dois
+lugares corrigem juntos com uma única mudança. `enum_identity` também foi
+simplificado para delegar inteiramente a `dart_enum_type_name` em vez de
+duplicar a lógica de nome com uma checagem própria (que era, por sinal, a
+checagem que não pegava o caso). Prova:
+`an_anonymous_enum_is_never_declared_under_libclangs_debug_spelling` em
+`crates/server/tests/lower_cpp.rs`. Reprodução mínima confirmada:
+`include/vrv/beam.h:25` no Verovio 6.2.0 real.
+
+**Impacto medido no Verovio 6.2.0 real (junto com o achado 9, não
+separado):** ver "Medição mais recente" acima — os dois juntos derrubaram
+16/301 → 7/300 arquivos inválidos e 7.909 → 5.089 erros do `dart analyze`.
+
+### 9. Parâmetro C++ sem nome quebra a assinatura Dart emitida — **corrigido**
 
 Achado novo (2026-08-17, mesma origem que o achado 8). Declarações C++ com
 parâmetro sem nome (legal em C++, comum em assinaturas de interface/pura
-virtual onde o parâmetro não é usado no corpo) saem com a vírgula/posição do
-parâmetro mas sem identificador nenhum:
+virtual onde o parâmetro não é usado no corpo) saíam com a vírgula/posição
+do parâmetro mas sem identificador nenhum:
 
 ```dart
 bool IsCloserToStaffThan(FloatingObject? , data_STAFFREL ) {
 ```
 
 Dart exige um nome para cada parâmetro posicional. Erro de *parse*.
-Reprodução mínima: `FloatingObject::IsCloserToStaffThan` no Verovio 6.2.0
-real; `lib/floatingobject.dart` é um dos 16 arquivos inválidos desta rodada.
-Correção provável: sintetizar um nome posicional (`arg0`, `arg1`, ...)
-sempre que o parâmetro C++ não tiver `spelling`, mesmo padrão que outras
-sínteses de nome já usam no projeto.
+
+**Corrigido** (`crates/server/src/lower/cpp.rs`,
+`collect_params_with_clone_prelude` — a função única compartilhada por
+função livre, método e construtor, `lower_function`/`lower_method`/o
+construtor, todos afetados igualmente): quando `clang_getCursorSpelling`
+do parâmetro vem vazio, sintetiza `arg{posição}` (`arg0`, `arg1`, ...) em
+vez de propagar a string vazia. Prova:
+`an_unnamed_parameter_gets_a_synthesized_positional_dart_name` em
+`crates/server/tests/lower_cpp.rs`. Reprodução mínima confirmada:
+`FloatingObject::IsCloserToStaffThan` no Verovio 6.2.0 real.
+
+**Impacto medido no Verovio 6.2.0 real (junto com o achado 8, não
+separado):** ver "Medição mais recente" acima. Isolar o efeito de cada um
+separadamente exigiria duas rodadas adicionais (~5min cada); não feito
+aqui porque os dois eram pequenos e isolados o bastante para valer aplicar
+juntos direto — o combinado já mostra que os dois padrões, sozinhos,
+respondem por 9 dos 16 arquivos inválidos e quase 36% dos erros da medição
+anterior.
 
 ## O que já funciona
 
@@ -509,32 +539,38 @@ de agora.
 7. **Achado 1, restante — ainda aberto.** Sobrecarga por aridade com
    retorno diferente (`IsAlignedWithSameLayer`) e grupos com 3+ membros.
 
-**Próximos passos, por alavancagem na medição de 2026-08-17 (7.909 erros,
-16/301 arquivos inválidos):**
+**Próximos passos, por alavancagem na medição de 2026-08-17 pós-achados 8/9
+(5.089 erros, 7/300 arquivos inválidos):**
 
-8. **Achados 8 e 9 (enum anônimo, parâmetro sem nome) primeiro** — os dois
-   são erros de *parse*, a categoria que a própria convenção deste
-   documento já trata como mais grave que erro de análise (quebra até a
-   formatação, não só `dart analyze`). Ambos têm reprodução mínima real no
-   Verovio (`beam.h:25`, `FloatingObject::IsCloserToStaffThan`) e correção
-   provável pequena e isolada (nome sintetizado em vez de texto
-   descritivo/vazio). Juntos, dois dos 16 arquivos que ainda não parseiam
-   — vale checar quantos dos 14 restantes compartilham a mesma causa antes
-   de assumir que são 16 causas distintas.
-9. **Novo achado dominante candidato: `receiver_of_type_never` (3.786,
-   ~48% dos erros) — ainda sem reprodução mínima isolada.** Hipótese a
-   verificar primeiro (não confirmada): mesma dinâmica do achado 5—
-   `emit::dart::emit_body` tipa uma expressão como `Never` quando a
-   compila a partir de um bailout, e código que antes ficava atrás de um
-   `Unsupported` de função inteira agora expõe chamadas/acessos sobre esses
-   valores `Never`. Se confirmado, resolver o achado 1 restante (item 7) e
-   o achado 4 (item 3) deve reduzir `receiver_of_type_never` como efeito
-   colateral, na mesma lógica já observada no achado 5 — então vale medir
-   de novo depois de resolver 7 e 3 antes de investir numa correção
-   dedicada aqui. `unused_field` (2.096) e `undefined_method` (2.066), os
-   próximos dois maiores, ainda não têm hipótese.
-10. **Achado 1, restante (item 7) e achado 4 (item 3) continuam a maior
-    alavancagem entre o que já tem causa raiz conhecida** — com o achado 3
-    parcialmente resolvido e o achado 6 resolvido, são os dois achados mais
-    antigos deste documento ainda sem correção, e a hipótese do item 9
-    acima é mais um motivo para priorizá-los.
+8. ~~Achados 8 e 9 (enum anônimo, parâmetro sem nome)~~ — **feitos**, ver
+   seções acima. 16/301 → 7/300 arquivos inválidos, 7.909 → 5.089 erros.
+9. **Os 7 arquivos que ainda não parseiam primeiro** — erro de *parse*
+   continua mais grave que erro de análise por convenção deste documento.
+   `lib/humlib.dart` já era conhecido (biblioteca de terceiros embarcada,
+   estilo de código diferente, não investigado); os outros 6
+   (`iocmme`, `jsonxx`, `pugixml`, `tuningsimpl`, `vrv`, `zip_file.dart`)
+   são achados candidatos novos, ainda sem reprodução mínima isolada —
+   próximo passo natural: rodar `dart format` em cada um para ver a causa
+   exata, do jeito que achados 8/9 foram isolados a partir do stderr do
+   `dart format` nos dois primeiros arquivos inválidos da rodada anterior.
+10. **Novo achado dominante candidato: `receiver_of_type_never` (3.786) —
+    ainda sem reprodução mínima isolada.** Hipótese a verificar primeiro
+    (não confirmada): mesma dinâmica do achado 5 — `emit::dart::emit_body`
+    tipa uma expressão como `Never` quando compila a partir de um bailout,
+    e código que antes ficava atrás de um `Unsupported` de função inteira
+    agora expõe chamadas/acessos sobre esses valores `Never`. Se
+    confirmado, resolver o achado 1 restante (item 12) e o achado 4 (item
+    11) deve reduzir `receiver_of_type_never` como efeito colateral, na
+    mesma lógica já observada no achado 5 — então vale medir de novo
+    depois de resolver 11 e 12 antes de investir numa correção dedicada
+    aqui. `unused_field` (2.096) e `undefined_method` (2.049), os próximos
+    dois maiores, ainda não têm hipótese.
+11. **Achado 4 (STL não reconhecida vira tipo inválido) — ainda aberto.**
+    Correção rápida e na linha de "silêncio é proibido": fazer
+    `lower_type` cair em `Type::Unsupported` para qualquer especialização
+    de template da stdlib sem adaptador, em vez de tratá-la como um
+    `Record` do usuário.
+12. **Achado 1, restante — ainda aberto.** Sobrecarga por aridade com
+    retorno diferente (`IsAlignedWithSameLayer`) e grupos com 3+ membros —
+    o achado mais antigo deste documento ainda sem correção completa, e a
+    hipótese do item 10 acima é mais um motivo para priorizá-lo.

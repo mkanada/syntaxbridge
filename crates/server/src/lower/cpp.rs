@@ -521,8 +521,7 @@ unsafe fn enum_identity(
     decl: clang_sys::CXCursor,
     project_root: &Path,
 ) -> Option<(String, String)> {
-    let name =
-        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(decl)) };
+    let name = unsafe { dart_enum_type_name(decl) };
     if name.is_empty() {
         return None;
     }
@@ -535,7 +534,7 @@ unsafe fn enum_identity(
         return None;
     }
 
-    Some((usr, unsafe { dart_enum_type_name(decl) }))
+    Some((usr, name))
 }
 
 /// Every enumerator of `decl`, in source order, already under the Dart
@@ -570,6 +569,18 @@ unsafe fn enum_variants(decl: clang_sys::CXCursor) -> Vec<String> {
 /// `qualified_static_member_name`) reach the identical name from the same
 /// cursor without having to know what else the file contains.
 unsafe fn dart_enum_type_name(decl: clang_sys::CXCursor) -> String {
+    // `clang_getCursorSpelling` on an anonymous `enum { ... };` is *not*
+    // reliably empty — this project's libclang returns the descriptive
+    // debug text `"(unnamed enum at <file>:<line>:<col>)"` instead (achado
+    // 8, `verovio_6_2_0_transpile_diagnosis`: that text leaked straight
+    // into a Dart `enum` declaration, which `dart format` rejects).
+    // `clang_Cursor_isAnonymous` is the version-independent way to ask the
+    // question this function actually needs answered, so every caller's
+    // existing `name.is_empty()` check (both here and in `lower_type`'s
+    // `CXType_Enum` branch) keeps working without knowing about the quirk.
+    if unsafe { clang_sys::clang_Cursor_isAnonymous(decl) } != 0 {
+        return String::new();
+    }
     let name =
         unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(decl)) };
     let owner = unsafe { clang_sys::clang_getCursorSemanticParent(decl) };
@@ -1260,8 +1271,18 @@ unsafe fn collect_params_with_clone_prelude(
             continue;
         }
 
-        let param_name = unsafe {
+        // A C++ parameter may legally have no name (common in an interface
+        // signature that never uses it, e.g. `bool F(int, bool named)`) —
+        // Dart requires every positional parameter to have one. Achado 9,
+        // `verovio_6_2_0_transpile_diagnosis`: left blank, this produced a
+        // parameter with no identifier at all, which `dart format` rejects.
+        let spelling = unsafe {
             type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(param_cursor))
+        };
+        let param_name = if spelling.is_empty() {
+            format!("arg{}", params.len())
+        } else {
+            spelling
         };
         let cx_type = unsafe { clang_sys::clang_getCursorType(param_cursor) };
         let ty = lower_type(cx_type);
