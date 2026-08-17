@@ -408,6 +408,13 @@ pub(crate) fn finish_function_catalog(partials: Vec<FunctionCatalogPartial>) -> 
     // of its decisions are acted on here.
     apply_overload_renames(&mut ir_functions, &mut ir_records, &declarations, &calls);
 
+    // Item 9 of the same diagnosis: a free function/method legally named
+    // after a Dart reserved word (`bool is()`) lowers with that name
+    // untouched, a Dart parse error at the declaration. Runs after the
+    // overload pass above (disjoint conditions, order doesn't matter
+    // between the two — see that function's own doc comment).
+    apply_reserved_word_renames(&mut ir_functions, &mut ir_records);
+
     // Verovio 6.2.0 diagnosis (`docs/plans/diagnostico-verovio-6.2.0.md`
     // achado 2): two distinct C++ classes with the same short name in
     // different namespaces both lower correctly, but `emit::dart` names the
@@ -563,6 +570,23 @@ fn apply_overload_renames(
         }
     }
 
+    apply_renames(ir_functions, ir_records, &renames);
+}
+
+/// Rewrites every `ir::Function`/`ir::Method` whose `usr` is a key of
+/// `renames` to its mapped name, and every call site referencing that same
+/// `usr` (`rename_calls_in_params`/`rename_calls_in_stmts`, walking default
+/// argument values and bodies alike) to match — the "computed once, applied
+/// everywhere" application half of both `apply_overload_renames` and
+/// `apply_reserved_word_renames`, factored out so the two renaming passes
+/// (different reasons to rename, same usr-keyed mechanics) can't drift
+/// apart on how a rename actually gets carried out. A no-op when `renames`
+/// is empty — the overwhelmingly common case for both callers.
+fn apply_renames(
+    ir_functions: &mut [ir::Function],
+    ir_records: &mut [ir::Record],
+    renames: &HashMap<String, String>,
+) {
     if renames.is_empty() {
         return;
     }
@@ -571,24 +595,62 @@ fn apply_overload_renames(
         if let Some(new_name) = renames.get(&function.usr) {
             function.name = new_name.clone();
         }
-        rename_calls_in_params(&mut function.params, &renames);
-        rename_calls_in_stmts(&mut function.body, &renames);
+        rename_calls_in_params(&mut function.params, renames);
+        rename_calls_in_stmts(&mut function.body, renames);
     }
     for record in ir_records.iter_mut() {
         for method in &mut record.methods {
             if let Some(new_name) = renames.get(&method.usr) {
                 method.name = new_name.clone();
             }
-            rename_calls_in_params(&mut method.params, &renames);
+            rename_calls_in_params(&mut method.params, renames);
             if let Some(body) = &mut method.body {
-                rename_calls_in_stmts(body, &renames);
+                rename_calls_in_stmts(body, renames);
             }
         }
         for constructor in &mut record.constructors {
-            rename_calls_in_params(&mut constructor.params, &renames);
-            rename_calls_in_stmts(&mut constructor.body, &renames);
+            rename_calls_in_params(&mut constructor.params, renames);
+            rename_calls_in_stmts(&mut constructor.body, renames);
         }
     }
+}
+
+/// Verovio 6.2.0 diagnosis (`docs/plans/diagnostico-verovio-6.2.0.md`, item
+/// 9): a free function or method legally named after a Dart reserved word
+/// (`bool is()`, `void finally()` — none of Dart's reserved words are
+/// reserved in C++) lowers with that name untouched, a parse error in the
+/// emitted Dart. Unlike a parameter/local variable (lexically scoped, fixed
+/// up directly in `lower::cpp` by `dart_safe_identifier`), a
+/// function/method name is resolved at each call site by `usr`, not by
+/// re-deriving the C++ spelling — so the fix reuses
+/// `apply_overload_renames`'s own `renames`-map-plus-`apply_renames`
+/// mechanism rather than duplicating it, keyed here by "is this name a
+/// reserved word" instead of "does this name collide with a sibling
+/// overload".
+///
+/// Runs after `apply_overload_renames`: the two renaming conditions are
+/// disjoint (an overload's suffix, e.g. `IsConst`, is never itself a
+/// reserved word), so order between them doesn't change the outcome, but
+/// grouping every renaming pass together matches the declaration order
+/// above.
+fn apply_reserved_word_renames(ir_functions: &mut [ir::Function], ir_records: &mut [ir::Record]) {
+    let mut renames: HashMap<String, String> = HashMap::new();
+    for function in ir_functions.iter() {
+        let safe_name = lower::cpp::dart_safe_identifier(&function.name);
+        if safe_name != function.name {
+            renames.insert(function.usr.clone(), safe_name);
+        }
+    }
+    for record in ir_records.iter() {
+        for method in &record.methods {
+            let safe_name = lower::cpp::dart_safe_identifier(&method.name);
+            if safe_name != method.name {
+                renames.insert(method.usr.clone(), safe_name);
+            }
+        }
+    }
+
+    apply_renames(ir_functions, ir_records, &renames);
 }
 
 /// Verovio 6.2.0 diagnosis (`docs/plans/diagnostico-verovio-6.2.0.md`

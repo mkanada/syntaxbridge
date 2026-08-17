@@ -100,6 +100,41 @@ dos achados 8/9) agora expõem chamadas cujo número de argumentos o
 `dart analyze` só consegue checar depois que a assinatura chamada
 realmente parseia.
 
+## Medição mais recente (2026-08-17, após os achados 10–12: zero arquivos inválidos)
+
+Investigação do item 9 da Recomendação ("os 7 arquivos que ainda não
+parseiam primeiro"): rodar `dart format --output=none` em cada um dos 7
+arquivos (`.diagnosis/dart-package/`, instrumentação temporária de
+`verovio_6_2_0_transpile_diagnosis.rs` que persiste o pacote emitido e
+imprime o stderr completo de cada arquivo inválido, não só dos dois
+primeiros) isolou três causas-raiz distintas, nenhuma delas prevista pelos
+achados 1–9:
+
+| Métrica | Valor | Medição anterior (mesmo dia) |
+| --- | --- | --- |
+| Unidades de compilação | 298 | 298 |
+| Funções livres lowered | 515 | 515 |
+| Classes/structs lowered | 1.344 | 1.345 |
+| Arquivos `.dart` emitidos | 300 | 300 |
+| Linhas emitidas | 63.707 | 63.766 |
+| Linhas stub (expressão + statement) | 10.598 + 1.216 ≈ 18,5% | 10.633 + 1.210 ≈ 18,6% |
+| Arquivos que não parseiam | **0 / 300 (0%)** | 7 / 300 (2%) |
+| Erros do `dart analyze` | **4.991** | 5.090 |
+| Avisos do `dart analyze` | 10.164 | 10.190 |
+| Tempo de extração `libclang` | 328,3s | 323,9s |
+
+**Todo arquivo emitido agora é, no mínimo, Dart sintaticamente válido** —
+pela primeira vez desde que este diagnóstico existe, `arquivos que não
+parseiam` chega a zero. A contagem de classes caiu em 1 (1.345 → 1.344,
+esperada: o achado 11 abaixo faz um `struct` anônimo parar de ser
+declarado, o comportamento correto) e a de erros do `dart analyze` caiu
+99 (5.090 → 4.991, −1,9%) — um efeito pequeno perto dos achados 8/9,
+porque os três achados desta rodada corrigem *erros de parse*
+(`Could not format`), que nem chegavam a contar como erro de
+`dart analyze` — eliminá-los destrava a *análise* de código que antes
+ficava inteiramente invisível atrás de "o arquivo não parseia", não
+elimina erros de análise por si só.
+
 ## Veredito
 
 O mecanismo central escala: as 298 unidades de compilação passam pela
@@ -496,6 +531,125 @@ juntos direto — o combinado já mostra que os dois padrões, sozinhos,
 respondem por 9 dos 16 arquivos inválidos e quase 36% dos erros da medição
 anterior.
 
+### 10. Identificador C++ colidindo com palavra reservada do Dart — **corrigido**
+
+Achado novo (2026-08-17, investigação do item 9 da Recomendação: os 7
+arquivos que ainda não parseiam após os achados 8/9).
+`dart_enum_constant_name` (achado do E-degrau original, não desta rodada)
+já tratava esse problema para *constantes de enum*, mas nenhum outro lugar
+que cunha um identificador Dart a partir de um nome C++ aplicava a mesma
+checagem — e um identificador C++ nomeado `is`, `in`, `var` ou `finally`
+(nenhuma dessas é palavra reservada em C++) é comum o bastante em código
+real para aparecer como nome de método (`bool is()`, `jsonxx.dart`), nome
+de função livre, nome de parâmetro (`void f(int in)`, `vrv.dart`;
+`void f(xpath_variable_boolean *var)`, `pugixml.dart`) e nome de variável
+local (`basic_istringstream is = ...;`, `jsonxx.dart`) — cada um, sozinho,
+um erro de *parse* (`'is' can't be used as an identifier because it's a
+keyword`).
+
+**Corrigido** com `lower::cpp::dart_safe_identifier`
+(`crates/server/src/lower/cpp.rs`), uma função pura (sem tabela de
+símbolos: dado o mesmo texto, sempre produz o mesmo resultado) que
+generaliza a lista de palavras reservadas que `dart_enum_constant_name` já
+tinha, agora compartilhada por todo lugar que cunha um identificador Dart
+de valor. Dois mecanismos diferentes aplicam essa função, um para cada
+classe de identificador:
+
+- **Parâmetro e variável local** (com escopo léxico, não por `usr`):
+  aplicada diretamente em `lower::cpp`, tanto na declaração
+  (`collect_params_with_clone_prelude`, o `DeclStmt`/`VarDecl` de
+  `lower_compound_stmt`) quanto em toda referência dentro do corpo
+  (`dart_member_name`, já o único ponto de passagem tanto para campo
+  quanto para parâmetro/local referenciado por `DeclRefExpr` — sendo pura,
+  a mesma função nos dois lados garante que as duas nunca discordem, sem
+  precisar de tabela alguma).
+- **Método e função livre** (resolvidos por `usr` em cada chamada, não por
+  nome): novo passe `function_catalog::apply_reserved_word_renames`, que
+  reaproveita o mesmo mecanismo `renames: HashMap<usr, nome>` +
+  `apply_renames` que `apply_overload_renames` (US-7) já estabeleceu para
+  a sobrecarga — extraído para uma função compartilhada
+  (`apply_renames`) para os dois passes de renomeação não poderem divergir
+  em como uma renomeação é de fato aplicada. Roda logo depois do passe de
+  sobrecarga (condições disjuntas, ordem entre os dois não importa).
+
+Provas: `a_method_named_after_a_dart_reserved_word_is_renamed_at_declaration_and_call_site`,
+`a_free_function_named_after_a_dart_reserved_word_is_renamed_at_declaration_and_call_site`,
+`a_parameter_named_after_a_dart_reserved_word_gets_a_safe_dart_name`,
+`a_local_variable_named_after_a_dart_reserved_word_gets_a_safe_dart_name`,
+todos em `crates/server/tests/lower_cpp.rs`.
+
+### 11. Struct anônimo vaza spelling de depuração do libclang — **corrigido**
+
+Achado novo (2026-08-17, mesma investigação do achado 10; repro
+confirmado: `zip_file.hpp:9461`, um `struct { ... } date_time;` sem nome de
+tag dentro de outra classe). Mesmo padrão do achado 8 (enum anônimo), mas
+para `struct`/`class`: `clang_getCursorSpelling` num record anônimo não
+retorna vazio — retorna o texto de depuração
+`"(unnamed struct at <arquivo>:<linha>:<coluna>)"` — e esse texto vazava
+tanto para uma declaração `class (unnamed struct at ...) { ... }` (erro de
+parse) quanto para o tipo de um campo desse struct (`(unnamed struct at
+...) date_time;`, também erro de parse — mais grave que o achado 4, que
+pelo menos produz um tipo sintaticamente válido, só inválido
+semanticamente).
+
+**Corrigido** (`crates/server/src/lower/cpp.rs`) com a mesma técnica do
+achado 8: `clang_Cursor_isAnonymous`, não `name.is_empty()`, decide se um
+record é anônimo. Dois pontos, espelhando exatamente `lower_record`/
+`lower_type`'s `CXType_Enum` do achado 8:
+
+- `lower_record` retorna `None` para um record anônimo (nunca declarado —
+  não há nome Dart válido para declará-lo sob, mesmo raciocínio de
+  `enum_identity`).
+- `lower_type`'s ramo `CXType_Record` força `name` vazio para um `decl`
+  anônimo, roteando pelo branch `Unsupported` já existente em vez de
+  produzir um `Type::Record` apontando para uma classe nunca declarada —
+  um campo desse tipo vira o bailout honesto genérico
+  (`dynamic /* unsupported: ... */`), o mesmo que qualquer outro tipo não
+  representável já usa.
+
+Prova: `an_anonymous_struct_is_never_declared_under_libclangs_debug_spelling`
+em `crates/server/tests/lower_cpp.rs`.
+
+### 12. Alvo de `TupleAssign` atrás de receptor anulável quebra a sintaxe de pattern-assignment — **corrigido**
+
+Achado novo (2026-08-17, mesma investigação; repro real:
+`Fraction::ReduceStatic` do `iocmme.dart`, chamado com um campo alcançado
+por um ponteiro anulável como argumento por referência —
+`_m_mensInfo!.proportNum`). A ponte de out-param (E10/achado 5) emite uma
+atribuição por desestruturação Dart, `(alvos...) = chamada;`. Quando um
+alvo é um campo acessado por um receptor anulável, esse campo precisa de
+`receptor!.campo` (o próprio `!` que o achado 5 já introduz) — mas a
+gramática de *pattern assignment* do Dart não aceita um `!` pós-fixo
+dentro de um elemento do padrão (`dart format`: "Expected to find ')'"
+bem no `!`, confirmado empiricamente contra o arquivo real). Atribuição
+comum (fora de um padrão) não tem essa restrição — `receptor!.campo =
+valor;` é Dart válido — então o problema é específico da sintaxe de
+desestruturação, não do `!` em si.
+
+**Corrigido** (`crates/server/src/emit/dart.rs`): quando algum alvo de
+`Stmt::TupleAssign` precisaria de `!` (`tuple_assign_needs_temp_block`,
+testando se é um `FieldAccess`/`Index` cujo receptor é `Type::Nullable`),
+a emissão contorna a gramática de padrão inteiramente — um bloco `{ ... }`
+(escopo léxico próprio, evitando qualquer colisão de nome mesmo com uma
+segunda chamada em ponte na mesma função) guarda o resultado da chamada
+numa temporária de nome fixo, e cada alvo é atribuído individualmente com
+sintaxe de atribuição comum (`receptor!.campo = temp.$N;`). Quando nenhum
+alvo precisa de `!`, a sintaxe de pattern-assignment original é preservada
+sem mudança.
+
+Prova: `a_tuple_assign_target_reached_through_a_nullable_receiver_avoids_pattern_assignment_syntax`
+em `crates/server/tests/lower_cpp.rs`.
+
+**Impacto medido no Verovio 6.2.0 real (achados 10–12 juntos, não
+separados — mesmo raciocínio dos achados 8/9: os três eram pequenos e
+isolados o bastante para valer aplicar juntos):** ver "Medição mais
+recente" acima. Os três achados juntos derrubaram os 7 arquivos que ainda
+não parseavam para **zero** — a primeira vez que este diagnóstico mede
+100% dos arquivos emitidos como Dart sintaticamente válido — e os erros do
+`dart analyze` caíram 5.090 → 4.991 (−99, −1,9%, efeito modesto porque os
+três corrigem erros de *parse*, que não contavam para essa métrica em
+primeiro lugar).
+
 ## O que já funciona
 
 Nada do que os treze degraus construíram foi contradito por esta escala:
@@ -544,16 +698,17 @@ de agora.
 
 8. ~~Achados 8 e 9 (enum anônimo, parâmetro sem nome)~~ — **feitos**, ver
    seções acima. 16/301 → 7/300 arquivos inválidos, 7.909 → 5.089 erros.
-9. **Os 7 arquivos que ainda não parseiam primeiro** — erro de *parse*
-   continua mais grave que erro de análise por convenção deste documento.
-   `lib/humlib.dart` já era conhecido (biblioteca de terceiros embarcada,
-   estilo de código diferente, não investigado); os outros 6
-   (`iocmme`, `jsonxx`, `pugixml`, `tuningsimpl`, `vrv`, `zip_file.dart`)
-   são achados candidatos novos, ainda sem reprodução mínima isolada —
-   próximo passo natural: rodar `dart format` em cada um para ver a causa
-   exata, do jeito que achados 8/9 foram isolados a partir do stderr do
-   `dart format` nos dois primeiros arquivos inválidos da rodada anterior.
-10. **Novo achado dominante candidato: `receiver_of_type_never` (3.786) —
+9. ~~Os 7 arquivos que ainda não parseiam~~ — **feito**. Investigação
+   isolou três causas-raiz independentes (achados 10–12 acima: identificador
+   colidindo com palavra reservada do Dart, struct anônimo, alvo de
+   `TupleAssign` atrás de receptor anulável) — nenhuma delas era
+   `lib/humlib.dart`-específica (biblioteca de terceiros embarcada, a
+   hipótese original para os 7): os três padrões apareciam espalhados por
+   `jsonxx`/`tuningsimpl`/`vrv`/`pugixml`/`iocmme`/`zip_file` também. **0/300
+   arquivos inválidos** na medição mais recente — pela primeira vez, todo
+   arquivo emitido é Dart sintaticamente válido; ver "Medição mais
+   recente" acima.
+10. **Novo achado dominante candidato: `receiver_of_type_never` (3.775) —
     ainda sem reprodução mínima isolada.** Hipótese a verificar primeiro
     (não confirmada): mesma dinâmica do achado 5 — `emit::dart::emit_body`
     tipa uma expressão como `Never` quando compila a partir de um bailout,
@@ -563,8 +718,9 @@ de agora.
     11) deve reduzir `receiver_of_type_never` como efeito colateral, na
     mesma lógica já observada no achado 5 — então vale medir de novo
     depois de resolver 11 e 12 antes de investir numa correção dedicada
-    aqui. `unused_field` (2.096) e `undefined_method` (2.049), os próximos
-    dois maiores, ainda não têm hipótese.
+    aqui. `unused_field` (2.096) e `undefined_method` (2.039), os próximos
+    dois maiores, ainda não têm hipótese. Com os arquivos inválidos
+    zerados (item 9), esta é agora a maior alavancagem única disponível.
 11. **Achado 4 (STL não reconhecida vira tipo inválido) — ainda aberto.**
     Correção rápida e na linha de "silêncio é proibido": fazer
     `lower_type` cair em `Type::Unsupported` para qualquer especialização

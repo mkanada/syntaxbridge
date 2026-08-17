@@ -127,6 +127,21 @@ fn transpiling_the_real_verovio_6_2_0_project_reports_coverage() {
         fs::write(&path, contents).expect("write emitted Dart file");
     }
 
+    // Persistent copy for post-mortem inspection: `package_dir` lives under
+    // `TempWorkspace`, deleted on drop at the end of this function, so once
+    // the test finishes there is no way to grep/read the emitted Dart short
+    // of rerunning the whole ~5min pipeline. `.diagnosis/` is already
+    // gitignored and already used for the JSON/MD snapshot below.
+    let persistent_package_dir = repo_root().join(".diagnosis/dart-package");
+    let _ = fs::remove_dir_all(&persistent_package_dir);
+    for (relative_path, contents) in &files {
+        let path = persistent_package_dir.join(relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create file's parent dir (persistent copy)");
+        }
+        fs::write(&path, contents).expect("write emitted Dart file (persistent copy)");
+    }
+
     eprintln!("[diagnosis] checking which files are even syntactically valid Dart...");
     let mut unparseable_files = Vec::new();
     for relative_path in files.keys() {
@@ -158,8 +173,8 @@ fn transpiling_the_real_verovio_6_2_0_project_reports_coverage() {
     for (path, reason) in unparseable_files.iter().take(15) {
         eprintln!("  - {path}: {}", reason.lines().next().unwrap_or(reason));
     }
-    eprintln!("[diagnosis] full stderr for the first 2 unparseable files:");
-    for (path, reason) in unparseable_files.iter().take(2) {
+    eprintln!("[diagnosis] full stderr for every unparseable file:");
+    for (path, reason) in unparseable_files.iter() {
         eprintln!("=== {path} ===\n{reason}");
     }
     eprintln!("[diagnosis] raw source of the first unparseable file (first 120 lines):");

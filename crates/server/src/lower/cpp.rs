@@ -431,7 +431,22 @@ pub fn lower_constructor(
 /// Lowers a `struct`/`class` *definition* cursor into IR — called from
 /// `function_catalog::visit_cursor` alongside its free-function handling,
 /// on the same already-parsed cursor (see this module's docs).
+///
+/// `None` for an anonymous struct/class (`struct { ... } field;`, item 9 of
+/// `docs/plans/diagnostico-verovio-6.2.0.md` — Verovio's own
+/// `zip_file.hpp`): the same libclang quirk achado 8 already documented for
+/// an anonymous *enum* applies here too — `clang_getCursorSpelling` returns
+/// the descriptive debug text `"(unnamed struct at <file>:<line>:<col>)"`,
+/// not an empty string, so the old `name.is_empty()` guard alone never
+/// caught it, and that text leaked straight into a Dart `class` declaration
+/// (a parse error). `clang_Cursor_isAnonymous` is the version-independent
+/// way to ask the question this function actually needs answered, mirroring
+/// `dart_enum_type_name`'s own fix for the enum case — no usable Dart type
+/// name, so there is nothing to declare here at all.
 pub fn lower_record(cursor: clang_sys::CXCursor, project_root: &Path) -> Option<ir::Record> {
+    if unsafe { clang_sys::clang_Cursor_isAnonymous(cursor) } != 0 {
+        return None;
+    }
     let name =
         unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(cursor)) };
     if name.is_empty() {
@@ -600,14 +615,47 @@ unsafe fn dart_enum_type_name(decl: clang_sys::CXCursor) -> String {
     }
 }
 
+/// Dart's true reserved words — illegal in *any* identifier position, not
+/// just `dart_enum_constant_name`'s enum-constant one. Dart's *built-in
+/// identifiers* (`as`, `mixin`, `static`, ...) are deliberately absent:
+/// they're barred from type-name position only, not from an ordinary
+/// value-level identifier like a parameter/local/method/function name, so
+/// renaming them here would churn names for nothing. None of these is a
+/// C++ keyword either, so an ordinary C++ identifier can land on any of
+/// them (Verovio 6.2.0 diagnosis, item 9: `bool is()`, `void f(int in)`,
+/// `int is = 1;`, `void finally()` all appear in the real corpus).
+const RESERVED_WORDS: &[&str] = &[
+    "assert", "break", "case", "catch", "class", "const", "continue", "default", "do", "else",
+    "enum", "extends", "false", "final", "finally", "for", "if", "in", "is", "new", "null",
+    "rethrow", "return", "super", "switch", "this", "throw", "true", "try", "var", "void", "while",
+    "with",
+];
+
+/// A C++ value-level identifier (parameter, local variable, method, free
+/// function) as a Dart one — every valid C++ identifier is already a valid
+/// Dart one, except for the handful landing on one of Dart's own reserved
+/// words (`RESERVED_WORDS`), which get a trailing `_` appended. Two
+/// distinct callers apply this at the *usr*-based level for methods/free
+/// functions (`function_catalog::apply_reserved_word_renames`, since a call
+/// site is resolved by usr, not by re-deriving the C++ spelling) and at the
+/// lexical level for parameters/locals (this module, both the declaration
+/// and every `DeclRefExpr`/`dart_member_name` reference — see that
+/// function's own doc comment for why a *pure* function of the string,
+/// with no symbol table, is enough to keep the two from ever disagreeing).
+pub(crate) fn dart_safe_identifier(name: &str) -> String {
+    if RESERVED_WORDS.contains(&name) {
+        format!("{name}_")
+    } else {
+        name.to_owned()
+    }
+}
+
 /// A C++ enumerator's name as a Dart enum constant. Every valid C++
 /// identifier is already a valid Dart one, so the only rewriting needed is
-/// for names Dart won't accept *in this position*: its true reserved words,
-/// and the members every Dart enum inherits (`index`/`values` from the enum
-/// itself, the rest from `Object`) — a constant can't shadow any of them.
-/// Dart's *built-in identifiers* (`as`, `mixin`, `static`, ...) are
-/// deliberately absent: they're barred from type names, not from ordinary
-/// identifiers like these, so renaming them would churn names for nothing.
+/// for names Dart won't accept *in this position*: `dart_safe_identifier`'s
+/// reserved words, plus the members every Dart enum inherits
+/// (`index`/`values` from the enum itself, the rest from `Object`) — a
+/// constant can't shadow any of them either.
 ///
 /// Both the declaration (`enum_variants`) and every reference
 /// (`qualified_static_member_name`) resolve names through here, so the two
@@ -616,55 +664,19 @@ unsafe fn dart_enum_type_name(decl: clang_sys::CXCursor) -> String {
 /// Dart then rejects the duplicate constant outright, which is the loud
 /// failure, not a silently mis-emitted program.
 fn dart_enum_constant_name(cpp_name: &str) -> String {
-    const RESERVED: &[&str] = &[
-        // Members every Dart enum already has.
+    const ENUM_INHERITED_MEMBERS: &[&str] = &[
         "index",
         "values",
         "hashCode",
         "runtimeType",
         "toString",
         "noSuchMethod",
-        // Dart's reserved words — none of these is a C++ keyword, so an
-        // ordinary C++ enumerator can land on any of them.
-        "assert",
-        "break",
-        "case",
-        "catch",
-        "class",
-        "const",
-        "continue",
-        "default",
-        "do",
-        "else",
-        "enum",
-        "extends",
-        "false",
-        "final",
-        "finally",
-        "for",
-        "if",
-        "in",
-        "is",
-        "new",
-        "null",
-        "rethrow",
-        "return",
-        "super",
-        "switch",
-        "this",
-        "throw",
-        "true",
-        "try",
-        "var",
-        "void",
-        "while",
-        "with",
     ];
 
-    if RESERVED.contains(&cpp_name) {
+    if ENUM_INHERITED_MEMBERS.contains(&cpp_name) {
         format!("{cpp_name}_")
     } else {
-        cpp_name.to_owned()
+        dart_safe_identifier(cpp_name)
     }
 }
 
@@ -772,7 +784,7 @@ unsafe fn dart_member_name(cursor: clang_sys::CXCursor) -> String {
     if is_private {
         format!("_{}", cpp_name.trim_end_matches('_'))
     } else {
-        cpp_name
+        dart_safe_identifier(&cpp_name)
     }
 }
 
@@ -1139,8 +1151,20 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
             }
             let usr =
                 unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(decl)) };
-            let name = unsafe {
-                type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(decl))
+            // Item 9 of `docs/plans/diagnostico-verovio-6.2.0.md`: an
+            // anonymous struct/class's `clang_getCursorSpelling` is
+            // libclang's descriptive debug text, not empty (same quirk
+            // `lower_record`'s own doc comment documents) — forcing `name`
+            // empty here for that case, same as `lower_record`, routes an
+            // anonymous struct field into the `Unsupported` branch just
+            // below instead of a `Type::Record` naming a class that was
+            // never (and, per `lower_record`, never will be) declared.
+            let name = if unsafe { clang_sys::clang_Cursor_isAnonymous(decl) } != 0 {
+                String::new()
+            } else {
+                unsafe {
+                    type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(decl))
+                }
             };
             if usr.is_empty() || name.is_empty() {
                 // `Unexposed` doesn't always mean "maybe a stdlib class" —
@@ -1276,14 +1300,23 @@ unsafe fn collect_params_with_clone_prelude(
         // Dart requires every positional parameter to have one. Achado 9,
         // `verovio_6_2_0_transpile_diagnosis`: left blank, this produced a
         // parameter with no identifier at all, which `dart format` rejects.
+        // Item 9 of the same diagnosis: a C++ parameter legally named after
+        // a Dart reserved word (`void f(int in)`, none of Dart's reserved
+        // words are reserved in C++) hits the same class of parse error —
+        // `dart_safe_identifier` covers both the synthesized `arg{n}` name
+        // (never reserved, so a no-op there) and a real reserved-word
+        // spelling in one pass. Every reference to this parameter inside
+        // the body resolves through the same function
+        // (`qualified_static_member_name` → `dart_member_name`'s public
+        // branch), so the two can never disagree.
         let spelling = unsafe {
             type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(param_cursor))
         };
-        let param_name = if spelling.is_empty() {
+        let param_name = dart_safe_identifier(&if spelling.is_empty() {
             format!("arg{}", params.len())
         } else {
             spelling
-        };
+        });
         let cx_type = unsafe { clang_sys::clang_getCursorType(param_cursor) };
         let ty = lower_type(cx_type);
 
@@ -1705,9 +1738,17 @@ unsafe fn lower_decl_stmt(
         };
     }
 
-    let name = unsafe {
+    // Item 9 of `docs/plans/diagnostico-verovio-6.2.0.md`
+    // (`verovio_6_2_0_transpile_diagnosis`): a local variable legally named
+    // after a Dart reserved word (`jsonxx.dart`'s own
+    // `basic_istringstream is = ...;`) hits the same parse error a
+    // reserved-word parameter/method name does — `dart_safe_identifier`
+    // covers it the same way. Every reference to this local inside the
+    // body resolves through the same function (`qualified_static_member_name`
+    // → `dart_member_name`'s public branch), so the two can never disagree.
+    let name = dart_safe_identifier(&unsafe {
         type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(*var_decl_cursor))
-    };
+    });
     let cx_type = unsafe { clang_sys::clang_getCursorType(*var_decl_cursor) };
     let ty = lower_type(cx_type);
 

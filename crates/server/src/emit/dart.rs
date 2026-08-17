@@ -2014,6 +2014,38 @@ fn emit_stmt(
             source.push_str(&format!("{pad}}}\n"));
             source
         }
+        // Item 9 of `docs/plans/diagnostico-verovio-6.2.0.md` (real repro:
+        // Verovio's `Fraction::ReduceStatic` called with a nullable-pointer
+        // field as an out-param argument): a target reached through a
+        // nullable receiver needs `receiver!.field` (achado 5's own
+        // null-safety fix, `receiver_bang`) — but Dart's pattern-assignment
+        // grammar doesn't accept a postfix `!` inside a pattern element
+        // (`dart format`: "Expected to find ')'" right after the `!`,
+        // confirmed empirically). Ordinary (non-pattern) assignment has no
+        // such restriction, so a target needing a bang routes around the
+        // pattern grammar entirely: a bare block scopes a temporary holding
+        // the call's result, then each target is assigned individually with
+        // ordinary assignment syntax. The block (not just consecutive
+        // statements) keeps the temporary's name from ever colliding with
+        // another local — including a second bridged call in the same
+        // function — without needing a counter to keep every temporary
+        // name unique.
+        Stmt::TupleAssign { targets, value, .. } if tuple_assign_needs_temp_block(targets) => {
+            let mut source = format!("{pad}{{\n");
+            source.push_str(&format!(
+                "{pad}{INDENT}final {TUPLE_ASSIGN_TEMP} = {};\n",
+                emit_expr(value, used_expr_helper, used_utf8_encode)
+            ));
+            for (index, target) in targets.iter().enumerate() {
+                source.push_str(&format!(
+                    "{pad}{INDENT}{} = {TUPLE_ASSIGN_TEMP}.${};\n",
+                    emit_expr(target, used_expr_helper, used_utf8_encode),
+                    index + 1
+                ));
+            }
+            source.push_str(&format!("{pad}}}\n"));
+            source
+        }
         Stmt::TupleAssign { targets, value, .. } => {
             // A single-element Dart record pattern needs a trailing comma
             // (`(a,) = expr;`) — see `emit_type`'s own `Type::Tuple` arm for
@@ -2132,6 +2164,34 @@ fn expr_ty(expr: &Expr) -> Option<&Type> {
 /// same "trust the source, surface a real crash instead of silently
 /// corrupting state" trade-off C++ itself already made for every one of
 /// these call sites.
+/// The temporary local `Stmt::TupleAssign`'s block-scoped fallback
+/// (`tuple_assign_needs_temp_block`) declares — a bare block statement is
+/// its own lexical scope in Dart, so this fixed name never collides with a
+/// same-named local outside it, or with another bridged call's own block
+/// elsewhere in the same function.
+const TUPLE_ASSIGN_TEMP: &str = "_syntaxBridgeTupleAssign";
+
+/// Whether `Stmt::TupleAssign`'s ordinary record-pattern syntax
+/// (`(targets...) = value;`) is unusable for this `targets` list — true
+/// when any target is reached through a nullable receiver
+/// (`FieldAccess`/`Index`, the only two `Expr` shapes with a receiver
+/// `receiver_bang` can apply `!` to) and so would need that `!` printed
+/// *inside* a pattern element, which Dart's pattern-assignment grammar
+/// rejects (`dart format`: "Expected to find ')'" right at the `!`,
+/// confirmed empirically against a real Verovio file — see this variant's
+/// own doc comment on `emit_stmt`'s `Stmt::TupleAssign` arm).
+fn tuple_assign_needs_temp_block(targets: &[Expr]) -> bool {
+    targets.iter().any(|target| match target {
+        Expr::FieldAccess {
+            target: receiver, ..
+        }
+        | Expr::Index {
+            target: receiver, ..
+        } => !receiver_bang(receiver).is_empty(),
+        _ => false,
+    })
+}
+
 fn receiver_bang(receiver: &Expr) -> &'static str {
     if matches!(expr_ty(receiver), Some(Type::Nullable(_))) {
         "!"

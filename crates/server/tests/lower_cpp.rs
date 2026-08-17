@@ -848,3 +848,249 @@ int f() {
         "expected the inner negation parenthesized, got:\n{source}"
     );
 }
+
+/// Diagnostic finding (`verovio_6_2_0_transpile_diagnosis`, item 9,
+/// `jsonxx.dart`/`humlib.dart`): a C++ method or free function named after a
+/// Dart reserved word (`is`, `finally`, ...) — legal in C++, none of these
+/// are C++ keywords — was emitted with its literal C++ name, which
+/// `dart format` rejects at the declaration (`'is' can't be used as an
+/// identifier because it's a keyword`). The declaration and every call site
+/// have to be renamed together (`function_catalog::apply_reserved_word_renames`,
+/// the same usr-keyed `renames` map `apply_overload_renames` already
+/// established for US-7's overload renaming), or the call site would keep
+/// invoking a name the declaration no longer has.
+#[test]
+fn a_method_named_after_a_dart_reserved_word_is_renamed_at_declaration_and_call_site() {
+    let source = lower_and_emit(
+        "lower-cpp-reserved-method-name",
+        r#"
+class Consulta {
+public:
+    bool is() {
+        return true;
+    }
+
+    bool checar() {
+        return is();
+    }
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("bool is()"),
+        "the raw C++ spelling must never be declared as a Dart method, got:\n{source}"
+    );
+    assert!(
+        source.contains("bool is_()"),
+        "expected the method renamed with a trailing underscore, got:\n{source}"
+    );
+    assert!(
+        source.contains("is_()") && !source.contains("return is();"),
+        "expected the call site renamed to match the declaration, got:\n{source}"
+    );
+}
+
+/// Same finding as the method case above, for a *free* function
+/// (`vrv.dart`'s own call shape, though the collision there was a
+/// parameter, not the function name itself — this is the function-name
+/// sibling case, exercised directly since it goes through a different IR
+/// path, `ir_functions` rather than a record's `methods`).
+#[test]
+fn a_free_function_named_after_a_dart_reserved_word_is_renamed_at_declaration_and_call_site() {
+    let source = lower_and_emit(
+        "lower-cpp-reserved-function-name",
+        r#"
+bool is() {
+    return true;
+}
+
+bool checar() {
+    return is();
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("bool is()"),
+        "the raw C++ spelling must never be declared as a Dart function, got:\n{source}"
+    );
+    assert!(
+        source.contains("bool is_()"),
+        "expected the function renamed with a trailing underscore, got:\n{source}"
+    );
+    assert!(
+        source.contains("is_()") && !source.contains("return is();"),
+        "expected the call site renamed to match the declaration, got:\n{source}"
+    );
+}
+
+/// Diagnostic finding (`verovio_6_2_0_transpile_diagnosis`, item 9,
+/// `tuningsimpl.dart`/`vrv.dart`/`pugixml.dart`): a C++ parameter named
+/// after a Dart reserved word (`is`, `in`, `var`, ...) — legal in C++, none
+/// of these are C++ keywords — was emitted with its literal name, which
+/// `dart format` rejects (`'in' can't be used as an identifier because it's
+/// a keyword`). Unlike a method/function name, a parameter is lexically
+/// scoped, not usr-keyed, so the fix has to live in `lower::cpp` itself
+/// (`dart_safe_identifier`, applied at both the parameter declaration and
+/// every reference inside the body, so the two can never disagree).
+#[test]
+fn a_parameter_named_after_a_dart_reserved_word_gets_a_safe_dart_name() {
+    let source = lower_and_emit(
+        "lower-cpp-reserved-parameter-name",
+        r#"
+int f(int in) {
+    return in + 1;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("(int in)"),
+        "the raw C++ spelling must never be declared as a Dart parameter, got:\n{source}"
+    );
+    assert!(
+        source.contains("int in_"),
+        "expected the parameter renamed with a trailing underscore, got:\n{source}"
+    );
+    assert!(
+        source.contains("in_ + 1"),
+        "expected the reference inside the body renamed to match, got:\n{source}"
+    );
+}
+
+/// Same finding as the parameter case above, for a *local variable*
+/// (`jsonxx.dart`'s own repro: `basic_istringstream is = ...;`) — a
+/// `DeclStmt`'s `VarDecl`, a different lowering path from a parameter's
+/// `ParmDecl`, exercised separately since nothing guarantees the two share
+/// code.
+#[test]
+fn a_local_variable_named_after_a_dart_reserved_word_gets_a_safe_dart_name() {
+    let source = lower_and_emit(
+        "lower-cpp-reserved-local-variable-name",
+        r#"
+int f() {
+    int is = 1;
+    return is + 1;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("int is =") && !source.contains("int is;"),
+        "the raw C++ spelling must never be declared as a Dart local variable, got:\n{source}"
+    );
+    assert!(
+        source.contains("int is_ ="),
+        "expected the local variable renamed with a trailing underscore, got:\n{source}"
+    );
+    assert!(
+        source.contains("is_ + 1"),
+        "expected the reference inside the body renamed to match, got:\n{source}"
+    );
+}
+
+/// Diagnostic finding (`verovio_6_2_0_transpile_diagnosis`, item 9,
+/// `zip_file.dart`): an anonymous `struct { ... } campo;` (unlike an
+/// anonymous `enum`, achado 8, no fixture in E01–E13 has one) hits the same
+/// libclang quirk achado 8 already documented for enums —
+/// `clang_getCursorSpelling` on an anonymous struct/class returns the
+/// descriptive debug text `"(unnamed struct at <file>:<line>:<col>)"`, not
+/// an empty string — and that text leaked straight into both a Dart `class`
+/// declaration (a parse error) and a field's type reference. Neither has a
+/// usable Dart name, so both must come back as an honest `Unsupported`
+/// stub instead — the record is simply never declared (mirroring
+/// `enum_identity`'s "anonymous — no usable Dart type name" early-out), and
+/// any field of that anonymous type becomes `Type::Unsupported`, `emit::dart`'s
+/// already-generic bailout for an unrepresentable field type.
+#[test]
+fn an_anonymous_struct_is_never_declared_under_libclangs_debug_spelling() {
+    let source = lower_and_emit(
+        "lower-cpp-anonymous-struct",
+        r#"
+struct Contêiner {
+    struct {
+        int ano;
+        int mes;
+    } data;
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("class ("),
+        "an anonymous struct has no valid Dart name and must not be declared \
+         at all, got:\n{source}"
+    );
+    assert!(
+        !source.contains(") data;"),
+        "a field of an anonymous struct type has no valid Dart type — it \
+         must never be printed as a raw (invalid) type reference, got:\n{source}"
+    );
+    // libclang's debug spelling is still fine to *quote* inside the honest
+    // `Unsupported` bailout's comment/exception message — that's a
+    // diagnostic string, not a Dart identifier, the same distinction
+    // achado 5's `dynamic /* unsupported: T* */` already draws.
+    assert!(
+        source.contains("dynamic /* unsupported:") && source.contains("(unnamed struct at"),
+        "expected the anonymous-struct field to become an honest Unsupported \
+         bailout, got:\n{source}"
+    );
+}
+
+/// Diagnostic finding (`verovio_6_2_0_transpile_diagnosis`, item 9,
+/// `iocmme.dart`/`pugixml.dart`, real repro `Fraction::ReduceStatic` called
+/// with a nullable-pointer field as an out-param argument): the out-param
+/// bridge (E10/`achado 5`, `docs/plans/diagnostico-verovio-6.2.0.md`) emits
+/// a Dart destructuring assignment, `(targets...) = call;` — but when a
+/// target is a field reached through a nullable receiver, the field access
+/// needs `receiver!.field` (achado 5's own null-safety fix), and Dart's
+/// pattern-assignment grammar doesn't accept a postfix `!` inside a pattern
+/// element (`dart format`: "Expected to find ')'" right after the `!`,
+/// confirmed empirically against the real Verovio file). Ordinary
+/// (non-pattern) assignment has no such restriction — `receiver!.field =
+/// value;` is perfectly legal Dart — so the fix routes around the pattern
+/// grammar entirely: a scoped block holds the call's result in a temporary,
+/// then each target is assigned individually with ordinary assignment
+/// syntax.
+#[test]
+fn a_tuple_assign_target_reached_through_a_nullable_receiver_avoids_pattern_assignment_syntax() {
+    let source = lower_and_emit(
+        "lower-cpp-tuple-assign-nullable-target",
+        r#"
+class Fraction {
+public:
+    static void ReduceStatic(int &num, int &den) {
+        num = num / 2;
+        den = den / 2;
+    }
+};
+
+class Info {
+public:
+    int proportNum;
+    int proportDen;
+};
+
+class Holder {
+public:
+    Info *info;
+
+    void Normalize() {
+        Fraction::ReduceStatic(info->proportNum, info->proportDen);
+    }
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("(info!.proportNum, info!.proportDen) ="),
+        "a nullable-receiver field access must never appear inside a Dart \
+         pattern-assignment target, got:\n{source}"
+    );
+    assert!(
+        source.contains("info!.proportNum =") && source.contains("info!.proportDen ="),
+        "expected each target assigned individually, with ordinary (non-pattern) \
+         null-assertion syntax, got:\n{source}"
+    );
+}
