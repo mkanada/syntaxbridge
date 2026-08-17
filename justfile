@@ -56,6 +56,18 @@ examples *args:
 examples-bless *args:
     SYNTAX_BRIDGE_BLESS=1 cargo test -p syntax-bridge-server --test conversion_examples {{args}}
 
+# Run the whole transpiler pipeline end to end (cmake ingest -> libclang IR
+# extraction -> Dart emission -> dart format/dart analyze) over the real,
+# unmodified Verovio 6.2.0 corpus (298 compilation units,
+# test-resources/verovio-version-6.2.0.tar.gz), inside the Flatpak sandbox so
+# cmake/clang++/dart come from the bundled toolchain, not the host. Needs
+# `just package-build` first, same as `just test`. Slow (minutes: ~5min of IR
+# extraction alone) and diagnostic-only, not pass/fail — prints a coverage
+# report (files/lines translated vs. stubbed, dart analyze error taxonomy)
+# via --nocapture; see crates/server/tests/verovio_6_2_0_transpile_diagnosis.rs.
+verovio-diagnosis *args:
+    just test -p syntax-bridge-server --test verovio_6_2_0_transpile_diagnosis -- --ignored --nocapture {{args}}
+
 # Build and install the Flatpak package, without running its in-sandbox tests.
 package-build:
     scripts/build-flatpak-package.sh

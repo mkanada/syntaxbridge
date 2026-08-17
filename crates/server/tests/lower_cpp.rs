@@ -736,7 +736,7 @@ public:
 /// used as a call target.
 #[test]
 fn a_free_operator_overload_with_no_dart_equivalent_becomes_unsupported_instead_of_an_invalid_call()
- {
+{
     let source = lower_and_emit(
         "lower-cpp-free-operator-shl",
         r#"
