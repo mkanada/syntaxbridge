@@ -54,8 +54,49 @@ pub fn overload_type_suffix(ty: &ir::Type) -> String {
         ir::Type::Record { name, .. } | ir::Type::Enum { name, .. } => name.clone(),
         ir::Type::Tuple(elements) => elements.iter().map(overload_type_suffix).collect(),
         ir::Type::Nullable(inner) => format!("Nullable{}", overload_type_suffix(inner)),
-        ir::Type::Unsupported(_) => "Unsupported".to_owned(),
+        // Achado 1 restante (`docs/plans/diagnostico-verovio-6.2.0.md`): a
+        // fixed `"Unsupported"` suffix here made every unrepresentable
+        // parameter type indistinguishable from every other one — two
+        // overloads whose only difference was, say, `int*` vs. `double*`
+        // (both `Unsupported`, case C01, never bridged) computed the exact
+        // same renamed Dart name and collided (`duplicate_definition`),
+        // confirmed live in the Verovio 6.2.0 corpus after the
+        // arity-and-return-type fix above (`CalculateDotLocations`,
+        // `GetCrossStaffExtremes`). The C++ spelling itself is real,
+        // distinguishing information the suffix was discarding — folded in
+        // here via `pascal_case_alnum_segments` (alphanumeric runs only, so
+        // `*`/`<`/`>`/`,`/whitespace in the spelling can't produce an
+        // invalid Dart identifier fragment).
+        ir::Type::Unsupported(spelling) => {
+            let sanitized = pascal_case_alnum_segments(spelling);
+            if sanitized.is_empty() {
+                "Unsupported".to_owned()
+            } else {
+                format!("Unsupported{sanitized}")
+            }
+        }
     }
+}
+
+/// `"int *"` → `"IntPointer"`-style fragments (here, just `"Int"` — the
+/// caller adds context); any run of non-alphanumeric characters is a
+/// separator, dropped, and each alphanumeric run gets its first letter
+/// uppercased and is joined with no separator — the same PascalCase-join
+/// shape `function_catalog::pascal_case_namespace` uses for a `::`-only
+/// separator, generalized here to arbitrary C++ type-spelling punctuation
+/// (`*`, `<>`, `,`, whitespace) so the result is always a valid fragment of
+/// a Dart identifier.
+fn pascal_case_alnum_segments(text: &str) -> String {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            let mut chars = segment.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
 }
 
 /// The deterministic Dart-side name for a call/declaration that resolves to
@@ -1095,7 +1136,8 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
                 };
                 return ir::Type::Unsupported(format!("union {spelling}"));
             }
-            match unsafe { stdlib_template_name(decl) }.as_deref() {
+            let stdlib_name = unsafe { stdlib_template_name(decl) };
+            match stdlib_name.as_deref() {
                 Some("basic_string") => return ir::Type::Str,
                 // `std::list<T>` shares `Type::List`'s shape with
                 // `std::vector<T>` — see that variant's doc comment for why
@@ -1147,7 +1189,28 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
                     };
                     return ir::Type::Map(Box::new(key), Box::new(value));
                 }
-                _ => {}
+                // Achado 4 (`docs/plans/diagnostico-verovio-6.2.0.md`): a
+                // stdlib template with no E05/E10 adapter (`std::array`,
+                // `std::unordered_map`, `std::pair`, `std::optional`, ...)
+                // still resolves to a real `usr`/name via
+                // `clang_getTypeDeclaration` below — falling through would
+                // return `Type::Record { usr, name }` pointing at a class
+                // this project never declares, which prints as a bare,
+                // silently-undefined type reference in the emitted Dart
+                // (`dart analyze`'s `undefined_class`) instead of the honest
+                // bailout every other unrepresentable type already gets.
+                // Only a *named* primary template (this branch only reaches
+                // `Some` when `stdlib_template_name` found one under `std`)
+                // triggers this — a project-defined class is never
+                // `stdlib_template_name`'d, so this can't misfire on the
+                // user's own types.
+                Some(other) => {
+                    let spelling = unsafe {
+                        type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(cx_type))
+                    };
+                    return ir::Type::Unsupported(format!("std::{other} (spelling: {spelling})"));
+                }
+                None => {}
             }
             let usr =
                 unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(decl)) };

@@ -861,7 +861,24 @@ pub fn overload_options_for(
         }
     }
 
-    if arities.len() > 1 {
+    // Achado 1 restante (`docs/plans/diagnostico-verovio-6.2.0.md`):
+    // "parametro-opcional" folds the whole group into a single Dart member
+    // with trailing optional parameters — sound only when every overload
+    // actually agrees on what that member *returns*. A setter/getter pair
+    // that also happens to differ in arity (Verovio's
+    // `Accid::IsAlignedWithSameLayer`: `bool IsAlignedWithSameLayer() const`
+    // vs. `void IsAlignedWithSameLayer(bool)`) has no single return type an
+    // optional-parameter Dart member could honestly declare — falls through
+    // to the same per-type renaming the "same arity, different types" case
+    // below already does, instead of being folded.
+    let returns_agree = group
+        .iter()
+        .map(|f| return_type_text(&f.signature))
+        .collect::<HashSet<_>>()
+        .len()
+        == 1;
+
+    if arities.len() > 1 && returns_agree {
         let mut consequences = call_site_consequences(&usrs, facts);
         for function in &group {
             consequences.push(Consequence {
@@ -898,8 +915,14 @@ pub fn overload_options_for(
         id: "renomear-por-tipo".to_owned(),
         label: "Renomear por tipo".to_owned(),
         description: format!(
-            "As sobrecargas de `{name}` têm a mesma aridade mas tipos de parâmetro diferentes — \
-             Dart não despacha por tipo estático, então cada uma precisa de um nome distinto."
+            "As sobrecargas de `{name}` não podem compartilhar um único membro Dart — {} — \
+             Dart não despacha por tipo estático, então cada uma precisa de um nome distinto.",
+            if arities.len() > 1 {
+                "diferem em número de parâmetros *e* no tipo de retorno, então nem um \
+                 parâmetro opcional resolveria"
+            } else {
+                "têm a mesma aridade mas tipos de parâmetro diferentes"
+            }
         ),
         consequences,
     }]
@@ -986,6 +1009,27 @@ fn count_parameters(signature: &str) -> usize {
 /// second, independently-written check could drift from this one.
 pub(crate) fn signature_is_const(signature: &str) -> bool {
     signature.trim_end().ends_with("const")
+}
+
+/// The return-type text of a signature (`FunctionDeclaration::signature`,
+/// always "ReturnType QualifiedName(params)[ const]") — everything before
+/// the qualified name, which itself never contains whitespace and always
+/// ends right where the parameter list's `(` opens, so the last whitespace
+/// before that `(` is exactly the split point. A plain substring compare,
+/// not a type parser — exact for its one purpose (achado 1 restante,
+/// `docs/plans/diagnostico-verovio-6.2.0.md`): telling whether every
+/// overload in a same-arity-mismatched group agrees on what it returns,
+/// which decides whether folding them into one Dart member with optional
+/// parameters (`"parametro-opcional"`) is even sound.
+fn return_type_text(signature: &str) -> &str {
+    let Some(open) = signature.find('(') else {
+        return signature.trim();
+    };
+    let before_name = signature[..open].trim_end();
+    match before_name.rfind(char::is_whitespace) {
+        Some(idx) => before_name[..idx].trim(),
+        None => "",
+    }
 }
 
 /// Every caller of any USR in `usrs`, as a `Consequence` naming the file
@@ -1758,6 +1802,37 @@ mod tests {
         let options = overload_options_for(Some("c:@S@Accid"), "get", &facts);
         assert_eq!(options.len(), 1, "{options:?}");
         assert_eq!(options[0].id, "renomear-const-nao-const", "{options:?}");
+    }
+
+    /// Achado 1 restante (`docs/plans/diagnostico-verovio-6.2.0.md`):
+    /// Verovio's `Accid::IsAlignedWithSameLayer` — a getter
+    /// (`bool IsAlignedWithSameLayer() const`) and a setter
+    /// (`void IsAlignedWithSameLayer(bool)`) sharing a name, differing both
+    /// in arity *and* return type. Before this fix, differing arity alone
+    /// routed to `"parametro-opcional"` (fold into one Dart member with an
+    /// optional parameter) regardless of return type — nonsensical here,
+    /// since no single Dart member can honestly declare both `bool` and
+    /// `void` as its return type. Must be renamed instead, the same as any
+    /// other overload Dart can't dispatch by type.
+    #[test]
+    fn overload_options_for_renames_instead_of_folding_when_arity_and_return_type_both_differ() {
+        let functions = vec![
+            function_declaration(
+                "c:@S@Accid@F@get#1",
+                "c:@S@Accid",
+                "bool Accid::get() const",
+            ),
+            function_declaration(
+                "c:@S@Accid@F@get#2",
+                "c:@S@Accid",
+                "void Accid::get(bool aligned)",
+            ),
+        ];
+        let facts = ProjectFacts::new_full(&[], &[], &functions, &[]);
+
+        let options = overload_options_for(Some("c:@S@Accid"), "get", &facts);
+        assert_eq!(options.len(), 1, "{options:?}");
+        assert_eq!(options[0].id, "renomear-por-tipo", "{options:?}");
     }
 
     #[test]

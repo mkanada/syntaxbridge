@@ -165,7 +165,7 @@ nenhum desses quatro tem reprodução mínima isolada ainda (ver
 
 ## Achados
 
-### 1. Sobrecarga que não se distingue por tipo de parâmetro (causa de ~85% dos erros) — **parcialmente corrigido**
+### 1. Sobrecarga que não se distingue por tipo de parâmetro (causa de ~85% dos erros) — **parcialmente corrigido, avançado em 2026-08-17**
 
 **Reprodução mínima:** rodando `extract_function_catalog` sobre **uma única**
 unidade de compilação (`src/accid.cpp`, sem envolver as outras 297), a classe
@@ -220,15 +220,68 @@ par estático/instância. Prova:
 em `crates/server/tests/function_catalog.rs`.
 
 **Impacto medido no Verovio 6.2.0 real:** `duplicate_definition` caiu de 757
-para 514 (−32%). **Não resolve o achado inteiro** — sobrevivem pelo menos
-dois outros casos que o texto acima já previa e que este trabalho não
-tocou: sobrecarga por aridade combinada com tipo de retorno diferente (ex.:
-`Accid::IsAlignedWithSameLayer`, setter `void(bool)` vs. getter `bool()
-const` — cai em `"parametro-opcional"`, que `apply_overload_renames`
-deliberadamente não renomeia por decisão do E07, mas aqui os dois lados têm
-*retorno* diferente, não é o mesmo membro com um parâmetro opcional) e
-grupos com mais de dois membros. Nenhum dos dois tem reprodução mínima
-isolada ainda.
+para 514 (−32%). **Não resolveu o achado inteiro** — sobreviveram pelo menos
+dois outros casos que o texto acima já previa: sobrecarga por aridade
+combinada com tipo de retorno diferente, e grupos com mais de dois membros.
+Os dois avançaram nesta rodada (ver abaixo).
+
+**Sub-caso "aridade + retorno diferente", corrigido (2026-08-17):**
+reprodução mínima confirmada, `Accid::IsAlignedWithSameLayer` (setter
+`void IsAlignedWithSameLayer(bool)` vs. getter
+`bool IsAlignedWithSameLayer() const`) — `mapping::overload_options_for`
+classificava qualquer grupo com aridades diferentes como
+`"parametro-opcional"` (dobrar num único membro Dart com parâmetro
+opcional), sem checar se os dois lados sequer concordam sobre o que
+retornam. Aqui não concordam (`bool` vs. `void`) — não existe um único
+membro Dart que possa declarar os dois retornos honestamente, então dobrar
+é errado, precisa renomear. Corrigido: nova função `mapping::return_type_text`
+extrai o texto do tipo de retorno de `FunctionDeclaration::signature`
+(substring antes do nome qualificado — sempre nesse formato, não é um parser
+de tipos); `overload_options_for` só escolhe `"parametro-opcional"` quando
+as aridades diferem *e* todo o grupo concorda no tipo de retorno — caso
+contrário cai no mesmo `"renomear-por-tipo"` que já existe para "mesma
+aridade, tipos diferentes", cujo mecanismo de aplicação
+(`function_catalog::apply_overload_renames` + `dart_overload_name`) já sabe
+lidar com aridade zero de um lado (vira sufixo vazio, nome original
+preservado, mesmo padrão do `"renomear-const-nao-const"`). Provas:
+`overload_options_for_renames_instead_of_folding_when_arity_and_return_type_both_differ`
+em `mapping.rs` (unitário) e
+`a_getter_and_setter_pair_differing_in_both_arity_and_return_type_get_distinct_dart_names`
+em `crates/server/tests/function_catalog.rs` (ponta a ponta, `libclang`
+real).
+
+**Sub-caso novo, descoberto só ao medir contra o corpus real, corrigido
+(2026-08-17):** com o sub-caso acima corrigido, a medição revelou uma
+segunda causa de `duplicate_definition` que o texto original do achado 1
+não previa: duas sobrecargas distinguíveis *apenas* por um parâmetro que,
+dos dois lados, é `Type::Unsupported` — mas com spellings C++ diferentes
+(ex.: `int*` vs. `double*`, ambos caso C01, nunca ganham ponte).
+`lower::cpp::overload_type_suffix` mapeava *qualquer* `Unsupported` para o
+mesmo sufixo fixo `"Unsupported"`, descartando a única informação que
+distinguiria os dois — `dart_overload_name` calculava o mesmo nome
+renomeado para os dois lados, mesma classe de colisão, um passo mais fundo
+que a decisão de renomear em si (que já estava correta: `"renomear-por-
+tipo"`). Corrigido: o sufixo de um `Unsupported` agora incorpora o próprio
+spelling C++, saneado por `pascal_case_alnum_segments` (nova função —
+qualquer sequência de caracteres não-alfanuméricos é separador, cada
+sequência alfanumérica vira PascalCase, junta sem separador — o mesmo
+esquema que `function_catalog::pascal_case_namespace` já usa para `::`,
+generalizado para a pontuação de um spelling de tipo C++ inteiro:
+`*`/`<>`/`,`/espaço). Prova:
+`two_overloads_distinguished_only_by_different_unsupported_parameter_types_get_distinct_dart_names`
+em `crates/server/tests/function_catalog.rs` (ponta a ponta, repro mínima
+`void Escrever(int*)` / `void Escrever(double*)`).
+
+**Impacto medido no Verovio 6.2.0 real, os dois sub-casos juntos:**
+`dart analyze` caiu de 4.227 para **4.162** erros (−65, −1,5%);
+`duplicate_definition` caiu de 137 para **103** (−25%). Efeito modesto em
+termos absolutos — os dois padrões são reais mas menos difundidos no
+Verovio do que o caso const/não-const original (−32% sozinho). Os 103
+`duplicate_definition` restantes já não têm reprodução mínima isolada, mas
+a lista impressa pelo diagnóstico mostra pelo menos um exemplo claro de
+"grupos com mais de dois membros" (`humlib.dart`'s `streamInsert`,
+repetido três vezes) — ainda o gap que resta do achado 1, sem correção
+tentada aqui.
 
 ### 2. Duas classes diferentes com o mesmo nome curto colidem — **corrigido**
 
@@ -306,21 +359,47 @@ equivalente em Dart vira bailout" ainda não teve seu próprio inventário de
 quais operadores C++20 aparecem no Verovio além de `<=>`/`<` da maquinaria
 de comparação.
 
-### 4. Container STL não reconhecido vira referência de tipo inválida, não um `Unsupported`
+### 4. Container STL não reconhecido vira referência de tipo inválida, não um `Unsupported` — **corrigido**
 
-`std::string`/`std::vector` têm adaptador (E05); qualquer outro container
-(`std::set` confirmado; `std::map`/`std::array`/etc. têm o mesmo formato,
-não confirmados individualmente) não tem. A lacuna em si seria honesta se
-virasse `Type::Unsupported` — mas `lower_type`'s ramo `CXType_Record` não
-distingue "template da stdlib sem adaptador" de "tipo do próprio usuário":
-ambos viram um `Type::Record` referenciando um nome que nunca foi
-`lower_record`'d. Em Dart isso imprime como uma referência de tipo crua e
-indefinida (`set campo = 0;`), sem nenhum marcador de "isto não foi
-traduzido" na própria linha — o único jeito de descobrir é ver o
-`dart analyze` reclamar de um tipo que não existe. É pior que um stub
-honesto: parece silencioso mesmo sem ser essa a intenção, o tipo de
-divergência que a regra "silêncio é proibido" (`AGENTS.md`) existe para
-evitar.
+`std::string`/`std::vector`/`std::list`/`std::set`/`std::map` têm adaptador
+(E05, mais os casos 4/5 de `docs/plans/verovio-6.2-pointer-types.md`);
+qualquer outro template da stdlib (`std::array` confirmado como repro
+mínima; `std::unordered_map`/`std::pair`/`std::optional`/etc. têm o mesmo
+formato, não confirmados individualmente) não tem. A lacuna em si seria
+honesta se virasse `Type::Unsupported` — mas `lower_type`'s ramo
+`CXType_Record` não distinguia "template da stdlib sem adaptador" de "tipo
+do próprio usuário": ambos viravam um `Type::Record` referenciando um nome
+que nunca foi `lower_record`'d. Em Dart isso imprimia como uma referência de
+tipo crua e indefinida (`array a` num parâmetro), sem nenhum marcador de
+"isto não foi traduzido" na própria linha — o único jeito de descobrir era
+ver o `dart analyze` reclamar de um tipo que não existe (`undefined_class`).
+Pior que um stub honesto: parecia silencioso mesmo sem ser essa a intenção,
+o tipo de divergência que a regra "silêncio é proibido" (`AGENTS.md`) existe
+para evitar.
+
+**Corrigido** (`crates/server/src/lower/cpp.rs`, `lower_type`'s
+`CXType_Record`/`CXType_Unexposed` branch): o resultado de
+`stdlib_template_name` (já calculado para reconhecer os cinco adaptadores)
+agora é guardado numa variável e usado por completo — um `Some(other)` que
+não bate com nenhum dos cinco nomes reconhecidos retorna `Type::Unsupported`
+diretamente, em vez de cair no `_ => {}` que deixava o fluxo seguir até a
+resolução genérica de usr/name (a mesma que trata um `Record` de verdade do
+projeto). Só um template *nomeado sob o namespace `std`* entra nesse ramo
+(`stdlib_template_name` só retorna `Some` nesse caso), então uma classe do
+próprio usuário nunca é afetada. Prova:
+`a_stdlib_container_without_an_adapter_becomes_unsupported_not_an_undeclared_record`
+em `crates/server/tests/lower_cpp.rs` (`std::array<int, 3>` como repro
+mínima confirmada).
+
+**Impacto medido no Verovio 6.2.0 real:** erros do `dart analyze` caíram de
+4.991 para **4.227** (−764, −15,3%), avisos de 10.164 para 9.904 (−260);
+`undefined_class` (400 na medição anterior) some inteiramente do top 20.
+Arquivos que não parseiam seguem em 0/300 (esse achado nunca produzia erro
+de *parse* — `set campo` é Dart sintaticamente válido, só semanticamente
+indefinido — então não afeta essa métrica). Linhas emitidas caem
+ligeiramente (63.707 → 62.560): cada uso de um container sem adaptador
+agora é uma linha de bailout explícita em vez de uma declaração de tipo
+inválida que ainda "parecia" código real.
 
 ### 5. Ponteiro cru onipresente — **parcialmente corrigido**
 
@@ -675,23 +754,25 @@ de agora.
 
 **Estado atual dos itens originais:**
 
-1. ~~Achado 1 (sobrecarga cega a tipo de parâmetro) primeiro~~ — **parcial**:
-   caso const/não-const corrigido (item 7 abaixo permanece aberto).
+1. ~~Achado 1 (sobrecarga cega a tipo de parâmetro) primeiro~~ — **parcial,
+   avançado**: caso const/não-const, aridade+retorno diferente, e sufixo de
+   `Unsupported` colidindo já corrigidos (item 12 abaixo — só "grupos com
+   3+ membros" permanece aberto).
 2. ~~Achado 3 (`operator()`)~~ — **parcial**, ver seção do achado 3
    (commit `e849c51`).
-3. **Achado 4 (STL não reconhecida vira tipo inválido) — ainda não feito.**
-   Continua correção rápida e na linha de "silêncio é proibido": fazer
-   `lower_type` cair em `Type::Unsupported` para qualquer especialização de
-   template da stdlib sem adaptador, em vez de tratá-la como um `Record` do
-   usuário.
+3. **Achado 4 (STL não reconhecida vira tipo inválido) — feito.** Ver
+   seção do achado 4 e o item 11 da lista de alavancagem abaixo.
 4. **Achado 2 (nome sem namespace) — feito.**
 5. **Achado 5 (ponteiro cru) — parcialmente feito.** Ver seção do achado 5;
    a contagem de erros subiu antes de poder cair, como já previsto ali.
 6. **Achado 6 (`mixin ... with`/`extends` inválido) — feito.** Revelou o
    achado 7 candidato (`extends_non_class` 244 → 370), ainda sem
    reprodução mínima isolada.
-7. **Achado 1, restante — ainda aberto.** Sobrecarga por aridade com
-   retorno diferente (`IsAlignedWithSameLayer`) e grupos com 3+ membros.
+7. ~~Achado 1, restante~~ — **avançado (2026-08-17)**: sobrecarga por
+   aridade com retorno diferente (`IsAlignedWithSameLayer`) e colisão de
+   sufixo entre dois `Unsupported` de spelling diferente, ambos corrigidos
+   — ver seção do achado 1. Só "grupos com 3+ membros" (item 12 abaixo)
+   permanece aberto.
 
 **Próximos passos, por alavancagem na medição de 2026-08-17 pós-achados 8/9
 (5.089 erros, 7/300 arquivos inválidos):**
@@ -708,25 +789,31 @@ de agora.
    arquivos inválidos** na medição mais recente — pela primeira vez, todo
    arquivo emitido é Dart sintaticamente válido; ver "Medição mais
    recente" acima.
-10. **Novo achado dominante candidato: `receiver_of_type_never` (3.775) —
-    ainda sem reprodução mínima isolada.** Hipótese a verificar primeiro
-    (não confirmada): mesma dinâmica do achado 5 — `emit::dart::emit_body`
-    tipa uma expressão como `Never` quando compila a partir de um bailout,
-    e código que antes ficava atrás de um `Unsupported` de função inteira
-    agora expõe chamadas/acessos sobre esses valores `Never`. Se
-    confirmado, resolver o achado 1 restante (item 12) e o achado 4 (item
-    11) deve reduzir `receiver_of_type_never` como efeito colateral, na
-    mesma lógica já observada no achado 5 — então vale medir de novo
-    depois de resolver 11 e 12 antes de investir numa correção dedicada
-    aqui. `unused_field` (2.096) e `undefined_method` (2.039), os próximos
-    dois maiores, ainda não têm hipótese. Com os arquivos inválidos
-    zerados (item 9), esta é agora a maior alavancagem única disponível.
-11. **Achado 4 (STL não reconhecida vira tipo inválido) — ainda aberto.**
-    Correção rápida e na linha de "silêncio é proibido": fazer
-    `lower_type` cair em `Type::Unsupported` para qualquer especialização
-    de template da stdlib sem adaptador, em vez de tratá-la como um
-    `Record` do usuário.
-12. **Achado 1, restante — ainda aberto.** Sobrecarga por aridade com
-    retorno diferente (`IsAlignedWithSameLayer`) e grupos com 3+ membros —
-    o achado mais antigo deste documento ainda sem correção completa, e a
-    hipótese do item 10 acima é mais um motivo para priorizá-lo.
+10. **Novo achado dominante candidato: `receiver_of_type_never` (3.659) —
+    ainda sem reprodução mínima isolada.** Hipótese original (não
+    confirmada): mesma dinâmica do achado 5 — `emit::dart::emit_body` tipa
+    uma expressão como `Never` quando compila a partir de um bailout, e
+    código que antes ficava atrás de um `Unsupported` de função inteira
+    agora expõe chamadas/acessos sobre esses valores `Never`. A hipótese
+    previa que resolver o achado 1 restante (item 12) reduziria isso como
+    efeito colateral — **não confirmado**: com os dois sub-casos do item 12
+    corrigidos, `receiver_of_type_never` ficou em 3.659, inalterado. Os dois
+    padrões corrigidos eram reais mas pouco difundidos (só afetam
+    `duplicate_definition`, que caiu; não tocam em bailout de corpo inteiro
+    do jeito que o achado 5 tocava) — a hipótese original media o achado 5,
+    não o achado 1, e não deveria ter sido estendida a ele sem essa
+    distinção. Ainda a maior alavancagem única disponível, mas agora sem
+    hipótese própria — `unused_field` (2.129) e `dead_code`/`undefined_method`
+    (1.868/1.809) também seguem sem hipótese.
+11. ~~Achado 4 (STL não reconhecida vira tipo inválido)~~ — **feito**. Ver
+    seção do achado 4 acima: `undefined_class` (400) some do top 20; erros
+    do `dart analyze` caem 4.991 → 4.227 (−15,3%).
+12. ~~Achado 1, restante~~ — **avançado (2026-08-17), não fechado.**
+    Sobrecarga por aridade com retorno diferente
+    (`Accid::IsAlignedWithSameLayer`) e colisão de sufixo entre dois
+    parâmetros `Unsupported` de spelling C++ diferente (`int*` vs.
+    `double*`) — ambos corrigidos, ver seção do achado 1. Impacto medido:
+    `dart analyze` 4.227 → 4.162 (−1,5%), `duplicate_definition` 137 → 103
+    (−25%). **Ainda aberto:** grupos com 3+ membros (repro real no corpus:
+    `humlib.dart`'s `streamInsert`, repetido três vezes), sem reprodução
+    mínima isolada.

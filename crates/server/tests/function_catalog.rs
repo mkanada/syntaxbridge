@@ -346,6 +346,129 @@ public:
     );
 }
 
+/// Achado 1 restante (`docs/plans/diagnostico-verovio-6.2.0.md`): Verovio's
+/// real `Accid::IsAlignedWithSameLayer` shape — a getter and a setter
+/// sharing a name, differing both in arity (0 vs. 1 parameter) *and* return
+/// type (`bool` vs. `void`). Before this fix, `mapping::overload_options_for`
+/// read differing arity alone as `"parametro-opcional"` (fold into one Dart
+/// member with an optional parameter, left unrenamed by
+/// `apply_overload_renames`) — the two methods survived lowering under the
+/// same Dart name, `duplicate_definition`. Must end up renamed, same as any
+/// other overload Dart can't dispatch by type.
+#[test]
+fn a_getter_and_setter_pair_differing_in_both_arity_and_return_type_get_distinct_dart_names() {
+    let workspace = TempWorkspace::new("function-catalog-arity-return-overload")
+        .expect("create temporary workspace");
+    let project_root = workspace.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project dir");
+    fs::write(
+        project_root.join("accid.cpp"),
+        r#"
+class Accid {
+public:
+    bool IsAlignedWithSameLayer() const { return aligned; }
+    void IsAlignedWithSameLayer(bool value) { aligned = value; }
+private:
+    bool aligned = false;
+};
+"#,
+    )
+    .expect("write accid.cpp");
+
+    let unit = CompilationUnit {
+        directory: project_root.display().to_string(),
+        file: project_root.join("accid.cpp").display().to_string(),
+        command: None,
+        arguments: vec!["clang++".to_owned(), "-std=c++17".to_owned()],
+    };
+
+    let catalog = function_catalog::extract_function_catalog(
+        std::slice::from_ref(&unit),
+        &project_root,
+        None,
+    )
+    .expect("extract function catalog");
+
+    let accid = catalog
+        .ir_records
+        .iter()
+        .find(|record| record.name == "Accid")
+        .unwrap_or_else(|| panic!("expected an Accid record: {:#?}", catalog.ir_records));
+    let method_names: Vec<&str> = accid
+        .methods
+        .iter()
+        .map(|method| method.name.as_str())
+        .collect();
+    assert_eq!(
+        method_names.len(),
+        2,
+        "expected both the getter and setter to survive lowering: {method_names:?}"
+    );
+    assert_ne!(
+        method_names[0], method_names[1],
+        "the getter and setter must not collide under the same Dart name: {method_names:?}"
+    );
+}
+
+/// Achado 1 restante, second sub-case (`docs/plans/diagnostico-verovio-6.2.0.md`):
+/// found in the real Verovio 6.2.0 corpus after the getter/setter fix above
+/// (e.g. `CalculateDotLocations`, `GetCrossStaffExtremes`) — two overloads
+/// whose only distinguishing parameter is itself `Type::Unsupported` (here,
+/// a raw pointer to a scalar, case C01 — never bridged) with two genuinely
+/// *different* C++ spellings (`int*` vs. `double*`). `renomear-por-tipo`
+/// correctly decides these need distinct names, but
+/// `lower::cpp::overload_type_suffix` mapped every `Unsupported` parameter
+/// to the same fixed suffix (`"Unsupported"`), so `dart_overload_name`
+/// computed the identical renamed name for both — the same
+/// `duplicate_definition` achado 1 exists to prevent, just one level
+/// deeper: past the renaming decision, into the suffix computation itself.
+#[test]
+fn two_overloads_distinguished_only_by_different_unsupported_parameter_types_get_distinct_dart_names()
+ {
+    let workspace = TempWorkspace::new("function-catalog-unsupported-overload")
+        .expect("create temporary workspace");
+    let project_root = workspace.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project dir");
+    fs::write(
+        project_root.join("ponte.cpp"),
+        r#"
+void Escrever(int* valor) {}
+void Escrever(double* valor) {}
+"#,
+    )
+    .expect("write ponte.cpp");
+
+    let unit = CompilationUnit {
+        directory: project_root.display().to_string(),
+        file: project_root.join("ponte.cpp").display().to_string(),
+        command: None,
+        arguments: vec!["clang++".to_owned(), "-std=c++17".to_owned()],
+    };
+
+    let catalog = function_catalog::extract_function_catalog(
+        std::slice::from_ref(&unit),
+        &project_root,
+        None,
+    )
+    .expect("extract function catalog");
+
+    let function_names: Vec<&str> = catalog
+        .ir_functions
+        .iter()
+        .map(|function| function.name.as_str())
+        .collect();
+    assert_eq!(
+        function_names.len(),
+        2,
+        "expected both overloads to survive lowering: {function_names:?}"
+    );
+    assert_ne!(
+        function_names[0], function_names[1],
+        "overloads distinguished only by different Unsupported parameter types must not \
+         collide under the same Dart name: {function_names:?}"
+    );
+}
+
 /// Criterion 3: a virtual call through a reference to the base class is
 /// recorded and marked as dynamic dispatch. Criterion 5: callers of a
 /// function can be listed from its definition. Criterion 6: a call that

@@ -537,6 +537,38 @@ void f(std::memory_order m) { }
     );
 }
 
+/// Achado 4 (`docs/plans/diagnostico-verovio-6.2.0.md`): a stdlib container
+/// with no E05 adapter (`basic_string`/`vector`/`list`/`set`/`map` are the
+/// only ones — `std::array` here has none) used to fall through
+/// `lower_type`'s `CXType_Record`/`CXType_Unexposed` branch the same way a
+/// project-defined class does: `clang_getTypeDeclaration` resolves fine (a
+/// real `array<int, 3>` decl, real usr, real name `array`), so the old code
+/// returned `Type::Record { usr, name: "array" }` pointing at a class this
+/// project never declares. That prints as a bare, undefined type reference
+/// in the emitted Dart (`array a`, per the same failure mode already fixed
+/// for an external enum just above) rather than an honest bailout — worse
+/// than a stub, because nothing in the emitted line itself flags it as
+/// untranslated.
+#[test]
+fn a_stdlib_container_without_an_adapter_becomes_unsupported_not_an_undeclared_record() {
+    let source = lower_and_emit(
+        "lower-cpp-stdlib-no-adapter",
+        r#"
+#include <array>
+void f(std::array<int, 3> a) { }
+"#,
+    );
+
+    assert!(
+        !source.contains("array a"),
+        "a stdlib container without an adapter must not be named as a bare Dart parameter type, got:\n{source}"
+    );
+    assert!(
+        source.contains("UnimplementedError"),
+        "the function should bail out loudly instead, got:\n{source}"
+    );
+}
+
 /// Clang propagates a nested enum's access specifier onto each of its
 /// `EnumConstantDecl`s, so a default-private `enum` inside a class had its
 /// *references* run through `dart_member_name` (which prefixes `_`) while
