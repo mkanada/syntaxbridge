@@ -280,6 +280,72 @@ private:
     );
 }
 
+/// Regression test for achado 1 of `docs/plans/diagnostico-verovio-6.2.0.md`
+/// (≈85% of every `dart analyze` error on the real Verovio 6.2.0 corpus):
+/// a const/non-const getter pair with *no parameters on either side*
+/// (`GetOffsetInterface()`/`GetOffsetInterface() const`, taken verbatim from
+/// that diagnosis) is exactly the shape `mapping::overload_options_for`
+/// already recognizes as `"renomear-const-nao-const"` — but
+/// `function_catalog::apply_overload_renames` used to hand both sides to
+/// `dart_overload_name`, which only ever appends a *parameter-type* suffix.
+/// With no parameters on either side, that suffix is empty for both, so
+/// "renaming" produced the exact same name twice — the two `ir::Method`
+/// entries `emit::dart` then prints as two identical-looking declarations in
+/// the same class, `dart analyze`'s `duplicate_definition`.
+#[test]
+fn a_const_and_non_const_overload_with_no_parameters_get_distinct_dart_names() {
+    let workspace =
+        TempWorkspace::new("function-catalog-const-overload").expect("create temporary workspace");
+    let project_root = workspace.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project dir");
+    fs::write(
+        project_root.join("accid.cpp"),
+        r#"
+class Accid {
+public:
+    int GetOffsetInterface() { return 0; }
+    int GetOffsetInterface() const { return 1; }
+};
+"#,
+    )
+    .expect("write accid.cpp");
+
+    let unit = CompilationUnit {
+        directory: project_root.display().to_string(),
+        file: project_root.join("accid.cpp").display().to_string(),
+        command: None,
+        arguments: vec!["clang++".to_owned(), "-std=c++17".to_owned()],
+    };
+
+    let catalog = function_catalog::extract_function_catalog(
+        std::slice::from_ref(&unit),
+        &project_root,
+        None,
+    )
+    .expect("extract function catalog");
+
+    let accid = catalog
+        .ir_records
+        .iter()
+        .find(|record| record.name == "Accid")
+        .unwrap_or_else(|| panic!("expected an Accid record: {:#?}", catalog.ir_records));
+    let method_names: Vec<&str> = accid
+        .methods
+        .iter()
+        .map(|method| method.name.as_str())
+        .collect();
+    assert_eq!(
+        method_names.len(),
+        2,
+        "expected both overloads to survive lowering: {method_names:?}"
+    );
+    assert_ne!(
+        method_names[0], method_names[1],
+        "the const and non-const overloads must not collide under the same Dart name: \
+         {method_names:?}"
+    );
+}
+
 /// Criterion 3: a virtual call through a reference to the base class is
 /// recorded and marked as dynamic dispatch. Criterion 5: callers of a
 /// function can be listed from its definition. Criterion 6: a call that

@@ -477,7 +477,29 @@ fn apply_overload_renames(
             }
             continue;
         }
-        if option.id != "renomear-por-tipo" && option.id != "renomear-const-nao-const" {
+        // Achado 1 (`docs/plans/diagnostico-verovio-6.2.0.md`): this id
+        // means the two declarations have the *same parameter list*
+        // (`mapping::overload_options_for`'s own `same_params` check) —
+        // `dart_overload_name` below computes its suffix purely from
+        // parameter types, so handing it both sides here would compute the
+        // same (usually empty) suffix twice and rename them to the same
+        // name, the exact bug this id exists to catch. Constness never
+        // survives into the IR (`ir::Method` has no such field — Dart
+        // doesn't dispatch on it), so it's read directly off each
+        // declaration's own signature text via `mapping::signature_is_const`
+        // instead. Only the `const` side is renamed, the same "leave the
+        // other one be" shape `"renomear-estatico-instancia"` already uses
+        // above — the non-`const` side keeps its original name, already
+        // unambiguous among the record's *other* members.
+        if option.id == "renomear-const-nao-const" {
+            for declaration in group {
+                if mapping::signature_is_const(&declaration.signature) {
+                    renames.insert(declaration.usr.clone(), format!("{name}Const"));
+                }
+            }
+            continue;
+        }
+        if option.id != "renomear-por-tipo" {
             continue;
         }
         for declaration in group {

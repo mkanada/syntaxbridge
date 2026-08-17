@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 
 use syntax_bridge_server::emit::dart::emit_module;
 use syntax_bridge_server::ir::{
-    BinaryOp, Constructor, Enum, Expr, Field, Function, Module, Origin, Param, Record, Stmt, Type,
+    BaseClass, BinaryOp, Constructor, Enum, Expr, Field, Function, Module, Origin, Param, Record,
+    Stmt, Type,
 };
 
 fn origin(line: u32) -> Origin {
@@ -899,5 +900,234 @@ fn an_enum_without_constants_still_emits_parseable_dart() {
     assert!(
         source.contains("TODO(syntax-bridge)"),
         "the placeholder should say why it's there, got:\n{source}"
+    );
+}
+
+fn base(usr: &str, name: &str) -> BaseClass {
+    BaseClass {
+        usr: usr.to_owned(),
+        name: name.to_owned(),
+    }
+}
+
+fn mixin_record(name: &str, base_class: Option<BaseClass>, mixins: Vec<BaseClass>) -> Record {
+    Record {
+        name: name.to_owned(),
+        usr: format!("c:@S@{name}"),
+        namespace: String::new(),
+        fields: Vec::new(),
+        static_fields: Vec::new(),
+        constructors: Vec::new(),
+        methods: Vec::new(),
+        base_class,
+        mixins,
+        destructor: None,
+        origin: origin(1),
+    }
+}
+
+/// Regression test: a record with more than one base always becomes
+/// `mixins`, and `emit_record` used to slap `mixin`'s keyword onto the same
+/// `with_clause` a plain multi-base `class` gets — `mixin Composto with
+/// Voador, Nadador {`, which `dart format` rejects ("A mixin can't have a
+/// with clause"). This shape never showed up in E09's own fixture
+/// (`PatoDaguaVoador`'s two bases, `Voador`/`Nadador`, are themselves
+/// base-less), only in the real Verovio 6.2.0 corpus, where an interface
+/// record used as a mixin elsewhere (`AltSymInterface`) itself has more than
+/// one base (`Interface`, `AttAltSym`) — see
+/// `docs/plans/diagnostico-verovio-6.2.0.md`. Dart's own equivalent for "a
+/// mixin built out of other mixins" is `mixin M on A, B {}` (a superclass
+/// *constraint*, not composition) — which pushes the actual composition
+/// down to whichever concrete class ends up applying the whole chain via
+/// `with`: it must list every transitive `on` dependency before the mixin
+/// that requires it, not just the mixin itself.
+#[test]
+fn a_mixin_built_from_multiple_bases_uses_on_not_with_and_leaf_classes_expand_the_chain() {
+    let voador = mixin_record("Voador", None, Vec::new());
+    let nadador = mixin_record("Nadador", None, Vec::new());
+    let composto = mixin_record(
+        "Composto",
+        None,
+        vec![base(&voador.usr, "Voador"), base(&nadador.usr, "Nadador")],
+    );
+    // `Usuario` only lists `Composto`, never `Voador`/`Nadador` directly —
+    // exactly how `ControlElement` lists `AltSymInterface` without also
+    // separately listing `Interface`/`AttAltSym` in the real corpus.
+    let usuario = mixin_record("Usuario", None, vec![base(&composto.usr, "Composto")]);
+    let module = Module {
+        records: vec![voador, nadador, composto, usuario],
+        functions: Vec::new(),
+        enums: Vec::new(),
+    };
+
+    let files = emit_module(&module);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert!(
+        source.contains("mixin Composto on Voador, Nadador {"),
+        "expected `Composto` to constrain via `on`, not compose via `with`, got:\n{source}"
+    );
+    assert!(
+        !source.contains("mixin Composto with"),
+        "a Dart `mixin` can't have a `with` clause, got:\n{source}"
+    );
+    assert!(
+        source.contains("class Usuario with Voador, Nadador, Composto {"),
+        "expected `Usuario` to expand `Composto`'s own `on` dependencies into its `with` \
+         clause, in dependency-before-dependent order, got:\n{source}"
+    );
+}
+
+/// Same bug, single-base shape: a record with exactly one base (E06's
+/// `extends`) that's *also* used as a mixin elsewhere used to keep its
+/// `extends` clause verbatim — `mixin AttAltSym extends Att {`, equally
+/// invalid Dart (a `mixin` can't have `extends` either, only `on`).
+#[test]
+fn a_mixin_with_a_single_base_uses_on_not_extends() {
+    let att_alt_sym = mixin_record("AttAltSym", Some(base("c:@S@Att", "Att")), Vec::new());
+    let rotulavel = mixin_record("Rotulavel", None, Vec::new());
+    let control_like = mixin_record(
+        "ControlLike",
+        None,
+        vec![
+            base(&att_alt_sym.usr, "AttAltSym"),
+            base(&rotulavel.usr, "Rotulavel"),
+        ],
+    );
+    let module = Module {
+        records: vec![att_alt_sym, rotulavel, control_like],
+        functions: Vec::new(),
+        enums: Vec::new(),
+    };
+
+    let files = emit_module(&module);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert!(
+        source.contains("mixin AttAltSym on Att {"),
+        "expected `AttAltSym` to constrain via `on`, not `extends`, got:\n{source}"
+    );
+    assert!(
+        !source.contains("mixin AttAltSym extends"),
+        "a Dart `mixin` can't have an `extends` clause, got:\n{source}"
+    );
+    assert!(
+        source.contains("class ControlLike with Att, AttAltSym, Rotulavel {"),
+        "expected `ControlLike` to expand `AttAltSym`'s own `on` dependency (`Att`, unresolved \
+         in this module but still needed) before it in the `with` clause, got:\n{source}"
+    );
+}
+
+/// Regression test: `mixin_usrs` used to collect only *direct*
+/// `record.mixins` targets, so a record reachable exclusively through
+/// another mixin's own `base_class` — never named directly in anyone's
+/// `mixins` list — kept its plain `class` keyword even though
+/// `expand_mixin_chain` (previous test) puts it in a leaf's `with` clause
+/// anyway. Dart's `mixin_of_non_class` fires the moment a `with` clause
+/// names something that isn't declared `mixin`: this is `Att` from the
+/// previous test, this time actually present as a record in the module (not
+/// just an unresolved name) so its own declaration keyword can be checked.
+#[test]
+fn a_base_reachable_only_through_another_mixins_base_class_still_gets_the_mixin_keyword() {
+    let att = mixin_record("Att", None, Vec::new());
+    let att_alt_sym = mixin_record("AttAltSym", Some(base(&att.usr, "Att")), Vec::new());
+    let rotulavel = mixin_record("Rotulavel", None, Vec::new());
+    let control_like = mixin_record(
+        "ControlLike",
+        None,
+        vec![
+            base(&att_alt_sym.usr, "AttAltSym"),
+            base(&rotulavel.usr, "Rotulavel"),
+        ],
+    );
+    let module = Module {
+        records: vec![att, att_alt_sym, rotulavel, control_like],
+        functions: Vec::new(),
+        enums: Vec::new(),
+    };
+
+    let files = emit_module(&module);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert!(
+        source.contains("mixin Att {"),
+        "expected `Att` to be declared `mixin`, since `ControlLike` applies it via `with`, \
+         got:\n{source}"
+    );
+    assert!(
+        !source.contains("class Att {"),
+        "a `with Att` clause needs `Att` declared as `mixin`, not `class` \
+         (`mixin_of_non_class`), got:\n{source}"
+    );
+    assert!(
+        source.contains("class ControlLike with Att, AttAltSym, Rotulavel {"),
+        "got:\n{source}"
+    );
+}
+
+/// Regression test: `collect_referenced_usrs_in_record` (E11's `import`
+/// computation) only ever looked at a record's *direct* `mixins` — but
+/// `emit_record`'s own `with` clause (`expand_mixin_chain`) prints every
+/// transitive `on` dependency by name too. A leaf class whose only *direct*
+/// mixin lives in its own file, while that mixin's own further-up bases
+/// live in a different one (the real Verovio 6.2.0 shape: `Abbr`'s two
+/// direct bases pull in eight more names transitively, none of them
+/// imported), used to emit a `with` clause referencing types this file
+/// never imports — `undefined_class` at best, or (since an unresolved name
+/// in a `with` clause reads as "not a mixin") `mixin_of_non_class`.
+#[test]
+fn a_leaf_class_imports_every_transitively_expanded_mixin_dependency() {
+    fn origin_in(file: &str) -> Origin {
+        Origin {
+            file: file.to_owned(),
+            line: 1,
+            column: 1,
+        }
+    }
+
+    // Three distinct files, so each import has exactly one possible cause:
+    // `Usuario` (file A) only ever names `Composto` (file B) directly in its
+    // own `record.mixins` — the existing, already-correct direct-usr
+    // collection accounts for that import on its own. `Voador`/`Nadador`
+    // (file C) are reachable only through *Composto's* own `mixins`, two
+    // levels down from `Usuario` — nothing in `Usuario`'s own direct fields
+    // ever names them, so file A's import for file C can only come from
+    // walking the same expanded chain `emit_record` prints into `Usuario`'s
+    // `with` clause.
+    let voador = Record {
+        origin: origin_in("/project/input-source/src/animais.cpp"),
+        ..mixin_record("Voador", None, Vec::new())
+    };
+    let nadador = Record {
+        origin: origin_in("/project/input-source/src/animais.cpp"),
+        ..mixin_record("Nadador", None, Vec::new())
+    };
+    let composto = Record {
+        origin: origin_in("/project/input-source/src/interfaces.cpp"),
+        ..mixin_record(
+            "Composto",
+            None,
+            vec![base(&voador.usr, "Voador"), base(&nadador.usr, "Nadador")],
+        )
+    };
+    let usuario = mixin_record("Usuario", None, vec![base(&composto.usr, "Composto")]);
+    let module = Module {
+        records: vec![voador, nadador, composto, usuario],
+        functions: Vec::new(),
+        enums: Vec::new(),
+    };
+
+    let files = emit_module(&module);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert!(
+        source.contains("import 'interfaces.dart';"),
+        "expected an import for `Composto`'s file (`Usuario`'s direct mixin), got:\n{source}"
+    );
+    assert!(
+        source.contains("import 'animais.dart';"),
+        "expected an import for `Voador`/`Nadador`'s file too — `Usuario`'s expanded `with` \
+         clause names them directly, even though neither is `Usuario`'s own direct mixin, \
+         got:\n{source}"
     );
 }

@@ -42,6 +42,18 @@ pub fn emit_module(module: &Module) -> BTreeMap<String, String> {
     // comment).
     let mixin_usrs = mixin_usrs(module);
 
+    // Needed by `expand_mixin_chain`: a leaf class's `with` clause must
+    // transitively pull in the `on` dependencies of every mixin it lists
+    // (see that function's doc comment), which means looking up each listed
+    // mixin's own `base_class`/`mixins` by usr — module-wide, since (like
+    // `mixin_usrs` above) the mixin and the class applying it can land in
+    // different files.
+    let records_by_usr: HashMap<&str, &Record> = module
+        .records
+        .iter()
+        .map(|record| (record.usr.as_str(), record))
+        .collect();
+
     // E11: which file *declares* each top-level record/function — the other
     // half of what a file needs to know before it can print its own
     // `import`s. Method/constructor usrs aren't included (only reachable
@@ -135,6 +147,7 @@ pub fn emit_module(module: &Module) -> BTreeMap<String, String> {
                     &records,
                     &functions,
                     &mixin_usrs,
+                    &records_by_usr,
                     &usr_to_stem,
                     &enums_by_usr,
                 ),
@@ -149,12 +162,98 @@ pub fn emit_module(module: &Module) -> BTreeMap<String, String> {
 /// needs the same `class`-vs-`mixin` keyword this module already derives
 /// from it, to build a matching declaration marker without recomputing this
 /// itself and risking the two disagreeing.
+///
+/// Transitive, not just direct `record.mixins` targets: `expand_mixin_chain`
+/// pulls a listed mixin's own `base_class`/`mixins` dependencies into
+/// whichever leaf class actually applies it via `with` — a dependency that's
+/// only ever reached that way (e.g. `AttAltSym`'s own single `base_class`,
+/// `Att`, never named directly in any record's `mixins` list) still ends up
+/// in a `with` clause somewhere, and Dart's `mixin_of_non_class` fires the
+/// moment that clause names something declared `class` instead of `mixin`.
+/// Closing over the same `base_class`/`mixins` edges `expand_mixin_chain`
+/// itself walks keeps the two from disagreeing about what needs the `mixin`
+/// keyword.
 pub(crate) fn mixin_usrs(module: &Module) -> HashSet<&str> {
-    module
+    let records_by_usr: HashMap<&str, &Record> = module
+        .records
+        .iter()
+        .map(|record| (record.usr.as_str(), record))
+        .collect();
+
+    let mut result: HashSet<&str> = HashSet::new();
+    let mut stack: Vec<&str> = module
         .records
         .iter()
         .flat_map(|record| record.mixins.iter().map(|base| base.usr.as_str()))
-        .collect()
+        .collect();
+    while let Some(usr) = stack.pop() {
+        if !result.insert(usr) {
+            continue;
+        }
+        if let Some(record) = records_by_usr.get(usr) {
+            stack.extend(
+                record
+                    .base_class
+                    .iter()
+                    .chain(record.mixins.iter())
+                    .map(|base| base.usr.as_str()),
+            );
+        }
+    }
+    result
+}
+
+/// The full `with`-clause a `class` needs to actually apply `bases`
+/// (`record.mixins`) once every one of Dart's `on`-constrained mixins in the
+/// chain (see `emit_record`'s `is_mixin` branch) is accounted for. A mixin
+/// declared `mixin M on A, B {}` only type-checks when applied to a class
+/// hierarchy that *already* has `A` and `B` — `mixin_usrs` was never enough
+/// to see that on its own, since a listed mixin like `AltSymInterface` can
+/// itself be built from further bases (`Interface`, `AttAltSym`) that the
+/// class applying it must list *first*, even though nothing in the C++
+/// source ever names them together (`ControlElement` inherits
+/// `AltSymInterface` directly, never `Interface`/`AttAltSym`). Recurses
+/// depth-first and pushes each base only after its own dependencies, so the
+/// result is already in valid application order; `seen` dedups by usr,
+/// keeping the first (i.e. earliest-required) occurrence — Dart tolerates a
+/// repeated mixin in one `with` clause, but a duplicate never adds anything
+/// a single occurrence didn't already satisfy. A base whose usr isn't a
+/// record in this module (an unresolved/external type, same as any other
+/// `BaseClass` this emitter meets) is kept as a leaf: printed by name, with
+/// no dependencies of its own to expand.
+///
+/// Returns the full `BaseClass` (usr *and* name), not just the printed
+/// name — `collect_referenced_usrs_in_record` needs the usr half to resolve
+/// each expanded dependency to the file it has to `import`, the same
+/// expansion `emit_record`'s own `with` clause already relies on to know
+/// what it needs printed by name.
+fn expand_mixin_chain<'a>(
+    bases: &'a [crate::ir::BaseClass],
+    records_by_usr: &HashMap<&str, &'a Record>,
+) -> Vec<&'a crate::ir::BaseClass> {
+    fn visit<'a>(
+        base: &'a crate::ir::BaseClass,
+        records_by_usr: &HashMap<&str, &'a Record>,
+        seen: &mut HashSet<&'a str>,
+        result: &mut Vec<&'a crate::ir::BaseClass>,
+    ) {
+        if !seen.insert(base.usr.as_str()) {
+            return;
+        }
+        if let Some(record) = records_by_usr.get(base.usr.as_str()) {
+            for dependency in record.base_class.iter().chain(record.mixins.iter()) {
+                visit(dependency, records_by_usr, seen, result);
+            }
+        }
+        result.push(base);
+    }
+
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for base in bases {
+        visit(base, records_by_usr, &mut seen, &mut result);
+    }
+    result
 }
 
 pub(crate) fn file_stem(path: &str) -> String {
@@ -236,13 +335,16 @@ fn fold_diacritic(ch: char) -> char {
 /// yet calls a method whose receiver's static type lives in another file)
 /// — deliberately narrower than the free-function/record-type case, not a
 /// silent gap: `dart analyze`'s `undefined_method` would surface it loudly
-/// if it ever mattered.
+/// if it ever mattered. `records_by_usr` is the third such lookup, added for
+/// `expand_mixin_chain`'s own module-wide `with`-clause expansion.
+#[allow(clippy::too_many_arguments)]
 fn emit_file(
     stem: &str,
     enums: &[&Enum],
     records: &[&Record],
     functions: &[&Function],
     mixin_usrs: &HashSet<&str>,
+    records_by_usr: &HashMap<&str, &Record>,
     usr_to_stem: &HashMap<&str, String>,
     enums_by_usr: &HashMap<&str, &Enum>,
 ) -> String {
@@ -262,6 +364,7 @@ fn emit_file(
         sections.push(emit_record(
             record,
             mixin_usrs.contains(record.usr.as_str()),
+            records_by_usr,
             &mut used_expr_helper,
             &mut used_utf8_encode,
             enums_by_usr,
@@ -285,7 +388,7 @@ fn emit_file(
 
     let mut referenced_usrs: HashSet<&str> = HashSet::new();
     for record in records {
-        collect_referenced_usrs_in_record(record, &mut referenced_usrs);
+        collect_referenced_usrs_in_record(record, records_by_usr, &mut referenced_usrs);
     }
     for function in functions {
         collect_referenced_usrs_in_type(&function.return_type, &mut referenced_usrs);
@@ -324,14 +427,27 @@ fn emit_unsupported_helper() -> String {
 /// field types, base class and mixins, and every constructor's/method's own
 /// params/return type/body — the input `emit_file` needs to decide which
 /// other files this one has to `import`.
-fn collect_referenced_usrs_in_record<'a>(record: &'a Record, out: &mut HashSet<&'a str>) {
+///
+/// `mixins` goes through the same `expand_mixin_chain` `emit_record` prints
+/// into the `with` clause, not just the direct list: a leaf class's own
+/// `with` names every transitive `on` dependency by name (Dart requires
+/// each spelled out, not resolved through imports the way `extends`' single
+/// target is), so this file needs an `import` for every one of them, not
+/// only the record's *direct* C++ bases — a real gap in the real Verovio
+/// 6.2.0 corpus (`Abbr`'s two direct bases pull in eight more names
+/// transitively, none imported without this).
+fn collect_referenced_usrs_in_record<'a>(
+    record: &'a Record,
+    records_by_usr: &HashMap<&str, &'a Record>,
+    out: &mut HashSet<&'a str>,
+) {
     for field in record.fields.iter().chain(&record.static_fields) {
         collect_referenced_usrs_in_type(&field.ty, out);
     }
     if let Some(base) = &record.base_class {
         out.insert(base.usr.as_str());
     }
-    for mixin in &record.mixins {
+    for mixin in expand_mixin_chain(&record.mixins, records_by_usr) {
         out.insert(mixin.usr.as_str());
     }
     for constructor in &record.constructors {
@@ -575,6 +691,7 @@ fn emit_enum(enum_decl: &Enum) -> String {
 fn emit_record(
     record: &Record,
     is_mixin: bool,
+    records_by_usr: &HashMap<&str, &Record>,
     used_expr_helper: &mut bool,
     used_utf8_encode: &mut bool,
     enums_by_usr: &HashMap<&str, &Enum>,
@@ -593,32 +710,59 @@ fn emit_record(
     } else {
         ""
     };
-    let extends_clause = match &record.base_class {
-        Some(base) => format!(" extends {}", base.name),
-        None => String::new(),
-    };
-    // E09: every base beyond a single `extends` becomes a Dart mixin
-    // (`Record::mixins`'s own doc comment on why `mapping::options_for`'s
-    // multiple-inheritance decision always shapes out this way) — never
-    // combined with `extends_clause` by any fixture yet, but concatenated
-    // rather than treated as mutually exclusive, since Dart itself allows
-    // `class X extends A with B, C {}`.
-    let with_clause = if record.mixins.is_empty() {
-        String::new()
+    // Dart forbids both `extends` and `with` on a `mixin` declaration — only
+    // `on` (a superclass *constraint*, not composition) is legal there. A
+    // record that's itself used as a mixin elsewhere (`is_mixin`) therefore
+    // never gets `extends_clause`/`with_clause` below; its own base(s) —
+    // whichever field is populated, `base_class` or `mixins`, the two are
+    // mutually exclusive (`lower::cpp::base_classes_of`'s doc comment) —
+    // become a single `on` clause instead. Composing the actual
+    // implementation back together is pushed down to whichever concrete
+    // `class` ends up applying the whole chain via `with` (below).
+    let bases_clause = if is_mixin {
+        let on_bases: Vec<&str> = record
+            .base_class
+            .iter()
+            .chain(record.mixins.iter())
+            .map(|base| base.name.as_str())
+            .collect();
+        if on_bases.is_empty() {
+            String::new()
+        } else {
+            format!(" on {}", on_bases.join(", "))
+        }
     } else {
-        format!(
-            " with {}",
-            record
-                .mixins
-                .iter()
-                .map(|base| base.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
+        let extends_clause = match &record.base_class {
+            Some(base) => format!(" extends {}", base.name),
+            None => String::new(),
+        };
+        // E09: every base beyond a single `extends` becomes a Dart mixin
+        // (`Record::mixins`'s own doc comment on why `mapping::options_for`'s
+        // multiple-inheritance decision always shapes out this way) — never
+        // combined with `extends_clause` by any fixture yet, but concatenated
+        // rather than treated as mutually exclusive, since Dart itself allows
+        // `class X extends A with B, C {}`. Expanded transitively
+        // (`expand_mixin_chain`) rather than printed as-is: a listed mixin
+        // that's itself built from further bases only got an `on` clause
+        // above, which is a constraint the *applying* class must satisfy,
+        // not composition the mixin does on its own.
+        let with_clause = if record.mixins.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " with {}",
+                expand_mixin_chain(&record.mixins, records_by_usr)
+                    .into_iter()
+                    .map(|base| base.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        format!("{extends_clause}{with_clause}")
     };
     let keyword = if is_mixin { "mixin" } else { "class" };
     let mut source = format!(
-        "{abstract_keyword}{keyword} {}{extends_clause}{with_clause} {{\n",
+        "{abstract_keyword}{keyword} {}{bases_clause} {{\n",
         record.name
     );
     for field in &record.fields {

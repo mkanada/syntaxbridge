@@ -829,7 +829,7 @@ pub fn overload_options_for(
         // compare the rest) would wrongly read as "different parameters".
         let same_params = parameter_list_text(&a.signature) == parameter_list_text(&b.signature);
         let one_const_one_not =
-            a.signature.trim_end().ends_with("const") != b.signature.trim_end().ends_with("const");
+            signature_is_const(&a.signature) != signature_is_const(&b.signature);
         if same_params && one_const_one_not {
             let mut consequences = vec![
                 Consequence {
@@ -972,6 +972,20 @@ fn count_parameters(signature: &str) -> usize {
     } else {
         inner.split(',').count()
     }
+}
+
+/// Whether `signature` carries a trailing `const` qualifier (a `const`
+/// method) — the only place that qualifier can appear in
+/// `FunctionDeclaration::signature`'s own text (return type, qualified name,
+/// parameter list, then optionally ` const`), so a plain suffix check is
+/// exact, not a heuristic. Shared between `overload_options_for`'s own
+/// `"renomear-const-nao-const"` detection and
+/// `function_catalog::apply_overload_renames`'s consumption of that
+/// decision (achado 1, `docs/plans/diagnostico-verovio-6.2.0.md`) — both
+/// need to agree on which side of the pair is the `const` one, and a
+/// second, independently-written check could drift from this one.
+pub(crate) fn signature_is_const(signature: &str) -> bool {
+    signature.trim_end().ends_with("const")
 }
 
 /// Every caller of any USR in `usrs`, as a `Consequence` naming the file

@@ -14,6 +14,11 @@
 # (scripts/publish-wip-screenshots.sh) — never part of the project history.
 /.wip-screenshots/
 
+# Latest-run snapshots from diagnostic tests (e.g.
+# verovio_6_2_0_transpile_diagnosis.rs), overwritten every run — local
+# artifact, never part of the project history.
+/.diagnosis/
+
 # Editor and OS files
 .DS_Store
 Thumbs.db
