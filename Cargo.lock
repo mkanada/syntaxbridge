@@ -880,6 +880,7 @@ dependencies = [
  "axum",
  "clang-sys",
  "criterion",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

@@ -11,13 +11,16 @@
 //! hatch, is covered by `tests/emit_dart.rs` instead — no Dart toolchain
 //! needed there).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use syntax_bridge_server::ingest::CompilationUnit;
+use syntax_bridge_server::ir::{
+    Constructor, Field, Function, Method, Module, Origin, Param, Record, Stmt, Type,
+};
 use syntax_bridge_server::mapping::MappingDecision;
 use syntax_bridge_server::transpile::{self, TranspileError};
 use syntax_bridge_server::type_catalog::{TypeDeclaration, TypeDeclarationKind};
@@ -419,6 +422,163 @@ fn write_package_removes_stale_files_from_a_previous_transpile() {
         fs::read_to_string(output_dir.join("lib/nova.dart")).expect("read lib/nova.dart"),
         "int nova() => 2;\n"
     );
+}
+
+/// `docs/plans/lista-de-externos.md`: proves the mock path
+/// (`emit::dart::emit_module_with_externals`, exercised here through
+/// `transpile::emit_package_with_externals`, the same entry point
+/// `project_service::build_transpiled_package` uses) survives the *real*
+/// Dart toolchain end to end — `emit_dart.rs`'s own tests only check the
+/// emitted text, never `dart format`/`dart analyze` against it. Covers a
+/// free function, a method, and a `Record`-returning function all marked
+/// external, in one package.
+#[test]
+fn a_package_with_externally_mocked_callables_passes_dart_analyze_and_dart_format() {
+    fn origin_at(line: u32) -> Origin {
+        Origin {
+            file: "/project/input-source/src/externos.cpp".to_owned(),
+            line,
+            column: 1,
+        }
+    }
+
+    let ponto = Record {
+        name: "Ponto".to_owned(),
+        usr: "c:@S@Ponto".to_owned(),
+        namespace: String::new(),
+        fields: vec![
+            Field {
+                name: "x".to_owned(),
+                ty: Type::Int,
+            },
+            Field {
+                name: "y".to_owned(),
+                ty: Type::Int,
+            },
+        ],
+        static_fields: Vec::new(),
+        constructors: Vec::new(),
+        methods: Vec::new(),
+        base_class: None,
+        mixins: Vec::new(),
+        destructor: None,
+        origin: origin_at(1),
+    };
+
+    let undefined_placeholder = |line: u32| {
+        vec![Stmt::Unsupported {
+            reason: "declared but never defined in any compilation unit of this project".to_owned(),
+            origin: origin_at(line),
+        }]
+    };
+
+    let free_function = Function {
+        name: "somaExterna".to_owned(),
+        usr: "c:@F@somaExterna#I#I#".to_owned(),
+        params: vec![
+            Param {
+                name: "a".to_owned(),
+                ty: Type::Int,
+                default_value: None,
+            },
+            Param {
+                name: "b".to_owned(),
+                ty: Type::Int,
+                default_value: None,
+            },
+        ],
+        return_type: Type::Int,
+        body: undefined_placeholder(5),
+        origin: origin_at(5),
+    };
+
+    let origem = Function {
+        name: "origem".to_owned(),
+        usr: "c:@F@origem#".to_owned(),
+        params: Vec::new(),
+        return_type: Type::Record {
+            usr: ponto.usr.clone(),
+            name: ponto.name.clone(),
+        },
+        body: undefined_placeholder(9),
+        origin: origin_at(9),
+    };
+
+    let shape = Record {
+        name: "Shape".to_owned(),
+        usr: "c:@S@Shape".to_owned(),
+        namespace: String::new(),
+        fields: Vec::new(),
+        static_fields: Vec::new(),
+        constructors: vec![Constructor {
+            usr: "c:@S@Shape@F@Shape#".to_owned(),
+            constructor_index: 0,
+            params: Vec::new(),
+            body: undefined_placeholder(13),
+            origin: origin_at(13),
+        }],
+        methods: vec![Method {
+            name: "area".to_owned(),
+            usr: "c:@S@Shape@F@area#".to_owned(),
+            params: Vec::new(),
+            return_type: Type::Double,
+            body: Some(undefined_placeholder(14)),
+            is_static: false,
+            is_override: false,
+            origin: origin_at(14),
+        }],
+        base_class: None,
+        mixins: Vec::new(),
+        destructor: None,
+        origin: origin_at(12),
+    };
+
+    let module = Module {
+        records: vec![ponto, shape],
+        functions: vec![free_function, origem],
+        enums: Vec::new(),
+    };
+
+    let external_usrs: HashSet<String> = [
+        "c:@F@somaExterna#I#I#",
+        "c:@F@origem#",
+        "c:@S@Shape@F@Shape#",
+        "c:@S@Shape@F@area#",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+
+    let package =
+        transpile::emit_package_with_externals(&module, "externos_pkg", &[], &[], &external_usrs)
+            .expect("emit package with externals");
+
+    let workspace = TempWorkspace::new("transpile-external-mock").expect("create temp workspace");
+    let output_dir = workspace.path().join("dart-package");
+    transpile::write_package(&package, &output_dir).expect("write package");
+
+    let source = &package.files["lib/externos.dart"];
+    assert!(!source.contains("throw"), "got:\n{source}");
+    assert!(
+        source.contains("// syntax-bridge: externo, corpo mockado"),
+        "got:\n{source}"
+    );
+
+    let analyze = Command::new("dart")
+        .arg("analyze")
+        .arg(&output_dir)
+        .output()
+        .expect("run dart analyze");
+    assert_success(analyze);
+
+    let format_check = Command::new("dart")
+        .arg("format")
+        .arg("--output=none")
+        .arg("--set-exit-if-changed")
+        .arg(&output_dir)
+        .output()
+        .expect("run dart format --set-exit-if-changed");
+    assert_success(format_check);
 }
 
 struct TempWorkspace {

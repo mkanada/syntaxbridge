@@ -4,6 +4,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, Transaction, params};
 
+use crate::externals::{ExternalMark, NameRegexRule, PathRegexRule};
 use crate::function_catalog::{
     CallEdge, CallResolution, FunctionDeclaration, FunctionDeclarationKind,
 };
@@ -138,7 +139,8 @@ impl ProjectStore {
                 is_virtual INTEGER NOT NULL,
                 is_pure_virtual INTEGER NOT NULL DEFAULT 0,
                 is_defaulted INTEGER NOT NULL DEFAULT 0,
-                overridden_usrs_json TEXT NOT NULL DEFAULT '[]'
+                overridden_usrs_json TEXT NOT NULL DEFAULT '[]',
+                has_definition INTEGER NOT NULL DEFAULT 1
             );
             CREATE TABLE IF NOT EXISTS call_edges (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -180,6 +182,21 @@ impl ProjectStore {
                 line INTEGER NOT NULL,
                 column INTEGER NOT NULL,
                 usr TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS external_marks (
+                usr TEXT PRIMARY KEY,
+                external INTEGER NOT NULL,
+                decided_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS external_name_regexes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pattern TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS external_path_regexes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pattern TEXT NOT NULL,
+                created_at TEXT NOT NULL
             );",
         )?;
 
@@ -622,7 +639,7 @@ impl ProjectStore {
         let mut statement = self.connection.prepare(
             "SELECT name, kind, namespace, owning_class_usr, signature, file, line, column,
                     end_line, end_column, usr, is_static, is_virtual, is_pure_virtual, is_defaulted,
-                    overridden_usrs_json
+                    overridden_usrs_json, has_definition
              FROM function_declarations ORDER BY id",
         )?;
 
@@ -644,6 +661,7 @@ impl ProjectStore {
                 row.get::<_, bool>(13)?,
                 row.get::<_, bool>(14)?,
                 row.get::<_, String>(15)?,
+                row.get::<_, bool>(16)?,
             ))
         })?;
 
@@ -666,6 +684,7 @@ impl ProjectStore {
                 is_pure_virtual,
                 is_defaulted,
                 overridden_usrs_json,
+                has_definition,
             ) = row?;
             let Some(kind) = FunctionDeclarationKind::parse(&kind) else {
                 continue;
@@ -689,6 +708,7 @@ impl ProjectStore {
                 is_pure_virtual,
                 is_defaulted,
                 overridden_usrs,
+                has_definition,
             });
         }
 
@@ -827,6 +847,136 @@ impl ProjectStore {
         Ok(decisions)
     }
 
+    /// Records (or updates) a manual external/not-external decision for one
+    /// usr — same upsert-by-usr shape as [`Self::set_type_mapping`], and for
+    /// the same reason: `external_marks` is a user decision, never
+    /// wholesale-replaced, only pruned (see `prune_external_marks_tx`) when
+    /// the usr itself stops existing in either catalog.
+    /// `docs/plans/lista-de-externos.md` decision 5: `external: true` forces
+    /// a usr into the effective set, `external: false` forces it out — both
+    /// override whatever a regex rule or auto-detection would otherwise say.
+    pub fn set_external_mark(&mut self, mark: &ExternalMark) -> Result<(), PersistenceError> {
+        self.connection.execute(
+            "INSERT INTO external_marks (usr, external, decided_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(usr) DO UPDATE SET
+                 external = excluded.external,
+                 decided_at = excluded.decided_at",
+            params![mark.usr, mark.external, mark.decided_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_external_marks(&self) -> Result<Vec<ExternalMark>, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT usr, external, decided_at FROM external_marks ORDER BY usr")?;
+
+        let rows = statement.query_map([], |row| {
+            Ok(ExternalMark {
+                usr: row.get(0)?,
+                external: row.get(1)?,
+                decided_at: row.get(2)?,
+            })
+        })?;
+
+        let mut marks = Vec::new();
+        for row in rows {
+            marks.push(row?);
+        }
+
+        Ok(marks)
+    }
+
+    /// Adds a name-regex rule (`docs/plans/lista-de-externos.md` decision 6)
+    /// — unlike a mark, there is no upsert here: two rules with the same
+    /// pattern text are two independent rows (removing one never silently
+    /// removes the other), and the effective set only ever cares about the
+    /// *union* of every rule's matches, not their count.
+    pub fn add_name_regex(
+        &mut self,
+        pattern: &str,
+        created_at: &str,
+    ) -> Result<i64, PersistenceError> {
+        self.connection.execute(
+            "INSERT INTO external_name_regexes (pattern, created_at) VALUES (?1, ?2)",
+            params![pattern, created_at],
+        )?;
+        Ok(self.connection.last_insert_rowid())
+    }
+
+    pub fn remove_name_regex(&mut self, id: i64) -> Result<(), PersistenceError> {
+        self.connection.execute(
+            "DELETE FROM external_name_regexes WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_name_regexes(&self) -> Result<Vec<NameRegexRule>, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, pattern, created_at FROM external_name_regexes ORDER BY id")?;
+
+        let rows = statement.query_map([], |row| {
+            Ok(NameRegexRule {
+                id: row.get(0)?,
+                pattern: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })?;
+
+        let mut rules = Vec::new();
+        for row in rows {
+            rules.push(row?);
+        }
+
+        Ok(rules)
+    }
+
+    /// Same shape as [`Self::add_name_regex`], matching file paths instead
+    /// (`docs/plans/lista-de-externos.md` decision 6).
+    pub fn add_path_regex(
+        &mut self,
+        pattern: &str,
+        created_at: &str,
+    ) -> Result<i64, PersistenceError> {
+        self.connection.execute(
+            "INSERT INTO external_path_regexes (pattern, created_at) VALUES (?1, ?2)",
+            params![pattern, created_at],
+        )?;
+        Ok(self.connection.last_insert_rowid())
+    }
+
+    pub fn remove_path_regex(&mut self, id: i64) -> Result<(), PersistenceError> {
+        self.connection.execute(
+            "DELETE FROM external_path_regexes WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_path_regexes(&self) -> Result<Vec<PathRegexRule>, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, pattern, created_at FROM external_path_regexes ORDER BY id")?;
+
+        let rows = statement.query_map([], |row| {
+            Ok(PathRegexRule {
+                id: row.get(0)?,
+                pattern: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })?;
+
+        let mut rules = Vec::new();
+        for row in rows {
+            rules.push(row?);
+        }
+
+        Ok(rules)
+    }
+
     /// Persists the IR `lower::cpp` produced alongside the
     /// declarations/calls stored by [`Self::replace_function_declarations`]/
     /// [`Self::replace_call_edges`] — reused by `project_service::transpile_project`
@@ -861,6 +1011,20 @@ impl ProjectStore {
         replace_type_usages_tx(&transaction, catalogs.type_usages)?;
         replace_source_files_tx(&transaction, catalogs.source_files)?;
         replace_function_declarations_tx(&transaction, catalogs.function_declarations)?;
+        // Deliberately *not* inside `replace_type_declarations_tx`/
+        // `replace_function_declarations_tx` themselves, unlike
+        // `type_mappings`'s prune inside `replace_type_declarations_tx`:
+        // `external_marks` is keyed by usrs from *both* catalogs (a type or
+        // a function), so pruning it correctly needs both tables already in
+        // their final, post-replace state — running it from either
+        // individual `_tx` function would prune against a catalog that's
+        // still mid-replace (or not yet replaced at all) in the other. Only
+        // safe here, after both have run in this same transaction. The
+        // standalone `replace_type_declarations`/`replace_function_declarations`
+        // methods (each their own transaction, only ever seeding one table
+        // at a time — mainly used by tests) deliberately never prune
+        // `external_marks` at all, for the same reason.
+        prune_external_marks_tx(&transaction)?;
         replace_call_edges_tx(&transaction, catalogs.call_edges)?;
         replace_ir_tx(
             &transaction,
@@ -1077,8 +1241,8 @@ fn replace_function_declarations_tx(
         "INSERT INTO function_declarations (
             name, kind, namespace, owning_class_usr, signature, file, line, column,
             end_line, end_column, usr, is_static, is_virtual, is_pure_virtual, is_defaulted,
-            overridden_usrs_json
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            overridden_usrs_json, has_definition
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
     )?;
     for declaration in declarations {
         let overridden_usrs_json = serde_json::to_string(&declaration.overridden_usrs)?;
@@ -1099,9 +1263,30 @@ fn replace_function_declarations_tx(
             declaration.is_pure_virtual,
             declaration.is_defaulted,
             overridden_usrs_json,
+            declaration.has_definition,
         ])?;
     }
 
+    Ok(())
+}
+
+/// Prunes `external_marks` rows whose usr no longer names anything in
+/// either catalog — see the call site in `replace_all` for why this can't
+/// live inside `replace_type_declarations_tx`/`replace_function_declarations_tx`
+/// themselves. Same known limitation as `type_mappings`'s prune in
+/// `replace_type_declarations_tx`: this is a silent `DELETE`, not the
+/// "sinalizar decisão órfã" US-12 (still `planejado`) eventually wants —
+/// replicating an existing gap, not introducing a new one
+/// (`docs/plans/lista-de-externos.md`).
+fn prune_external_marks_tx(transaction: &Transaction) -> Result<(), PersistenceError> {
+    transaction.execute(
+        "DELETE FROM external_marks WHERE usr NOT IN (
+             SELECT usr FROM type_declarations
+             UNION
+             SELECT usr FROM function_declarations
+         )",
+        [],
+    )?;
     Ok(())
 }
 
@@ -1352,6 +1537,16 @@ fn migrate_function_columns(connection: &Connection) -> Result<(), PersistenceEr
         "function_declarations",
         "is_static",
         "is_static INTEGER NOT NULL DEFAULT 0",
+    )?;
+    // A database created before `docs/plans/lista-de-externos.md` is
+    // missing this column too — `DEFAULT 1` is correct for every row that
+    // already exists, since only a definition/pure-virtual cursor was ever
+    // cataloged before this migration existed.
+    ensure_column(
+        connection,
+        "function_declarations",
+        "has_definition",
+        "has_definition INTEGER NOT NULL DEFAULT 1",
     )
 }
 
@@ -1596,6 +1791,12 @@ mod tests {
         assert_eq!(declarations.len(), 1);
         assert_eq!(declarations[0].name, "area");
         assert_eq!(declarations[0].overridden_usrs, Vec::<String>::new());
+        // `has_definition` is also new since this legacy schema — every row
+        // that predates it was, by construction, only ever cataloged from a
+        // definition cursor (`docs/plans/lista-de-externos.md`'s prototype
+        // cataloging didn't exist yet), so backfilling `true` is correct,
+        // not just a safe default.
+        assert!(declarations[0].has_definition);
 
         let _ = fs::remove_file(&db_path);
     }
@@ -1881,6 +2082,7 @@ mod tests {
                     "c:@N@geometry@S@Drawable@F@area#1#".to_owned(),
                     "c:@N@geometry@S@Measurable@F@area#1#".to_owned(),
                 ],
+                has_definition: true,
             },
             FunctionDeclaration {
                 name: "add".to_owned(),
@@ -1899,6 +2101,7 @@ mod tests {
                 is_pure_virtual: false,
                 is_defaulted: false,
                 overridden_usrs: Vec::new(),
+                has_definition: true,
             },
         ]
     }
@@ -2184,6 +2387,220 @@ mod tests {
             decisions,
             vec![sample_type_mapping()],
             "the orphaned decision should be pruned, the surviving one kept"
+        );
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    fn sample_external_mark() -> ExternalMark {
+        ExternalMark {
+            usr: "c:@S@Humlib".to_owned(),
+            external: true,
+            decided_at: "2026-08-17T00:00:00Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn round_trips_external_marks() {
+        let db_path = temp_db_path("project-external-marks");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+        store
+            .set_external_mark(&sample_external_mark())
+            .expect("persist external mark");
+
+        let marks = store.list_external_marks().expect("list external marks");
+        assert_eq!(marks, vec![sample_external_mark()]);
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    /// Setting a mark twice for the same usr updates it in place (upsert on
+    /// the primary key) — this is also how a user flips an item from
+    /// "forced external" to "forced not-external" (decision 5,
+    /// `docs/plans/lista-de-externos.md`), not just how a duplicate write
+    /// is deduplicated.
+    #[test]
+    fn setting_an_external_mark_again_updates_it_in_place() {
+        let db_path = temp_db_path("project-external-marks-update");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+        store
+            .set_external_mark(&sample_external_mark())
+            .expect("persist external mark");
+        let flipped = ExternalMark {
+            external: false,
+            decided_at: "2026-08-18T00:00:00Z".to_owned(),
+            ..sample_external_mark()
+        };
+        store
+            .set_external_mark(&flipped)
+            .expect("update external mark");
+
+        let marks = store.list_external_marks().expect("list external marks");
+        assert_eq!(marks, vec![flipped]);
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn round_trips_name_and_path_regexes() {
+        let db_path = temp_db_path("project-external-regexes");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+        let name_id = store
+            .add_name_regex("^humlib::", "2026-08-17T00:00:00Z")
+            .expect("persist name regex");
+        let path_id = store
+            .add_path_regex("^third_party/", "2026-08-17T00:00:00Z")
+            .expect("persist path regex");
+
+        let name_rules = store.list_name_regexes().expect("list name regexes");
+        assert_eq!(
+            name_rules,
+            vec![NameRegexRule {
+                id: name_id,
+                pattern: "^humlib::".to_owned(),
+                created_at: "2026-08-17T00:00:00Z".to_owned(),
+            }]
+        );
+
+        let path_rules = store.list_path_regexes().expect("list path regexes");
+        assert_eq!(
+            path_rules,
+            vec![PathRegexRule {
+                id: path_id,
+                pattern: "^third_party/".to_owned(),
+                created_at: "2026-08-17T00:00:00Z".to_owned(),
+            }]
+        );
+
+        store.remove_name_regex(name_id).expect("remove name regex");
+        store.remove_path_regex(path_id).expect("remove path regex");
+        assert!(
+            store
+                .list_name_regexes()
+                .expect("list name regexes")
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_path_regexes()
+                .expect("list path regexes")
+                .is_empty()
+        );
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    /// Mirrors `replacing_type_declarations_prunes_mappings_for_types_no_longer_in_the_catalog`,
+    /// but for `external_marks`, and exercised through `replace_all` rather
+    /// than the standalone `replace_type_declarations` — see
+    /// `prune_external_marks_tx`'s doc comment for why pruning only ever
+    /// runs there: `external_marks` spans both the type and the function
+    /// catalog, so it can only be pruned correctly once both are already in
+    /// their final, post-replace state.
+    #[test]
+    fn replace_all_prunes_external_marks_for_usrs_no_longer_in_either_catalog() {
+        let db_path = temp_db_path("project-external-marks-prune");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+        let surviving_type = TypeDeclaration {
+            usr: "c:@S@Ponto".to_owned(),
+            ..sample_type_declarations()[0].clone()
+        };
+        store
+            .replace_all(&ProjectCatalogs {
+                compilation_units: &[],
+                type_declarations: std::slice::from_ref(&surviving_type),
+                type_dependencies: &[],
+                type_usages: &[],
+                source_files: &[],
+                function_declarations: &[],
+                call_edges: &[],
+                ir_functions: &[],
+                ir_records: &[],
+                ir_enums: &[],
+                pointer_declarations: &[],
+            })
+            .expect("seed initial catalog");
+
+        store
+            .set_external_mark(&ExternalMark {
+                usr: surviving_type.usr.clone(),
+                ..sample_external_mark()
+            })
+            .expect("mark the surviving type external");
+        store
+            .set_external_mark(&ExternalMark {
+                usr: "c:@S@ClasseRenomeada".to_owned(),
+                ..sample_external_mark()
+            })
+            .expect("mark a type about to disappear external");
+
+        // Re-ingestion: `Ponto` survives, `ClasseRenomeada` doesn't exist in
+        // the fresh catalog (renamed/removed).
+        store
+            .replace_all(&ProjectCatalogs {
+                compilation_units: &[],
+                type_declarations: std::slice::from_ref(&surviving_type),
+                type_dependencies: &[],
+                type_usages: &[],
+                source_files: &[],
+                function_declarations: &[],
+                call_edges: &[],
+                ir_functions: &[],
+                ir_records: &[],
+                ir_enums: &[],
+                pointer_declarations: &[],
+            })
+            .expect("replace with a catalog missing the renamed type");
+
+        let marks = store.list_external_marks().expect("list external marks");
+        assert_eq!(
+            marks,
+            vec![ExternalMark {
+                usr: surviving_type.usr.clone(),
+                ..sample_external_mark()
+            }],
+            "the orphaned mark should be pruned, the surviving one kept"
+        );
+
+        let _ = fs::remove_file(&db_path);
+    }
+
+    /// Regression guard for the asymmetry `prune_external_marks_tx`'s doc
+    /// comment describes: the standalone single-catalog `replace_*` methods
+    /// must **not** prune `external_marks` on their own — each only ever
+    /// sees one of the two catalogs `external_marks` spans, so pruning
+    /// there would incorrectly drop a mark for a usr that only exists in
+    /// the *other*, untouched catalog.
+    #[test]
+    fn replacing_only_type_declarations_does_not_prune_external_marks() {
+        let db_path = temp_db_path("project-external-marks-no-prune-on-partial-replace");
+        let mut store = ProjectStore::open(&db_path).expect("open project store");
+
+        // A mark for a function usr — `replace_type_declarations` below
+        // never touches `function_declarations`, so this usr is never
+        // actually gone, even though `type_declarations` alone knows
+        // nothing about it.
+        store
+            .set_external_mark(&ExternalMark {
+                usr: "c:@F@add#I#I#".to_owned(),
+                ..sample_external_mark()
+            })
+            .expect("mark a function usr external");
+
+        store
+            .replace_type_declarations(&sample_type_declarations())
+            .expect("replace type declarations only");
+
+        let marks = store.list_external_marks().expect("list external marks");
+        assert_eq!(
+            marks.len(),
+            1,
+            "a partial replace must never prune a mark belonging to the \
+             catalog it didn't touch: {marks:?}"
         );
 
         let _ = fs::remove_file(&db_path);

@@ -10,7 +10,7 @@
 //! only has a `compile_commands.json` from configuring+building a bare
 //! fixture — no ingested project at all.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
@@ -162,6 +162,30 @@ pub fn emit_package(
     type_catalog: &[TypeDeclaration],
     decisions: &[MappingDecision],
 ) -> Result<TranspiledPackage, TranspileError> {
+    emit_package_with_externals(
+        module,
+        package_name,
+        type_catalog,
+        decisions,
+        &HashSet::new(),
+    )
+}
+
+/// Like [`emit_package`], but every callable whose usr is in `external_usrs`
+/// (`externals::effective_external_set`, `docs/plans/lista-de-externos.md`)
+/// gets a mock body (`dart::emit_module_with_externals`) instead of a real
+/// one. The only production call site that needs this is
+/// `project_service::build_transpiled_package` — every other caller (the
+/// `examples/` oracle harness, `validate::dart`, this module's own tests)
+/// goes through plain `emit_package`/`transpile`/`transpile_with_mappings`,
+/// none of which have an externals concept to thread through.
+pub fn emit_package_with_externals(
+    module: &Module,
+    package_name: &str,
+    type_catalog: &[TypeDeclaration],
+    decisions: &[MappingDecision],
+    external_usrs: &HashSet<String>,
+) -> Result<TranspiledPackage, TranspileError> {
     // Built once, outside the loop: `ProjectFacts::new` indexes the whole
     // type catalog up front (see `mapping::ProjectFacts`'s own doc comment
     // on why those indices exist), so constructing it per record would make
@@ -185,7 +209,8 @@ pub fn emit_package(
         }
     }
 
-    let mut files = dart::emit_module(module);
+    let external_usr_refs: HashSet<&str> = external_usrs.iter().map(String::as_str).collect();
+    let mut files = dart::emit_module_with_externals(module, &external_usr_refs);
     for contents in files.values_mut() {
         *contents = format_dart_source(contents)?;
     }

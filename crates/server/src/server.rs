@@ -20,7 +20,9 @@ use tokio::sync::oneshot;
 use crate::ingest::CreateProjectRequest;
 use crate::jobs::{JobPhase, JobRegistry};
 use crate::persistence;
-use crate::project_service::{self, ListTypesError, OpenProjectError, ReadSourceFileError};
+use crate::project_service::{
+    self, AddRegexError, ListTypesError, OpenProjectError, ReadSourceFileError,
+};
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:37651";
 
@@ -167,6 +169,32 @@ fn app(global_db_path: PathBuf) -> Router {
         )
         .route("/projects/transpile", post(transpile_project_from_http))
         .route("/projects/validate", post(validate_project_from_http))
+        .route("/projects/externals", get(list_externals_from_http))
+        .route("/projects/externals/mark", post(mark_external_from_http))
+        .route(
+            "/projects/externals/mark-file",
+            post(mark_file_external_from_http),
+        )
+        .route(
+            "/projects/externals/mark-type",
+            post(mark_type_external_from_http),
+        )
+        .route(
+            "/projects/externals/name-regex",
+            post(add_name_regex_from_http),
+        )
+        .route(
+            "/projects/externals/name-regex/remove",
+            post(remove_name_regex_from_http),
+        )
+        .route(
+            "/projects/externals/path-regex",
+            post(add_path_regex_from_http),
+        )
+        .route(
+            "/projects/externals/path-regex/remove",
+            post(remove_path_regex_from_http),
+        )
         .with_state(state)
 }
 
@@ -593,6 +621,326 @@ async fn list_pointers_from_http(Query(query): Query<ProjectDirQuery>) -> Respon
             )
         }
     }
+}
+
+/// Serves the effective "extern" set plus both live regex rule lists
+/// (`docs/plans/lista-de-externos.md`), mirrors `list_types_from_http`.
+async fn list_externals_from_http(Query(query): Query<ProjectDirQuery>) -> Response {
+    log_server(format_args!(
+        "listing externals: project_dir={}",
+        query.project_dir.display()
+    ));
+
+    match tokio::task::spawn_blocking(move || project_service::list_externals(&query.project_dir))
+        .await
+    {
+        Ok(Ok(listing)) => json_response(StatusCode::OK, listing),
+        Ok(Err(error)) => list_types_error_response(error),
+        Err(error) => {
+            log_server(format_args!("list externals task failed: {error}"));
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":"list_externals_failed","message":error.to_string()}),
+            )
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct MarkExternalRequest {
+    project_dir: PathBuf,
+    usr: String,
+    external: bool,
+}
+
+/// A single, direct usr mark (decision 5/7, `docs/plans/lista-de-externos.md`)
+/// — the request the Types/Functions views' per-row toggle sends.
+async fn mark_external_from_http(
+    payload: Result<Json<MarkExternalRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(request) => request,
+        Err(error) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error":"invalid_json","message":error.body_text()}),
+            );
+        }
+    };
+
+    log_server(format_args!(
+        "marking external: project_dir={} usr={} external={}",
+        request.project_dir.display(),
+        request.usr,
+        request.external
+    ));
+
+    match tokio::task::spawn_blocking(move || {
+        project_service::mark_external(&request.project_dir, &request.usr, request.external)
+    })
+    .await
+    {
+        Ok(Ok(())) => json_response(StatusCode::OK, json!({"status": "ok"})),
+        Ok(Err(error)) => list_types_error_response(error),
+        Err(error) => {
+            log_server(format_args!("mark external task failed: {error}"));
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":"mark_external_failed","message":error.to_string()}),
+            )
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct MarkFileExternalRequest {
+    project_dir: PathBuf,
+    file: String,
+}
+
+/// Expands a file into every usr it declares and marks each one external
+/// (decision 3's "cascata é foto") — the request `SourceFilesView`'s
+/// per-row action sends.
+async fn mark_file_external_from_http(
+    payload: Result<Json<MarkFileExternalRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(request) => request,
+        Err(error) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error":"invalid_json","message":error.body_text()}),
+            );
+        }
+    };
+
+    log_server(format_args!(
+        "marking file external: project_dir={} file={}",
+        request.project_dir.display(),
+        request.file
+    ));
+
+    match tokio::task::spawn_blocking(move || {
+        project_service::mark_file_external(&request.project_dir, &request.file)
+    })
+    .await
+    {
+        Ok(Ok(usrs)) => json_response(StatusCode::OK, json!({"marked_usrs": usrs})),
+        Ok(Err(error)) => list_types_error_response(error),
+        Err(error) => {
+            log_server(format_args!("mark file external task failed: {error}"));
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":"mark_file_external_failed","message":error.to_string()}),
+            )
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct MarkTypeExternalRequest {
+    project_dir: PathBuf,
+    type_usr: String,
+}
+
+/// Same shape as `mark_file_external_from_http`, expanding a type to itself
+/// plus every method it owns instead of a file to its contents.
+async fn mark_type_external_from_http(
+    payload: Result<Json<MarkTypeExternalRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(request) => request,
+        Err(error) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error":"invalid_json","message":error.body_text()}),
+            );
+        }
+    };
+
+    log_server(format_args!(
+        "marking type external: project_dir={} type_usr={}",
+        request.project_dir.display(),
+        request.type_usr
+    ));
+
+    match tokio::task::spawn_blocking(move || {
+        project_service::mark_type_external(&request.project_dir, &request.type_usr)
+    })
+    .await
+    {
+        Ok(Ok(usrs)) => json_response(StatusCode::OK, json!({"marked_usrs": usrs})),
+        Ok(Err(error)) => list_types_error_response(error),
+        Err(error) => {
+            log_server(format_args!("mark type external task failed: {error}"));
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":"mark_type_external_failed","message":error.to_string()}),
+            )
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AddRegexRequest {
+    project_dir: PathBuf,
+    pattern: String,
+}
+
+async fn add_name_regex_from_http(
+    payload: Result<Json<AddRegexRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(request) => request,
+        Err(error) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error":"invalid_json","message":error.body_text()}),
+            );
+        }
+    };
+
+    log_server(format_args!(
+        "adding name regex: project_dir={} pattern={:?}",
+        request.project_dir.display(),
+        request.pattern
+    ));
+
+    match tokio::task::spawn_blocking(move || {
+        project_service::add_name_regex(&request.project_dir, &request.pattern)
+    })
+    .await
+    {
+        Ok(Ok(rule)) => json_response(StatusCode::OK, rule),
+        Ok(Err(error)) => add_regex_error_response(error),
+        Err(error) => {
+            log_server(format_args!("add name regex task failed: {error}"));
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":"add_name_regex_failed","message":error.to_string()}),
+            )
+        }
+    }
+}
+
+async fn add_path_regex_from_http(
+    payload: Result<Json<AddRegexRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(request) => request,
+        Err(error) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error":"invalid_json","message":error.body_text()}),
+            );
+        }
+    };
+
+    log_server(format_args!(
+        "adding path regex: project_dir={} pattern={:?}",
+        request.project_dir.display(),
+        request.pattern
+    ));
+
+    match tokio::task::spawn_blocking(move || {
+        project_service::add_path_regex(&request.project_dir, &request.pattern)
+    })
+    .await
+    {
+        Ok(Ok(rule)) => json_response(StatusCode::OK, rule),
+        Ok(Err(error)) => add_regex_error_response(error),
+        Err(error) => {
+            log_server(format_args!("add path regex task failed: {error}"));
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":"add_path_regex_failed","message":error.to_string()}),
+            )
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RemoveRegexRequest {
+    project_dir: PathBuf,
+    id: i64,
+}
+
+async fn remove_name_regex_from_http(
+    payload: Result<Json<RemoveRegexRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(request) => request,
+        Err(error) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error":"invalid_json","message":error.body_text()}),
+            );
+        }
+    };
+
+    match tokio::task::spawn_blocking(move || {
+        project_service::remove_name_regex(&request.project_dir, request.id)
+    })
+    .await
+    {
+        Ok(Ok(())) => json_response(StatusCode::OK, json!({"status": "ok"})),
+        Ok(Err(error)) => list_types_error_response(error),
+        Err(error) => {
+            log_server(format_args!("remove name regex task failed: {error}"));
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":"remove_name_regex_failed","message":error.to_string()}),
+            )
+        }
+    }
+}
+
+async fn remove_path_regex_from_http(
+    payload: Result<Json<RemoveRegexRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(request) => request,
+        Err(error) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error":"invalid_json","message":error.body_text()}),
+            );
+        }
+    };
+
+    match tokio::task::spawn_blocking(move || {
+        project_service::remove_path_regex(&request.project_dir, request.id)
+    })
+    .await
+    {
+        Ok(Ok(())) => json_response(StatusCode::OK, json!({"status": "ok"})),
+        Ok(Err(error)) => list_types_error_response(error),
+        Err(error) => {
+            log_server(format_args!("remove path regex task failed: {error}"));
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":"remove_path_regex_failed","message":error.to_string()}),
+            )
+        }
+    }
+}
+
+fn add_regex_error_response(error: AddRegexError) -> Response {
+    let status = if error.is_client_error() {
+        match &error {
+            AddRegexError::InvalidPattern(_) => StatusCode::BAD_REQUEST,
+            _ => StatusCode::NOT_FOUND,
+        }
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    log_server(format_args!(
+        "add regex failed: status={status} error={error:?}"
+    ));
+    json_response(
+        status,
+        json!({"error":"add_regex_failed","message":error.to_string()}),
+    )
 }
 
 #[derive(Deserialize)]

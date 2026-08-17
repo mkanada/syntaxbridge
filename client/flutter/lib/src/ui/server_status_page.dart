@@ -12,6 +12,7 @@ import 'diagnostics_view.dart';
 import 'dockable_panel.dart';
 import 'execution_log.dart';
 import 'execution_log_view.dart';
+import 'externals_view.dart';
 import 'functions_view.dart';
 import 'ide_theme.dart';
 import 'panel_descriptor.dart';
@@ -53,6 +54,7 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     'types',
     'functions',
     'pointers',
+    'externals',
     'log',
   };
   final Map<String, DockSide> _panelSides = {
@@ -61,6 +63,7 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     'usages': DockSide.center,
     'functions': DockSide.left,
     'pointers': DockSide.left,
+    'externals': DockSide.left,
     'callers': DockSide.center,
     'dartOutput': DockSide.center,
     'validation': DockSide.center,
@@ -81,6 +84,14 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
   Future<TranspiledPackage>? _transpiledPackage;
   Future<List<DartDiagnostic>>? _diagnostics;
   late Future<List<PointerDeclaration>> _pointers;
+  late Future<ExternalListing> _externals;
+
+  /// Every usr currently in the effective external set — kept as a plain
+  /// field (not read straight from [_externals]) so `TypesView`/
+  /// `FunctionsView`'s per-row toggle can be built without nesting a second
+  /// `FutureBuilder` inside their own panel's. Populated once [_externals]
+  /// first resolves and again after every mark/regex action refreshes it.
+  Set<String> _externalUsrs = {};
 
   @override
   void initState() {
@@ -88,6 +99,7 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     _status = _loadServerStatus(notify: false);
     _types = _loadTypes();
     _functions = _loadFunctions();
+    _externals = _loadExternals();
     _pointers = _loadPointers();
   }
 
@@ -550,6 +562,158 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     }
   }
 
+  Future<ExternalListing> _loadExternals() async {
+    try {
+      final listing = await widget.serverClient.listExternals(
+        widget.project.projectDir,
+      );
+      if (mounted) {
+        setState(() {
+          _externalUsrs = listing.statuses
+              .where((status) => status.effective)
+              .map((status) => status.usr)
+              .toSet();
+        });
+      }
+      _addLog(
+        'Loaded ${listing.statuses.length} extern items',
+        level: ExecutionLogLevel.success,
+        notify: false,
+      );
+      return listing;
+    } catch (error, stackTrace) {
+      cliLog('list externals exception: $error');
+      cliLog('list externals stack: $stackTrace');
+      _addLog(
+        'Failed to load extern items: ${projectErrorMessage(error)}',
+        level: ExecutionLogLevel.error,
+        notify: false,
+      );
+      rethrow;
+    }
+  }
+
+  void _refreshExternals() {
+    setState(() {
+      _externals = _loadExternals();
+    });
+  }
+
+  Future<void> _toggleExternal(String usr, bool external) async {
+    try {
+      await widget.serverClient.markExternal(
+        projectDir: widget.project.projectDir,
+        usr: usr,
+        external: external,
+      );
+      _addLog(
+        external ? 'Marked $usr as external' : 'Unmarked $usr as external',
+        level: ExecutionLogLevel.success,
+      );
+    } catch (error, stackTrace) {
+      cliLog('mark external exception: $error');
+      cliLog('mark external stack: $stackTrace');
+      _addLog(
+        'Failed to mark external: ${projectErrorMessage(error)}',
+        level: ExecutionLogLevel.error,
+      );
+    }
+    _refreshExternals();
+  }
+
+  Future<void> _markFileExternal(SourceFile file) async {
+    try {
+      final marked = await widget.serverClient.markFileExternal(
+        projectDir: widget.project.projectDir,
+        file: file.path,
+      );
+      _addLog(
+        'Marked ${marked.length} declaration(s) in ${file.path} as external',
+        level: ExecutionLogLevel.success,
+      );
+    } catch (error, stackTrace) {
+      cliLog('mark file external exception: $error');
+      cliLog('mark file external stack: $stackTrace');
+      _addLog(
+        'Failed to mark file external: ${projectErrorMessage(error)}',
+        level: ExecutionLogLevel.error,
+      );
+    }
+    _refreshExternals();
+  }
+
+  Future<void> _addNameRegex(String pattern) async {
+    try {
+      await widget.serverClient.addNameRegex(
+        projectDir: widget.project.projectDir,
+        pattern: pattern,
+      );
+      _addLog('Added name regexp $pattern', level: ExecutionLogLevel.success);
+    } catch (error, stackTrace) {
+      cliLog('add name regex exception: $error');
+      cliLog('add name regex stack: $stackTrace');
+      _addLog(
+        'Failed to add name regexp: ${projectErrorMessage(error)}',
+        level: ExecutionLogLevel.error,
+      );
+    }
+    _refreshExternals();
+  }
+
+  Future<void> _removeNameRegex(int id) async {
+    try {
+      await widget.serverClient.removeNameRegex(
+        projectDir: widget.project.projectDir,
+        id: id,
+      );
+      _addLog('Removed name regexp', level: ExecutionLogLevel.success);
+    } catch (error, stackTrace) {
+      cliLog('remove name regex exception: $error');
+      cliLog('remove name regex stack: $stackTrace');
+      _addLog(
+        'Failed to remove name regexp: ${projectErrorMessage(error)}',
+        level: ExecutionLogLevel.error,
+      );
+    }
+    _refreshExternals();
+  }
+
+  Future<void> _addPathRegex(String pattern) async {
+    try {
+      await widget.serverClient.addPathRegex(
+        projectDir: widget.project.projectDir,
+        pattern: pattern,
+      );
+      _addLog('Added path regexp $pattern', level: ExecutionLogLevel.success);
+    } catch (error, stackTrace) {
+      cliLog('add path regex exception: $error');
+      cliLog('add path regex stack: $stackTrace');
+      _addLog(
+        'Failed to add path regexp: ${projectErrorMessage(error)}',
+        level: ExecutionLogLevel.error,
+      );
+    }
+    _refreshExternals();
+  }
+
+  Future<void> _removePathRegex(int id) async {
+    try {
+      await widget.serverClient.removePathRegex(
+        projectDir: widget.project.projectDir,
+        id: id,
+      );
+      _addLog('Removed path regexp', level: ExecutionLogLevel.success);
+    } catch (error, stackTrace) {
+      cliLog('remove path regex exception: $error');
+      cliLog('remove path regex stack: $stackTrace');
+      _addLog(
+        'Failed to remove path regexp: ${projectErrorMessage(error)}',
+        level: ExecutionLogLevel.error,
+      );
+    }
+    _refreshExternals();
+  }
+
   Future<ServerStatus> _loadServerStatus({bool notify = true}) async {
     _addLog('Checking server connection', notify: notify);
 
@@ -710,6 +874,7 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
           project: widget.project,
           onFileSelected: _selectSourceFile,
           selectedPath: _selectedSourceFile?.path,
+          onMarkFileExternal: _markFileExternal,
         ),
       ),
       PanelDescriptor(
@@ -746,6 +911,9 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
               usageCounts: listing?.usageCounts ?? const {},
               onTypeSelected: _selectType,
               selectedType: _selectedType,
+              externalUsrs: _externalUsrs,
+              onToggleExternal: (type) =>
+                  _toggleExternal(type.usr, !_externalUsrs.contains(type.usr)),
             );
           },
         ),
@@ -835,6 +1003,56 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
               callerCounts: listing?.callerCounts ?? const {},
               onFunctionSelected: _selectFunction,
               selectedFunction: _selectedFunction,
+              externalUsrs: _externalUsrs,
+              onToggleExternal: (function) => _toggleExternal(
+                function.usr,
+                !_externalUsrs.contains(function.usr),
+              ),
+            );
+          },
+        ),
+      ),
+      PanelDescriptor(
+        id: 'externals',
+        title: 'Extern',
+        icon: Icons.link_off,
+        defaultSide: DockSide.left,
+        builder: (context) => FutureBuilder<ExternalListing>(
+          future: _externals,
+          builder: (context, snapshot) {
+            if (snapshot.connectionState != ConnectionState.done) {
+              return const Center(
+                child: Padding(
+                  padding: EdgeInsets.all(16),
+                  child: CircularProgressIndicator(),
+                ),
+              );
+            }
+
+            final error = snapshot.error;
+            if (error != null) {
+              return Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(
+                  'Failed to load extern items: ${projectErrorMessage(error)}',
+                  style: const TextStyle(color: IdePalette.red),
+                ),
+              );
+            }
+
+            return ExternalsView(
+              listing:
+                  snapshot.data ??
+                  const ExternalListing(
+                    statuses: [],
+                    nameRegexes: [],
+                    pathRegexes: [],
+                  ),
+              onToggleExternal: _toggleExternal,
+              onAddNameRegex: _addNameRegex,
+              onRemoveNameRegex: _removeNameRegex,
+              onAddPathRegex: _addPathRegex,
+              onRemovePathRegex: _removePathRegex,
             );
           },
         ),

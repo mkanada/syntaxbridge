@@ -13,6 +13,11 @@ axum = "0.8"
 # extension is newer still) resolves it fine at runtime via `runtime` — this
 # feature only gates which bindings are compiled in, not what loads.
 clang-sys = { version = "1.8", features = ["runtime", "clang_18_0"] }
+# `externals.rs`'s two live regexp rule lists
+# (`docs/plans/lista-de-externos.md` decision 6) — already vendored
+# (`vendor/regex`) as a transitive dependency before this became a direct
+# one.
+regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 # `unbounded_depth`: `ProjectStore::list_ir`/`replace_ir` round-trip

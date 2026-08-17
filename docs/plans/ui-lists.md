@@ -211,6 +211,7 @@ escritos à mão em linguagens diferentes.
 | US-10 | divergências e cobertura | resultado | painel inferior |
 | US-11 | itens não convertidos | resultado | painel inferior e relatório de exportação |
 | US-12 | diff de re-ingestão | resultado | painel inferior; documento de diff no centro |
+| Extern | marcações + regexp de código não-transpilado | decisão (implementado como navegador nesta entrega, ver `docs/plans/lista-de-externos.md`) | painel esquerdo, aba irmã de Tipos/Funções |
 
 ## Ordem sugerida
 

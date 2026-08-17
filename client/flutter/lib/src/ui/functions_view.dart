@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../project/project_models.dart';
+import 'external_toggle_button.dart';
 import 'ide_theme.dart';
 
 enum _SortField { name, kind, callerCount }
@@ -18,6 +19,8 @@ class FunctionsView extends StatefulWidget {
     required this.onFunctionSelected,
     this.selectedFunction,
     this.callerCounts = const <String, int>{},
+    this.externalUsrs = const <String>{},
+    this.onToggleExternal,
   });
 
   final List<FunctionDeclaration> functions;
@@ -27,6 +30,17 @@ class FunctionsView extends StatefulWidget {
   /// Each function's caller count (US-5 criterion 5), keyed by its `usr`. A
   /// function with no entry (or an empty `usr`) shows as 0 callers.
   final Map<String, int> callerCounts;
+
+  /// Every usr currently in the effective external set
+  /// (`docs/plans/lista-de-externos.md`) — drives each row's mark/unmark
+  /// icon state.
+  final Set<String> externalUsrs;
+
+  /// Marks (or unmarks) a function/method/constructor external directly —
+  /// the one direct-marking path available for every
+  /// `FunctionDeclarationKind`, not routed through a type's cascade.
+  /// `null` hides the per-row control entirely.
+  final ValueChanged<FunctionDeclaration>? onToggleExternal;
 
   @override
   State<FunctionsView> createState() => _FunctionsViewState();
@@ -151,7 +165,7 @@ class _FunctionsViewState extends State<FunctionsView> {
             style: const TextStyle(color: IdePalette.muted, fontSize: 12),
           ),
           trailing: SizedBox(
-            width: 110,
+            width: widget.onToggleExternal == null ? 110 : 146,
             child: Wrap(
               alignment: WrapAlignment.end,
               crossAxisAlignment: WrapCrossAlignment.center,
@@ -171,6 +185,11 @@ class _FunctionsViewState extends State<FunctionsView> {
                   function.kind.label,
                   style: const TextStyle(color: IdePalette.muted, fontSize: 12),
                 ),
+                if (widget.onToggleExternal case final onToggleExternal?)
+                  ExternalToggleButton(
+                    isExternal: widget.externalUsrs.contains(function.usr),
+                    onPressed: () => onToggleExternal(function),
+                  ),
               ],
             ),
           ),

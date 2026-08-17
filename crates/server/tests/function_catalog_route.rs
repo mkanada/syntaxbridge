@@ -36,6 +36,7 @@ fn sample_declarations() -> Vec<FunctionDeclaration> {
             is_pure_virtual: false,
             is_defaulted: false,
             overridden_usrs: Vec::new(),
+            has_definition: true,
         },
         FunctionDeclaration {
             name: "add".to_owned(),
@@ -54,6 +55,7 @@ fn sample_declarations() -> Vec<FunctionDeclaration> {
             is_pure_virtual: false,
             is_defaulted: false,
             overridden_usrs: Vec::new(),
+            has_definition: true,
         },
     ]
 }

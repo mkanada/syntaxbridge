@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../project/project_models.dart';
+import 'external_toggle_button.dart';
 import 'ide_theme.dart';
 
 enum _SortField { name, kind, usageCount }
@@ -21,6 +22,8 @@ class TypesView extends StatefulWidget {
     required this.onTypeSelected,
     this.selectedType,
     this.usageCounts = const <String, int>{},
+    this.externalUsrs = const <String>{},
+    this.onToggleExternal,
   });
 
   final List<TypeDeclaration> types;
@@ -30,6 +33,16 @@ class TypesView extends StatefulWidget {
   /// Each type's usage count (US-4), keyed by its `usr`. A type with no
   /// entry (or an empty `usr`) shows as 0 uses.
   final Map<String, int> usageCounts;
+
+  /// Every usr currently in the effective external set
+  /// (`docs/plans/lista-de-externos.md`) — drives each row's mark/unmark
+  /// icon state.
+  final Set<String> externalUsrs;
+
+  /// Marks (or unmarks) a type external directly — cascades server-side to
+  /// every method it owns (decision 3, "cascata é foto"). `null` hides the
+  /// per-row control entirely.
+  final ValueChanged<TypeDeclaration>? onToggleExternal;
 
   @override
   State<TypesView> createState() => _TypesViewState();
@@ -196,7 +209,7 @@ class _TypesViewState extends State<TypesView> {
           leading: const Icon(Icons.data_object),
           title: Text(_qualifiedName(type), overflow: TextOverflow.ellipsis),
           trailing: SizedBox(
-            width: 96,
+            width: widget.onToggleExternal == null ? 96 : 132,
             child: Wrap(
               alignment: WrapAlignment.end,
               crossAxisAlignment: WrapCrossAlignment.center,
@@ -210,6 +223,11 @@ class _TypesViewState extends State<TypesView> {
                   type.kind.label,
                   style: const TextStyle(color: IdePalette.muted, fontSize: 12),
                 ),
+                if (widget.onToggleExternal case final onToggleExternal?)
+                  ExternalToggleButton(
+                    isExternal: widget.externalUsrs.contains(type.usr),
+                    onPressed: () => onToggleExternal(type),
+                  ),
               ],
             ),
           ),

@@ -124,6 +124,19 @@ pub struct FunctionDeclaration {
     /// from more than one base with the same signature. Empty when the
     /// method overrides nothing (including for non-methods).
     pub overridden_usrs: Vec<String>,
+    /// Whether `visit_cursor` found a real `libclang` definition for this
+    /// usr in *any* parsed compilation unit — `true` for everything before
+    /// this field existed (a definition is still required to reach
+    /// `push_declaration` at all, except for the one new case below).
+    /// `false` only for a free-function prototype cataloged with no
+    /// definition anywhere in the project (`docs/plans/lista-de-externos.md`):
+    /// the auto-detection signal `externals::effective_external_set` uses to
+    /// tell "this project never compiles a body for this symbol" apart from
+    /// an ordinary declared-and-defined function. Always `true` for
+    /// `Method`/`Constructor`/`Destructor`/`FunctionTemplate`/
+    /// `FunctionMacro` — those kinds are still only cataloged from a
+    /// definition (or a pure-virtual declaration) cursor, unchanged.
+    pub has_definition: bool,
 }
 
 /// Whether a call site's target could be determined statically, and if so,
@@ -157,11 +170,15 @@ pub struct CallEdge {
 /// One worker's local (not yet cross-chunk deduplicated) results — shared
 /// between `parse_chunk`'s return type, `finish_function_catalog`'s
 /// parameter, and `extraction::WorkerPartials`, which all merge the same
-/// four-tuple shape.
+/// tuple shape. The `Vec<bool>` is `ir_function_is_prototype` — parallel to
+/// the `Vec<ir::Function>` right before it (see `VisitorState`'s field of
+/// the same name for why this can't just be folded into `ir::Function`
+/// itself).
 pub(crate) type FunctionCatalogPartial = (
     Vec<FunctionDeclaration>,
     Vec<CallEdge>,
     Vec<ir::Function>,
+    Vec<bool>,
     Vec<ir::Record>,
     Vec<ir::Enum>,
 );
@@ -302,11 +319,21 @@ pub fn extract_function_catalog_cancellable(
 /// workers directly, sharing a parse with `pointer_catalog`) can reuse the
 /// exact same merge and post-processing behavior.
 pub(crate) fn finish_function_catalog(partials: Vec<FunctionCatalogPartial>) -> FunctionCatalog {
-    let mut seen = HashSet::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
     let mut declarations = Vec::new();
     let mut call_seen = HashSet::new();
     let mut calls = Vec::new();
-    let mut ir_seen = HashSet::new();
+    // Index (not just membership), and a parallel "is this stored entry a
+    // prototype" map — same upgrade-in-place rationale as `seen`/
+    // `declarations` above: two different workers can each see only one
+    // side (one the prototype, one the real definition) of the same usr,
+    // and whichever arrives second in this loop must be able to replace an
+    // already-accepted prototype stand-in, never the reverse. See
+    // `VisitorState.ir_function_is_prototype`'s doc comment for why an
+    // `ir::Function` value alone can't answer "is this a prototype" on its
+    // own.
+    let mut ir_function_index: HashMap<String, usize> = HashMap::new();
+    let mut ir_function_is_prototype: HashMap<String, bool> = HashMap::new();
     let mut ir_functions = Vec::new();
     let mut ir_record_seen = HashSet::new();
     let mut ir_records = Vec::new();
@@ -317,13 +344,23 @@ pub(crate) fn finish_function_catalog(partials: Vec<FunctionCatalogPartial>) -> 
         partial_declarations,
         partial_calls,
         partial_ir_functions,
+        partial_ir_function_is_prototype,
         partial_ir_records,
         partial_ir_enums,
     ) in partials
     {
         for declaration in partial_declarations {
-            if seen.insert(declaration_identity(&declaration)) {
-                declarations.push(declaration);
+            let identity = declaration_identity(&declaration);
+            match seen.get(&identity) {
+                None => {
+                    seen.insert(identity, declarations.len());
+                    declarations.push(declaration);
+                }
+                Some(&index) => {
+                    if !declarations[index].has_definition && declaration.has_definition {
+                        declarations[index] = declaration;
+                    }
+                }
             }
         }
 
@@ -333,9 +370,22 @@ pub(crate) fn finish_function_catalog(partials: Vec<FunctionCatalogPartial>) -> 
             }
         }
 
-        for function in partial_ir_functions {
-            if ir_seen.insert(function.usr.clone()) {
-                ir_functions.push(function);
+        for (function, is_prototype) in partial_ir_functions
+            .into_iter()
+            .zip(partial_ir_function_is_prototype)
+        {
+            match ir_function_index.get(&function.usr) {
+                None => {
+                    ir_function_index.insert(function.usr.clone(), ir_functions.len());
+                    ir_function_is_prototype.insert(function.usr.clone(), is_prototype);
+                    ir_functions.push(function);
+                }
+                Some(&index) => {
+                    if ir_function_is_prototype[&function.usr] && !is_prototype {
+                        ir_functions[index] = function;
+                        ir_function_is_prototype.insert(ir_functions[index].usr.clone(), false);
+                    }
+                }
             }
         }
 
@@ -1577,11 +1627,12 @@ fn parse_chunk(
          per-thread load is not expected to fail",
     );
 
-    let mut seen = HashSet::new();
+    let mut seen = HashMap::new();
     let mut declarations = Vec::new();
     let mut call_seen = HashSet::new();
     let mut calls = Vec::new();
     let mut ir_functions = Vec::new();
+    let mut ir_function_is_prototype = Vec::new();
     let mut ir_records = Vec::new();
     let mut ir_record_seen = HashSet::new();
     let mut ir_member_seen = HashSet::new();
@@ -1607,6 +1658,7 @@ fn parse_chunk(
                 calls: &mut calls,
                 call_seen: &mut call_seen,
                 ir_functions: &mut ir_functions,
+                ir_function_is_prototype: &mut ir_function_is_prototype,
                 ir_records: &mut ir_records,
                 ir_record_seen: &mut ir_record_seen,
                 ir_member_seen: &mut ir_member_seen,
@@ -1637,7 +1689,14 @@ fn parse_chunk(
         clang_sys::clang_disposeIndex(index);
     }
 
-    (declarations, calls, ir_functions, ir_records, ir_enums)
+    (
+        declarations,
+        calls,
+        ir_functions,
+        ir_function_is_prototype,
+        ir_records,
+        ir_enums,
+    )
 }
 
 fn log_function_catalog(args: fmt::Arguments<'_>) {
@@ -1657,10 +1716,27 @@ fn timestamp_millis() -> u128 {
 pub(crate) struct VisitorState<'a> {
     project_root: &'a Path,
     declarations: &'a mut Vec<FunctionDeclaration>,
-    seen: &'a mut HashSet<String>,
+    /// Declaration identity (`declaration_identity`) → index into
+    /// `declarations`, not just a membership set — `push_declaration` needs
+    /// the index to *upgrade* an already-pushed prototype-only entry
+    /// in place when a real definition for the same usr shows up later in
+    /// this same worker's traversal (a free function declared in a header,
+    /// defined in a `.cpp` the same worker also parses), without ever
+    /// losing the definition to a "first seen wins" rule.
+    seen: &'a mut HashMap<String, usize>,
     calls: &'a mut Vec<CallEdge>,
     call_seen: &'a mut HashSet<(String, CallResolution, String, u32, u32)>,
     ir_functions: &'a mut Vec<ir::Function>,
+    /// Parallel to `ir_functions` (same length, same order): `true` for an
+    /// entry synthesized from a free-function prototype with no definition
+    /// anywhere in this project (`docs/plans/lista-de-externos.md`),
+    /// `false` for a real definition. Needed because an `ir::Function`
+    /// value alone can't tell the two apart (an empty `body` isn't a
+    /// reliable signal — a real function can legitimately have one) — the
+    /// cross-worker merge in `finish_function_catalog` uses this to prefer
+    /// a real definition over a prototype stand-in for the same usr,
+    /// exactly like `seen` does for `declarations`.
+    ir_function_is_prototype: &'a mut Vec<bool>,
     ir_records: &'a mut Vec<ir::Record>,
     /// Dedupes record *creation* within one worker's traversal — a class
     /// fully defined in a header is reparsed once per translation unit that
@@ -1697,13 +1773,15 @@ pub(crate) struct VisitorState<'a> {
 
 impl<'a> VisitorState<'a> {
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         project_root: &'a Path,
         declarations: &'a mut Vec<FunctionDeclaration>,
-        seen: &'a mut HashSet<String>,
+        seen: &'a mut HashMap<String, usize>,
         calls: &'a mut Vec<CallEdge>,
         call_seen: &'a mut HashSet<(String, CallResolution, String, u32, u32)>,
         ir_functions: &'a mut Vec<ir::Function>,
+        ir_function_is_prototype: &'a mut Vec<bool>,
         ir_records: &'a mut Vec<ir::Record>,
         ir_record_seen: &'a mut HashSet<String>,
         ir_member_seen: &'a mut HashSet<String>,
@@ -1718,6 +1796,7 @@ impl<'a> VisitorState<'a> {
             calls,
             call_seen,
             ir_functions,
+            ir_function_is_prototype,
             ir_records,
             ir_record_seen,
             ir_member_seen,
@@ -1751,9 +1830,23 @@ fn declaration_identity(declaration: &FunctionDeclaration) -> String {
     )
 }
 
+/// Pushes `declaration`, or — if this worker already pushed a
+/// prototype-only entry (`has_definition: false`) for the same identity —
+/// upgrades it in place to the real definition now found. Never downgrades
+/// an existing definition, and never duplicates: see `VisitorState.seen`'s
+/// doc comment for why a plain membership set isn't enough here.
 fn push_declaration(state: &mut VisitorState<'_>, declaration: FunctionDeclaration) {
-    if state.seen.insert(declaration_identity(&declaration)) {
-        state.declarations.push(declaration);
+    let identity = declaration_identity(&declaration);
+    match state.seen.get(&identity) {
+        None => {
+            state.seen.insert(identity, state.declarations.len());
+            state.declarations.push(declaration);
+        }
+        Some(&index) => {
+            if !state.declarations[index].has_definition && declaration.has_definition {
+                state.declarations[index] = declaration;
+            }
+        }
     }
 }
 
@@ -1894,19 +1987,38 @@ extern "C" fn visit_cursor(
     // still the one and only cursor for that virtual slot, and skipping it
     // would make `mapping::options_for`'s interface-vs-mixin rule (US-7,
     // `docs/mapping-solver-cases.md` case B03) blind to every pure
-    // interface method. Unlike an ordinary in-header prototype (which *is*
-    // correctly skipped here, to avoid double-counting it alongside its
-    // out-of-line definition), a pure virtual method can never gain a
-    // separate defining cursor elsewhere, so this can't introduce a
-    // duplicate.
+    // interface method. Unlike an ordinary in-header prototype of a
+    // method/constructor/destructor (still correctly skipped here, to avoid
+    // double-counting it alongside its out-of-line definition), a pure
+    // virtual method can never gain a separate defining cursor elsewhere,
+    // so this can't introduce a duplicate.
     let is_pure_virtual_declaration =
         unsafe { clang_sys::clang_CXXMethod_isPureVirtual(cursor) } != 0;
+    let is_definition = unsafe { clang_sys::clang_isCursorDefinition(cursor) } != 0;
+    let declaration_kind = function_declaration_kind_for(kind);
 
-    if let Some(declaration_kind) = function_declaration_kind_for(kind)
-        && (unsafe { clang_sys::clang_isCursorDefinition(cursor) } != 0
-            || is_pure_virtual_declaration)
-        && let Some(declaration) = describe_function(cursor, declaration_kind, state.project_root)
+    // Unlike a method/constructor/destructor prototype (skipped, per the
+    // comment above), a **free function** prototype is deliberately
+    // cataloged even without a definition anywhere in this project —
+    // `docs/plans/lista-de-externos.md`'s auto-detection needs a real,
+    // structured signature (not just a name) for a symbol this project
+    // declares but never defines, so a mock can be emitted with the right
+    // return type. Scoped to `!is_system_header`: every libc/toolchain
+    // prototype reachable through an `#include` would otherwise flood the
+    // catalog with thousands of entries nothing ever calls.
+    let is_uncatalogued_free_prototype = declaration_kind
+        == Some(FunctionDeclarationKind::FreeFunction)
+        && !is_definition
+        && unsafe {
+            clang_sys::clang_Location_isInSystemHeader(clang_sys::clang_getCursorLocation(cursor))
+        } == 0;
+
+    if let Some(declaration_kind) = declaration_kind
+        && (is_definition || is_pure_virtual_declaration || is_uncatalogued_free_prototype)
+        && let Some(mut declaration) =
+            describe_function(cursor, declaration_kind, state.project_root)
     {
+        declaration.has_definition = is_definition;
         let caller_usr = declaration.usr.clone();
         let declared_kind = declaration.kind;
         let owning_class_usr = declaration.owning_class_usr.clone();
@@ -1921,27 +2033,50 @@ extern "C" fn visit_cursor(
             && let Some(mut function_ir) =
                 lower::cpp::lower_function(cursor, &caller_usr, state.project_root)
         {
-            // E08: this cursor is a full explicit specialization
-            // (`template<> std::string dobro<std::string>(...)`) when its
-            // own `clang_getSpecializedCursorTemplate` is non-null — a
-            // real, user-written `FreeFunction` declaration by every other
-            // measure, which is exactly why `function_declaration_kind_for`
-            // never needed a separate case for it. Renamed here via the
-            // same `monomorphized_template_name` every call site
-            // referencing it independently recomputes (`lower_call_expr`),
-            // so a specialization's own declaration and its call sites can
-            // never end up naming it differently.
-            let specialized_template =
-                unsafe { clang_sys::clang_getSpecializedCursorTemplate(cursor) };
-            if unsafe { clang_sys::clang_Cursor_isNull(specialized_template) } == 0 {
-                let base_name = unsafe {
-                    type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(
-                        specialized_template,
-                    ))
-                };
-                function_ir.name = lower::cpp::monomorphized_template_name(&base_name, cursor);
+            if !is_definition {
+                // A prototype-only cursor: `lower_function` already
+                // tolerates the missing `CompoundStmt` (empty `body`), but
+                // an empty body is silently wrong Dart for a non-`void`
+                // return type (no `return` statement) if this usr is ever
+                // *not* in the effective external set (`externals.rs`) —
+                // e.g. the user manually excluded an auto-detected
+                // candidate. A single `Unsupported` statement makes the
+                // ordinary (non-mock) emission path bail out honestly
+                // instead, the same "silêncio é proibido" idiom every other
+                // unrepresentable construct already uses.
+                function_ir.body = vec![ir::Stmt::Unsupported {
+                    reason: "declared but never defined in any compilation \
+                             unit of this project"
+                        .to_owned(),
+                    origin: function_ir.origin.clone(),
+                }];
+                state.ir_functions.push(function_ir);
+                state.ir_function_is_prototype.push(true);
+            } else {
+                // E08: this cursor is a full explicit specialization
+                // (`template<> std::string dobro<std::string>(...)`) when
+                // its own `clang_getSpecializedCursorTemplate` is non-null —
+                // a real, user-written `FreeFunction` declaration by every
+                // other measure, which is exactly why
+                // `function_declaration_kind_for` never needed a separate
+                // case for it. Renamed here via the same
+                // `monomorphized_template_name` every call site referencing
+                // it independently recomputes (`lower_call_expr`), so a
+                // specialization's own declaration and its call sites can
+                // never end up naming it differently.
+                let specialized_template =
+                    unsafe { clang_sys::clang_getSpecializedCursorTemplate(cursor) };
+                if unsafe { clang_sys::clang_Cursor_isNull(specialized_template) } == 0 {
+                    let base_name = unsafe {
+                        type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(
+                            specialized_template,
+                        ))
+                    };
+                    function_ir.name = lower::cpp::monomorphized_template_name(&base_name, cursor);
+                }
+                state.ir_functions.push(function_ir);
+                state.ir_function_is_prototype.push(false);
             }
-            state.ir_functions.push(function_ir);
         }
 
         // E04: a method's or constructor's *definition* cursor — inline
@@ -2005,6 +2140,7 @@ extern "C" fn visit_cursor(
                 calls: &mut *state.calls,
                 call_seen: &mut *state.call_seen,
                 ir_functions: &mut *state.ir_functions,
+                ir_function_is_prototype: &mut *state.ir_function_is_prototype,
                 ir_seen: &mut *state.ir_seen,
                 pending_overload: None,
             };
@@ -2037,6 +2173,11 @@ struct CallVisitorState<'a> {
     /// the same way any other cross-source duplicate already does, in
     /// `extract_function_catalog_cancellable`'s final merge.
     ir_functions: &'a mut Vec<ir::Function>,
+    /// Parallel to `ir_functions` (same length, same order) — see
+    /// `VisitorState.ir_function_is_prototype`'s doc comment. Always pushed
+    /// `false` here: a monomorphized function is synthesized from a real
+    /// template instantiation, never a prototype-only stand-in.
+    ir_function_is_prototype: &'a mut Vec<bool>,
     ir_seen: &'a mut HashSet<String>,
     /// Set by `visit_call_site` when the immediately preceding sibling
     /// cursor was an unresolved `CXCursor_OverloadedDeclRef` (case B04) —
@@ -2252,6 +2393,7 @@ fn record_call(cursor: clang_sys::CXCursor, state: &mut CallVisitorState<'_>) {
                     function_ir.name =
                         lower::cpp::monomorphized_template_name(&base_name, referenced);
                     state.ir_functions.push(function_ir);
+                    state.ir_function_is_prototype.push(false);
                 }
             }
 
@@ -2332,6 +2474,7 @@ fn describe_macro(cursor: clang_sys::CXCursor, project_root: &Path) -> Option<Fu
         is_pure_virtual: false,
         is_defaulted: false,
         overridden_usrs: Vec::new(),
+        has_definition: true,
     })
 }
 
@@ -2407,6 +2550,10 @@ fn describe_function(
         is_pure_virtual,
         is_defaulted,
         overridden_usrs,
+        // Overwritten by the caller (`visit_cursor` is the only call site),
+        // which knows `clang_isCursorDefinition` for this exact cursor —
+        // this function has no opinion on it either way.
+        has_definition: true,
     })
 }
 

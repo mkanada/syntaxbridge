@@ -133,6 +133,60 @@ void main() {
     expect(find.text('Shape'), findsNothing);
   });
 
+  testWidgets('marks a type external when its row toggle is tapped', (
+    tester,
+  ) async {
+    const shape = TypeDeclaration(
+      name: 'Shape',
+      kind: TypeDeclarationKind.class_,
+      file: '/workspace/src/shape.h',
+      line: 1,
+      column: 1,
+      usr: 'c:@S@Shape',
+    );
+    TypeDeclaration? toggled;
+    await tester.pumpWidget(
+      _host(const [shape], onToggleExternal: (type) => toggled = type),
+    );
+
+    await tester.tap(find.byIcon(Icons.link));
+    await tester.pump();
+
+    expect(toggled, shape);
+  });
+
+  testWidgets('shows the unmark icon for a type already in the external set', (
+    tester,
+  ) async {
+    const shape = TypeDeclaration(
+      name: 'Shape',
+      kind: TypeDeclarationKind.class_,
+      file: '/workspace/src/shape.h',
+      line: 1,
+      column: 1,
+      usr: 'c:@S@Shape',
+    );
+    await tester.pumpWidget(
+      _host(
+        const [shape],
+        externalUsrs: const {'c:@S@Shape'},
+        onToggleExternal: (_) {},
+      ),
+    );
+
+    expect(find.byIcon(Icons.link_off), findsOneWidget);
+    expect(find.byIcon(Icons.link), findsNothing);
+  });
+
+  testWidgets('hides the external toggle when no callback is provided', (
+    tester,
+  ) async {
+    await tester.pumpWidget(_host(const [point]));
+
+    expect(find.byIcon(Icons.link), findsNothing);
+    expect(find.byIcon(Icons.link_off), findsNothing);
+  });
+
   testWidgets('distinguishes homonym types declared in different namespaces', (
     tester,
   ) async {
@@ -281,6 +335,8 @@ Widget _host(
   List<TypeDeclaration> types, {
   ValueChanged<TypeDeclaration>? onTypeSelected,
   Map<String, int> usageCounts = const {},
+  Set<String> externalUsrs = const {},
+  ValueChanged<TypeDeclaration>? onToggleExternal,
 }) {
   return MaterialApp(
     home: Scaffold(
@@ -288,6 +344,8 @@ Widget _host(
         types: types,
         onTypeSelected: onTypeSelected ?? (_) {},
         usageCounts: usageCounts,
+        externalUsrs: externalUsrs,
+        onToggleExternal: onToggleExternal,
       ),
     ),
   );

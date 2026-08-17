@@ -359,6 +359,186 @@ class HttpServerClient implements ServerClient {
         .toList();
   }
 
+  @override
+  Future<ExternalListing> listExternals(String projectDir) async {
+    final url = baseUrl
+        .resolve('/projects/externals')
+        .replace(queryParameters: {'project_dir': projectDir});
+    cliLog('HTTP GET $url');
+    final request = await _httpClient.getUrl(url);
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP GET $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException(_errorMessageFromBody(body));
+    }
+
+    return ExternalListing.fromJson(jsonDecode(body) as Map<String, Object?>);
+  }
+
+  @override
+  Future<void> markExternal({
+    required String projectDir,
+    required String usr,
+    required bool external,
+  }) async {
+    final url = baseUrl.resolve('/projects/externals/mark');
+    final payload = jsonEncode({
+      'project_dir': projectDir,
+      'usr': usr,
+      'external': external,
+    });
+    cliLog('HTTP POST $url payload=$payload');
+    final request = await _httpClient.postUrl(url);
+    request.headers.contentType = ContentType.json;
+    request.write(payload);
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP POST $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException(_errorMessageFromBody(body));
+    }
+  }
+
+  @override
+  Future<List<String>> markFileExternal({
+    required String projectDir,
+    required String file,
+  }) async {
+    final url = baseUrl.resolve('/projects/externals/mark-file');
+    final payload = jsonEncode({'project_dir': projectDir, 'file': file});
+    cliLog('HTTP POST $url payload=$payload');
+    final request = await _httpClient.postUrl(url);
+    request.headers.contentType = ContentType.json;
+    request.write(payload);
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP POST $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException(_errorMessageFromBody(body));
+    }
+
+    final json = jsonDecode(body) as Map<String, Object?>;
+    final markedJson =
+        json['marked_usrs'] as List<Object?>? ?? const <Object?>[];
+    return markedJson.whereType<String>().toList();
+  }
+
+  @override
+  Future<List<String>> markTypeExternal({
+    required String projectDir,
+    required String typeUsr,
+  }) async {
+    final url = baseUrl.resolve('/projects/externals/mark-type');
+    final payload = jsonEncode({
+      'project_dir': projectDir,
+      'type_usr': typeUsr,
+    });
+    cliLog('HTTP POST $url payload=$payload');
+    final request = await _httpClient.postUrl(url);
+    request.headers.contentType = ContentType.json;
+    request.write(payload);
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP POST $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException(_errorMessageFromBody(body));
+    }
+
+    final json = jsonDecode(body) as Map<String, Object?>;
+    final markedJson =
+        json['marked_usrs'] as List<Object?>? ?? const <Object?>[];
+    return markedJson.whereType<String>().toList();
+  }
+
+  @override
+  Future<NameRegexRule> addNameRegex({
+    required String projectDir,
+    required String pattern,
+  }) async {
+    final url = baseUrl.resolve('/projects/externals/name-regex');
+    final payload = jsonEncode({'project_dir': projectDir, 'pattern': pattern});
+    cliLog('HTTP POST $url payload=$payload');
+    final request = await _httpClient.postUrl(url);
+    request.headers.contentType = ContentType.json;
+    request.write(payload);
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP POST $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException(_errorMessageFromBody(body));
+    }
+
+    return NameRegexRule.fromJson(jsonDecode(body) as Map<String, Object?>);
+  }
+
+  @override
+  Future<void> removeNameRegex({
+    required String projectDir,
+    required int id,
+  }) async {
+    final url = baseUrl.resolve('/projects/externals/name-regex/remove');
+    final payload = jsonEncode({'project_dir': projectDir, 'id': id});
+    cliLog('HTTP POST $url payload=$payload');
+    final request = await _httpClient.postUrl(url);
+    request.headers.contentType = ContentType.json;
+    request.write(payload);
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP POST $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException(_errorMessageFromBody(body));
+    }
+  }
+
+  @override
+  Future<PathRegexRule> addPathRegex({
+    required String projectDir,
+    required String pattern,
+  }) async {
+    final url = baseUrl.resolve('/projects/externals/path-regex');
+    final payload = jsonEncode({'project_dir': projectDir, 'pattern': pattern});
+    cliLog('HTTP POST $url payload=$payload');
+    final request = await _httpClient.postUrl(url);
+    request.headers.contentType = ContentType.json;
+    request.write(payload);
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP POST $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException(_errorMessageFromBody(body));
+    }
+
+    return PathRegexRule.fromJson(jsonDecode(body) as Map<String, Object?>);
+  }
+
+  @override
+  Future<void> removePathRegex({
+    required String projectDir,
+    required int id,
+  }) async {
+    final url = baseUrl.resolve('/projects/externals/path-regex/remove');
+    final payload = jsonEncode({'project_dir': projectDir, 'id': id});
+    cliLog('HTTP POST $url payload=$payload');
+    final request = await _httpClient.postUrl(url);
+    request.headers.contentType = ContentType.json;
+    request.write(payload);
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP POST $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException(_errorMessageFromBody(body));
+    }
+  }
+
   String _errorMessageFromBody(String body) {
     try {
       final json = jsonDecode(body);

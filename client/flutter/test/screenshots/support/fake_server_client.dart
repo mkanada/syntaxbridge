@@ -22,7 +22,15 @@ class ScreenshotFakeServerClient implements ServerClient {
     this.callsByFile = const <String, List<CallEdge>>{},
     this.transpiledPackage,
     this.diagnostics = const <DartDiagnostic>[],
-  });
+    ExternalListing externalListing = const ExternalListing(
+      statuses: <ExternalStatus>[],
+      nameRegexes: <NameRegexRule>[],
+      pathRegexes: <PathRegexRule>[],
+    ),
+    this.fileMarkResult = const <String>[],
+    this.typeMarkResult = const <String>[],
+    // ignore: prefer_initializing_formals
+  }) : _externalListing = externalListing;
 
   final ServerStatus status;
   final CreatedProject? project;
@@ -41,6 +49,18 @@ class ScreenshotFakeServerClient implements ServerClient {
   final Map<String, List<CallEdge>> callsByFile;
   final TranspiledPackage? transpiledPackage;
   final List<DartDiagnostic> diagnostics;
+
+  /// Returned by [markFileExternal]/[markTypeExternal] — the fake doesn't
+  /// replicate the server's `expand_file_mark`/`expand_type_mark`
+  /// expansion, so a screenshot test that needs to show the *result* of
+  /// marking a file/type should construct [ExternalListing] with that
+  /// result already reflected, rather than relying on these calls to
+  /// mutate it.
+  final List<String> fileMarkResult;
+  final List<String> typeMarkResult;
+  ExternalListing _externalListing;
+  String? markedFile;
+  String? markedTypeUsr;
   String? createdProjectName;
   String? readSourceFilePath;
   String? openedProjectDir;
@@ -166,6 +186,121 @@ class ScreenshotFakeServerClient implements ServerClient {
   Future<List<DartDiagnostic>> validateProject(String projectDir) async {
     validateProjectDir = projectDir;
     return diagnostics;
+  }
+
+  @override
+  Future<ExternalListing> listExternals(String projectDir) async =>
+      _externalListing;
+
+  @override
+  Future<void> markExternal({
+    required String projectDir,
+    required String usr,
+    required bool external,
+  }) async {
+    final withoutUsr = _externalListing.statuses
+        .where((status) => status.usr != usr)
+        .toList();
+    _externalListing = ExternalListing(
+      statuses: [
+        ...withoutUsr,
+        ExternalStatus(
+          usr: usr,
+          effective: external,
+          sources: [
+            ExternalSource(
+              kind: external
+                  ? ExternalSourceKind.manualInclude
+                  : ExternalSourceKind.manualExclude,
+            ),
+          ],
+        ),
+      ],
+      nameRegexes: _externalListing.nameRegexes,
+      pathRegexes: _externalListing.pathRegexes,
+    );
+  }
+
+  @override
+  Future<List<String>> markFileExternal({
+    required String projectDir,
+    required String file,
+  }) async {
+    markedFile = file;
+    return fileMarkResult;
+  }
+
+  @override
+  Future<List<String>> markTypeExternal({
+    required String projectDir,
+    required String typeUsr,
+  }) async {
+    markedTypeUsr = typeUsr;
+    return typeMarkResult;
+  }
+
+  @override
+  Future<NameRegexRule> addNameRegex({
+    required String projectDir,
+    required String pattern,
+  }) async {
+    final rule = NameRegexRule(
+      id: _externalListing.nameRegexes.length + 1,
+      pattern: pattern,
+      createdAt: '0',
+    );
+    _externalListing = ExternalListing(
+      statuses: _externalListing.statuses,
+      nameRegexes: [..._externalListing.nameRegexes, rule],
+      pathRegexes: _externalListing.pathRegexes,
+    );
+    return rule;
+  }
+
+  @override
+  Future<void> removeNameRegex({
+    required String projectDir,
+    required int id,
+  }) async {
+    _externalListing = ExternalListing(
+      statuses: _externalListing.statuses,
+      nameRegexes: _externalListing.nameRegexes
+          .where((rule) => rule.id != id)
+          .toList(),
+      pathRegexes: _externalListing.pathRegexes,
+    );
+  }
+
+  @override
+  Future<PathRegexRule> addPathRegex({
+    required String projectDir,
+    required String pattern,
+  }) async {
+    final rule = PathRegexRule(
+      id: _externalListing.pathRegexes.length + 1,
+      pattern: pattern,
+      createdAt: '0',
+    );
+    _externalListing = ExternalListing(
+      statuses: _externalListing.statuses,
+      nameRegexes: _externalListing.nameRegexes,
+      pathRegexes: [..._externalListing.pathRegexes, rule],
+    );
+    return rule;
+  }
+
+  @override
+  Future<void> removePathRegex({
+    required String projectDir,
+    required int id,
+  }) async {
+    _externalListing = ExternalListing(
+      statuses: _externalListing.statuses,
+      nameRegexes: _externalListing.nameRegexes,
+      pathRegexes: _externalListing.pathRegexes
+          .where((rule) => rule.id != id)
+          .toList(),
+    );
   }
 }
 

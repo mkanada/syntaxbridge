@@ -392,4 +392,47 @@ class _ScriptedServerClient implements ServerClient {
   @override
   Future<List<DartDiagnostic>> validateProject(String projectDir) =>
       throw UnimplementedError('not used by this screen');
+
+  @override
+  Future<ExternalListing> listExternals(String projectDir) =>
+      throw UnimplementedError('not used by this screen');
+
+  @override
+  Future<void> markExternal({
+    required String projectDir,
+    required String usr,
+    required bool external,
+  }) => throw UnimplementedError('not used by this screen');
+
+  @override
+  Future<List<String>> markFileExternal({
+    required String projectDir,
+    required String file,
+  }) => throw UnimplementedError('not used by this screen');
+
+  @override
+  Future<List<String>> markTypeExternal({
+    required String projectDir,
+    required String typeUsr,
+  }) => throw UnimplementedError('not used by this screen');
+
+  @override
+  Future<NameRegexRule> addNameRegex({
+    required String projectDir,
+    required String pattern,
+  }) => throw UnimplementedError('not used by this screen');
+
+  @override
+  Future<void> removeNameRegex({required String projectDir, required int id}) =>
+      throw UnimplementedError('not used by this screen');
+
+  @override
+  Future<PathRegexRule> addPathRegex({
+    required String projectDir,
+    required String pattern,
+  }) => throw UnimplementedError('not used by this screen');
+
+  @override
+  Future<void> removePathRegex({required String projectDir, required int id}) =>
+      throw UnimplementedError('not used by this screen');
 }

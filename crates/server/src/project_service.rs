@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use crate::externals::{self, ExternalMark, NameRegexRule, PathRegexRule};
 use crate::extraction::{self, ExtractionError};
 use crate::function_catalog::{self, CallEdge, FunctionDeclaration};
 use crate::ingest::{self, CompilationUnit, CreateProjectRequest, CreatedProject, IngestError};
@@ -589,6 +590,228 @@ pub fn list_pointers(project_dir: &Path) -> Result<PointerCatalogListing, ListTy
     })
 }
 
+/// Serves the effective "extern" set (`docs/plans/lista-de-externos.md`)
+/// plus both live regex rule lists, computed fresh from the already-
+/// persisted catalogs on every request — mirrors `list_types`/`list_pointers`
+/// in never reparsing, and mirrors `externals::effective_external_set`'s own
+/// doc comment in never materializing the result: this function's whole job
+/// is to gather that pure function's five inputs from the store.
+#[derive(Debug, Serialize)]
+pub struct ExternalListing {
+    pub statuses: Vec<externals::ExternalStatus>,
+    pub name_regexes: Vec<NameRegexRule>,
+    pub path_regexes: Vec<PathRegexRule>,
+}
+
+pub fn list_externals(project_dir: &Path) -> Result<ExternalListing, ListTypesError> {
+    if !is_openable_project(project_dir) {
+        return Err(ListTypesError::NotFound(project_dir.to_path_buf()));
+    }
+
+    let project_db_path = project_dir.join("project.db");
+    let project_store = ProjectStore::open(&project_db_path)?;
+    let type_declarations = project_store.list_type_declarations()?;
+    let function_declarations = project_store.list_function_declarations()?;
+    let call_edges = project_store.list_call_edges()?;
+    let name_regexes = project_store.list_name_regexes()?;
+    let path_regexes = project_store.list_path_regexes()?;
+    let manual_marks = project_store.list_external_marks()?;
+
+    let statuses = externals::effective_external_set(
+        &type_declarations,
+        &function_declarations,
+        &call_edges,
+        &name_regexes,
+        &path_regexes,
+        &manual_marks,
+    );
+
+    Ok(ExternalListing {
+        statuses,
+        name_regexes,
+        path_regexes,
+    })
+}
+
+/// Records a manual external/not-external decision for one usr (decision 5,
+/// `docs/plans/lista-de-externos.md`) — the direct-marking path used from
+/// the Types/Functions views (a single usr, no expansion needed).
+pub fn mark_external(project_dir: &Path, usr: &str, external: bool) -> Result<(), ListTypesError> {
+    if !is_openable_project(project_dir) {
+        return Err(ListTypesError::NotFound(project_dir.to_path_buf()));
+    }
+
+    let project_db_path = project_dir.join("project.db");
+    let mut project_store = ProjectStore::open(&project_db_path)?;
+    project_store.set_external_mark(&ExternalMark {
+        usr: usr.to_owned(),
+        external,
+        decided_at: now_timestamp(),
+    })?;
+    Ok(())
+}
+
+/// Marks every type/function declared in `file` external — decision 3's
+/// "cascata é foto": expands to the file's usrs *now*
+/// (`externals::expand_file_mark`) and writes one independent mark per usr;
+/// nothing links them back to the file afterward. Returns the usrs marked,
+/// so the caller can show the user what just happened.
+pub fn mark_file_external(project_dir: &Path, file: &str) -> Result<Vec<String>, ListTypesError> {
+    if !is_openable_project(project_dir) {
+        return Err(ListTypesError::NotFound(project_dir.to_path_buf()));
+    }
+
+    let project_db_path = project_dir.join("project.db");
+    let mut project_store = ProjectStore::open(&project_db_path)?;
+    let type_declarations = project_store.list_type_declarations()?;
+    let function_declarations = project_store.list_function_declarations()?;
+    let usrs = externals::expand_file_mark(file, &type_declarations, &function_declarations);
+
+    let decided_at = now_timestamp();
+    for usr in &usrs {
+        project_store.set_external_mark(&ExternalMark {
+            usr: usr.clone(),
+            external: true,
+            decided_at: decided_at.clone(),
+        })?;
+    }
+    Ok(usrs)
+}
+
+/// Same shape as [`mark_file_external`], expanding a type to itself plus
+/// every method it owns (`externals::expand_type_mark`) instead of a file
+/// to its contents.
+pub fn mark_type_external(
+    project_dir: &Path,
+    type_usr: &str,
+) -> Result<Vec<String>, ListTypesError> {
+    if !is_openable_project(project_dir) {
+        return Err(ListTypesError::NotFound(project_dir.to_path_buf()));
+    }
+
+    let project_db_path = project_dir.join("project.db");
+    let mut project_store = ProjectStore::open(&project_db_path)?;
+    let function_declarations = project_store.list_function_declarations()?;
+    let usrs = externals::expand_type_mark(type_usr, &function_declarations);
+
+    let decided_at = now_timestamp();
+    for usr in &usrs {
+        project_store.set_external_mark(&ExternalMark {
+            usr: usr.clone(),
+            external: true,
+            decided_at: decided_at.clone(),
+        })?;
+    }
+    Ok(usrs)
+}
+
+#[derive(Debug)]
+pub enum AddRegexError {
+    NotFound(PathBuf),
+    InvalidPattern(String),
+    Persistence(PersistenceError),
+}
+
+impl AddRegexError {
+    pub fn is_client_error(&self) -> bool {
+        matches!(self, Self::NotFound(_) | Self::InvalidPattern(_))
+    }
+}
+
+impl fmt::Display for AddRegexError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound(path) => write!(formatter, "no project found at {}", path.display()),
+            Self::InvalidPattern(message) => write!(formatter, "invalid regex pattern: {message}"),
+            Self::Persistence(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for AddRegexError {}
+
+impl From<PersistenceError> for AddRegexError {
+    fn from(error: PersistenceError) -> Self {
+        Self::Persistence(error)
+    }
+}
+
+/// Adds a name-regex rule (decision 6, `docs/plans/lista-de-externos.md`) —
+/// refuses an invalid pattern (`externals::validate_regex_pattern`) instead
+/// of persisting it and letting `effective_external_set` silently skip it
+/// on every future read, per that function's own doc comment on the
+/// invariant this call site is responsible for upholding.
+pub fn add_name_regex(project_dir: &Path, pattern: &str) -> Result<NameRegexRule, AddRegexError> {
+    if !is_openable_project(project_dir) {
+        return Err(AddRegexError::NotFound(project_dir.to_path_buf()));
+    }
+    externals::validate_regex_pattern(pattern).map_err(AddRegexError::InvalidPattern)?;
+
+    let project_db_path = project_dir.join("project.db");
+    let mut project_store = ProjectStore::open(&project_db_path)?;
+    let created_at = now_timestamp();
+    let id = project_store.add_name_regex(pattern, &created_at)?;
+    Ok(NameRegexRule {
+        id,
+        pattern: pattern.to_owned(),
+        created_at,
+    })
+}
+
+pub fn remove_name_regex(project_dir: &Path, id: i64) -> Result<(), ListTypesError> {
+    if !is_openable_project(project_dir) {
+        return Err(ListTypesError::NotFound(project_dir.to_path_buf()));
+    }
+    let project_db_path = project_dir.join("project.db");
+    let mut project_store = ProjectStore::open(&project_db_path)?;
+    project_store.remove_name_regex(id)?;
+    Ok(())
+}
+
+/// Same shape as [`add_name_regex`], for path-regex rules.
+pub fn add_path_regex(project_dir: &Path, pattern: &str) -> Result<PathRegexRule, AddRegexError> {
+    if !is_openable_project(project_dir) {
+        return Err(AddRegexError::NotFound(project_dir.to_path_buf()));
+    }
+    externals::validate_regex_pattern(pattern).map_err(AddRegexError::InvalidPattern)?;
+
+    let project_db_path = project_dir.join("project.db");
+    let mut project_store = ProjectStore::open(&project_db_path)?;
+    let created_at = now_timestamp();
+    let id = project_store.add_path_regex(pattern, &created_at)?;
+    Ok(PathRegexRule {
+        id,
+        pattern: pattern.to_owned(),
+        created_at,
+    })
+}
+
+pub fn remove_path_regex(project_dir: &Path, id: i64) -> Result<(), ListTypesError> {
+    if !is_openable_project(project_dir) {
+        return Err(ListTypesError::NotFound(project_dir.to_path_buf()));
+    }
+    let project_db_path = project_dir.join("project.db");
+    let mut project_store = ProjectStore::open(&project_db_path)?;
+    project_store.remove_path_regex(id)?;
+    Ok(())
+}
+
+/// Milliseconds since the Unix epoch, as a decimal string — not true RFC
+/// 3339 despite `ExternalMark`/`NameRegexRule`/`PathRegexRule`'s `TEXT`
+/// columns being able to hold either: no date/time crate is a dependency of
+/// this workspace, and `global_store`'s `created_at_millis`/
+/// `last_opened_at_millis` already establish "epoch millis, stored as a
+/// plain number" as this codebase's actual precedent for a server-generated
+/// timestamp, not the aspirational RFC 3339 `mapping::MappingDecision`'s
+/// doc comment describes but that no production code has ever actually
+/// generated (only hand-written test literals).
+fn now_timestamp() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().to_string())
+        .unwrap_or_else(|_| "0".to_owned())
+}
+
 /// Reads a single source file's content for display, refusing to read
 /// anything outside `project_dir`'s `input-source` subtree even if the
 /// caller supplies an absolute path elsewhere on disk.
@@ -692,6 +915,30 @@ fn build_transpiled_package(
     let compilation_units = project_store.list_compilation_units()?;
     let type_catalog = project_store.list_type_declarations()?;
     let type_mappings = project_store.list_type_mappings()?;
+    // `docs/plans/lista-de-externos.md`: the effective external set is
+    // always recomputed from the persisted catalogs, never itself
+    // persisted — same "decision persisted, effect computed" shape
+    // `type_mappings` above already uses. Only `effective: true` usrs are
+    // passed to the emitter; `MockContext::is_external` is only ever
+    // consulted with a function/method/constructor usr, so the type usrs
+    // also present here are harmless, never looked up.
+    let external_function_declarations = project_store.list_function_declarations()?;
+    let external_call_edges = project_store.list_call_edges()?;
+    let name_regexes = project_store.list_name_regexes()?;
+    let path_regexes = project_store.list_path_regexes()?;
+    let external_marks = project_store.list_external_marks()?;
+    let external_usrs: std::collections::HashSet<String> = externals::effective_external_set(
+        &type_catalog,
+        &external_function_declarations,
+        &external_call_edges,
+        &name_regexes,
+        &path_regexes,
+        &external_marks,
+    )
+    .into_iter()
+    .filter(|status| status.effective)
+    .map(|status| status.usr)
+    .collect();
     let input_source_dir = project_dir.join("input-source");
     let package_name = project_dir
         .file_name()
@@ -718,7 +965,13 @@ fn build_transpiled_package(
             enums: ir_enums,
         }
     };
-    let package = transpile::emit_package(&module, package_name, &type_catalog, &type_mappings)?;
+    let package = transpile::emit_package_with_externals(
+        &module,
+        package_name,
+        &type_catalog,
+        &type_mappings,
+        &external_usrs,
+    )?;
     transpile::write_package(&package, &project_dir.join("transpiled"))?;
 
     Ok((module, package))

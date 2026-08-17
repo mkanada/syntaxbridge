@@ -86,4 +86,50 @@ abstract class ServerClient {
   /// translated back to its C++ origin where one could be located (US-9,
   /// criterion 3).
   Future<List<DartDiagnostic>> validateProject(String projectDir);
+
+  /// The effective "extern" set plus both live regexp rule lists
+  /// (`docs/plans/lista-de-externos.md`), recomputed fresh from the
+  /// persisted catalogs on every call — never materialized server-side.
+  Future<ExternalListing> listExternals(String projectDir);
+
+  /// Records (or updates) a manual external/not-external decision for one
+  /// usr — the direct-marking action `TypesView`/`FunctionsView`'s per-row
+  /// toggle sends.
+  Future<void> markExternal({
+    required String projectDir,
+    required String usr,
+    required bool external,
+  });
+
+  /// Marks every type/function declared in [file] external — decision 3's
+  /// "cascata é foto": expands to that file's usrs *now* and writes one
+  /// independent mark per usr. Returns the usrs marked.
+  Future<List<String>> markFileExternal({
+    required String projectDir,
+    required String file,
+  });
+
+  /// Same shape as [markFileExternal], expanding a type to itself plus
+  /// every method it owns instead of a file to its contents.
+  Future<List<String>> markTypeExternal({
+    required String projectDir,
+    required String typeUsr,
+  });
+
+  /// Adds a name-regexp rule (decision 6). Throws if [pattern] doesn't
+  /// compile — never persisted invalid.
+  Future<NameRegexRule> addNameRegex({
+    required String projectDir,
+    required String pattern,
+  });
+
+  Future<void> removeNameRegex({required String projectDir, required int id});
+
+  /// Same shape as [addNameRegex], for path-regexp rules.
+  Future<PathRegexRule> addPathRegex({
+    required String projectDir,
+    required String pattern,
+  });
+
+  Future<void> removePathRegex({required String projectDir, required int id});
 }

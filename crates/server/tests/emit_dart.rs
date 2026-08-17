@@ -4,10 +4,12 @@
 
 use std::collections::BTreeMap;
 
-use syntax_bridge_server::emit::dart::emit_module;
+use std::collections::HashSet;
+
+use syntax_bridge_server::emit::dart::{emit_module, emit_module_with_externals};
 use syntax_bridge_server::ir::{
-    BaseClass, BinaryOp, Constructor, Enum, Expr, Field, Function, Module, Origin, Param, Record,
-    Stmt, Type,
+    BaseClass, BinaryOp, Constructor, Enum, Expr, Field, Function, Method, Module, Origin, Param,
+    Record, Stmt, Type,
 };
 
 fn origin(line: u32) -> Origin {
@@ -1130,4 +1132,292 @@ fn a_leaf_class_imports_every_transitively_expanded_mixin_dependency() {
          clause names them directly, even though neither is `Usuario`'s own direct mixin, \
          got:\n{source}"
     );
+}
+
+/// `docs/plans/lista-de-externos.md` decision 1: "mock = valor plausível,
+/// execução segue" — a free function whose usr is in the effective external
+/// set gets a `return` of a plausible default for its type, never a
+/// `throw`, even though its own body (never lowered, per
+/// `function_catalog`'s prototype cataloging) is the `Stmt::Unsupported`
+/// placeholder `lower::cpp` synthesizes for exactly this case.
+#[test]
+fn an_externally_marked_free_function_returns_a_plausible_default_instead_of_throwing() {
+    let function = Function {
+        body: vec![Stmt::Unsupported {
+            reason: "declared but never defined in any compilation unit of this project".to_owned(),
+            origin: origin(2),
+        }],
+        ..soma_function()
+    };
+    let module = Module {
+        records: Vec::new(),
+        functions: vec![function.clone()],
+        enums: Vec::new(),
+    };
+    let external_usrs: HashSet<&str> = [function.usr.as_str()].into_iter().collect();
+
+    let files = emit_module_with_externals(&module, &external_usrs);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert!(
+        source.contains("// syntax-bridge: externo, corpo mockado"),
+        "expected an honest marker comment, got:\n{source}"
+    );
+    assert!(
+        source.contains("return 0;"),
+        "expected a plausible int default, got:\n{source}"
+    );
+    assert!(
+        !source.contains("throw"),
+        "an external usr must never throw — that's the Unsupported idiom this path \
+         exists to replace, got:\n{source}"
+    );
+}
+
+/// A `void`-returning external function has nothing to `return` a default
+/// of — the mock body is just the marker comment, still never a `throw`.
+#[test]
+fn an_externally_marked_void_function_has_an_empty_mocked_body() {
+    let function = Function {
+        return_type: Type::Void,
+        body: vec![Stmt::Unsupported {
+            reason: "declared but never defined".to_owned(),
+            origin: origin(2),
+        }],
+        ..soma_function()
+    };
+    let module = Module {
+        records: Vec::new(),
+        functions: vec![function.clone()],
+        enums: Vec::new(),
+    };
+    let external_usrs: HashSet<&str> = [function.usr.as_str()].into_iter().collect();
+
+    let files = emit_module_with_externals(&module, &external_usrs);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert!(
+        source.contains("// syntax-bridge: externo, corpo mockado"),
+        "got:\n{source}"
+    );
+    assert!(!source.contains("throw"), "got:\n{source}");
+    assert!(!source.contains("return "), "got:\n{source}");
+}
+
+/// Regression guard for `emit_module`'s own delegation: with no usr in the
+/// external set, output must be byte-identical to before this feature
+/// existed — `emit_module` is `emit_module_with_externals` with an empty
+/// set, never a behavior change for a project that marks nothing external.
+#[test]
+fn emit_module_produces_the_same_output_as_an_empty_external_set() {
+    let module = Module {
+        records: Vec::new(),
+        functions: vec![soma_function()],
+        enums: Vec::new(),
+    };
+
+    let plain = emit_module(&module);
+    let with_empty_set = emit_module_with_externals(&module, &HashSet::new());
+    assert_eq!(plain, with_empty_set);
+}
+
+fn area_method(usr: &str, return_type: Type, body: Vec<Stmt>) -> Method {
+    Method {
+        name: "area".to_owned(),
+        usr: usr.to_owned(),
+        params: Vec::new(),
+        return_type,
+        body: Some(body),
+        is_static: false,
+        is_override: false,
+        origin: origin(3),
+    }
+}
+
+/// Same guarantee as the free-function case, for a method reached by
+/// marking its owning type external (decision 3's cascade,
+/// `docs/plans/lista-de-externos.md`) or the method's own usr directly.
+#[test]
+fn an_externally_marked_method_mocks_its_return_value() {
+    let method = area_method(
+        "c:@S@Shape@F@area#",
+        Type::Double,
+        vec![Stmt::Unsupported {
+            reason: "declared but never defined".to_owned(),
+            origin: origin(3),
+        }],
+    );
+    let record = Record {
+        name: "Shape".to_owned(),
+        usr: "c:@S@Shape".to_owned(),
+        namespace: String::new(),
+        fields: Vec::new(),
+        static_fields: Vec::new(),
+        constructors: Vec::new(),
+        methods: vec![method],
+        base_class: None,
+        mixins: Vec::new(),
+        destructor: None,
+        origin: origin(1),
+    };
+    let module = Module {
+        records: vec![record],
+        functions: Vec::new(),
+        enums: Vec::new(),
+    };
+    let external_usrs: HashSet<&str> = ["c:@S@Shape@F@area#"].into_iter().collect();
+
+    let files = emit_module_with_externals(&module, &external_usrs);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert!(
+        source.contains("// syntax-bridge: externo, corpo mockado"),
+        "got:\n{source}"
+    );
+    assert!(source.contains("return 0;"), "got:\n{source}");
+    assert!(!source.contains("throw"), "got:\n{source}");
+}
+
+/// A constructor has no return type of its own to mock — its fields already
+/// get a sound default at declaration (`emit_field_declaration`), so an
+/// external constructor's mocked body is simply empty, and the object still
+/// comes out fully initialized.
+#[test]
+fn an_externally_marked_constructor_has_an_empty_mocked_body() {
+    let constructor = Constructor {
+        usr: "c:@S@Shape@F@Shape#".to_owned(),
+        constructor_index: 0,
+        params: Vec::new(),
+        body: vec![Stmt::Unsupported {
+            reason: "declared but never defined".to_owned(),
+            origin: origin(2),
+        }],
+        origin: origin(2),
+    };
+    let record = Record {
+        name: "Shape".to_owned(),
+        usr: "c:@S@Shape".to_owned(),
+        namespace: String::new(),
+        fields: vec![Field {
+            name: "radius".to_owned(),
+            ty: Type::Double,
+        }],
+        static_fields: Vec::new(),
+        constructors: vec![constructor],
+        methods: Vec::new(),
+        base_class: None,
+        mixins: Vec::new(),
+        destructor: None,
+        origin: origin(1),
+    };
+    let module = Module {
+        records: vec![record],
+        functions: Vec::new(),
+        enums: Vec::new(),
+    };
+    let external_usrs: HashSet<&str> = ["c:@S@Shape@F@Shape#"].into_iter().collect();
+
+    let files = emit_module_with_externals(&module, &external_usrs);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert!(
+        source.contains("// syntax-bridge: externo, corpo mockado"),
+        "got:\n{source}"
+    );
+    assert!(!source.contains("throw"), "got:\n{source}");
+}
+
+/// When the mocked type itself has no plausible value at all
+/// (`Type::Unsupported` — the product doesn't know how to represent it,
+/// mocked or not), the mock path falls back to the same honest
+/// `Stmt::Unsupported` bailout every other unrepresentable construct uses —
+/// the one case where "nada de frio" still yields to "silêncio é proibido",
+/// because there is no non-throwing Dart value of that type to return.
+#[test]
+fn an_externally_marked_function_with_an_unmockable_return_type_still_bails_out_honestly() {
+    let function = Function {
+        return_type: Type::Unsupported("long".to_owned()),
+        body: vec![Stmt::Unsupported {
+            reason: "declared but never defined".to_owned(),
+            origin: origin(2),
+        }],
+        ..soma_function()
+    };
+    let module = Module {
+        records: Vec::new(),
+        functions: vec![function.clone()],
+        enums: Vec::new(),
+    };
+    let external_usrs: HashSet<&str> = [function.usr.as_str()].into_iter().collect();
+
+    let files = emit_module_with_externals(&module, &external_usrs);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert!(
+        source.contains("throw UnimplementedError("),
+        "expected the honest Unsupported bailout when the type itself has no \
+         plausible value, got:\n{source}"
+    );
+    assert!(
+        source.contains("não tem valor plausível para mock"),
+        "got:\n{source}"
+    );
+}
+
+/// A `Record`-returning external function mocks a real, instantiable value —
+/// a call to the record's own synthetic positional constructor (no
+/// `constructors` of its own), with each field's own default recursively.
+#[test]
+fn an_externally_marked_function_returning_a_record_mocks_a_constructor_call() {
+    let ponto = Record {
+        name: "Ponto".to_owned(),
+        usr: "c:@S@Ponto".to_owned(),
+        namespace: String::new(),
+        fields: vec![
+            Field {
+                name: "x".to_owned(),
+                ty: Type::Int,
+            },
+            Field {
+                name: "y".to_owned(),
+                ty: Type::Int,
+            },
+        ],
+        static_fields: Vec::new(),
+        constructors: Vec::new(),
+        methods: Vec::new(),
+        base_class: None,
+        mixins: Vec::new(),
+        destructor: None,
+        origin: origin(1),
+    };
+    let function = Function {
+        name: "origem".to_owned(),
+        usr: "c:@F@origem#".to_owned(),
+        params: Vec::new(),
+        return_type: Type::Record {
+            usr: ponto.usr.clone(),
+            name: ponto.name.clone(),
+        },
+        body: vec![Stmt::Unsupported {
+            reason: "declared but never defined".to_owned(),
+            origin: origin(5),
+        }],
+        origin: origin(5),
+    };
+    let module = Module {
+        records: vec![ponto],
+        functions: vec![function.clone()],
+        enums: Vec::new(),
+    };
+    let external_usrs: HashSet<&str> = [function.usr.as_str()].into_iter().collect();
+
+    let files = emit_module_with_externals(&module, &external_usrs);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert!(
+        source.contains("return Ponto(0, 0);"),
+        "expected a real, instantiable mock value, got:\n{source}"
+    );
+    assert!(!source.contains("throw"), "got:\n{source}");
 }

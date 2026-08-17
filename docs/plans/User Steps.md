@@ -47,6 +47,10 @@ Este arquivo é a fonte única do roadmap. Os antigos `docs/plans/ingest.md` e
 `docs/plans/separate-compilation-units.md` foram absorvidos por US-1 e US-6,
 respectivamente, e removidos do repositório.
 
+`docs/plans/lista-de-externos.md` documenta um recurso negociado fora deste
+roadmap (não tem ID US-N): a lista de "extern", marcação de código que o
+usuário decide não transpilar, emitido como mock em vez de bailout.
+
 US-6 está desdobrado em cinco sub-passos (US-6.1 a US-6.5). O desdobramento
 nasceu de uma decisão arquitetural em aberto, **hoje tomada** (as quatro
 respostas da rodada 1, no início do item): US-6 tem duas fases, e a fase A —

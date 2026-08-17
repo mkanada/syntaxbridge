@@ -31,6 +31,23 @@ const UNSUPPORTED_HELPER_NAME: &str = "_syntaxBridgeUnsupported";
 /// (`lib/<stem>.dart`); a `BTreeMap` keeps the result — and therefore every
 /// consumer that iterates it — deterministic (§5 restriction 5).
 pub fn emit_module(module: &Module) -> BTreeMap<String, String> {
+    emit_module_with_externals(module, &HashSet::new())
+}
+
+/// Like [`emit_module`], but every callable (free function, method,
+/// constructor) whose usr is in `external_usrs`
+/// (`docs/plans/lista-de-externos.md` — the effective external set
+/// `project_service::build_transpiled_package` computes from
+/// `externals::effective_external_set`) gets a mock body instead of its
+/// real one, or the `Unsupported` bailout it would otherwise fall back to.
+/// `external_usrs` holds borrowed `&str`s rather than owned `String`s so a
+/// caller that already has `Vec<ExternalStatus>` (usrs as `String`) can
+/// build the set with one pass of `.iter().map(String::as_str)`, without an
+/// intermediate clone of every usr.
+pub fn emit_module_with_externals(
+    module: &Module,
+    external_usrs: &HashSet<&str>,
+) -> BTreeMap<String, String> {
     // E09: gathered across the *whole* module, not per-file — a mixin and
     // the class that uses it could in principle land in different files
     // (multi-TU dedup is E11's own armadilha, not reopened here), and
@@ -105,6 +122,12 @@ pub fn emit_module(module: &Module) -> BTreeMap<String, String> {
         .map(|enum_decl| (enum_decl.usr.as_str(), enum_decl))
         .collect();
 
+    let mock = MockContext {
+        external_usrs,
+        enums_by_usr: &enums_by_usr,
+        records_by_usr: &records_by_usr,
+    };
+
     let stems: BTreeSet<String> = functions_by_stem
         .keys()
         .chain(records_by_stem.keys())
@@ -150,6 +173,7 @@ pub fn emit_module(module: &Module) -> BTreeMap<String, String> {
                     &records_by_usr,
                     &usr_to_stem,
                     &enums_by_usr,
+                    &mock,
                 ),
             )
         })
@@ -347,6 +371,7 @@ fn emit_file(
     records_by_usr: &HashMap<&str, &Record>,
     usr_to_stem: &HashMap<&str, String>,
     enums_by_usr: &HashMap<&str, &Enum>,
+    mock: &MockContext<'_>,
 ) -> String {
     let mut used_expr_helper = false;
     // Set by `Expr::StringByteLength` (E05's UTF-8-byte-length bridge for
@@ -368,11 +393,13 @@ fn emit_file(
             &mut used_expr_helper,
             &mut used_utf8_encode,
             enums_by_usr,
+            mock,
         ));
     }
     for function in functions {
         sections.push(emit_function(
             function,
+            mock,
             &mut used_expr_helper,
             &mut used_utf8_encode,
         ));
@@ -688,6 +715,7 @@ fn emit_enum(enum_decl: &Enum) -> String {
 /// own field initialization, so the E03 synthetic positional constructor
 /// would either be redundant or, worse, a second and inconsistent way to
 /// construct the same class.
+#[allow(clippy::too_many_arguments)]
 fn emit_record(
     record: &Record,
     is_mixin: bool,
@@ -695,6 +723,7 @@ fn emit_record(
     used_expr_helper: &mut bool,
     used_utf8_encode: &mut bool,
     enums_by_usr: &HashMap<&str, &Enum>,
+    mock: &MockContext<'_>,
 ) -> String {
     // `abstract` is required the moment a class has any unimplemented
     // member — derived, not stored: a separate `Record.is_abstract` flag
@@ -843,6 +872,7 @@ fn emit_record(
             source.push_str(&emit_constructor(
                 &record.name,
                 constructor,
+                mock,
                 used_expr_helper,
                 used_utf8_encode,
             ));
@@ -854,6 +884,7 @@ fn emit_record(
         source.push_str(&emit_method(
             &record.name,
             method,
+            mock,
             used_expr_helper,
             used_utf8_encode,
         ));
@@ -923,23 +954,166 @@ fn field_default_literal(ty: &Type, enums_by_usr: &HashMap<&str, &Enum>) -> Opti
     }
 }
 
+/// What `emit_function`/`emit_method`/`emit_equality_operator`/
+/// `emit_constructor` need to render a mock body instead of a real one when
+/// the callable's own usr is in the effective external set
+/// (`docs/plans/lista-de-externos.md`) — bundled into one struct rather than
+/// three loose parameters threaded through every one of those call sites.
+/// `enums_by_usr`/`records_by_usr` are the exact same module-wide lookups
+/// `emit_record`/`field_default_literal` already build once in
+/// `emit_module` — reused here, not recomputed.
+struct MockContext<'a> {
+    external_usrs: &'a HashSet<&'a str>,
+    enums_by_usr: &'a HashMap<&'a str, &'a Enum>,
+    records_by_usr: &'a HashMap<&'a str, &'a Record>,
+}
+
+impl MockContext<'_> {
+    fn is_external(&self, usr: &str) -> bool {
+        self.external_usrs.contains(usr)
+    }
+}
+
+/// Recursion guard for [`mock_value_for_type`]'s `Record` case — generous
+/// enough that no real C++ struct nesting depth should ever reach it (a
+/// record can't contain itself *by value*, only by pointer/reference, which
+/// already maps to `Type::Nullable`/`null` before recursion ever starts), so
+/// this only exists as a defensive backstop, never expected to trigger.
+const MOCK_VALUE_MAX_DEPTH: usize = 16;
+
+/// Decision 1 (`docs/plans/lista-de-externos.md`): "mock = valor plausível,
+/// execução segue" — the value an external callable's mocked body returns.
+/// `None` when no plausible value exists for `ty` at all (an `Unsupported`
+/// type, or a `Record` this module never lowered) — the one case where a
+/// mock still has to fall back to the honest `Unsupported` bailout, because
+/// there is no Dart value of that type to construct, mocked or not.
+///
+/// Every scalar/collection/`Enum` case matches `field_default_literal`
+/// exactly (this function exists because that one intentionally stops at
+/// `Record`/`Tuple`/`Void`, which a *field* declaration can leave `late`
+/// but a mocked function's `return` statement can't). `Record` is resolved
+/// by calling the record's own constructor — the synthetic positional one
+/// (`emit_record`'s own "no constructors" branch, one arg per field, in
+/// field order) when it has none of its own, otherwise its lowest-index
+/// (primary) real constructor — with each argument itself built
+/// recursively, so a record nesting another record by value still gets a
+/// real, instantiable value instead of bottoming out early.
+fn mock_value_for_type(
+    ty: &Type,
+    enums_by_usr: &HashMap<&str, &Enum>,
+    records_by_usr: &HashMap<&str, &Record>,
+    depth: usize,
+) -> Option<String> {
+    if let Some(literal) = field_default_literal(ty, enums_by_usr) {
+        return Some(literal);
+    }
+
+    if depth >= MOCK_VALUE_MAX_DEPTH {
+        return None;
+    }
+
+    match ty {
+        Type::Record { usr, name } => {
+            let record = records_by_usr.get(usr.as_str())?;
+            let arg_types: Vec<&Type> = if record.constructors.is_empty() {
+                record.fields.iter().map(|field| &field.ty).collect()
+            } else {
+                let mut constructors: Vec<&Constructor> = record.constructors.iter().collect();
+                constructors.sort_by_key(|constructor| constructor.constructor_index);
+                constructors[0]
+                    .params
+                    .iter()
+                    .map(|param| &param.ty)
+                    .collect()
+            };
+            let args: Option<Vec<String>> = arg_types
+                .into_iter()
+                .map(|arg_ty| mock_value_for_type(arg_ty, enums_by_usr, records_by_usr, depth + 1))
+                .collect();
+            Some(format!("{name}({})", args?.join(", ")))
+        }
+        Type::Tuple(types) => {
+            let values: Option<Vec<String>> = types
+                .iter()
+                .map(|slot_ty| {
+                    mock_value_for_type(slot_ty, enums_by_usr, records_by_usr, depth + 1)
+                })
+                .collect();
+            Some(format!("({})", values?.join(", ")))
+        }
+        Type::Void | Type::Unsupported(_) => None,
+        // Every other variant is handled by `field_default_literal` above.
+        _ => None,
+    }
+}
+
+/// The mock body itself (decision 1): `Void` needs no `return` at all; every
+/// other representable type returns [`mock_value_for_type`]'s plausible
+/// value, with an honest marker comment above it (never a `throw` — that's
+/// exactly the `Unsupported` idiom this path exists to *not* use). Only
+/// falls back to the real `Stmt::Unsupported` bailout when `ty` itself has
+/// no constructible Dart value at all — a pre-existing gap in what the
+/// product can represent, not something mocking could fix either way.
+fn emit_mock_body(
+    return_type: &Type,
+    origin: &Origin,
+    mock: &MockContext<'_>,
+    depth: usize,
+    used_expr_helper: &mut bool,
+    used_utf8_encode: &mut bool,
+) -> String {
+    let pad = INDENT.repeat(depth);
+    if matches!(return_type, Type::Void) {
+        return format!("{pad}// syntax-bridge: externo, corpo mockado\n");
+    }
+
+    match mock_value_for_type(return_type, mock.enums_by_usr, mock.records_by_usr, 0) {
+        Some(value) => {
+            format!("{pad}// syntax-bridge: externo, corpo mockado\n{pad}return {value};\n")
+        }
+        None => {
+            let bailout = Stmt::Unsupported {
+                reason: format!(
+                    "externo, mas o tipo de retorno {} não tem valor plausível para mock",
+                    emit_type(return_type)
+                ),
+                origin: origin.clone(),
+            };
+            emit_stmt(&bailout, depth, used_expr_helper, used_utf8_encode)
+        }
+    }
+}
+
 fn emit_constructor(
     record_name: &str,
     constructor: &Constructor,
+    mock: &MockContext<'_>,
     used_expr_helper: &mut bool,
     used_utf8_encode: &mut bool,
 ) -> String {
     let dart_name = dart_constructor_name(record_name, constructor.constructor_index);
     let params = format_params(&constructor.params, used_expr_helper, used_utf8_encode);
-    let body = emit_body(
-        &constructor.params,
-        None,
-        &constructor.body,
-        &constructor.origin,
-        used_expr_helper,
-        used_utf8_encode,
-        2,
-    );
+    // A constructor has no return type to mock a value for — every field
+    // already got a sound default at its own declaration
+    // (`emit_field_declaration`, always consulted once a record has any
+    // real constructor at all), so an external constructor's mock body is
+    // simply empty: the object still comes out fully, validly initialized.
+    let body = if mock.is_external(&constructor.usr) {
+        format!(
+            "{}// syntax-bridge: externo, corpo mockado\n",
+            INDENT.repeat(2)
+        )
+    } else {
+        emit_body(
+            &constructor.params,
+            None,
+            &constructor.body,
+            &constructor.origin,
+            used_expr_helper,
+            used_utf8_encode,
+            2,
+        )
+    };
     format!("{INDENT}{dart_name}({params}) {{\n{body}{INDENT}}}\n")
 }
 
@@ -960,6 +1134,7 @@ fn dart_constructor_name(record_name: &str, constructor_index: usize) -> String 
 fn emit_method(
     record_name: &str,
     method: &Method,
+    mock: &MockContext<'_>,
     used_expr_helper: &mut bool,
     used_utf8_encode: &mut bool,
 ) -> String {
@@ -972,7 +1147,13 @@ fn emit_method(
     // the signature and lets Dart's own flow analysis promote `other` back
     // to `record_name` for the wrapped body, unchanged.
     if method.name == "operator==" {
-        return emit_equality_operator(record_name, method, used_expr_helper, used_utf8_encode);
+        return emit_equality_operator(
+            record_name,
+            method,
+            mock,
+            used_expr_helper,
+            used_utf8_encode,
+        );
     }
 
     // Every other C++ operator overload printed under its own literal name
@@ -985,7 +1166,7 @@ fn emit_method(
         // Dart's own callable-object idiom: a plain method named `call`
         // makes `obj(args)` dispatch to it automatically — this bridge
         // preserves the call-site syntax too, not just the declaration.
-        return emit_method_named("call", method, used_expr_helper, used_utf8_encode);
+        return emit_method_named("call", method, mock, used_expr_helper, used_utf8_encode);
     }
     if let Some(symbol) = direct_dart_operator_symbol(&method.name, method.params.len()) {
         // Same arity, same meaning, Dart's own `operator <symbol>` syntax —
@@ -993,6 +1174,7 @@ fn emit_method(
         return emit_method_named(
             &format!("operator {symbol}"),
             method,
+            mock,
             used_expr_helper,
             used_utf8_encode,
         );
@@ -1002,11 +1184,22 @@ fn emit_method(
         // conversion operator, ...). Declaring it under a synthesized,
         // always-valid name keeps the file parseable; the body still bails
         // out loudly instead of pretending the translation succeeded
-        // ("silêncio é proibido").
+        // ("silêncio é proibido"). Deliberately **not** consulting `mock`
+        // here even if this usr is externally marked: the operator's own
+        // *name* has no Dart equivalent regardless of whose body fills it,
+        // so a bailout is the honest answer either way — a rare enough
+        // combination (external *and* an unrepresentable operator) not to
+        // be worth a second mock path for.
         return emit_unsupported_operator(method, used_expr_helper, used_utf8_encode);
     }
 
-    emit_method_named(&method.name, method, used_expr_helper, used_utf8_encode)
+    emit_method_named(
+        &method.name,
+        method,
+        mock,
+        used_expr_helper,
+        used_utf8_encode,
+    )
 }
 
 /// The generic method-emission shape every ordinary method, and every
@@ -1015,6 +1208,7 @@ fn emit_method(
 fn emit_method_named(
     dart_name: &str,
     method: &Method,
+    mock: &MockContext<'_>,
     used_expr_helper: &mut bool,
     used_utf8_encode: &mut bool,
 ) -> String {
@@ -1029,20 +1223,35 @@ fn emit_method_named(
     // A pure virtual method (`body: None`, E06's abstract-method case) has
     // no implementation to print — Dart's own abstract-member syntax is a
     // signature with no body at all, not empty braces (`{}` would mean "does
-    // nothing", not "not implemented").
+    // nothing", not "not implemented"). A pure virtual method is never
+    // itself externally marked in practice (nothing calls
+    // `FunctionDeclarationKind::Method` cataloging for a body-less cursor
+    // except the pure-virtual carve-out, whose `has_definition` is still
+    // `true` — see that field's doc comment), so `mock` is irrelevant here.
     let Some(body_stmts) = &method.body else {
         return format!("{override_prefix}{INDENT}{return_type} {dart_name}({params});\n");
     };
 
-    let body = emit_body(
-        &method.params,
-        Some(&method.return_type),
-        body_stmts,
-        &method.origin,
-        used_expr_helper,
-        used_utf8_encode,
-        2,
-    );
+    let body = if mock.is_external(&method.usr) {
+        emit_mock_body(
+            &method.return_type,
+            &method.origin,
+            mock,
+            2,
+            used_expr_helper,
+            used_utf8_encode,
+        )
+    } else {
+        emit_body(
+            &method.params,
+            Some(&method.return_type),
+            body_stmts,
+            &method.origin,
+            used_expr_helper,
+            used_utf8_encode,
+            2,
+        )
+    };
     let static_keyword = if method.is_static { "static " } else { "" };
     format!(
         "{override_prefix}{INDENT}{static_keyword}{return_type} {dart_name}({params}) {{\n{body}{INDENT}}}\n"
@@ -1141,6 +1350,7 @@ fn bridge_name_for_unsupported_operator(method_name: &str, arity: usize) -> &'st
 fn emit_equality_operator(
     record_name: &str,
     method: &Method,
+    mock: &MockContext<'_>,
     used_expr_helper: &mut bool,
     used_utf8_encode: &mut bool,
 ) -> String {
@@ -1158,15 +1368,31 @@ fn emit_equality_operator(
         .map(|param| param.name.as_str())
         .expect("operator== always has exactly one parameter in valid C++");
 
-    let inner_body = emit_body(
-        &method.params,
-        Some(&method.return_type),
-        body_stmts,
-        &method.origin,
-        used_expr_helper,
-        used_utf8_encode,
-        3,
-    );
+    // `bool`, not `method.return_type`: the printed signature above is
+    // always `bool operator ==`, regardless of what C++ declared — same
+    // reasoning `emit_mock_body`'s caller elsewhere always mocks the
+    // *printed* return type, not a value that wouldn't match the
+    // signature's own declared type.
+    let inner_body = if mock.is_external(&method.usr) {
+        emit_mock_body(
+            &Type::Bool,
+            &method.origin,
+            mock,
+            3,
+            used_expr_helper,
+            used_utf8_encode,
+        )
+    } else {
+        emit_body(
+            &method.params,
+            Some(&method.return_type),
+            body_stmts,
+            &method.origin,
+            used_expr_helper,
+            used_utf8_encode,
+            3,
+        )
+    };
     format!(
         "{override_prefix}{INDENT}bool operator ==(Object {other_name}) {{\n\
          {INDENT}{INDENT}if ({other_name} is {record_name}) {{\n\
@@ -1247,19 +1473,31 @@ fn first_unsupported_field_reason(record: &Record) -> Option<String> {
 
 fn emit_function(
     function: &Function,
+    mock: &MockContext<'_>,
     used_expr_helper: &mut bool,
     used_utf8_encode: &mut bool,
 ) -> String {
     let params = format_params(&function.params, used_expr_helper, used_utf8_encode);
-    let body = emit_body(
-        &function.params,
-        Some(&function.return_type),
-        &function.body,
-        &function.origin,
-        used_expr_helper,
-        used_utf8_encode,
-        1,
-    );
+    let body = if mock.is_external(&function.usr) {
+        emit_mock_body(
+            &function.return_type,
+            &function.origin,
+            mock,
+            1,
+            used_expr_helper,
+            used_utf8_encode,
+        )
+    } else {
+        emit_body(
+            &function.params,
+            Some(&function.return_type),
+            &function.body,
+            &function.origin,
+            used_expr_helper,
+            used_utf8_encode,
+            1,
+        )
+    };
 
     // Dart has no free-standing operators at all — every operator is an
     // instance method — so a *free* C++ operator function (the conventional

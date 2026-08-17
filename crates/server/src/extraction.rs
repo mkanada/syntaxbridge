@@ -27,7 +27,7 @@
 //! keeps doing its own independent parse — this module is strictly
 //! additive, used only by `project_service::create_project`.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -240,11 +240,12 @@ fn parse_units(
     let mut translation_units = BTreeSet::new();
     let mut headers = BTreeSet::new();
 
-    let mut function_seen = HashSet::new();
+    let mut function_seen = HashMap::new();
     let mut function_declarations = Vec::new();
     let mut call_seen = HashSet::new();
     let mut calls = Vec::new();
     let mut ir_functions = Vec::new();
+    let mut ir_function_is_prototype = Vec::new();
     let mut ir_records = Vec::new();
     let mut ir_record_seen = HashSet::new();
     let mut ir_member_seen = HashSet::new();
@@ -315,6 +316,7 @@ fn parse_units(
                     &mut calls,
                     &mut call_seen,
                     &mut ir_functions,
+                    &mut ir_function_is_prototype,
                     &mut ir_records,
                     &mut ir_record_seen,
                     &mut ir_member_seen,
@@ -358,6 +360,7 @@ fn parse_units(
             function_declarations,
             calls,
             ir_functions,
+            ir_function_is_prototype,
             ir_records,
             ir_enums,
         ),

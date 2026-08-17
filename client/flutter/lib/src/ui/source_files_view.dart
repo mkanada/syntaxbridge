@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../project/project_models.dart';
+import 'ide_theme.dart';
 
 class SourceFilesView extends StatelessWidget {
   const SourceFilesView({
@@ -8,11 +9,20 @@ class SourceFilesView extends StatelessWidget {
     required this.project,
     required this.onFileSelected,
     this.selectedPath,
+    this.onMarkFileExternal,
   });
 
   final CreatedProject project;
   final ValueChanged<SourceFile> onFileSelected;
   final String? selectedPath;
+
+  /// Marks every type/function declared in a file external in one action
+  /// (decision 3, `docs/plans/lista-de-externos.md`: expands to that file's
+  /// usrs *now*, a one-time snapshot — not an ongoing "this file is
+  /// external" state, so unlike [TypesView]/[FunctionsView]'s per-row
+  /// control this isn't a toggle with an on/off icon). `null` hides the
+  /// per-row action entirely.
+  final ValueChanged<SourceFile>? onMarkFileExternal;
 
   @override
   Widget build(BuildContext context) {
@@ -42,6 +52,16 @@ class SourceFilesView extends StatelessWidget {
                       : Icons.article_outlined,
                 ),
                 title: Text(relativePath),
+                trailing: onMarkFileExternal == null
+                    ? null
+                    : IconButton(
+                        iconSize: 16,
+                        visualDensity: VisualDensity.compact,
+                        tooltip: 'Marcar tudo neste arquivo como externo',
+                        color: IdePalette.muted,
+                        icon: const Icon(Icons.link),
+                        onPressed: () => onMarkFileExternal!(file),
+                      ),
                 onTap: () => onFileSelected(file),
               );
             },

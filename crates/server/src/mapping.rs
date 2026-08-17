@@ -1724,6 +1724,7 @@ mod tests {
             is_pure_virtual: false,
             is_defaulted: false,
             overridden_usrs: Vec::new(),
+            has_definition: true,
         }
     }
 
@@ -1876,6 +1877,7 @@ mod tests {
             is_pure_virtual: false,
             is_defaulted: false,
             overridden_usrs: Vec::new(),
+            has_definition: true,
         }
     }
 

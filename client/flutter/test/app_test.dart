@@ -1068,6 +1068,18 @@ void main() {
   testWidgets('captures the screen and logs where it was saved', (
     tester,
   ) async {
+    // The log's `ListView` only builds items in (or near) its viewport;
+    // by this point there are enough entries (connection check, four
+    // catalog loads, the capture itself) that the newest one, at the
+    // bottom, wouldn't be built at the default test viewport size. A
+    // taller viewport (mirrors the desktop size other tests in this file
+    // already configure) is simpler and more robust here than scrolling a
+    // specific `Scrollable` among several open panels' own lists.
+    tester.view
+      ..devicePixelRatio = 1
+      ..physicalSize = const Size(1280, 1400);
+    addTearDown(tester.view.reset);
+
     final screenshotStorage = _FakeScreenshotStorage(
       savedPath: '/tmp/screenshots/syntax-bridge-fake.png',
     );
@@ -1308,6 +1320,57 @@ class _FakeServerClient implements ServerClient {
     validateProjectDir = projectDir;
     return diagnostics;
   }
+
+  @override
+  Future<ExternalListing> listExternals(String projectDir) async =>
+      const ExternalListing(
+        statuses: <ExternalStatus>[],
+        nameRegexes: <NameRegexRule>[],
+        pathRegexes: <PathRegexRule>[],
+      );
+
+  @override
+  Future<void> markExternal({
+    required String projectDir,
+    required String usr,
+    required bool external,
+  }) async {}
+
+  @override
+  Future<List<String>> markFileExternal({
+    required String projectDir,
+    required String file,
+  }) async => const <String>[];
+
+  @override
+  Future<List<String>> markTypeExternal({
+    required String projectDir,
+    required String typeUsr,
+  }) async => const <String>[];
+
+  @override
+  Future<NameRegexRule> addNameRegex({
+    required String projectDir,
+    required String pattern,
+  }) async => NameRegexRule(id: 1, pattern: pattern, createdAt: '0');
+
+  @override
+  Future<void> removeNameRegex({
+    required String projectDir,
+    required int id,
+  }) async {}
+
+  @override
+  Future<PathRegexRule> addPathRegex({
+    required String projectDir,
+    required String pattern,
+  }) async => PathRegexRule(id: 1, pattern: pattern, createdAt: '0');
+
+  @override
+  Future<void> removePathRegex({
+    required String projectDir,
+    required int id,
+  }) async {}
 }
 
 class _FakePathPicker implements PathPicker {

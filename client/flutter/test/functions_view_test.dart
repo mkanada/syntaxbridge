@@ -140,6 +140,45 @@ void main() {
     expect(selected, area);
   });
 
+  testWidgets('marks a function external when its row toggle is tapped', (
+    tester,
+  ) async {
+    FunctionDeclaration? toggled;
+    await tester.pumpWidget(
+      _host(const [addInt], onToggleExternal: (function) => toggled = function),
+    );
+
+    await tester.tap(find.byIcon(Icons.link));
+    await tester.pump();
+
+    expect(toggled, addInt);
+  });
+
+  testWidgets(
+    'shows the unmark icon for a function already in the external set',
+    (tester) async {
+      await tester.pumpWidget(
+        _host(
+          const [addInt],
+          externalUsrs: const {'c:@F@add#I#I#'},
+          onToggleExternal: (_) {},
+        ),
+      );
+
+      expect(find.byIcon(Icons.link_off), findsOneWidget);
+      expect(find.byIcon(Icons.link), findsNothing);
+    },
+  );
+
+  testWidgets('hides the external toggle when no callback is provided', (
+    tester,
+  ) async {
+    await tester.pumpWidget(_host(const [addInt]));
+
+    expect(find.byIcon(Icons.link), findsNothing);
+    expect(find.byIcon(Icons.link_off), findsNothing);
+  });
+
   testWidgets("shows each function's caller count", (tester) async {
     await tester.pumpWidget(
       _host(
@@ -190,6 +229,8 @@ Widget _host(
   List<FunctionDeclaration> functions, {
   ValueChanged<FunctionDeclaration>? onFunctionSelected,
   Map<String, int> callerCounts = const {},
+  Set<String> externalUsrs = const {},
+  ValueChanged<FunctionDeclaration>? onToggleExternal,
 }) {
   return MaterialApp(
     home: Scaffold(
@@ -197,6 +238,8 @@ Widget _host(
         functions: functions,
         onFunctionSelected: onFunctionSelected ?? (_) {},
         callerCounts: callerCounts,
+        externalUsrs: externalUsrs,
+        onToggleExternal: onToggleExternal,
       ),
     ),
   );

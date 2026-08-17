@@ -899,3 +899,162 @@ class DartDiagnostic {
   final int dartLine;
   final CppOrigin? origin;
 }
+
+/// Why a usr is (or would be) external. Mirrors `externals::ExternalSource`
+/// in `crates/server/src/externals.rs` — see
+/// `docs/plans/lista-de-externos.md`. `pattern` is only set for
+/// [kind] `nameRegex`/`pathRegex`.
+enum ExternalSourceKind {
+  manualInclude,
+  manualExclude,
+  nameRegex,
+  pathRegex,
+  autoUndefinedFunction;
+
+  static ExternalSourceKind fromJson(String? value) {
+    return switch (value) {
+      'manual_include' => ExternalSourceKind.manualInclude,
+      'manual_exclude' => ExternalSourceKind.manualExclude,
+      'name_regex' => ExternalSourceKind.nameRegex,
+      'path_regex' => ExternalSourceKind.pathRegex,
+      'auto_undefined_function' => ExternalSourceKind.autoUndefinedFunction,
+      _ => ExternalSourceKind.autoUndefinedFunction,
+    };
+  }
+
+  /// Short label for the source badge shown next to an item in the
+  /// Extern view.
+  String get label {
+    return switch (this) {
+      ExternalSourceKind.manualInclude => 'manual',
+      ExternalSourceKind.manualExclude => 'excluído manualmente',
+      ExternalSourceKind.nameRegex => 'regexp de nome',
+      ExternalSourceKind.pathRegex => 'regexp de caminho',
+      ExternalSourceKind.autoUndefinedFunction => 'detectado automaticamente',
+    };
+  }
+}
+
+class ExternalSource {
+  const ExternalSource({required this.kind, this.pattern});
+
+  factory ExternalSource.fromJson(Map<String, Object?> json) {
+    return ExternalSource(
+      kind: ExternalSourceKind.fromJson(json['kind'] as String?),
+      pattern: json['pattern'] as String?,
+    );
+  }
+
+  final ExternalSourceKind kind;
+  final String? pattern;
+}
+
+/// One usr's full external status — whether it's currently in the effective
+/// external set, and every source that contributed to that (manual mark,
+/// either regexp list, auto-detection). Mirrors `externals::ExternalStatus`.
+class ExternalStatus {
+  const ExternalStatus({
+    required this.usr,
+    required this.effective,
+    required this.sources,
+  });
+
+  factory ExternalStatus.fromJson(Map<String, Object?> json) {
+    final sourcesJson = json['sources'] as List<Object?>? ?? const <Object?>[];
+    return ExternalStatus(
+      usr: json['usr'] as String? ?? '',
+      effective: json['effective'] as bool? ?? false,
+      sources: sourcesJson
+          .whereType<Map<String, Object?>>()
+          .map(ExternalSource.fromJson)
+          .toList(),
+    );
+  }
+
+  final String usr;
+  final bool effective;
+  final List<ExternalSource> sources;
+}
+
+/// One name-regexp rule (decision 6, `docs/plans/lista-de-externos.md`) —
+/// matches a qualified C++ name. Mirrors `externals::NameRegexRule`.
+class NameRegexRule {
+  const NameRegexRule({
+    required this.id,
+    required this.pattern,
+    required this.createdAt,
+  });
+
+  factory NameRegexRule.fromJson(Map<String, Object?> json) {
+    return NameRegexRule(
+      id: (json['id'] as num?)?.toInt() ?? 0,
+      pattern: json['pattern'] as String? ?? '',
+      createdAt: json['created_at'] as String? ?? '',
+    );
+  }
+
+  final int id;
+  final String pattern;
+  final String createdAt;
+}
+
+/// One path-regexp rule — matches a declaration's file path. Mirrors
+/// `externals::PathRegexRule`.
+class PathRegexRule {
+  const PathRegexRule({
+    required this.id,
+    required this.pattern,
+    required this.createdAt,
+  });
+
+  factory PathRegexRule.fromJson(Map<String, Object?> json) {
+    return PathRegexRule(
+      id: (json['id'] as num?)?.toInt() ?? 0,
+      pattern: json['pattern'] as String? ?? '',
+      createdAt: json['created_at'] as String? ?? '',
+    );
+  }
+
+  final int id;
+  final String pattern;
+  final String createdAt;
+}
+
+/// The response of `GET /projects/externals`: the effective external set
+/// plus both live regexp rule lists. Mirrors
+/// `project_service::ExternalListing`.
+class ExternalListing {
+  const ExternalListing({
+    required this.statuses,
+    required this.nameRegexes,
+    required this.pathRegexes,
+  });
+
+  factory ExternalListing.fromJson(Map<String, Object?> json) {
+    final statusesJson =
+        json['statuses'] as List<Object?>? ?? const <Object?>[];
+    final nameRegexesJson =
+        json['name_regexes'] as List<Object?>? ?? const <Object?>[];
+    final pathRegexesJson =
+        json['path_regexes'] as List<Object?>? ?? const <Object?>[];
+
+    return ExternalListing(
+      statuses: statusesJson
+          .whereType<Map<String, Object?>>()
+          .map(ExternalStatus.fromJson)
+          .toList(),
+      nameRegexes: nameRegexesJson
+          .whereType<Map<String, Object?>>()
+          .map(NameRegexRule.fromJson)
+          .toList(),
+      pathRegexes: pathRegexesJson
+          .whereType<Map<String, Object?>>()
+          .map(PathRegexRule.fromJson)
+          .toList(),
+    );
+  }
+
+  final List<ExternalStatus> statuses;
+  final List<NameRegexRule> nameRegexes;
+  final List<PathRegexRule> pathRegexes;
+}

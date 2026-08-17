@@ -725,6 +725,211 @@ fn extract_function_catalog_lists_function_and_method_templates_by_their_primary
     );
 }
 
+/// `docs/plans/lista-de-externos.md`: a free function declared but never
+/// defined in any compilation unit of this fixture is still cataloged, with
+/// `has_definition: false` and a real `ir::Function` (correct return type,
+/// synthesized `Unsupported` body) — the auto-detection signal the
+/// "extern" list needs to offer a mock for a symbol this project never
+/// compiles a body for. A system-header prototype (`std::printf`, pulled in
+/// by `<cstdio>`) must **not** be cataloged the same way — that gate is
+/// what keeps the catalog from flooding with every libc declaration reached
+/// through an `#include`.
+const UNDEFINED_CALLEE_CPP: &str = r#"
+#include <cstdio>
+
+int NeverDefined(int x);
+
+int caller() {
+    printf("hello\n");
+    return NeverDefined(4);
+}
+"#;
+
+fn write_undefined_callee_fixture(project_root: &Path) -> CompilationUnit {
+    fs::create_dir_all(project_root).expect("create project dir");
+    let file_path = project_root.join("undefined_callee.cpp");
+    fs::write(&file_path, UNDEFINED_CALLEE_CPP).expect("write undefined_callee.cpp");
+
+    CompilationUnit {
+        directory: project_root.display().to_string(),
+        file: file_path.display().to_string(),
+        command: None,
+        arguments: vec!["clang++".to_owned(), "-std=c++17".to_owned()],
+    }
+}
+
+#[test]
+fn a_declared_but_never_defined_free_function_is_cataloged_with_a_mockable_signature() {
+    let workspace = TempWorkspace::new("function-catalog-undefined-callee")
+        .expect("create temporary workspace");
+    let project_root = workspace.path().join("project");
+    let unit = write_undefined_callee_fixture(&project_root);
+
+    let catalog = function_catalog::extract_function_catalog(
+        std::slice::from_ref(&unit),
+        &project_root,
+        None,
+    )
+    .expect("extract function catalog");
+
+    let never_defined = catalog
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "NeverDefined")
+        .unwrap_or_else(|| {
+            panic!(
+                "expected NeverDefined to be cataloged despite having no \
+                 definition: {:#?}",
+                catalog.declarations
+            )
+        });
+    assert!(
+        !never_defined.has_definition,
+        "expected has_definition == false for a prototype-only function: \
+         {never_defined:#?}"
+    );
+
+    let never_defined_ir = catalog
+        .ir_functions
+        .iter()
+        .find(|function| function.usr == never_defined.usr)
+        .unwrap_or_else(|| {
+            panic!(
+                "expected an ir::Function synthesized for the prototype-only \
+                 usr {:?}: {:#?}",
+                never_defined.usr, catalog.ir_functions
+            )
+        });
+    assert_eq!(
+        never_defined_ir.return_type,
+        syntax_bridge_server::ir::Type::Int
+    );
+    assert_eq!(
+        never_defined_ir.body.len(),
+        1,
+        "expected a single synthesized bailout statement: {:#?}",
+        never_defined_ir.body
+    );
+    assert!(
+        matches!(
+            &never_defined_ir.body[0],
+            syntax_bridge_server::ir::Stmt::Unsupported { .. }
+        ),
+        "expected the synthesized body to be an honest Unsupported bailout \
+         (only relevant if this usr ever falls outside the effective \
+         external set): {:#?}",
+        never_defined_ir.body
+    );
+
+    assert!(
+        !catalog
+            .declarations
+            .iter()
+            .any(|declaration| declaration.name == "printf"),
+        "a system-header prototype must never be cataloged just because it \
+         was declared, or every libc symbol reachable through an #include \
+         would flood the catalog: {:#?}",
+        catalog.declarations
+    );
+}
+
+/// Companion to the test above: when the *same* usr is a prototype-only
+/// sighting in one compilation unit and a real definition in another, the
+/// merge must keep the definition — never the reverse, and never both.
+const SHARED_HEADER_H: &str = r#"
+int Shared(int x);
+"#;
+
+const DECLARES_ONLY_CPP: &str = r#"
+#include "shared.h"
+
+int caller() {
+    return Shared(1);
+}
+"#;
+
+const DEFINES_SHARED_CPP: &str = r#"
+#include "shared.h"
+
+int Shared(int x) {
+    return x * 2;
+}
+"#;
+
+fn write_split_prototype_and_definition_fixture(project_root: &Path) -> Vec<CompilationUnit> {
+    fs::create_dir_all(project_root).expect("create project dir");
+    fs::write(project_root.join("shared.h"), SHARED_HEADER_H).expect("write shared.h");
+    let declares_only = project_root.join("declares_only.cpp");
+    fs::write(&declares_only, DECLARES_ONLY_CPP).expect("write declares_only.cpp");
+    let defines_shared = project_root.join("defines_shared.cpp");
+    fs::write(&defines_shared, DEFINES_SHARED_CPP).expect("write defines_shared.cpp");
+
+    vec![
+        CompilationUnit {
+            directory: project_root.display().to_string(),
+            file: declares_only.display().to_string(),
+            command: None,
+            arguments: vec!["clang++".to_owned(), "-std=c++17".to_owned()],
+        },
+        CompilationUnit {
+            directory: project_root.display().to_string(),
+            file: defines_shared.display().to_string(),
+            command: None,
+            arguments: vec!["clang++".to_owned(), "-std=c++17".to_owned()],
+        },
+    ]
+}
+
+#[test]
+fn a_prototype_seen_in_one_compilation_unit_is_upgraded_to_the_definition_found_in_another() {
+    let workspace = TempWorkspace::new("function-catalog-prototype-upgrade")
+        .expect("create temporary workspace");
+    let project_root = workspace.path().join("project");
+    let units = write_split_prototype_and_definition_fixture(&project_root);
+
+    let catalog = function_catalog::extract_function_catalog(&units, &project_root, None)
+        .expect("extract function catalog");
+
+    let shared_declarations: Vec<_> = catalog
+        .declarations
+        .iter()
+        .filter(|declaration| declaration.name == "Shared")
+        .collect();
+    assert_eq!(
+        shared_declarations.len(),
+        1,
+        "expected exactly one Shared declaration after merge, not one per \
+         compilation unit: {shared_declarations:#?}"
+    );
+    assert!(
+        shared_declarations[0].has_definition,
+        "expected the merge to prefer the real definition over the \
+         prototype-only sighting: {:#?}",
+        shared_declarations[0]
+    );
+
+    let shared_usr = shared_declarations[0].usr.clone();
+    let shared_ir: Vec<_> = catalog
+        .ir_functions
+        .iter()
+        .filter(|function| function.usr == shared_usr)
+        .collect();
+    assert_eq!(
+        shared_ir.len(),
+        1,
+        "expected exactly one ir::Function for Shared after merge: {shared_ir:#?}"
+    );
+    assert!(
+        !matches!(
+            shared_ir[0].body.as_slice(),
+            [syntax_bridge_server::ir::Stmt::Unsupported { .. }]
+        ),
+        "expected the real body (`return x * 2;`), not the synthesized \
+         prototype bailout: {:#?}",
+        shared_ir[0].body
+    );
+}
+
 struct TempWorkspace {
     path: PathBuf,
 }
