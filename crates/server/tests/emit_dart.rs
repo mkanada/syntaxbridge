@@ -289,16 +289,27 @@ fn an_unsupported_message_escapes_dollar_signs_so_dart_never_interpolates_it() {
     );
 }
 
+/// A bailout expression still always throws at runtime, but it must not
+/// advertise `Never` to the Dart analyzer. Real generated code can keep
+/// traversing the syntactic expression around that bailout (`unsupported().x`
+/// or `unsupported().method()`), and a `Never` receiver turns each such
+/// traversal into `receiver_of_type_never`. `dynamic` keeps the bailout
+/// explicit while quarantining the unknown static type at its boundary.
 #[test]
-fn an_unsupported_expression_calls_a_never_returning_helper_that_still_type_checks() {
+fn an_unsupported_expression_calls_a_dynamic_helper_to_quarantine_the_bailout_type() {
     let function = Function {
         name: "retorna_desconhecido".to_owned(),
         usr: "c:@F@retorna_desconhecido#".to_owned(),
         params: vec![],
         return_type: Type::Int,
         body: vec![Stmt::Return {
-            value: Some(Expr::Unsupported {
-                reason: "unsupported expression cursor kind 999".to_owned(),
+            value: Some(Expr::FieldAccess {
+                target: Box::new(Expr::Unsupported {
+                    reason: "unsupported expression cursor kind 999".to_owned(),
+                    origin: origin(6),
+                }),
+                field: "value".to_owned(),
+                ty: Type::Int,
                 origin: origin(6),
             }),
             origin: origin(6),
@@ -316,13 +327,13 @@ fn an_unsupported_expression_calls_a_never_returning_helper_that_still_type_chec
 
     assert!(
         source.contains(
-            "return _syntaxBridgeUnsupported('/project/input-source/src/aritmetica.cpp:6: unsupported expression cursor kind 999');"
+            "return _syntaxBridgeUnsupported('/project/input-source/src/aritmetica.cpp:6: unsupported expression cursor kind 999').value;"
         ),
         "missing helper call, got:\n{source}"
     );
     assert!(
-        source.contains("Never _syntaxBridgeUnsupported(String reason) {"),
-        "helper function should be defined when used, got:\n{source}"
+        source.contains("dynamic _syntaxBridgeUnsupported(String reason) {"),
+        "helper function should quarantine the unsupported expression as dynamic, got:\n{source}"
     );
 }
 

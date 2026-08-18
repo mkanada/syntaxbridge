@@ -24,6 +24,7 @@ use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+use serde_json::Value;
 use syntax_bridge_server::emit::dart;
 use syntax_bridge_server::function_catalog;
 use syntax_bridge_server::ingest::{self, CreateProjectRequest};
@@ -185,66 +186,40 @@ fn transpiling_the_real_verovio_6_2_0_project_reports_coverage() {
         }
     }
 
-    eprintln!("[diagnosis] running `dart analyze` over the whole package...");
+    eprintln!("[diagnosis] running `dart analyze --format=json` over the whole package...");
     let analyze_output = Command::new("dart")
         .arg("analyze")
+        .arg("--format=json")
         .arg(&package_dir)
         .output()
         .expect("run dart analyze");
     let analyze_text = String::from_utf8_lossy(&analyze_output.stdout).into_owned();
-    let error_count = analyze_text
-        .lines()
-        .filter(|line| line.trim_start().starts_with("error"))
+    let diagnostics = parse_dart_analyze_json(&analyze_text).expect("parse dart analyze JSON");
+    let error_count = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == "ERROR")
         .count();
-    let warning_count = analyze_text
-        .lines()
-        .filter(|line| line.trim_start().starts_with("warning"))
+    let warning_count = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == "WARNING")
         .count();
     eprintln!(
         "[diagnosis] dart analyze: {error_count} errors, {warning_count} warnings ({} total \
          lines of output)",
-        analyze_text.lines().count()
+        diagnostics.len()
     );
-    eprintln!("[diagnosis] first 20 duplicate_definition lines:");
-    for line in analyze_text
-        .lines()
-        .filter(|line| line.contains("duplicate_definition"))
-        .take(20)
-    {
-        eprintln!("  {line}");
-    }
-    eprintln!("[diagnosis] first 10 mixin_of_non_class lines:");
-    for line in analyze_text
-        .lines()
-        .filter(|line| line.contains("mixin_of_non_class"))
-        .take(10)
-    {
-        eprintln!("  {line}");
-    }
-    eprintln!("[diagnosis] first 10 extends_non_class lines:");
-    for line in analyze_text
-        .lines()
-        .filter(|line| line.contains("extends_non_class"))
-        .take(10)
-    {
-        eprintln!("  {line}");
-    }
 
-    // A rough taxonomy of *why* `dart analyze` rejects a file — the lint
-    // rule name is the last bracketed token on each error line
-    // (`- undefined_method` style). Cheap text scan, not a JSON-format
-    // parse (`--format=json` exists but this is diagnostic-only).
+    // Taxonomy and concrete first occurrences of *why* `dart analyze`
+    // rejects the package. JSON gives stable rule/path/line data, unlike the
+    // human-oriented default output whose wording is not an interface.
     use std::collections::BTreeMap;
     let mut rule_counts: BTreeMap<String, usize> = BTreeMap::new();
-    for line in analyze_text.lines() {
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with("error") && !trimmed.starts_with("warning") {
-            continue;
-        }
-        if let Some(rule) = trimmed.rsplit(" - ").next()
-            && rule != trimmed
-        {
-            *rule_counts.entry(rule.trim().to_owned()).or_insert(0) += 1;
+    let mut rule_occurrences: BTreeMap<String, Vec<AnalyzerDiagnostic>> = BTreeMap::new();
+    for diagnostic in &diagnostics {
+        *rule_counts.entry(diagnostic.rule.clone()).or_insert(0) += 1;
+        let occurrences = rule_occurrences.entry(diagnostic.rule.clone()).or_default();
+        if occurrences.len() < 5 {
+            occurrences.push(diagnostic.clone());
         }
     }
     let mut rule_counts: Vec<(String, usize)> = rule_counts.into_iter().collect();
@@ -252,6 +227,15 @@ fn transpiling_the_real_verovio_6_2_0_project_reports_coverage() {
     eprintln!("[diagnosis] top diagnostic rules:");
     for (rule, count) in rule_counts.iter().take(20) {
         eprintln!("  - {count:>5}  {rule}");
+    }
+    eprintln!("[diagnosis] first occurrences for top diagnostic rules:");
+    for (rule, _) in rule_counts.iter().take(20) {
+        for occurrence in rule_occurrences.get(rule).into_iter().flatten().take(5) {
+            eprintln!(
+                "  - [{rule}] {}:{}:{}: {}",
+                occurrence.path, occurrence.line, occurrence.column, occurrence.message
+            );
+        }
     }
 
     eprintln!(
@@ -289,6 +273,11 @@ fn transpiling_the_real_verovio_6_2_0_project_reports_coverage() {
                 count: *count,
             })
             .collect(),
+        top_rule_occurrences: rule_counts
+            .iter()
+            .take(20)
+            .flat_map(|(rule, _)| rule_occurrences.get(rule).into_iter().flatten().cloned())
+            .collect(),
         unparseable_files: unparseable_files
             .iter()
             .map(|(path, reason)| UnparseableFile {
@@ -299,6 +288,11 @@ fn transpiling_the_real_verovio_6_2_0_project_reports_coverage() {
     };
     write_diagnosis_report(&report, &repo_root().join(".diagnosis"), "verovio-6.2.0")
         .expect("write diagnosis report snapshot");
+    fs::write(
+        repo_root().join(".diagnosis/verovio-6.2.0.analyze.json"),
+        &analyze_text,
+    )
+    .expect("write raw dart analyze JSON snapshot");
     eprintln!(
         "[diagnosis] wrote latest-run snapshot to {:?}",
         repo_root().join(".diagnosis")
@@ -356,6 +350,7 @@ struct DiagnosisReport {
     dart_analyze_warnings: usize,
     extraction_time_seconds: f64,
     top_rules: Vec<RuleCount>,
+    top_rule_occurrences: Vec<AnalyzerDiagnostic>,
     unparseable_files: Vec<UnparseableFile>,
 }
 
@@ -363,6 +358,59 @@ struct DiagnosisReport {
 struct RuleCount {
     rule: String,
     count: usize,
+}
+
+/// One concrete `dart analyze --format=json` result, kept with the report so
+/// a dominant rule can be reduced to a minimal C++ reproduction without
+/// rerunning the whole Verovio corpus.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct AnalyzerDiagnostic {
+    rule: String,
+    severity: String,
+    path: String,
+    line: u64,
+    column: u64,
+    message: String,
+}
+
+/// Reads both JSON shapes Dart has used for analyzer output: the normal
+/// object with a `diagnostics` array and a bare diagnostics array. Unknown or
+/// incomplete entries are ignored rather than making a diagnostic-only run
+/// fail because a future SDK adds a non-location event.
+fn parse_dart_analyze_json(text: &str) -> Result<Vec<AnalyzerDiagnostic>, serde_json::Error> {
+    let value: Value = serde_json::from_str(text)?;
+    let entries = match &value {
+        Value::Object(object) => object
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+        Value::Array(entries) => entries.as_slice(),
+        _ => &[],
+    };
+
+    Ok(entries
+        .iter()
+        .filter_map(|entry| {
+            let object = entry.as_object()?;
+            let rule = object.get("code")?.as_str()?.to_owned();
+            let severity = object.get("severity")?.as_str()?.to_owned();
+            let message = object
+                .get("problemMessage")
+                .or_else(|| object.get("message"))?
+                .as_str()?
+                .to_owned();
+            let start = object.get("location")?.get("range")?.get("start")?;
+            Some(AnalyzerDiagnostic {
+                rule,
+                severity,
+                path: object.get("location")?.get("file")?.as_str()?.to_owned(),
+                line: start.get("line")?.as_u64()?,
+                column: start.get("column")?.as_u64()?,
+                message,
+            })
+        })
+        .collect())
 }
 
 #[derive(Debug, Serialize)]
@@ -442,6 +490,18 @@ impl DiagnosisReport {
             ));
         }
 
+        out.push_str("\n## Primeiras ocorrências das regras dominantes\n\n");
+        for occurrence in &self.top_rule_occurrences {
+            out.push_str(&format!(
+                "- `{}` — {}:{}:{} — {}\n",
+                occurrence.rule,
+                occurrence.path,
+                occurrence.line,
+                occurrence.column,
+                occurrence.message
+            ));
+        }
+
         out.push_str(&format!(
             "\n## Arquivos que não parseiam ({})\n\n",
             self.unparseable_files.len()
@@ -492,6 +552,14 @@ fn write_diagnosis_report_writes_json_and_markdown_snapshots() {
                 count: 929,
             },
         ],
+        top_rule_occurrences: vec![AnalyzerDiagnostic {
+            rule: "duplicate_definition".to_owned(),
+            severity: "ERROR".to_owned(),
+            path: "lib/accid.dart".to_owned(),
+            line: 42,
+            column: 7,
+            message: "The name is already defined.".to_owned(),
+        }],
         unparseable_files: vec![UnparseableFile {
             path: "lib/accid.dart".to_owned(),
             reason_first_line: "Error: Expected ';' after this.".to_owned(),
@@ -511,11 +579,16 @@ fn write_diagnosis_report_writes_json_and_markdown_snapshots() {
         serde_json::from_str(&json_contents).expect("parse json snapshot");
     assert_eq!(parsed["compilation_units"], 298);
     assert_eq!(parsed["top_rules"][0]["rule"], "duplicate_definition");
+    assert_eq!(
+        parsed["top_rule_occurrences"][0]["line"], 42,
+        "expected a concrete analyzer location"
+    );
     assert_eq!(parsed["unparseable_files"][0]["path"], "lib/accid.dart");
 
     let md_contents = fs::read_to_string(&md_path).expect("read markdown snapshot");
     assert!(md_contents.contains("| Unidades de compilação | 298 |"));
     assert!(md_contents.contains("duplicate_definition"));
+    assert!(md_contents.contains("Primeiras ocorrências"));
     assert!(md_contents.contains("lib/accid.dart"));
 
     // Uma segunda rodada sobrescreve, não acumula.
@@ -526,6 +599,42 @@ fn write_diagnosis_report_writes_json_and_markdown_snapshots() {
     let overwritten = fs::read_to_string(&md_path).expect("read overwritten markdown snapshot");
     assert!(overwritten.contains("| Unidades de compilação | 1 |"));
     assert!(!overwritten.contains("| Unidades de compilação | 298 |"));
+}
+
+#[test]
+fn analyzer_json_occurrences_keep_rule_location_and_message_for_triage() {
+    let output = r#"{
+      "diagnostics": [
+        {
+          "code": "receiver_of_type_never",
+          "severity": "ERROR",
+          "problemMessage": "The method 'run' can't be called on 'Never'.",
+          "location": {
+            "file": "/tmp/verovio/lib/vrv.dart",
+            "range": { "start": { "line": 42, "column": 17 } }
+          }
+        },
+        {
+          "code": "unused_field",
+          "severity": "WARNING",
+          "problemMessage": "The value of the field isn't used.",
+          "location": {
+            "file": "/tmp/verovio/lib/vrv.dart",
+            "range": { "start": { "line": 8, "column": 3 } }
+          }
+        }
+      ]
+    }"#;
+
+    let diagnostics = parse_dart_analyze_json(output).expect("parse analyzer JSON");
+
+    assert_eq!(diagnostics.len(), 2);
+    assert_eq!(diagnostics[0].rule, "receiver_of_type_never");
+    assert_eq!(diagnostics[0].severity, "ERROR");
+    assert_eq!(diagnostics[0].path, "/tmp/verovio/lib/vrv.dart");
+    assert_eq!(diagnostics[0].line, 42);
+    assert_eq!(diagnostics[0].column, 17);
+    assert!(diagnostics[0].message.contains("can't be called"));
 }
 
 fn repo_root() -> PathBuf {

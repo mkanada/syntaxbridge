@@ -135,6 +135,36 @@ porque os três achados desta rodada corrigem *erros de parse*
 ficava inteiramente invisível atrás de "o arquivo não parseia", não
 elimina erros de análise por si só.
 
+## Medição mais recente (2026-08-18, diagnóstico estruturado e bailout de expressão)
+
+Esta rodada trocou a leitura da saída humana de `dart analyze` por
+`dart analyze --format=json`. Além da contagem por regra, o snapshot agora
+preserva as primeiras ocorrências (regra, arquivo, linha, coluna e mensagem)
+em `.diagnosis/verovio-6.2.0.{json,md}` e guarda a saída bruta em
+`.diagnosis/verovio-6.2.0.analyze.json`. Isso transforma a próxima escolha em
+evidência localizável, em vez de inferência a partir de texto de terminal.
+
+| Métrica | Valor |
+| --- | --- |
+| Unidades de compilação | 298 |
+| Funções livres lowered | 515 |
+| Classes/structs lowered | 1.344 |
+| Arquivos `.dart` emitidos | 300 |
+| Linhas emitidas | 62.560 |
+| Linhas stub (expressão + statement) | 9.980 + 1.361 ≈ 18,1% |
+| Arquivos que não parseiam | **0 / 300 (0%)** |
+| Erros do `dart analyze` | 4.163 |
+| Avisos do `dart analyze` | 4.220 |
+| Tempo de extração `libclang` | 413,8s |
+
+O achado candidato `receiver_of_type_never` foi isolado com uma reprodução
+mínima: uma expressão não suportada usada como receptor de acesso a campo. O
+helper `_syntaxBridgeUnsupported` continua lançando `UnimplementedError`, mas
+agora é tipado como `dynamic`, não `Never`; portanto a falha continua explícita
+em tempo de execução sem contaminar a análise estática do código ao redor.
+A regra, antes com 3.659 ocorrências, não aparece mais no top 20 do diagnóstico
+estruturado.
+
 ## Veredito
 
 O mecanismo central escala: as 298 unidades de compilação passam pela
@@ -158,10 +188,13 @@ o achado dominante — `duplicate_definition` caiu para 135 nesta medição
 "Recomendação" para a hipótese de por que corrigir arquivos que antes nem
 parseavam também reduziu isso). O maior contribuinte na regra do
 `dart analyze` (soma de erro + aviso por regra, não separado por
-severidade) segue sendo `receiver_of_type_never` (3.786), seguido por
-`unused_field` (2.096), `undefined_method` (2.049) e `dead_code` (1.993) —
-nenhum desses quatro tem reprodução mínima isolada ainda (ver
-"Recomendação").
+severidade) seguia sendo `receiver_of_type_never` (3.786). Ele foi eliminado
+na rodada de 2026-08-18; o diagnóstico estruturado aponta agora
+`undefined_method` (1.811 erros) como a principal lacuna semântica, seguido
+por `extends_non_class` (370), `undefined_identifier` (359) e
+`implicit_super_initializer_missing_arguments` (314). As primeiras ocorrências
+convergem para a representação de herança múltipla como mixins (ver a
+recomendação atualizada).
 
 ## Achados
 
@@ -774,8 +807,8 @@ de agora.
    — ver seção do achado 1. Só "grupos com 3+ membros" (item 12 abaixo)
    permanece aberto.
 
-**Próximos passos, por alavancagem na medição de 2026-08-17 pós-achados 8/9
-(5.089 erros, 7/300 arquivos inválidos):**
+**Próximos passos, por alavancagem na medição de 2026-08-18 (4.163 erros,
+0/300 arquivos inválidos):**
 
 8. ~~Achados 8 e 9 (enum anônimo, parâmetro sem nome)~~ — **feitos**, ver
    seções acima. 16/301 → 7/300 arquivos inválidos, 7.909 → 5.089 erros.
@@ -789,22 +822,11 @@ de agora.
    arquivos inválidos** na medição mais recente — pela primeira vez, todo
    arquivo emitido é Dart sintaticamente válido; ver "Medição mais
    recente" acima.
-10. **Novo achado dominante candidato: `receiver_of_type_never` (3.659) —
-    ainda sem reprodução mínima isolada.** Hipótese original (não
-    confirmada): mesma dinâmica do achado 5 — `emit::dart::emit_body` tipa
-    uma expressão como `Never` quando compila a partir de um bailout, e
-    código que antes ficava atrás de um `Unsupported` de função inteira
-    agora expõe chamadas/acessos sobre esses valores `Never`. A hipótese
-    previa que resolver o achado 1 restante (item 12) reduziria isso como
-    efeito colateral — **não confirmado**: com os dois sub-casos do item 12
-    corrigidos, `receiver_of_type_never` ficou em 3.659, inalterado. Os dois
-    padrões corrigidos eram reais mas pouco difundidos (só afetam
-    `duplicate_definition`, que caiu; não tocam em bailout de corpo inteiro
-    do jeito que o achado 5 tocava) — a hipótese original media o achado 5,
-    não o achado 1, e não deveria ter sido estendida a ele sem essa
-    distinção. Ainda a maior alavancagem única disponível, mas agora sem
-    hipótese própria — `unused_field` (2.129) e `dead_code`/`undefined_method`
-    (1.868/1.809) também seguem sem hipótese.
+10. ~~`receiver_of_type_never`~~ — **feito (2026-08-18)**. A reprodução
+    mínima confirmou que um bailout de expressão tipado como `Never` se
+    propagava por acessos e chamadas posteriores. O helper continua lançando,
+    mas seu retorno é `dynamic`; a regra desaparece completamente do
+    diagnóstico do Verovio.
 11. ~~Achado 4 (STL não reconhecida vira tipo inválido)~~ — **feito**. Ver
     seção do achado 4 acima: `undefined_class` (400) some do top 20; erros
     do `dart analyze` caem 4.991 → 4.227 (−15,3%).
@@ -817,3 +839,13 @@ de agora.
     (−25%). **Ainda aberto:** grupos com 3+ membros (repro real no corpus:
     `humlib.dart`'s `streamInsert`, repetido três vezes), sem reprodução
     mínima isolada.
+13. **Próximo alvo: contrato de herança de registros convertidos em `mixin`.**
+    As ocorrências concretas conectam `undefined_method` (por exemplo,
+    `LayerElement.GetAncestorStaff`), `override_on_non_overriding_member`,
+    `extends_non_class`, `undefined_identifier` de membros herdados como
+    `_m_doc`, e construtores de base obrigatórios. A hipótese verificável é
+    que um registro C++ transformado em mixin deixa de expor, no tipo estático
+    do próprio mixin, os membros recebidos pelos seus `on` constraints. Antes
+    de mudar a estratégia de múltipla herança, criar uma reprodução mínima
+    com base, mixin intermediário e chamada por referência ao mixin; comparar
+    uma composição que preserve o contrato público e a inicialização de base.

@@ -7,9 +7,11 @@
 //! - In statement position, they become a `// TODO(syntax-bridge): <reason>`
 //!   comment followed by `throw UnimplementedError(...)`.
 //! - In expression position, a bare `throw` isn't valid Dart syntax, so they
-//!   call a private `Never`-returning helper instead — `Never` unifies with
-//!   any expected type, so the surrounding expression still type-checks.
-//!   The helper is only emitted into a file that actually needs it.
+//!   call a private `dynamic`-returning helper instead. It still always throws
+//!   at runtime, but `dynamic` quarantines the unknown static type at the
+//!   bailout boundary: a surrounding field/method access must not turn into
+//!   Dart's `receiver_of_type_never` diagnostic. The helper is only emitted
+//!   into a file that actually needs it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -446,7 +448,7 @@ fn emit_file(
 
 fn emit_unsupported_helper() -> String {
     format!(
-        "Never {UNSUPPORTED_HELPER_NAME}(String reason) {{\n{INDENT}throw UnimplementedError(reason);\n}}\n"
+        "dynamic {UNSUPPORTED_HELPER_NAME}(String reason) {{\n{INDENT}throw UnimplementedError(reason);\n}}\n"
     )
 }
 
