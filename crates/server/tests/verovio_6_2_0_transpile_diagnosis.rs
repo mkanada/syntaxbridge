@@ -85,8 +85,23 @@ fn transpiling_the_real_verovio_6_2_0_project_reports_coverage() {
     let files = dart::emit_module(&module);
     eprintln!("[diagnosis] emitted {} Dart files", files.len());
 
+    // `dynamic` hides a missing source-to-target mapping from both users and
+    // the Dart analyzer. Keep the real-project diagnostic as the broad
+    // regression gate: every generated token must now be a concrete Dart
+    // type or a named bridge such as `SyntaxBridgeOpaque`.
+    let dynamic_files: Vec<&str> = files
+        .iter()
+        .filter_map(|(path, contents)| {
+            contains_dart_token(contents, "dynamic").then_some(path.as_str())
+        })
+        .collect();
+    assert!(
+        dynamic_files.is_empty(),
+        "generated Dart must not contain `dynamic`; found it in {dynamic_files:?}"
+    );
+
     // Coverage proxy: how much of the emitted text is an honest stub
-    // (`_syntaxBridgeUnsupported(...)` in expression position, `// TODO
+    // (`_syntaxBridgeUnsupported<T>(...)` in expression position, `// TODO
     // (syntax-bridge):` in statement position — see emit::dart's module
     // docs) versus real translated code. Line-based, not a real parse — a
     // cheap, order-of-magnitude signal, not a precise metric.
@@ -96,7 +111,7 @@ fn transpiling_the_real_verovio_6_2_0_project_reports_coverage() {
     for contents in files.values() {
         for line in contents.lines() {
             total_lines += 1;
-            if line.contains("_syntaxBridgeUnsupported(") {
+            if line.contains("_syntaxBridgeUnsupported<") {
                 unsupported_expr_lines += 1;
             }
             if line.contains("// TODO(syntax-bridge):") {
@@ -302,6 +317,24 @@ fn transpiling_the_real_verovio_6_2_0_project_reports_coverage() {
     // eprintln! report above and the `.diagnosis/` snapshot written just
     // above, read with --nocapture. It only fails if the pipeline itself
     // couldn't run at all.
+}
+
+/// Checks whole Dart identifier tokens rather than a substring: `dynamic_`
+/// is the safe renaming of a C++ variable called `dynamic`, not the Dart
+/// escape-hatch type this diagnostic forbids.
+fn contains_dart_token(source: &str, sought: &str) -> bool {
+    source
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .any(|token| token == sought)
+}
+
+#[test]
+fn dynamic_regression_check_ignores_a_safe_identifier_suffix() {
+    assert!(contains_dart_token(
+        "int value = 0; dynamic value2;",
+        "dynamic"
+    ));
+    assert!(!contains_dart_token("int dynamic_ = 0;", "dynamic"));
 }
 
 fn current_timestamp_iso8601() -> String {

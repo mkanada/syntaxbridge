@@ -289,14 +289,13 @@ fn an_unsupported_message_escapes_dollar_signs_so_dart_never_interpolates_it() {
     );
 }
 
-/// A bailout expression still always throws at runtime, but it must not
-/// advertise `Never` to the Dart analyzer. Real generated code can keep
-/// traversing the syntactic expression around that bailout (`unsupported().x`
-/// or `unsupported().method()`), and a `Never` receiver turns each such
-/// traversal into `receiver_of_type_never`. `dynamic` keeps the bailout
-/// explicit while quarantining the unknown static type at its boundary.
+/// A bailout expression still always throws at runtime, but it must not emit
+/// `dynamic`. Real generated code can keep traversing the syntactic expression
+/// around that bailout (`unsupported().x` or `unsupported().method()`), so the
+/// helper is generic and receives an explicit, named opaque bridge type until
+/// lowering can preserve the source expression's exact type.
 #[test]
-fn an_unsupported_expression_calls_a_dynamic_helper_to_quarantine_the_bailout_type() {
+fn an_unsupported_expression_calls_a_typed_helper_without_dynamic() {
     let function = Function {
         name: "retorna_desconhecido".to_owned(),
         usr: "c:@F@retorna_desconhecido#".to_owned(),
@@ -327,13 +326,62 @@ fn an_unsupported_expression_calls_a_dynamic_helper_to_quarantine_the_bailout_ty
 
     assert!(
         source.contains(
-            "return _syntaxBridgeUnsupported('/project/input-source/src/aritmetica.cpp:6: unsupported expression cursor kind 999').value;"
+            "return _syntaxBridgeUnsupported<SyntaxBridgeOpaque>('/project/input-source/src/aritmetica.cpp:6: unsupported expression cursor kind 999').value;"
         ),
         "missing helper call, got:\n{source}"
     );
     assert!(
-        source.contains("dynamic _syntaxBridgeUnsupported(String reason) {"),
-        "helper function should quarantine the unsupported expression as dynamic, got:\n{source}"
+        source.contains("T _syntaxBridgeUnsupported<T>(String reason) {"),
+        "helper function should preserve an explicit static type, got:\n{source}"
+    );
+    assert!(
+        source.contains("final class SyntaxBridgeOpaque {"),
+        "unsupported types need a named bridge declaration, got:\n{source}"
+    );
+    assert!(
+        !source.contains("dynamic"),
+        "an unsupported expression must not reintroduce dynamic, got:\n{source}"
+    );
+}
+
+#[test]
+fn a_typed_unsupported_expression_preserves_its_static_dart_type() {
+    let function = Function {
+        name: "comprimento_desconhecido".to_owned(),
+        usr: "c:@F@comprimento_desconhecido#".to_owned(),
+        params: vec![],
+        return_type: Type::Int,
+        body: vec![Stmt::Return {
+            value: Some(Expr::FieldAccess {
+                target: Box::new(Expr::UnsupportedTyped {
+                    reason: "unsupported expression cursor kind 998".to_owned(),
+                    ty: Type::Str,
+                    origin: origin(6),
+                }),
+                field: "length".to_owned(),
+                ty: Type::Int,
+                origin: origin(6),
+            }),
+            origin: origin(6),
+        }],
+        origin: origin(4),
+    };
+    let module = Module {
+        records: Vec::new(),
+        functions: vec![function],
+        enums: Vec::new(),
+    };
+
+    let source = &emit_module(&module)["lib/aritmetica.dart"];
+    assert!(
+        source.contains(
+            "return _syntaxBridgeUnsupported<String>('/project/input-source/src/aritmetica.cpp:6: unsupported expression cursor kind 998').length;"
+        ),
+        "the bailout must retain String as its receiver type, got:\n{source}"
+    );
+    assert!(
+        !source.contains("SyntaxBridgeOpaque") && !source.contains("dynamic"),
+        "a known type must not fall back to the opaque bridge or dynamic, got:\n{source}"
     );
 }
 
@@ -433,6 +481,14 @@ fn a_function_with_an_unsupported_parameter_type_throws_instead_of_running_its_b
     assert!(
         !source.contains("return a;"),
         "the original (wrong) body must not be emitted, got:\n{source}"
+    );
+    assert!(
+        source.contains("SyntaxBridgeOpaque /* unsupported: long */ a"),
+        "an unsupported source type needs the named opaque bridge, got:\n{source}"
+    );
+    assert!(
+        source.contains("final class SyntaxBridgeOpaque {") && !source.contains("dynamic"),
+        "the generated signature must not fall back to dynamic, got:\n{source}"
     );
 }
 

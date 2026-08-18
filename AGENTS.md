@@ -99,6 +99,15 @@ inclusao de `klee` volta a ser avaliada quando a fase A tiver medido, com
   opcoes de mapeamento globalmente viaveis; quando nenhum mapeamento direto for
   viavel, gere codigo ponte que torne a conversao possivel, em vez de declarar o
   tipo nao convertivel.
+- **`dynamic` nao e uma solucao de transpilar.** Nunca o introduza para fazer o
+  Dart analisar ou para esconder um tipo C++ ainda sem mapeamento. Cada tipo
+  precisa de um destino Dart preciso, um adaptador/ponte nomeado, ou uma
+  fronteira externa explicitamente modelada; `Type::Unsupported` e um
+  diagnostico temporario a eliminar, nao um tipo de saida aceitavel. O mesmo
+  vale para bailouts de expressao: eles devem preservar o tipo estatico esperado
+  e falhar explicitamente, sem propagar `dynamic`. Ao encontrar um tipo novo,
+  registre seu spelling, ocorrencias e direcao de mapeamento antes de escolher a
+  implementacao.
 
 ## Estado atual
 

@@ -309,6 +309,15 @@ pub enum Expr {
         reason: String,
         origin: Origin,
     },
+    /// An unsupported expression whose C++ result type was still available
+    /// from libclang. Unlike the legacy `Unsupported` shape, this preserves
+    /// the static type expected by the surrounding Dart expression so the
+    /// throwing bailout can remain type-safe without `dynamic`.
+    UnsupportedTyped {
+        reason: String,
+        ty: Type,
+        origin: Origin,
+    },
 }
 
 impl Expr {
@@ -330,7 +339,8 @@ impl Expr {
             | Self::Index { origin, .. }
             | Self::StringByteLength { origin, .. }
             | Self::Tuple { origin, .. }
-            | Self::Unsupported { origin, .. } => origin,
+            | Self::Unsupported { origin, .. }
+            | Self::UnsupportedTyped { origin, .. } => origin,
         }
     }
 }

@@ -7,11 +7,10 @@
 //! - In statement position, they become a `// TODO(syntax-bridge): <reason>`
 //!   comment followed by `throw UnimplementedError(...)`.
 //! - In expression position, a bare `throw` isn't valid Dart syntax, so they
-//!   call a private `dynamic`-returning helper instead. It still always throws
-//!   at runtime, but `dynamic` quarantines the unknown static type at the
-//!   bailout boundary: a surrounding field/method access must not turn into
-//!   Dart's `receiver_of_type_never` diagnostic. The helper is only emitted
-//!   into a file that actually needs it.
+//!   call a private generic helper with an explicit opaque bridge type. It
+//!   still always throws at runtime without introducing `dynamic` into the
+//!   generated API. The helper and bridge are emitted only into a file that
+//!   needs either one.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -23,6 +22,7 @@ use crate::ir::{
 
 const INDENT: &str = "  ";
 const UNSUPPORTED_HELPER_NAME: &str = "_syntaxBridgeUnsupported";
+const OPAQUE_TYPE_NAME: &str = "SyntaxBridgeOpaque";
 
 /// Groups `module`'s records and functions by the C++ source file they came
 /// from (one `.dart` file per `.cpp`/`.hpp`) and emits each, records before
@@ -414,6 +414,12 @@ fn emit_file(
         }
         source.push_str(&emit_unsupported_helper());
     }
+    if source.contains(OPAQUE_TYPE_NAME) {
+        if !source.is_empty() {
+            source.push('\n');
+        }
+        source.push_str(&emit_opaque_type());
+    }
 
     let mut referenced_usrs: HashSet<&str> = HashSet::new();
     for record in records {
@@ -448,8 +454,16 @@ fn emit_file(
 
 fn emit_unsupported_helper() -> String {
     format!(
-        "dynamic {UNSUPPORTED_HELPER_NAME}(String reason) {{\n{INDENT}throw UnimplementedError(reason);\n}}\n"
+        "T {UNSUPPORTED_HELPER_NAME}<T>(String reason) {{\n{INDENT}throw UnimplementedError(reason);\n}}\n"
     )
+}
+
+/// A named bridge for source types that have not acquired their own Dart
+/// adapter yet. The original spelling remains in a trailing comment emitted
+/// by `emit_type`, so this class never turns an unknown C++ type into an
+/// untracked `dynamic` escape hatch.
+fn emit_opaque_type() -> String {
+    format!("final class {OPAQUE_TYPE_NAME} {{\n{INDENT}const {OPAQUE_TYPE_NAME}();\n}}\n")
 }
 
 /// E11: every `usr` a record's own shape and members reach — field/static
@@ -611,6 +625,7 @@ fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str
         | Expr::BoolLiteral { .. }
         | Expr::StringLiteral { .. }
         | Expr::Unsupported { .. } => {}
+        Expr::UnsupportedTyped { ty, .. } => collect_referenced_usrs_in_type(ty, out),
         Expr::Ref { ty, .. } | Expr::This { ty, .. } => collect_referenced_usrs_in_type(ty, out),
         Expr::Binary { lhs, rhs, ty, .. } => {
             collect_referenced_usrs_in_type(ty, out);
@@ -847,8 +862,8 @@ fn emit_record(
             .collect::<Vec<_>>()
             .join(", ");
 
-        // A field type the IR can't represent (`dynamic /* unsupported: ... */`
-        // above) means this class's shape is incomplete — silently allowing
+        // A field type the IR can't represent (`SyntaxBridgeOpaque /*
+        // unsupported: ... */` above) means this class's shape is incomplete — silently allowing
         // construction would accept any value into that field with no signal
         // anything is wrong. The constructor still declares (and assigns, via
         // the `this.field` initializing formals) every field, then throws
@@ -1539,10 +1554,11 @@ fn emit_function(
 /// interesting decision lives in the lowering step, and duplicating the
 /// reasoning risks the two drifting apart.
 ///
-/// A parameter or return type the IR can't represent is emitted as
-/// `dynamic` — if the body then ran as normal Dart on top of that, it would
-/// silently compute on untyped values (e.g. arithmetic on a `long`
-/// parameter) instead of ever signaling the translation is incomplete.
+/// A parameter or return type the IR can't represent is emitted through the
+/// named `SyntaxBridgeOpaque` bridge. If the body then ran as normal Dart on
+/// top of it, it would silently compute on a value with no faithful mapping
+/// (e.g. arithmetic on a `long` parameter) instead of ever signaling the
+/// translation is incomplete.
 /// Checked before the body itself: a signature-level failure takes priority
 /// and makes the body's own contents irrelevant.
 ///
@@ -1689,6 +1705,7 @@ fn expr_unsupported_type_spelling(expr: &Expr) -> Option<&str> {
         | Expr::BoolLiteral { .. }
         | Expr::StringLiteral { .. }
         | Expr::Unsupported { .. } => None,
+        Expr::UnsupportedTyped { ty, .. } => unsupported_spelling(ty),
         Expr::Ref { ty, .. } => unsupported_spelling(ty),
         Expr::Binary { ty, lhs, rhs, .. } => unsupported_spelling(ty)
             .or_else(|| expr_unsupported_type_spelling(lhs))
@@ -1807,7 +1824,9 @@ fn emit_type(ty: &Type) -> String {
                 .join(", ")
         ),
         Type::Nullable(inner) => format!("{}?", emit_type(inner)),
-        Type::Unsupported(spelling) => format!("dynamic /* unsupported: {spelling} */"),
+        Type::Unsupported(spelling) => {
+            format!("{OPAQUE_TYPE_NAME} /* unsupported: {spelling} */")
+        }
     }
 }
 
@@ -2152,6 +2171,7 @@ fn expr_ty(expr: &Expr) -> Option<&Type> {
         | Expr::StringByteLength { .. }
         | Expr::Tuple { .. }
         | Expr::Unsupported { .. } => None,
+        Expr::UnsupportedTyped { ty, .. } => Some(ty),
     }
 }
 
@@ -2340,7 +2360,15 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
         Expr::Unsupported { reason, origin } => {
             *used_expr_helper = true;
             format!(
-                "{UNSUPPORTED_HELPER_NAME}({message})",
+                "{UNSUPPORTED_HELPER_NAME}<{OPAQUE_TYPE_NAME}>({message})",
+                message = dart_string_literal(&unsupported_message(reason, origin))
+            )
+        }
+        Expr::UnsupportedTyped { reason, ty, origin } => {
+            *used_expr_helper = true;
+            format!(
+                "{UNSUPPORTED_HELPER_NAME}<{}>({message})",
+                emit_type(ty),
                 message = dart_string_literal(&unsupported_message(reason, origin))
             )
         }

@@ -661,13 +661,16 @@ unsafe fn dart_enum_type_name(decl: clang_sys::CXCursor) -> String {
 /// identifiers* (`as`, `mixin`, `static`, ...) are deliberately absent:
 /// they're barred from type-name position only, not from an ordinary
 /// value-level identifier like a parameter/local/method/function name, so
-/// renaming them here would churn names for nothing. None of these is a
-/// C++ keyword either, so an ordinary C++ identifier can land on any of
-/// them (Verovio 6.2.0 diagnosis, item 9: `bool is()`, `void f(int in)`,
-/// `int is = 1;`, `void finally()` all appear in the real corpus).
+/// renaming them here would churn names for nothing. `dynamic` is the one
+/// deliberate exception: it is normalized even where Dart permits it so the
+/// generated package has no `dynamic` escape-hatch spelling at all. None of
+/// the remaining words is a C++ keyword either, so an ordinary C++ identifier
+/// can land on any of them (Verovio 6.2.0 diagnosis, item 9: `bool is()`,
+/// `void f(int in)`, `int is = 1;`, `void finally()` all appear in the real
+/// corpus).
 const RESERVED_WORDS: &[&str] = &[
-    "assert", "break", "case", "catch", "class", "const", "continue", "default", "do", "else",
-    "enum", "extends", "false", "final", "finally", "for", "if", "in", "is", "new", "null",
+    "assert", "break", "case", "catch", "class", "const", "continue", "default", "do", "dynamic",
+    "else", "enum", "extends", "false", "final", "finally", "for", "if", "in", "is", "new", "null",
     "rethrow", "return", "super", "switch", "this", "throw", "true", "try", "var", "void", "while",
     "with",
 ];
@@ -992,7 +995,11 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
     // keeps case C01's own answer, unchanged: `Type::Unsupported`, honest
     // about still needing `dart:ffi`.
     if cx_type.kind == clang_sys::CXType_Pointer {
-        let mut pointee_ty = lower_type(unsafe { clang_sys::clang_getPointeeType(cx_type) });
+        let pointee_cx_type = unsafe { clang_sys::clang_getPointeeType(cx_type) };
+        let pointee_spelling = unsafe {
+            type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(pointee_cx_type))
+        };
+        let mut pointee_ty = lower_type(pointee_cx_type);
         // `char`/`const char` — the raw-pointer sibling of E05's
         // `std::string` adapter. `mapping::scalar_pointee_dart_type`
         // already decided these two spellings map to Dart `String`
@@ -1007,9 +1014,7 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
         // the same representation `std::string` already uses — lets it
         // fall through the ordinary `Known` branch just below instead of
         // needing a parallel case.
-        if let ir::Type::Unsupported(spelling) = &pointee_ty
-            && mapping::scalar_pointee_dart_type(spelling).is_some()
-        {
+        if mapping::scalar_pointee_dart_type(&pointee_spelling).is_some() {
             pointee_ty = ir::Type::Str;
         }
         // `lower_type` has no project-wide catalog in hand (only the
@@ -1058,19 +1063,41 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
     }
 
     match cx_type.kind {
-        clang_sys::CXType_Int => ir::Type::Int,
-        // `std::string::size()`/`std::vector::size()` both return
-        // `size_type` — `size_t`, `unsigned long` on this project's
-        // toolchain (confirmed empirically, not assumed: this is exactly
-        // the type E05's `mensagem.size()` return-value conversion hit).
-        // Mapped to the same `Type::Int` every other integer width in this
-        // corpus uses — Dart's `int` is 64-bit already, and cross-language
-        // integer-width divergence is an accepted, already-precedented gap
-        // here (E01's `int` overflow, `examples/E01-funcao-aritmetica/NOTES.md`),
-        // not a new one.
-        clang_sys::CXType_ULong => ir::Type::Int,
+        // Dart has one arbitrary-precision integral scalar. C/C++'s signed,
+        // unsigned, character, fixed-width and wide-character scalar kinds
+        // all preserve their value-domain shape as `int`; signedness and
+        // fixed-width constraints belong to a boundary validator when a
+        // particular API needs them, not to `dynamic` placeholders in the
+        // generated program. `size_t` reaches this arm as `unsigned long` on
+        // the Flatpak toolchain.
+        clang_sys::CXType_Char_U
+        | clang_sys::CXType_UChar
+        | clang_sys::CXType_Char16
+        | clang_sys::CXType_Char32
+        | clang_sys::CXType_UShort
+        | clang_sys::CXType_UInt
+        | clang_sys::CXType_ULong
+        | clang_sys::CXType_ULongLong
+        | clang_sys::CXType_UInt128
+        | clang_sys::CXType_Char_S
+        | clang_sys::CXType_SChar
+        | clang_sys::CXType_WChar
+        | clang_sys::CXType_Short
+        | clang_sys::CXType_Int
+        | clang_sys::CXType_Long
+        | clang_sys::CXType_LongLong
+        | clang_sys::CXType_Int128 => ir::Type::Int,
         clang_sys::CXType_Bool => ir::Type::Bool,
-        clang_sys::CXType_Double => ir::Type::Double,
+        // Dart's `double` is IEEE-754 binary64. It is the closest Dart
+        // scalar for every C/C++ floating kind; precision narrower/wider than
+        // binary64 is tracked by the source type catalog rather than erased
+        // into `dynamic` in the emitted API.
+        clang_sys::CXType_Half
+        | clang_sys::CXType_Float
+        | clang_sys::CXType_Double
+        | clang_sys::CXType_LongDouble
+        | clang_sys::CXType_Float128
+        | clang_sys::CXType_Float16 => ir::Type::Double,
         clang_sys::CXType_Void => ir::Type::Void,
         // Caso 4 of `docs/plans/verovio-6.2-pointer-types.md`: an
         // `enum`/`enum class` use, mirroring the `CXType_Record` branch
@@ -2204,10 +2231,11 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
                 // as sound.
                 inner
             } else {
-                ir::Expr::Unsupported {
+                ir::Expr::UnsupportedTyped {
                     reason: format!(
                         "unsupported implicit conversion from {child_ty:?} to {outer_ty:?}"
                     ),
+                    ty: outer_ty,
                     origin,
                 }
             };
@@ -2311,8 +2339,9 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
         return unsafe { lower_call_expr(cursor, project_root, origin) };
     }
 
-    ir::Expr::Unsupported {
+    ir::Expr::UnsupportedTyped {
         reason: format!("unsupported expression cursor kind {kind}"),
+        ty: lower_type(unsafe { clang_sys::clang_getCursorType(cursor) }),
         origin,
     }
 }

@@ -135,7 +135,7 @@ porque os três achados desta rodada corrigem *erros de parse*
 ficava inteiramente invisível atrás de "o arquivo não parseia", não
 elimina erros de análise por si só.
 
-## Medição mais recente (2026-08-18, diagnóstico estruturado e bailout de expressão)
+## Medição anterior (2026-08-18, diagnóstico estruturado e bailout de expressão)
 
 Esta rodada trocou a leitura da saída humana de `dart analyze` por
 `dart analyze --format=json`. Além da contagem por regra, o snapshot agora
@@ -158,12 +158,40 @@ evidência localizável, em vez de inferência a partir de texto de terminal.
 | Tempo de extração `libclang` | 413,8s |
 
 O achado candidato `receiver_of_type_never` foi isolado com uma reprodução
-mínima: uma expressão não suportada usada como receptor de acesso a campo. O
-helper `_syntaxBridgeUnsupported` continua lançando `UnimplementedError`, mas
-agora é tipado como `dynamic`, não `Never`; portanto a falha continua explícita
-em tempo de execução sem contaminar a análise estática do código ao redor.
-A regra, antes com 3.659 ocorrências, não aparece mais no top 20 do diagnóstico
-estruturado.
+mínima: uma expressão não suportada usada como receptor de acesso a campo. A
+rodada descrita nesta seção usava temporariamente `dynamic` para evitar a
+propagação de `Never`; a rodada seguinte substituiu esse paliativo por
+`_syntaxBridgeUnsupported<T>`, que preserva o tipo estático esperado sem emitir
+`dynamic` (ver a medição nova abaixo).
+
+## Medição mais recente (2026-08-18, eliminação de `dynamic`)
+
+O lowering agora normaliza os escalares fundamentais C/C++ para os escalares
+mais próximos do Dart (`int` e `double`). Para uma expressão que não pode ser
+traduzida, `Expr::UnsupportedTyped` preserva o tipo estático e o emissor gera
+`_syntaxBridgeUnsupported<T>`. Tipos de fronteira ainda sem adaptador são
+`SyntaxBridgeOpaque`, uma classe Dart nomeada; eles não são `dynamic`.
+
+| Métrica | Valor |
+| --- | --- |
+| Unidades de compilação | 298 |
+| Funções livres lowered | 515 |
+| Classes/structs lowered | 1.344 |
+| Arquivos `.dart` emitidos | 300 |
+| Linhas emitidas | 60.284 |
+| Linhas stub (expressão + statement) | 8.756 + 1.408 ≈ 16,9% |
+| Arquivos que não parseiam | **0 / 300 (0%)** |
+| Tokens `dynamic` emitidos | **0** |
+| Linhas que referenciam `SyntaxBridgeOpaque` | 3.804 |
+| Erros do `dart analyze` | 6.408 |
+| Avisos do `dart analyze` | 4.048 |
+| Tempo de extração `libclang` | 545,2s |
+
+O aumento de erros em relação à medição anterior é intencionalmente
+diagnóstico: operações que `dynamic` aceitava sem checagem agora revelam onde
+faltam adaptadores específicos. As próximas pontes a priorizar são ponteiros e
+buffers, produtos/coleções STL, callbacks e as fronteiras de stream/regex;
+elas devem substituir `SyntaxBridgeOpaque` por contratos Dart nomeados.
 
 ## Veredito
 
@@ -441,8 +469,9 @@ E10 decidiu conscientemente não construir ponte para ponteiro cru
 (`examples/E10-ponteiros-union-out-params/NOTES.md`). Em uma árvore de
 objetos real com despacho virtual — exatamente a forma do Verovio — ponteiro
 cru aparecia em uma fração enorme de campos, parâmetros e retornos, cada um
-virando `dynamic /* unsupported: T * */`: sintaticamente válido, mas sem
-nenhuma segurança de tipo.
+virando uma referência a `SyntaxBridgeOpaque`: sintaticamente válida e
+explicitamente marcada como fronteira sem adaptador, mas ainda sem a segurança
+semântica de uma ponte de ponteiro específica.
 
 **Parcialmente corrigido** com um solver dedicado,
 `mapping::pointer_options_for` (caso A10, `docs/mapping-solver-cases.md`).
@@ -715,9 +744,9 @@ record é anônimo. Dois pontos, espelhando exatamente `lower_record`/
 - `lower_type`'s ramo `CXType_Record` força `name` vazio para um `decl`
   anônimo, roteando pelo branch `Unsupported` já existente em vez de
   produzir um `Type::Record` apontando para uma classe nunca declarada —
-  um campo desse tipo vira o bailout honesto genérico
-  (`dynamic /* unsupported: ... */`), o mesmo que qualquer outro tipo não
-  representável já usa.
+um campo desse tipo vira a ponte explícita
+  (`SyntaxBridgeOpaque /* unsupported: ... */`), o mesmo mecanismo que
+  qualquer outro tipo ainda não representável usa.
 
 Prova: `an_anonymous_struct_is_never_declared_under_libclangs_debug_spelling`
 em `crates/server/tests/lower_cpp.rs`.
@@ -824,9 +853,9 @@ de agora.
    recente" acima.
 10. ~~`receiver_of_type_never`~~ — **feito (2026-08-18)**. A reprodução
     mínima confirmou que um bailout de expressão tipado como `Never` se
-    propagava por acessos e chamadas posteriores. O helper continua lançando,
-    mas seu retorno é `dynamic`; a regra desaparece completamente do
-    diagnóstico do Verovio.
+    propagava por acessos e chamadas posteriores. O helper agora é genérico
+    (`_syntaxBridgeUnsupported<T>`) e preserva o tipo estático esperado; o
+    pacote do Verovio não contém nenhum token `dynamic` emitido.
 11. ~~Achado 4 (STL não reconhecida vira tipo inválido)~~ — **feito**. Ver
     seção do achado 4 acima: `undefined_class` (400) some do top 20; erros
     do `dart analyze` caem 4.991 → 4.227 (−15,3%).

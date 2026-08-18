@@ -569,6 +569,46 @@ void f(std::array<int, 3> a) { }
     );
 }
 
+/// C++ has many scalar spellings but Dart only needs `int` and `double` for
+/// their value domains. None of these ordinary scalar types may cross the
+/// lowering boundary as `Type::Unsupported`, which would make the emitter
+/// fall back to `dynamic` instead of producing a Dart scalar signature.
+#[test]
+fn c_and_cpp_scalar_types_lower_to_the_closest_dart_scalars() {
+    let source = lower_and_emit(
+        "lower-cpp-all-scalars",
+        r#"
+double scalar_bridge(
+    unsigned int unsigned_count,
+    unsigned short short_count,
+    signed char signed_byte,
+    char byte,
+    wchar_t wide_char,
+    char16_t utf16_unit,
+    char32_t unicode_code_point,
+    short signed_short,
+    long signed_long,
+    long long signed_long_long,
+    unsigned long long unsigned_long_long,
+    float ratio,
+    long double precise) {
+  return ratio;
+}
+"#,
+    );
+
+    assert!(
+        source.contains(
+            "double scalar_bridge(int unsigned_count, int short_count, int signed_byte, int byte, int wide_char, int utf16_unit, int unicode_code_point, int signed_short, int signed_long, int signed_long_long, int unsigned_long_long, double ratio, double precise)"
+        ),
+        "ordinary C/C++ scalars must use Dart scalar types, got:\n{source}"
+    );
+    assert!(
+        !source.contains("dynamic"),
+        "scalar lowering must not leave a dynamic placeholder, got:\n{source}"
+    );
+}
+
 /// Clang propagates a nested enum's access specifier onto each of its
 /// `EnumConstantDecl`s, so a default-private `enum` inside a class had its
 /// *references* run through `dart_member_name` (which prefixes `_`) while
@@ -1022,6 +1062,33 @@ int f() {
     );
 }
 
+/// `dynamic` is accepted by Dart in a few identifier positions, but it must
+/// never survive as a generated identifier: the package-level guarantee is
+/// that searching generated Dart for `dynamic` finds no type escape hatch.
+/// C++ permits this perfectly ordinary local name, so normalize it together
+/// with the strictly reserved words.
+#[test]
+fn a_local_variable_named_dynamic_is_renamed() {
+    let source = lower_and_emit(
+        "lower-cpp-dynamic-local-name",
+        r#"
+int f() {
+    int dynamic = 1;
+    return dynamic + 1;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("int dynamic =") && !source.contains("return dynamic +"),
+        "the generated Dart must not retain dynamic as an identifier, got:\n{source}"
+    );
+    assert!(
+        source.contains("int dynamic_ = 1") && source.contains("dynamic_ + 1"),
+        "expected declaration and reference to be renamed consistently, got:\n{source}"
+    );
+}
+
 /// Diagnostic finding (`verovio_6_2_0_transpile_diagnosis`, item 9,
 /// `zip_file.dart`): an anonymous `struct { ... } campo;` (unlike an
 /// anonymous `enum`, achado 8, no fixture in E01–E13 has one) hits the same
@@ -1061,10 +1128,11 @@ struct Contêiner {
     );
     // libclang's debug spelling is still fine to *quote* inside the honest
     // `Unsupported` bailout's comment/exception message — that's a
-    // diagnostic string, not a Dart identifier, the same distinction
-    // achado 5's `dynamic /* unsupported: T* */` already draws.
+    // diagnostic string, not a Dart identifier, and is represented by the
+    // named opaque bridge rather than a dynamic type escape hatch.
     assert!(
-        source.contains("dynamic /* unsupported:") && source.contains("(unnamed struct at"),
+        source.contains("SyntaxBridgeOpaque /* unsupported:")
+            && source.contains("(unnamed struct at"),
         "expected the anonymous-struct field to become an honest Unsupported \
          bailout, got:\n{source}"
     );

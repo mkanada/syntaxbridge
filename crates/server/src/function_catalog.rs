@@ -1035,6 +1035,7 @@ impl IrRefVisitor<'_> {
             | ir::Expr::BoolLiteral { .. }
             | ir::Expr::StringLiteral { .. }
             | ir::Expr::Unsupported { .. } => {}
+            ir::Expr::UnsupportedTyped { ty, .. } => self.visit_type(ty),
             ir::Expr::Ref { ty, .. } | ir::Expr::This { ty, .. } => {
                 self.visit_type(ty);
             }
@@ -1344,7 +1345,8 @@ fn expr_references_name(expr: &ir::Expr, name: &str) -> bool {
         | ir::Expr::BoolLiteral { .. }
         | ir::Expr::StringLiteral { .. }
         | ir::Expr::This { .. }
-        | ir::Expr::Unsupported { .. } => false,
+        | ir::Expr::Unsupported { .. }
+        | ir::Expr::UnsupportedTyped { .. } => false,
         ir::Expr::Binary { lhs, rhs, .. } => {
             expr_references_name(lhs, name) || expr_references_name(rhs, name)
         }
@@ -1474,7 +1476,8 @@ fn replace_this_with_ref_in_expr(expr: &mut ir::Expr, var_name: &str) {
         | ir::Expr::BoolLiteral { .. }
         | ir::Expr::StringLiteral { .. }
         | ir::Expr::Ref { .. }
-        | ir::Expr::Unsupported { .. } => {}
+        | ir::Expr::Unsupported { .. }
+        | ir::Expr::UnsupportedTyped { .. } => {}
         ir::Expr::Binary { lhs, rhs, .. } => {
             replace_this_with_ref_in_expr(lhs, var_name);
             replace_this_with_ref_in_expr(rhs, var_name);
@@ -1624,7 +1627,8 @@ fn rename_calls_in_expr(expr: &mut ir::Expr, renames: &HashMap<String, String>) 
         | ir::Expr::StringLiteral { .. }
         | ir::Expr::Ref { .. }
         | ir::Expr::This { .. }
-        | ir::Expr::Unsupported { .. } => {}
+        | ir::Expr::Unsupported { .. }
+        | ir::Expr::UnsupportedTyped { .. } => {}
         ir::Expr::Binary { lhs, rhs, .. } => {
             rename_calls_in_expr(lhs, renames);
             rename_calls_in_expr(rhs, renames);
