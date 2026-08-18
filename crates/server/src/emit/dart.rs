@@ -2307,21 +2307,25 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
             // empirically). Parenthesizing whenever the operand's own text
             // starts with the same character keeps the two tokens apart
             // regardless of how deep the nesting goes.
-            if operand_text.starts_with(op_text) {
+            if *op == UnaryOp::Not {
+                format!("{op_text}({operand_text})")
+            } else if operand_text.starts_with(op_text) {
                 format!("{op_text}({operand_text})")
             } else {
                 format!("{op_text}{operand_text}")
             }
         }
-        // The only promotion `lower::cpp` currently constructs a `Convert`
-        // node for is int → double (see the IR's own doc comment) — Dart
-        // never implicitly widens an `int` expression to `double`.
-        Expr::Convert { operand, .. } => {
-            format!(
+        Expr::Convert { operand, ty, .. } => match ty {
+            Type::Double => format!(
                 "{}.toDouble()",
                 emit_expr(operand, used_expr_helper, used_utf8_encode)
-            )
-        }
+            ),
+            Type::Bool => format!(
+                "{} != 0",
+                emit_expr(operand, used_expr_helper, used_utf8_encode)
+            ),
+            _ => unreachable!("only represented scalar conversions construct Expr::Convert"),
+        },
         Expr::Call {
             target,
             callee_name,
@@ -2465,6 +2469,7 @@ fn emit_binary_op(op: BinaryOp, ty: &Type) -> &'static str {
 fn emit_unary_op(op: UnaryOp) -> &'static str {
     match op {
         UnaryOp::Neg => "-",
+        UnaryOp::Not => "!",
     }
 }
 

@@ -166,6 +166,7 @@ pub enum BinaryOp {
 #[serde(rename_all = "snake_case")]
 pub enum UnaryOp {
     Neg,
+    Not,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -216,13 +217,11 @@ pub enum Expr {
         ty: Type,
         origin: Origin,
     },
-    /// An implicit numeric promotion C++ inserted on `operand` (currently
-    /// only `int` → `double`, from the usual arithmetic conversions or an
-    /// `int` initializing/assigning to a `double`) — `lower::cpp` must keep
-    /// this explicit rather than discarding it as sugar, since Dart (unlike
-    /// C++) never implicitly widens an `int` *expression* to `double`
-    /// (only integer *literals* coerce). `emit::dart` turns this into
-    /// `<operand>.toDouble()`.
+    /// An implicit scalar conversion C++ inserted on `operand` — currently
+    /// `int` → `double` and C++ truthiness `int` → `bool`. `lower::cpp` must
+    /// keep it explicit rather than discarding it as sugar: Dart neither
+    /// widens an integer expression to `double` nor accepts one as a boolean
+    /// condition. `emit::dart` turns these into `.toDouble()` and `!= 0`.
     Convert {
         operand: Box<Expr>,
         ty: Type,

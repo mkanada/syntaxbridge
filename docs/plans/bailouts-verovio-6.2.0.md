@@ -10,10 +10,10 @@ dependem de procurar textos no Dart formatado.
 
 | Origem do bailout | Ocorrências | Causas distintas |
 | --- | ---: | ---: |
-| Tipo C++ sem mapeamento (`Type::Unsupported`) | 1.926 | 221 spellings |
-| Expressão sem lowering (`Expr::Unsupported*`) | 27.905 | 1.916 razões |
+| Tipo C++ sem mapeamento (`Type::Unsupported`) | 1.964 | 222 spellings |
+| Expressão sem lowering (`Expr::Unsupported*`) | 26.917 | 1.990 razões |
 | Statement sem lowering (`Stmt::Unsupported`) | 2.214 | 31 razões |
-| **Total** | **32.045** | — |
+| **Total** | **31.095** | — |
 
 Uma ocorrência é um nó do IR, não uma linha do pacote Dart: um mesmo nó pode
 aparecer em mais de um arquivo por inclusão de headers. `SyntaxBridgeOpaque` e
@@ -22,9 +22,25 @@ ao Dart; não são uma solução semântica para a categoria que os originou.
 
 As famílias de cada tabela são mutuamente exclusivas no *snapshot-base* abaixo.
 As listas exatas de spellings e razões continuam no JSON, para que uma nova
-causa não seja escondida pela agregação deste plano. A execução mais recente
-já reduziu os tipos sem mapeamento de 4.384 para 1.926 (−2.458; **−56,1%**),
-sem introduzir `dynamic`.
+causa não seja escondida pela agregação deste plano.
+
+### Atualização de 2026-08-18 — casos 1 e 2
+
+Esta execução removeu completamente três causas que estavam no snapshot-base:
+
+- `unsupported unary operator kind 10` (`!`): 2.153 → 0;
+- `unsupported implicit conversion from Int to Bool`: 567 → 0;
+- `standard-library method call's first child was not the expected
+  member-reference cursor`: 1.785 → 0.
+
+O terceiro item não declara os métodos resolvidos: ele apenas encontra o
+receptor também na forma de chamada de operador (por exemplo, `destino =
+origem`). Assim, o diagnóstico passa a apontar a operação real — por exemplo,
+`std::basic_string::operator=` (1.142) e `std::vector::operator=` (49) — que
+serão tratadas pela tabela de adaptadores. O total de expressões caiu de
+27.905 para 26.917 (−988); a diferença não é a soma das três causas porque
+um lowering que antes parava cedo passa a expor o próximo nó ainda não
+suportado.
 
 ## 1. Tipos sem mapeamento — snapshot-base de 4.384 ocorrências
 
@@ -62,7 +78,7 @@ padrão do parâmetro Dart.
 | Spelling vazio | 171 | A declaração/type canônico não foi resolvido e o fallback perdeu o nome. | Nunca emitir ponte sem identidade: registrar cursor, USR, tipo canônico e localização. Resolver como alias/externo ou falhar o diagnóstico com causa rastreável. |
 | Outros tipos nomeados | 67 | Bibliotecas e aliases específicos (`tm`, `Scale`, `KeyboardMapping`, `basic_fstream` etc.). | Classificar no catálogo como record do projeto, adaptador de biblioteca ou API externa. Cada spelling novo deve ter decisão registrada antes de sair do diagnóstico. |
 
-## 2. Expressões sem lowering — 27.905 ocorrências
+## 2. Expressões sem lowering — snapshot-base de 27.905 ocorrências
 
 | Família | Qtde. | Causa raiz | Direção de solução |
 | --- | ---: | --- | --- |
@@ -97,7 +113,7 @@ padrão do parâmetro Dart.
 | `InitListExpr` (119) | 7 | `List`/`Set`/record literal tipado conforme o destino. |
 | `ConceptSpecializationExpr` (153) / `DeclStmt` vazando como expressão (231) | 7 | Tratar conceito como informação de tipo e elevar declaração para statement. |
 
-## 3. Statements sem lowering — 2.214 ocorrências
+## 3. Statements sem lowering — snapshot-base de 2.214 ocorrências
 
 | Família | Qtde. | Causa raiz | Direção de solução |
 | --- | ---: | --- | --- |

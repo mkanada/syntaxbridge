@@ -2572,6 +2572,16 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
                     ty: ir::Type::Double,
                     origin,
                 }
+            } else if child_ty == ir::Type::Int && outer_ty == ir::Type::Bool {
+                // C++ truthiness is an implicit conversion, not a Dart
+                // property of integers. Keep it as a typed conversion so a
+                // returned/conditioned integer becomes `value != 0` instead
+                // of an invalid Dart boolean context.
+                ir::Expr::Convert {
+                    operand: Box::new(inner),
+                    ty: ir::Type::Bool,
+                    origin,
+                }
             } else if outer_ty == ir::Type::Void {
                 // `(void)fmt;` (E13's `LogDebug` stub) — C++'s idiom for
                 // "evaluate this and deliberately discard the result",
@@ -2783,6 +2793,19 @@ unsafe fn lower_unary_expr(
     };
 
     let operand = unsafe { lower_expr(*operand_cursor, project_root) };
+    let operand_ty = lower_type(unsafe { clang_sys::clang_getCursorType(*operand_cursor) });
+    let operand = if op == ir::UnaryOp::Not && operand_ty == ir::Type::Int {
+        // `!integer` is legal C++ truthiness but invalid Dart. The unary
+        // operation itself still returns `bool`; only its operand needs the
+        // explicit conversion.
+        ir::Expr::Convert {
+            operand: Box::new(operand),
+            ty: ir::Type::Bool,
+            origin: origin.clone(),
+        }
+    } else {
+        operand
+    };
     let ty = lower_type(unsafe { clang_sys::clang_getCursorType(cursor) });
     ir::Expr::Unary {
         op,
@@ -3208,19 +3231,21 @@ unsafe fn lower_stdlib_method_call(
         });
     }
 
-    let receiver_children = unsafe { collect_children(call_cursor) };
-    let member_ref_cursor = *receiver_children.first()?;
-    if unsafe { clang_sys::clang_getCursorKind(member_ref_cursor) }
-        != clang_sys::CXCursor_MemberRefExpr
-    {
-        return Some(ir::Expr::Unsupported {
-            reason: "standard-library method call's first child was not the expected \
-                      member-reference cursor"
-                .to_owned(),
-            origin: origin.clone(),
-        });
-    }
-    let target = unsafe { member_ref_receiver(member_ref_cursor, project_root, origin) };
+    // A normal dot call owns a `MemberRefExpr` for its callee. Overloaded
+    // operators, however, use the same call cursor but expose the receiver
+    // as argument zero (`destination = source` is the common case in the
+    // Verovio corpus). Normalize both shapes *before* method dispatch: a
+    // method that we do not yet bridge must still report its own name, not a
+    // fragile incidental detail of libclang's child ordering.
+    let target = match unsafe { stdlib_method_receiver(call_cursor, project_root, origin) } {
+        Ok(target) => target,
+        Err(reason) => {
+            return Some(ir::Expr::Unsupported {
+                reason,
+                origin: origin.clone(),
+            });
+        }
+    };
 
     match (template_name.as_str(), callee_name.as_str()) {
         ("basic_string", "size") | ("basic_string", "length") => Some(ir::Expr::StringByteLength {
@@ -3238,6 +3263,34 @@ unsafe fn lower_stdlib_method_call(
             origin: origin.clone(),
         }),
     }
+}
+
+/// Resolves the object receiving a standard-library method call while
+/// normalizing libclang's two call shapes: a regular dot call has a direct
+/// `MemberRefExpr` child, while an overloaded operator passes its receiver as
+/// argument zero. Keeping this structural normalization separate from the
+/// stdlib method table lets an unsupported method retain a precise diagnostic.
+unsafe fn stdlib_method_receiver(
+    call_cursor: clang_sys::CXCursor,
+    project_root: &Path,
+    origin: &ir::Origin,
+) -> Result<ir::Expr, String> {
+    let member_ref = unsafe { collect_children(call_cursor) }
+        .into_iter()
+        .find(|child| unsafe {
+            clang_sys::clang_getCursorKind(*child) == clang_sys::CXCursor_MemberRefExpr
+        });
+
+    if let Some(member_ref) = member_ref {
+        return Ok(unsafe { member_ref_receiver(member_ref, project_root, origin) });
+    }
+
+    let arg_count = unsafe { clang_sys::clang_Cursor_getNumArguments(call_cursor) };
+    if arg_count < 1 {
+        return Err("standard-library operator call had no receiver argument".to_owned());
+    }
+    let receiver_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
+    Ok(unsafe { lower_expr(receiver_cursor, project_root) })
 }
 
 /// `std::gcd(a, b)` (`<numeric>`, E13's `Fraction::Reduce`) — the one
@@ -3674,6 +3727,7 @@ fn lower_binary_op(kind: clang_sys::CXBinaryOperatorKind) -> Option<ir::BinaryOp
 fn lower_unary_op(kind: clang_sys::CXUnaryOperatorKind) -> Option<ir::UnaryOp> {
     match kind {
         clang_sys::CXUnaryOperator_Minus => Some(ir::UnaryOp::Neg),
+        clang_sys::CXUnaryOperator_LNot => Some(ir::UnaryOp::Not),
         _ => None,
     }
 }

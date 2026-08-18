@@ -895,6 +895,99 @@ int find_index(std::string text) {
     );
 }
 
+/// C++ accepts an integer both as a boolean return value and as the operand
+/// of logical negation. Dart requires a real `bool`, so lowering must retain
+/// the truth conversion explicitly instead of emitting an invalid `!value`
+/// or bailing out the enclosing function.
+#[test]
+fn integer_truthiness_and_logical_not_lower_to_typed_dart_booleans() {
+    let source = lower_and_emit(
+        "lower-cpp-integer-truthiness",
+        r#"
+bool is_zero(int value) {
+    return !value;
+}
+
+bool is_present(int value) {
+    return value;
+}
+
+bool has_value(int value) {
+    if (value) {
+        return true;
+    }
+    return false;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("bool is_zero(int value)")
+            && source.contains("return !(value != 0);")
+            && source.contains("bool is_present(int value)")
+            && source.contains("return value != 0;")
+            && source.contains("bool has_value(int value)")
+            && source.contains("if (value != 0)"),
+        "integer truthiness must become an explicit typed Dart boolean conversion, got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported unary operator kind 10")
+            && !source.contains("unsupported implicit conversion from Int to Bool"),
+        "logical-not and int-to-bool must not remain expression bailouts, got:\n{source}"
+    );
+}
+
+/// A standard-library member call can have a semantic wrapper around its
+/// callee when its receiver is itself a call expression. The dispatcher must
+/// locate the member reference structurally, rather than assuming it is the
+/// first direct child of the call cursor.
+#[test]
+fn a_stdlib_method_call_with_a_temporary_receiver_keeps_its_receiver() {
+    let source = lower_and_emit(
+        "lower-cpp-stdlib-temporary-receiver",
+        r#"
+#include <vector>
+
+std::vector<int> make_values();
+
+int count_values() {
+    return make_values().size();
+}
+"#,
+    );
+
+    assert!(
+        source.contains("int count_values()")
+            && source.contains("return make_values().length;")
+            && !source.contains("standard-library method call's first child was not"),
+        "a wrapped stdlib receiver must still reach the stdlib dispatcher, got:\n{source}"
+    );
+}
+
+/// Libclang represents an overloaded assignment as an operator call: its
+/// receiver is the first call argument, not a `MemberRefExpr`. The stdlib
+/// dispatcher must normalize that shape before deciding whether it supports
+/// the method itself, so its diagnostic remains specific and actionable.
+#[test]
+fn a_stdlib_operator_call_uses_its_first_argument_as_the_receiver() {
+    let source = lower_and_emit(
+        "lower-cpp-stdlib-operator-receiver",
+        r#"
+#include <vector>
+
+void copy_values(std::vector<int>& destination, const std::vector<int>& source) {
+    destination = source;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("unsupported std::vector::operator= call")
+            && !source.contains("standard-library method call's first child was not"),
+        "an operator-style stdlib call must expose its receiver before dispatch, got:\n{source}"
+    );
+}
+
 /// `std::tuple` has a direct structural counterpart in Dart's record types.
 /// Keeping it typed at an API boundary does not claim that every `std::get`
 /// expression is already lowered; those operations retain their own explicit
