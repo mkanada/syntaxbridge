@@ -23,6 +23,8 @@ use crate::ir::{
 const INDENT: &str = "  ";
 const UNSUPPORTED_HELPER_NAME: &str = "_syntaxBridgeUnsupported";
 const OPAQUE_TYPE_NAME: &str = "SyntaxBridgeOpaque";
+const PAIR_TYPE_NAME: &str = "SyntaxBridgePair";
+const SUPPORT_FILE_NAME: &str = "syntax_bridge_support.dart";
 
 /// Groups `module`'s records and functions by the C++ source file they came
 /// from (one `.dart` file per `.cpp`/`.hpp`) and emits each, records before
@@ -137,7 +139,7 @@ pub fn emit_module_with_externals(
         .cloned()
         .collect();
 
-    stems
+    let mut files: BTreeMap<String, String> = stems
         .into_iter()
         .map(|stem| {
             let mut enums = enums_by_stem.remove(&stem).unwrap_or_default();
@@ -179,7 +181,11 @@ pub fn emit_module_with_externals(
                 ),
             )
         })
-        .collect()
+        .collect();
+    if files.values().any(|source| source.contains(PAIR_TYPE_NAME)) {
+        files.insert(format!("lib/{SUPPORT_FILE_NAME}"), emit_pair_support());
+    }
+    files
 }
 
 /// Every record `usr` used as a mixin (E09) somewhere in `module`, computed
@@ -443,6 +449,12 @@ fn emit_file(
     if used_utf8_encode {
         import_lines.push("import 'dart:convert';".to_owned());
     }
+    if source.contains("Uint8List") {
+        import_lines.push("import 'dart:typed_data';".to_owned());
+    }
+    if source.contains(PAIR_TYPE_NAME) {
+        import_lines.push(format!("import '{SUPPORT_FILE_NAME}';"));
+    }
     for other_stem in &needed_imports {
         import_lines.push(format!("import '{other_stem}.dart';"));
     }
@@ -464,6 +476,12 @@ fn emit_unsupported_helper() -> String {
 /// untracked `dynamic` escape hatch.
 fn emit_opaque_type() -> String {
     format!("final class {OPAQUE_TYPE_NAME} {{\n{INDENT}const {OPAQUE_TYPE_NAME}();\n}}\n")
+}
+
+fn emit_pair_support() -> String {
+    format!(
+        "final class {PAIR_TYPE_NAME}<A, B> {{\n{INDENT}const {PAIR_TYPE_NAME}(this.first, this.second);\n\n{INDENT}final A first;\n{INDENT}final B second;\n}}\n"
+    )
 }
 
 /// E11: every `usr` a record's own shape and members reach — field/static
@@ -516,9 +534,18 @@ fn collect_referenced_usrs_in_type<'a>(ty: &'a Type, out: &mut HashSet<&'a str>)
             out.insert(usr.as_str());
         }
         Type::List(element) | Type::Set(element) => collect_referenced_usrs_in_type(element, out),
-        Type::Map(key, value) => {
+        Type::Map(key, value) | Type::Pair(key, value) => {
             collect_referenced_usrs_in_type(key, out);
             collect_referenced_usrs_in_type(value, out);
+        }
+        Type::Callback {
+            return_type,
+            params,
+        } => {
+            collect_referenced_usrs_in_type(return_type, out);
+            for parameter in params {
+                collect_referenced_usrs_in_type(parameter, out);
+            }
         }
         Type::Tuple(elements) => {
             for element in elements {
@@ -526,7 +553,13 @@ fn collect_referenced_usrs_in_type<'a>(ty: &'a Type, out: &mut HashSet<&'a str>)
             }
         }
         Type::Nullable(inner) => collect_referenced_usrs_in_type(inner, out),
-        Type::Int | Type::Bool | Type::Double | Type::Void | Type::Str | Type::Unsupported(_) => {}
+        Type::Int
+        | Type::Bool
+        | Type::Double
+        | Type::Void
+        | Type::Str
+        | Type::Bytes
+        | Type::Unsupported(_) => {}
     }
 }
 
@@ -959,6 +992,7 @@ fn field_default_literal(ty: &Type, enums_by_usr: &HashMap<&str, &Enum>) -> Opti
         Type::Nullable(_) => Some("null".to_owned()),
         Type::Int | Type::Double => Some("0".to_owned()),
         Type::Str => Some("''".to_owned()),
+        Type::Bytes => Some("Uint8List(0)".to_owned()),
         Type::List(_) => Some("[]".to_owned()),
         // Dart's `{}` is an empty set or an empty map depending on the
         // context type, which is exactly the declared type here.
@@ -967,7 +1001,12 @@ fn field_default_literal(ty: &Type, enums_by_usr: &HashMap<&str, &Enum>) -> Opti
             let first = enums_by_usr.get(usr.as_str())?.variants.first()?;
             Some(format!("{name}.{first}"))
         }
-        Type::Record { .. } | Type::Tuple(_) | Type::Void | Type::Unsupported(_) => None,
+        Type::Record { .. }
+        | Type::Pair(_, _)
+        | Type::Callback { .. }
+        | Type::Tuple(_)
+        | Type::Void
+        | Type::Unsupported(_) => None,
     }
 }
 
@@ -1058,6 +1097,12 @@ fn mock_value_for_type(
                 .collect();
             Some(format!("({})", values?.join(", ")))
         }
+        Type::Pair(first, second) => Some(format!(
+            "{PAIR_TYPE_NAME}({}, {})",
+            mock_value_for_type(first, enums_by_usr, records_by_usr, depth + 1)?,
+            mock_value_for_type(second, enums_by_usr, records_by_usr, depth + 1)?,
+        )),
+        Type::Callback { .. } => None,
         Type::Void | Type::Unsupported(_) => None,
         // Every other variant is handled by `field_default_literal` above.
         _ => None,
@@ -1804,9 +1849,23 @@ fn emit_type(ty: &Type) -> String {
         Type::Void => "void".to_owned(),
         Type::Record { name, .. } | Type::Enum { name, .. } => name.clone(),
         Type::Str => "String".to_owned(),
+        Type::Bytes => "Uint8List".to_owned(),
         Type::List(element) => format!("List<{}>", emit_type(element)),
         Type::Set(element) => format!("Set<{}>", emit_type(element)),
         Type::Map(key, value) => format!("Map<{}, {}>", emit_type(key), emit_type(value)),
+        Type::Pair(first, second) => format!(
+            "{PAIR_TYPE_NAME}<{}, {}>",
+            emit_type(first),
+            emit_type(second)
+        ),
+        Type::Callback {
+            return_type,
+            params,
+        } => format!(
+            "{} Function({})",
+            emit_type(return_type),
+            params.iter().map(emit_type).collect::<Vec<_>>().join(", ")
+        ),
         // A single-element Dart record needs a trailing comma
         // (`(int,)`) to disambiguate it from a plain parenthesized
         // expression — `lower::cpp`'s out-param bridge (`Type::Tuple`)

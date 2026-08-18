@@ -64,6 +64,12 @@ pub enum Type {
     /// `Expr::StringByteLength` for why `.size()` in particular can't be a
     /// plain `FieldAccess`/`Call`).
     Str,
+    /// A contiguous buffer of unsigned bytes (`uint8_t*`/`mz_uint8*`) —
+    /// emitted as Dart's `Uint8List`, rather than a generic `List<int>`, so
+    /// the binary-data contract remains visible at the generated API
+    /// boundary. Pointer uses become `Nullable(Bytes)` when the source
+    /// pointer may be null.
+    Bytes,
     /// `std::vector<T>` — the other half of E05's library adapter, mapped to
     /// Dart's `List<T>`. Only `T = Int` is exercised by any exemplo so far;
     /// the element type is still carried generally (not hardcoded to `Int`)
@@ -92,6 +98,19 @@ pub enum Type {
     /// Caso 5 of `docs/plans/verovio-6.2-pointer-types.md`
     /// (`MapOfStrOptions` in Verovio 6.2.0).
     Map(Box<Type>, Box<Type>),
+    /// `std::pair<A, B>` — a shared generated `SyntaxBridgePair<A, B>`.
+    /// A named adapter (rather than `Tuple`) preserves C++'s stable `first`
+    /// and `second` member names and remains the same nominal Dart type when
+    /// it crosses generated source files.
+    Pair(Box<Type>, Box<Type>),
+    /// A C/C++ function pointer whose parameter and return types are all
+    /// represented in this IR. Emitted as a typed Dart closure
+    /// (`ReturnType Function(Args...)`); ABI callbacks that need native
+    /// calling conventions remain a separate FFI bridge.
+    Callback {
+        return_type: Box<Type>,
+        params: Vec<Type>,
+    },
     /// A Dart record type synthesized as a bridge for C++'s "out parameter"
     /// idiom (`void f(int &a, int &b)`) — E10 flagged the idea and
     /// deliberately didn't build it ("nenhum fixture força essa

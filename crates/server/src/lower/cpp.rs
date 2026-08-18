@@ -44,12 +44,26 @@ pub fn overload_type_suffix(ty: &ir::Type) -> String {
         ir::Type::Double => "Double".to_owned(),
         ir::Type::Void => "Void".to_owned(),
         ir::Type::Str => "String".to_owned(),
+        ir::Type::Bytes => "Bytes".to_owned(),
         ir::Type::List(element) => format!("List{}", overload_type_suffix(element)),
         ir::Type::Set(element) => format!("Set{}", overload_type_suffix(element)),
         ir::Type::Map(key, value) => format!(
             "Map{}{}",
             overload_type_suffix(key),
             overload_type_suffix(value)
+        ),
+        ir::Type::Pair(first, second) => format!(
+            "Pair{}{}",
+            overload_type_suffix(first),
+            overload_type_suffix(second)
+        ),
+        ir::Type::Callback {
+            return_type,
+            params,
+        } => format!(
+            "Callback{}{}",
+            overload_type_suffix(return_type),
+            params.iter().map(overload_type_suffix).collect::<String>()
         ),
         ir::Type::Record { name, .. } | ir::Type::Enum { name, .. } => name.clone(),
         ir::Type::Tuple(elements) => elements.iter().map(overload_type_suffix).collect(),
@@ -996,6 +1010,9 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
     // about still needing `dart:ffi`.
     if cx_type.kind == clang_sys::CXType_Pointer {
         let pointee_cx_type = unsafe { clang_sys::clang_getPointeeType(cx_type) };
+        if pointee_cx_type.kind == clang_sys::CXType_FunctionProto {
+            return unsafe { lower_callback_type(pointee_cx_type) };
+        }
         let pointee_spelling = unsafe {
             type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(pointee_cx_type))
         };
@@ -1014,7 +1031,11 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
         // the same representation `std::string` already uses — lets it
         // fall through the ordinary `Known` branch just below instead of
         // needing a parallel case.
-        if mapping::scalar_pointee_dart_type(&pointee_spelling).is_some() {
+        if is_known_byte_buffer_type(&pointee_spelling) {
+            pointee_ty = ir::Type::Bytes;
+        } else if mapping::scalar_pointee_dart_type(&pointee_spelling).is_some()
+            || unsafe { is_text_character_type(pointee_cx_type) }
+        {
             pointee_ty = ir::Type::Str;
         }
         // `lower_type` has no project-wide catalog in hand (only the
@@ -1037,6 +1058,10 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
                 usr: "std::string".to_owned(),
                 name: "String".to_owned(),
             },
+            ir::Type::Bytes => mapping::PointeeShape::Known {
+                usr: "syntax-bridge:bytes".to_owned(),
+                name: "Uint8List".to_owned(),
+            },
             ir::Type::List(_) => mapping::PointeeShape::Known {
                 usr: "std::vector".to_owned(),
                 name: "List".to_owned(),
@@ -1048,6 +1073,10 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
             ir::Type::Map(_, _) => mapping::PointeeShape::Known {
                 usr: "std::map".to_owned(),
                 name: "Map".to_owned(),
+            },
+            ir::Type::Pair(_, _) => mapping::PointeeShape::Known {
+                usr: "std::pair".to_owned(),
+                name: "SyntaxBridgePair".to_owned(),
             },
             _ => mapping::PointeeShape::Opaque,
         };
@@ -1099,6 +1128,15 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
         | clang_sys::CXType_Float128
         | clang_sys::CXType_Float16 => ir::Type::Double,
         clang_sys::CXType_Void => ir::Type::Void,
+        // A native `T[N]` has the same value-container shape as Dart's
+        // `List<T>`. The bound is deliberately not erased into a fake type:
+        // it remains available from the source catalog for a future boundary
+        // validator, while the generated program keeps the element type and
+        // does not need a `SyntaxBridgeOpaque` field just because a fixed
+        // array appeared in a C++ record.
+        clang_sys::CXType_ConstantArray => ir::Type::List(Box::new(lower_type(unsafe {
+            clang_sys::clang_getArrayElementType(cx_type)
+        }))),
         // Caso 4 of `docs/plans/verovio-6.2-pointer-types.md`: an
         // `enum`/`enum class` use, mirroring the `CXType_Record` branch
         // below but simpler — `clang_getTypeDeclaration` on an enum type
@@ -1166,12 +1204,20 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
             let stdlib_name = unsafe { stdlib_template_name(decl) };
             match stdlib_name.as_deref() {
                 Some("basic_string") => return ir::Type::Str,
-                // `std::list<T>` shares `Type::List`'s shape with
-                // `std::vector<T>` — see that variant's doc comment for why
-                // this is a deliberate reuse (caso 5,
-                // `docs/plans/verovio-6.2-pointer-types.md`), not an
-                // oversight.
-                Some("vector") | Some("list") => {
+                // `std::list<T>`, `std::deque<T>`, `std::array<T, N>` and
+                // `std::initializer_list<T>` preserve the same value shape
+                // Dart exposes as `List<T>`. Their iteration and allocation
+                // characteristics differ, and fixed array bounds need a
+                // boundary validator when they are observable, but none of
+                // that warrants an opaque type in an otherwise typed API.
+                // Methods with semantics that Dart's List does not share
+                // still take their own explicit expression bailout until
+                // they gain a lowering rule.
+                Some("vector")
+                | Some("list")
+                | Some("deque")
+                | Some("array")
+                | Some("initializer_list") => {
                     let element =
                         if unsafe { clang_sys::clang_Type_getNumTemplateArguments(cx_type) } >= 1 {
                             lower_type(unsafe {
@@ -1179,12 +1225,15 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
                             })
                         } else {
                             ir::Type::Unsupported(
-                                "std::vector/list with no element type argument".to_owned(),
+                                "std::sequence with no element type argument".to_owned(),
                             )
                         };
                     return ir::Type::List(Box::new(element));
                 }
-                Some("set") => {
+                // `unordered_set` preserves Set's membership semantics; the
+                // iteration-order difference is a separate behavioral
+                // concern, not a reason to erase the type boundary.
+                Some("set") | Some("unordered_set") => {
                     let element = if unsafe {
                         clang_sys::clang_Type_getNumTemplateArguments(cx_type)
                     } >= 1
@@ -1197,7 +1246,10 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
                     };
                     return ir::Type::Set(Box::new(element));
                 }
-                Some("map") => {
+                // Just like `unordered_set`, `unordered_map` has Dart's
+                // `Map<K, V>` value shape even though its ordering and
+                // performance characteristics differ from `std::map`.
+                Some("map") | Some("unordered_map") => {
                     let arg_count =
                         unsafe { clang_sys::clang_Type_getNumTemplateArguments(cx_type) };
                     let key = if arg_count >= 1 {
@@ -1215,6 +1267,74 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
                         ir::Type::Unsupported("std::map with no value type argument".to_owned())
                     };
                     return ir::Type::Map(Box::new(key), Box::new(value));
+                }
+                Some("pair") => {
+                    let arg_count =
+                        unsafe { clang_sys::clang_Type_getNumTemplateArguments(cx_type) };
+                    let first = if arg_count >= 1 {
+                        lower_type(unsafe {
+                            clang_sys::clang_Type_getTemplateArgumentAsType(cx_type, 0)
+                        })
+                    } else {
+                        ir::Type::Unsupported("std::pair with no first type argument".to_owned())
+                    };
+                    let second = if arg_count >= 2 {
+                        lower_type(unsafe {
+                            clang_sys::clang_Type_getTemplateArgumentAsType(cx_type, 1)
+                        })
+                    } else {
+                        ir::Type::Unsupported("std::pair with no second type argument".to_owned())
+                    };
+                    return ir::Type::Pair(Box::new(first), Box::new(second));
+                }
+                // A `std::tuple` is a positional product just like Dart's
+                // record type. Unlike `std::pair`, it has no stable
+                // `first`/`second` field names to preserve, so the IR's
+                // existing `Tuple` variant (introduced for out parameters)
+                // is the direct representation. This maps only the type
+                // boundary: `std::get` and tuple-specific operations remain
+                // independently lowered expressions rather than being
+                // silently treated as Dart record access.
+                Some("tuple") => {
+                    let argument_count =
+                        unsafe { clang_sys::clang_Type_getNumTemplateArguments(cx_type) };
+                    if argument_count < 0 {
+                        return ir::Type::Unsupported(
+                            "std::tuple with unavailable type arguments".to_owned(),
+                        );
+                    }
+                    return ir::Type::Tuple(
+                        (0..argument_count)
+                            .map(|index| unsafe {
+                                lower_type(clang_sys::clang_Type_getTemplateArgumentAsType(
+                                    cx_type,
+                                    index as c_uint,
+                                ))
+                            })
+                            .collect(),
+                    );
+                }
+                // `optional<T>` and the standard smart pointers are typed
+                // wrappers around the presence or absence of a known value.
+                // Dart's `T?` represents that shape directly.  This does not
+                // claim to preserve ownership/control-block mechanics — any
+                // operation that observes those mechanics remains an
+                // expression-level bailout until it has a deliberate Dart
+                // adapter — but it keeps signatures and fields statically
+                // typed instead of turning them into SyntaxBridgeOpaque.
+                Some("optional") | Some("unique_ptr") | Some("shared_ptr") | Some("weak_ptr") => {
+                    let element =
+                        if unsafe { clang_sys::clang_Type_getNumTemplateArguments(cx_type) } >= 1 {
+                            lower_type(unsafe {
+                                clang_sys::clang_Type_getTemplateArgumentAsType(cx_type, 0)
+                            })
+                        } else {
+                            ir::Type::Unsupported(
+                                "std::optional/smart pointer with no element type argument"
+                                    .to_owned(),
+                            )
+                        };
+                    return ir::Type::Nullable(Box::new(element));
                 }
                 // Achado 4 (`docs/plans/diagnostico-verovio-6.2.0.md`): a
                 // stdlib template with no E05/E10 adapter (`std::array`,
@@ -1286,12 +1406,80 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
             }
         }
         _ => {
+            // `auto` locals inferred from dependent standard-library calls
+            // (for example, `std::string::find`) are reported as
+            // `CXType_Auto`, spelled `size_type`, rather than as the
+            // `CXType_Unexposed` aliases handled above. At this fallback
+            // point every structured type/template adapter has already had
+            // a chance to preserve its own shape, so following a genuinely
+            // different canonical kind is safe and turns the inferred scalar
+            // into its normal Dart type (`int` here) instead of an opaque
+            // bailout.
+            let canonical = unsafe { clang_sys::clang_getCanonicalType(cx_type) };
+            if canonical.kind != cx_type.kind {
+                return lower_type(canonical);
+            }
             let spelling = unsafe {
                 type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(cx_type))
             };
             ir::Type::Unsupported(spelling)
         }
     }
+}
+
+/// Whether `cx_type` is one character code unit that a null-terminated C++
+/// pointer conventionally uses as text.  The canonical kind, rather than the
+/// spelling, keeps typedefs such as PugiXML's `char_t` on the same C-string
+/// bridge as a plain `char*`; a binary `unsigned char*` still remains an
+/// explicit pointer/buffer bailout.
+unsafe fn is_text_character_type(cx_type: clang_sys::CXType) -> bool {
+    let canonical = unsafe { clang_sys::clang_getCanonicalType(cx_type) };
+    matches!(
+        canonical.kind,
+        clang_sys::CXType_Char_S
+            | clang_sys::CXType_Char_U
+            | clang_sys::CXType_WChar
+            | clang_sys::CXType_Char16
+            | clang_sys::CXType_Char32
+    )
+}
+
+/// Lowers a non-ABI C++ function-pointer type to a typed Dart closure. The
+/// enclosing pointer is intentionally discarded only after inspecting the
+/// `FunctionProto` it points to: a Dart closure has the same call shape, but
+/// it is not claimed to be an FFI `NativeFunction`.
+unsafe fn lower_callback_type(function_type: clang_sys::CXType) -> ir::Type {
+    let argument_count = unsafe { clang_sys::clang_getNumArgTypes(function_type) };
+    if argument_count < 0 {
+        let spelling = unsafe {
+            type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(function_type))
+        };
+        return ir::Type::Unsupported(format!("function pointer with no prototype: {spelling}"));
+    }
+    let params = (0..argument_count as c_uint)
+        .map(|index| lower_type(unsafe { clang_sys::clang_getArgType(function_type, index) }))
+        .collect();
+    let return_type = lower_type(unsafe { clang_sys::clang_getResultType(function_type) });
+    ir::Type::Callback {
+        return_type: Box::new(return_type),
+        params,
+    }
+}
+
+/// The byte aliases that have an explicit binary-buffer contract in the
+/// source surface this transpiler supports. Deliberately narrower than every
+/// `unsigned char*`: that raw spelling can still mean one scalar or an ABI
+/// object, whereas these named aliases conventionally denote a byte span.
+fn is_known_byte_buffer_type(spelling: &str) -> bool {
+    matches!(
+        spelling
+            .trim()
+            .strip_prefix("const ")
+            .unwrap_or(spelling.trim())
+            .trim_end_matches(" const")
+            .trim(),
+        "uint8_t" | "std::uint8_t" | "mz_uint8"
+    )
 }
 
 /// The primary template's name (`"basic_string"`, `"vector"`) for a
@@ -1341,6 +1529,111 @@ unsafe fn stdlib_template_name(decl: clang_sys::CXCursor) -> Option<String> {
     Some(unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(template)) })
 }
 
+/// Whether a parameter declaration spells an actual C++ default argument.
+///
+/// A `ParmVarDecl`'s child cursors are not sufficient: libclang also exposes
+/// non-type template arguments from its type (`std::array<int, 3> values`)
+/// as children. Tokenizing the parameter's own extent settles that ambiguity
+/// for a default written on the same declaration. A default inherited from a
+/// preceding header declaration has its expression child outside this extent,
+/// so it is identified by source range instead.
+unsafe fn parameter_has_explicit_default(cursor: clang_sys::CXCursor) -> bool {
+    let translation_unit = unsafe { clang_sys::clang_Cursor_getTranslationUnit(cursor) };
+    let extent = unsafe { clang_sys::clang_getCursorExtent(cursor) };
+    let mut tokens: *mut clang_sys::CXToken = std::ptr::null_mut();
+    let mut token_count: c_uint = 0;
+    unsafe {
+        clang_sys::clang_tokenize(translation_unit, extent, &mut tokens, &mut token_count);
+    }
+
+    let has_default = if tokens.is_null() {
+        false
+    } else {
+        (0..token_count).any(|index| {
+            let token = unsafe { *tokens.add(index as usize) };
+            unsafe {
+                type_catalog::cxstring_to_string(clang_sys::clang_getTokenSpelling(
+                    translation_unit,
+                    token,
+                )) == "="
+            }
+        })
+    };
+
+    if !tokens.is_null() {
+        unsafe {
+            clang_sys::clang_disposeTokens(translation_unit, tokens, token_count);
+        }
+    }
+
+    if has_default {
+        return true;
+    }
+
+    unsafe { collect_children(cursor) }
+        .into_iter()
+        .filter(|child| {
+            !matches!(
+                unsafe { clang_sys::clang_getCursorKind(*child) },
+                clang_sys::CXCursor_TypeRef
+                    | clang_sys::CXCursor_NamespaceRef
+                    | clang_sys::CXCursor_TemplateRef
+            )
+        })
+        .any(|child| unsafe { !cursor_extent_contains_child_location(cursor, child) })
+}
+
+/// Whether `child` originates in `cursor`'s own source extent. This is the
+/// distinction libclang preserves for a default argument inherited by a
+/// definition: the `ParmVarDecl` belongs to the definition, but its default
+/// expression still points back to the prior declaration (often a header).
+/// A non-type template argument is spelled inside the parameter's own range.
+unsafe fn cursor_extent_contains_child_location(
+    cursor: clang_sys::CXCursor,
+    child: clang_sys::CXCursor,
+) -> bool {
+    let extent = unsafe { clang_sys::clang_getCursorExtent(cursor) };
+    let Some((start_file, start_offset)) =
+        (unsafe { source_file_and_offset(clang_sys::clang_getRangeStart(extent)) })
+    else {
+        return false;
+    };
+    let Some((end_file, end_offset)) =
+        (unsafe { source_file_and_offset(clang_sys::clang_getRangeEnd(extent)) })
+    else {
+        return false;
+    };
+    let Some((child_file, child_offset)) =
+        (unsafe { source_file_and_offset(clang_sys::clang_getCursorLocation(child)) })
+    else {
+        return false;
+    };
+
+    start_file == end_file
+        && start_file == child_file
+        && start_offset <= child_offset
+        && child_offset <= end_offset
+}
+
+unsafe fn source_file_and_offset(
+    location: clang_sys::CXSourceLocation,
+) -> Option<(clang_sys::CXFile, c_uint)> {
+    let mut file = std::ptr::null_mut();
+    let mut line = 0;
+    let mut column = 0;
+    let mut offset = 0;
+    unsafe {
+        clang_sys::clang_getSpellingLocation(
+            location,
+            &mut file,
+            &mut line,
+            &mut column,
+            &mut offset,
+        );
+    }
+    (!file.is_null()).then_some((file, offset))
+}
+
 unsafe fn collect_children(cursor: clang_sys::CXCursor) -> Vec<clang_sys::CXCursor> {
     let mut children: Vec<clang_sys::CXCursor> = Vec::new();
 
@@ -1365,6 +1658,75 @@ unsafe fn collect_children(cursor: clang_sys::CXCursor) -> Vec<clang_sys::CXCurs
     children
 }
 
+/// Lowers a parameter with the small amount of signature context that a raw
+/// type spelling alone cannot carry. A `void*` is only a byte buffer when a
+/// sibling scalar parameter names *that same* pointer's length; otherwise it
+/// retains `lower_type`'s explicit unsupported result.
+unsafe fn lower_parameter_type(
+    parameter: clang_sys::CXCursor,
+    siblings: &[clang_sys::CXCursor],
+) -> ir::Type {
+    let cx_type = unsafe { clang_sys::clang_getCursorType(parameter) };
+    if unsafe { is_void_pointer_type(cx_type) }
+        && unsafe { has_matching_scalar_length_parameter(parameter, siblings) }
+    {
+        ir::Type::Nullable(Box::new(ir::Type::Bytes))
+    } else {
+        lower_type(cx_type)
+    }
+}
+
+unsafe fn is_void_pointer_type(cx_type: clang_sys::CXType) -> bool {
+    if cx_type.kind != clang_sys::CXType_Pointer {
+        return false;
+    }
+    let pointee = unsafe { clang_sys::clang_getPointeeType(cx_type) };
+    let canonical = unsafe { clang_sys::clang_getCanonicalType(pointee) };
+    canonical.kind == clang_sys::CXType_Void
+}
+
+/// Finds a scalar length whose source name proves it belongs to `pointer`:
+/// `data` + `data_size`, `pIn_buf` + `pIn_buf_size`, and their camel-case
+/// equivalents. The condition deliberately does not accept a merely nearby
+/// `size` parameter for an arbitrary `void*`; without the name relationship
+/// that would be a guess about an ABI handle rather than a buffer contract.
+unsafe fn has_matching_scalar_length_parameter(
+    pointer: clang_sys::CXCursor,
+    siblings: &[clang_sys::CXCursor],
+) -> bool {
+    let pointer_name =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(pointer)) };
+    let pointer_key = normalized_parameter_name(&pointer_name);
+    if pointer_key.is_empty() {
+        return false;
+    }
+
+    siblings.iter().copied().any(|candidate| {
+        if unsafe { clang_sys::clang_equalCursors(pointer, candidate) } != 0 {
+            return false;
+        }
+        let candidate_type = unsafe { clang_sys::clang_getCursorType(candidate) };
+        if lower_type(candidate_type) != ir::Type::Int {
+            return false;
+        }
+        let candidate_name = unsafe {
+            type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(candidate))
+        };
+        let candidate_key = normalized_parameter_name(&candidate_name);
+        let Some(suffix) = candidate_key.strip_prefix(&pointer_key) else {
+            return false;
+        };
+        matches!(suffix, "size" | "length" | "len" | "count" | "bytes")
+    })
+}
+
+fn normalized_parameter_name(name: &str) -> String {
+    name.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 /// Collects parameters and, for every by-value `Record`-typed one, an
 /// implicit self-clone statement (`p = Ponto(p.x, p.y);`) — E03's armadilha
 /// (see this module's docs and `examples/E03-struct-pod/NOTES.md`). Works
@@ -1379,12 +1741,12 @@ unsafe fn collect_params_with_clone_prelude(
 ) -> (Vec<ir::Param>, Vec<ir::Stmt>) {
     let mut params = Vec::new();
     let mut prelude = Vec::new();
+    let param_cursors: Vec<clang_sys::CXCursor> = unsafe { collect_children(cursor) }
+        .into_iter()
+        .filter(|child| unsafe { clang_sys::clang_getCursorKind(*child) } == clang_sys::CXCursor_ParmDecl)
+        .collect();
 
-    for param_cursor in unsafe { collect_children(cursor) } {
-        if unsafe { clang_sys::clang_getCursorKind(param_cursor) } != clang_sys::CXCursor_ParmDecl {
-            continue;
-        }
-
+    for param_cursor in param_cursors.iter().copied() {
         // A C++ parameter may legally have no name (common in an interface
         // signature that never uses it, e.g. `bool F(int, bool named)`) —
         // Dart requires every positional parameter to have one. Achado 9,
@@ -1408,7 +1770,7 @@ unsafe fn collect_params_with_clone_prelude(
             spelling
         });
         let cx_type = unsafe { clang_sys::clang_getCursorType(param_cursor) };
-        let ty = lower_type(cx_type);
+        let ty = unsafe { lower_parameter_type(param_cursor, &param_cursors) };
 
         // `lower_type` unwraps `const Animal&` down to the same `Type::Record`
         // a by-value `Animal` parameter resolves to (E06 — `lower_type`'s own
@@ -1465,11 +1827,18 @@ unsafe fn collect_params_with_clone_prelude(
         // value" lowered from its own type reference, breaking every E05
         // function whose parameter list has one — the same TypeRef trap
         // `lower_decl_stmt` already filters for a local variable's
-        // initializer. Only looked up for a scalar/`Str` parameter: a
-        // `Record`-typed default would interact with the by-value clone
-        // prelude above in a way no fixture forces yet, so it stays
-        // unimplemented rather than guessed at.
-        let default_value = if matches!(ty, ir::Type::Record { .. }) {
+        // initializer. An additional source-token check matters for a
+        // parameter such as `std::array<int, 3> values`: libclang exposes
+        // the non-type template argument `3` as another ParmVarDecl child,
+        // indistinguishable by cursor kind from a real default expression.
+        // A default argument is the only one of the two whose parameter
+        // spelling contains `=`. Only looked up for a scalar/`Str`
+        // parameter: a `Record`-typed default would interact with the
+        // by-value clone prelude above in a way no fixture forces yet, so it
+        // stays unimplemented rather than guessed at.
+        let default_value = if matches!(ty, ir::Type::Record { .. })
+            || !unsafe { parameter_has_explicit_default(param_cursor) }
+        {
             None
         } else {
             unsafe { collect_children(param_cursor) }
@@ -1857,14 +2226,18 @@ unsafe fn lower_decl_stmt(
     // resolved constructor. `Ponto p;` with no written initializer *also*
     // gets a child: an implicit default-constructor `CallExpr` `libclang`
     // synthesizes — confirmed via `clang -Xclang -ast-dump` before writing
-    // this, not guessed. All three need filtering out before "first
-    // remaining child, if any" is the real initializer.
+    // this, not guessed. A dependent standard-library alias such as
+    // `std::vector<int>::size_type` adds a `TemplateRef` alongside its real
+    // initializer for the same navigational purpose. All four need filtering
+    // out before "first remaining child, if any" is the real initializer.
     let init_candidates: Vec<clang_sys::CXCursor> = unsafe { collect_children(*var_decl_cursor) }
         .into_iter()
         .filter(|child| {
             !matches!(
                 unsafe { clang_sys::clang_getCursorKind(*child) },
-                clang_sys::CXCursor_TypeRef | clang_sys::CXCursor_NamespaceRef
+                clang_sys::CXCursor_TypeRef
+                    | clang_sys::CXCursor_NamespaceRef
+                    | clang_sys::CXCursor_TemplateRef
             )
         })
         .filter(|child| !unsafe { is_default_construct_with_no_args(*child) })
@@ -1947,9 +2320,12 @@ fn default_scalar_value(ty: &ir::Type, origin: &ir::Origin) -> ir::Expr {
         ir::Type::Record { .. }
         | ir::Type::Enum { .. }
         | ir::Type::Str
+        | ir::Type::Bytes
         | ir::Type::List(_)
         | ir::Type::Set(_)
         | ir::Type::Map(_, _)
+        | ir::Type::Pair(_, _)
+        | ir::Type::Callback { .. }
         | ir::Type::Tuple(_)
         | ir::Type::Nullable(_)
         | ir::Type::Void

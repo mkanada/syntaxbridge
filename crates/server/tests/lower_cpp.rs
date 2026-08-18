@@ -537,22 +537,14 @@ void f(std::memory_order m) { }
     );
 }
 
-/// Achado 4 (`docs/plans/diagnostico-verovio-6.2.0.md`): a stdlib container
-/// with no E05 adapter (`basic_string`/`vector`/`list`/`set`/`map` are the
-/// only ones — `std::array` here has none) used to fall through
-/// `lower_type`'s `CXType_Record`/`CXType_Unexposed` branch the same way a
-/// project-defined class does: `clang_getTypeDeclaration` resolves fine (a
-/// real `array<int, 3>` decl, real usr, real name `array`), so the old code
-/// returned `Type::Record { usr, name: "array" }` pointing at a class this
-/// project never declares. That prints as a bare, undefined type reference
-/// in the emitted Dart (`array a`, per the same failure mode already fixed
-/// for an external enum just above) rather than an honest bailout — worse
-/// than a stub, because nothing in the emitted line itself flags it as
-/// untranslated.
+/// `std::array<T, N>` has Dart's `List<T>` value shape. Libclang exposes the
+/// non-type template argument `N` as a child of the `ParmVarDecl`, so this
+/// also guards against mistaking its bound for a C++ default argument and
+/// emitting invalid Dart such as `List<int> a = 3`.
 #[test]
-fn a_stdlib_container_without_an_adapter_becomes_unsupported_not_an_undeclared_record() {
+fn a_std_array_lowers_to_a_list_without_a_spurious_default_argument() {
     let source = lower_and_emit(
-        "lower-cpp-stdlib-no-adapter",
+        "lower-cpp-stdlib-array",
         r#"
 #include <array>
 void f(std::array<int, 3> a) { }
@@ -560,12 +552,372 @@ void f(std::array<int, 3> a) { }
     );
 
     assert!(
-        !source.contains("array a"),
-        "a stdlib container without an adapter must not be named as a bare Dart parameter type, got:\n{source}"
+        source.contains("void f(List<int> a)"),
+        "std::array must lower to a required Dart List parameter, got:\n{source}"
     );
     assert!(
-        source.contains("UnimplementedError"),
-        "the function should bail out loudly instead, got:\n{source}"
+        !source.contains("a = 3") && !source.contains("UnimplementedError"),
+        "the template bound is not a default argument or a bailout, got:\n{source}"
+    );
+}
+
+/// C++ permits a default argument to live on a prior declaration while the
+/// lowered function body comes from a later definition. The inherited default
+/// is a real API contract, unlike the non-type `3` child that libclang exposes
+/// for `std::array<int, 3>`.
+#[test]
+fn a_default_argument_declared_in_a_header_is_preserved_on_its_definition() {
+    let workspace = TempWorkspace::new("lower-cpp-header-default-argument")
+        .expect("create temporary workspace");
+    fs::write(
+        workspace.path().join("api.hpp"),
+        "int increment(int value, int step = 1);\n",
+    )
+    .expect("write fixture header");
+    let unit = write_fixture(
+        workspace.path(),
+        r#"
+#include "api.hpp"
+
+int increment(int value, int step) {
+    return value + step;
+}
+"#,
+        "api.cpp",
+    );
+    let catalog = function_catalog::extract_function_catalog(&[unit], workspace.path(), None)
+        .expect("extract function catalog");
+    let module = syntax_bridge_server::ir::Module {
+        functions: catalog.ir_functions,
+        records: catalog.ir_records,
+        enums: catalog.ir_enums,
+    };
+    let source = syntax_bridge_server::emit::dart::emit_module(&module)
+        .into_values()
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        source.contains("int increment(int value, [int step = 1])"),
+        "a header-declared default must survive on the lowered definition, got:\n{source}"
+    );
+}
+
+/// These standard-library wrappers preserve a value shape Dart already has:
+/// fixed-size and deque containers are lists, the unordered variants use the
+/// same `Set`/`Map` interface, `optional` is nullable, smart pointers are
+/// nullable references, and an initializer list is a list.  Their method
+/// translation is deliberately a separate concern; at the type boundary none
+/// of them needs an opaque placeholder.
+#[test]
+fn standard_library_value_wrappers_lower_to_existing_dart_core_types() {
+    let workspace =
+        TempWorkspace::new("lower-cpp-stdlib-value-wrappers").expect("create temporary workspace");
+    let unit = write_fixture(
+        workspace.path(),
+        r#"
+#include <array>
+#include <deque>
+#include <initializer_list>
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+
+void bridge(
+    std::array<int, 3> fixed,
+    std::deque<double> queue,
+    std::unordered_set<int> ids,
+    std::unordered_map<int, std::string> labels,
+    std::initializer_list<int> initial,
+    std::optional<int> maybe_count,
+    std::unique_ptr<std::string> owned,
+    std::shared_ptr<int> shared) {}
+"#,
+        "value_wrappers.cpp",
+    );
+
+    let catalog = function_catalog::extract_function_catalog(&[unit], workspace.path(), None)
+        .expect("extract function catalog");
+    let function = catalog
+        .ir_functions
+        .iter()
+        .find(|function| function.name == "bridge")
+        .expect("bridge function");
+
+    assert_eq!(
+        function
+            .params
+            .iter()
+            .map(|param| &param.ty)
+            .collect::<Vec<_>>(),
+        vec![
+            &Type::List(Box::new(Type::Int)),
+            &Type::List(Box::new(Type::Double)),
+            &Type::Set(Box::new(Type::Int)),
+            &Type::Map(Box::new(Type::Int), Box::new(Type::Str)),
+            &Type::List(Box::new(Type::Int)),
+            &Type::Nullable(Box::new(Type::Int)),
+            &Type::Nullable(Box::new(Type::Str)),
+            &Type::Nullable(Box::new(Type::Int)),
+        ],
+        "value-shaped standard library types must not become Type::Unsupported: {function:?}"
+    );
+}
+
+/// A character typedef keeps its source spelling on a pointer even though
+/// its canonical pointee type is `char`. The pointer must therefore follow
+/// the existing C-string bridge (`String?`), rather than becoming opaque just
+/// because a library chose an alias such as `char_t`.
+#[test]
+fn a_pointer_to_a_character_typedef_lowers_like_a_c_string() {
+    let source = lower_and_emit(
+        "lower-cpp-character-typedef-pointer",
+        r#"
+typedef char char_t;
+
+void set_label(const char_t* label) {}
+"#,
+    );
+
+    assert!(
+        source.contains("void set_label(String? label)"),
+        "a character typedef pointer must retain C-string semantics, got:\n{source}"
+    );
+    assert!(
+        !source.contains("SyntaxBridgeOpaque") && !source.contains("UnimplementedError"),
+        "a character typedef pointer must not force a type bailout, got:\n{source}"
+    );
+}
+
+/// A native fixed-size array is a value container, not an FFI pointer. Its
+/// bound is not encoded in Dart's type system, but its element type and list
+/// shape are, so a record field can remain typed while array operations gain
+/// dedicated lowering rules incrementally.
+#[test]
+fn native_fixed_size_arrays_lower_to_typed_dart_lists() {
+    let source = lower_and_emit(
+        "lower-cpp-native-arrays",
+        r#"
+struct Buffer {
+    char bytes[32];
+    int samples[3];
+};
+"#,
+    );
+
+    assert!(
+        source.contains("List<int> bytes") && source.contains("List<int> samples"),
+        "native arrays must preserve their element types as Dart Lists, got:\n{source}"
+    );
+    assert!(
+        !source.contains("SyntaxBridgeOpaque") && !source.contains("UnimplementedError"),
+        "native array fields must not force a type bailout, got:\n{source}"
+    );
+}
+
+/// Verovio's miniz dependency exposes binary payloads through its named
+/// `mz_uint8*` alias. It is neither a C string nor an arbitrary `void*`: the
+/// Dart boundary can retain its byte-buffer contract as `Uint8List?`.
+#[test]
+fn a_known_byte_buffer_pointer_lowers_to_a_nullable_uint8_list() {
+    let source = lower_and_emit(
+        "lower-cpp-byte-buffer-pointer",
+        r#"
+typedef unsigned char mz_uint8;
+
+void inflate(const mz_uint8* input, mz_uint8* output) {}
+"#,
+    );
+
+    assert!(
+        source.contains("import 'dart:typed_data';"),
+        "a byte-buffer bridge must import Uint8List, got:\n{source}"
+    );
+    assert!(
+        source.contains("void inflate(Uint8List? input, Uint8List? output)"),
+        "known byte pointers must retain their Uint8List contract, got:\n{source}"
+    );
+    assert!(
+        !source.contains("SyntaxBridgeOpaque") && !source.contains("UnimplementedError"),
+        "known byte pointers must not force a type bailout, got:\n{source}"
+    );
+}
+
+/// A `std::pair` is not lowered to a positional Dart record: C++ programs
+/// access its stable `first` and `second` members, and generated files need
+/// one shared nominal type when a pair crosses a file boundary.
+#[test]
+fn a_std_pair_lowers_to_the_shared_named_pair_adapter() {
+    let files = {
+        let workspace =
+            TempWorkspace::new("lower-cpp-std-pair").expect("create temporary workspace");
+        let unit = write_fixture(
+            workspace.path(),
+            r#"
+#include <string>
+#include <utility>
+
+void consume(std::pair<int, std::string> value) {}
+"#,
+            "pair.cpp",
+        );
+        let catalog = function_catalog::extract_function_catalog(&[unit], workspace.path(), None)
+            .expect("extract function catalog");
+        let module = syntax_bridge_server::ir::Module {
+            functions: catalog.ir_functions,
+            records: catalog.ir_records,
+            enums: catalog.ir_enums,
+        };
+        syntax_bridge_server::emit::dart::emit_module(&module)
+    };
+
+    assert!(
+        files["lib/pair.dart"].contains("import 'syntax_bridge_support.dart';")
+            && files["lib/pair.dart"].contains("SyntaxBridgePair<int, String> value"),
+        "pair use must import and name the shared adapter, got:\n{}",
+        files["lib/pair.dart"]
+    );
+    assert!(
+        files["lib/syntax_bridge_support.dart"].contains("final class SyntaxBridgePair<A, B>")
+            && files["lib/syntax_bridge_support.dart"].contains("final A first;")
+            && files["lib/syntax_bridge_support.dart"].contains("final B second;"),
+        "pair adapter must preserve C++ member names, got:\n{}",
+        files["lib/syntax_bridge_support.dart"]
+    );
+}
+
+/// A `void*` only becomes a Dart byte buffer when its surrounding signature
+/// proves the buffer contract: a named payload plus its matching scalar
+/// length. An unrelated `void*` must remain an explicit bailout instead of
+/// being silently guessed as bytes.
+#[test]
+fn a_void_pointer_with_a_matching_length_parameter_lowers_to_bytes() {
+    let source = lower_and_emit(
+        "lower-cpp-void-buffer",
+        r#"
+#include <cstddef>
+
+void digest(const void* data, size_t data_size) {}
+void keep_opaque(void* context) {}
+"#,
+    );
+
+    assert!(
+        source.contains("import 'dart:typed_data';")
+            && source.contains("void digest(Uint8List? data, int data_size)"),
+        "a void buffer with an explicit matching length must become Uint8List?, got:\n{source}"
+    );
+    assert!(
+        source.contains("void keep_opaque(SyntaxBridgeOpaque"),
+        "an unclassified void pointer must stay an explicit bailout, got:\n{source}"
+    );
+}
+
+/// A C++ function pointer with a fully representable signature is a Dart
+/// closure type at the API boundary. Its invocation lowering is separate;
+/// preserving this type must not require an opaque pointer or `dynamic`.
+#[test]
+fn a_typed_function_pointer_lowers_to_a_dart_callback() {
+    let source = lower_and_emit(
+        "lower-cpp-function-pointer",
+        r#"
+int apply(int (*transform)(int), int value) {
+    return transform(value);
+}
+"#,
+    );
+
+    assert!(
+        source.contains("int apply(int Function(int) transform, int value)"),
+        "a representable function pointer must become a typed Dart callback, got:\n{source}"
+    );
+    assert!(
+        !source.contains("SyntaxBridgeOpaque /* unsupported: int (*)(int) */"),
+        "callback type must not remain an opaque pointer, got:\n{source}"
+    );
+}
+
+/// Container-dependent scalar aliases such as `std::vector<T>::size_type`
+/// retain their canonical integer value domain in Dart. They must not become
+/// an opaque declaration merely because libclang exposes the spelling as an
+/// unexposed dependent alias at a use site.
+#[test]
+fn a_standard_container_size_type_lowers_to_an_int() {
+    let source = lower_and_emit(
+        "lower-cpp-container-size-type",
+        r#"
+#include <vector>
+
+int advance(std::vector<int>::size_type offset) {
+    std::vector<int>::size_type next = offset + 1;
+    return next;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("int advance(int offset)") && source.contains("int next = offset + 1;"),
+        "a standard container size_type must lower to int in both signature and local use, got:\n{source}"
+    );
+    assert!(
+        !source.contains("size_type") && !source.contains("SyntaxBridgeOpaque"),
+        "a canonical scalar alias must not remain an opaque type bailout, got:\n{source}"
+    );
+}
+
+/// An `auto` local inferred from a standard-library operation can arrive as
+/// `CXType_Auto` with the dependent spelling `size_type`. Its canonical type
+/// is still an integer; the type bailout must disappear even while the
+/// operation that produced the value awaits its own expression lowering.
+#[test]
+fn an_auto_local_inferred_as_size_type_lowers_to_an_int() {
+    let source = lower_and_emit(
+        "lower-cpp-auto-size-type",
+        r#"
+#include <string>
+
+int find_index(std::string text) {
+    auto index = text.find("x");
+    return index;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("unsupported type in expression: size_type"),
+        "the canonical type of an auto size_type local must not cause a type bailout, got:\n{source}"
+    );
+    assert!(
+        !source.contains("SyntaxBridgeOpaque /* unsupported: size_type */"),
+        "an auto size_type local must not emit an opaque Dart type, got:\n{source}"
+    );
+}
+
+/// `std::tuple` has a direct structural counterpart in Dart's record types.
+/// Keeping it typed at an API boundary does not claim that every `std::get`
+/// expression is already lowered; those operations retain their own explicit
+/// expression-level coverage.
+#[test]
+fn a_std_tuple_lowers_to_a_typed_dart_record() {
+    let source = lower_and_emit(
+        "lower-cpp-std-tuple",
+        r#"
+#include <string>
+#include <tuple>
+
+void consume(std::tuple<int, std::string, bool> value) {}
+"#,
+    );
+
+    assert!(
+        source.contains("void consume((int, String, bool) value)"),
+        "a std::tuple must preserve every typed slot as a Dart record, got:\n{source}"
+    );
+    assert!(
+        !source.contains("std::tuple") && !source.contains("SyntaxBridgeOpaque"),
+        "a std::tuple signature must not remain an opaque type bailout, got:\n{source}"
     );
 }
 

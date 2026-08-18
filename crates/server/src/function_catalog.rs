@@ -794,6 +794,19 @@ fn rename_record_refs_in_type(ty: &mut ir::Type, renames: &HashMap<String, Strin
             rename_record_refs_in_type(key, renames);
             rename_record_refs_in_type(value, renames);
         }
+        ir::Type::Pair(first, second) => {
+            rename_record_refs_in_type(first, renames);
+            rename_record_refs_in_type(second, renames);
+        }
+        ir::Type::Callback {
+            return_type,
+            params,
+        } => {
+            rename_record_refs_in_type(return_type, renames);
+            for parameter in params {
+                rename_record_refs_in_type(parameter, renames);
+            }
+        }
         ir::Type::Tuple(elements) => {
             for element in elements {
                 rename_record_refs_in_type(element, renames);
@@ -804,6 +817,7 @@ fn rename_record_refs_in_type(ty: &mut ir::Type, renames: &HashMap<String, Strin
         | ir::Type::Double
         | ir::Type::Void
         | ir::Type::Str
+        | ir::Type::Bytes
         | ir::Type::Enum { .. }
         | ir::Type::Unsupported(_) => {}
     }
@@ -1114,6 +1128,19 @@ impl IrRefVisitor<'_> {
                 self.visit_type(key);
                 self.visit_type(value);
             }
+            ir::Type::Pair(first, second) => {
+                self.visit_type(first);
+                self.visit_type(second);
+            }
+            ir::Type::Callback {
+                return_type,
+                params,
+            } => {
+                self.visit_type(return_type);
+                for parameter in params {
+                    self.visit_type(parameter);
+                }
+            }
             ir::Type::Tuple(elements) => {
                 for element in elements {
                     self.visit_type(element);
@@ -1124,6 +1151,7 @@ impl IrRefVisitor<'_> {
             | ir::Type::Double
             | ir::Type::Void
             | ir::Type::Str
+            | ir::Type::Bytes
             | ir::Type::Record { .. }
             | ir::Type::Enum { .. }
             | ir::Type::Unsupported(_) => {}

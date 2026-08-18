@@ -28,7 +28,7 @@ use serde_json::Value;
 use syntax_bridge_server::emit::dart;
 use syntax_bridge_server::function_catalog;
 use syntax_bridge_server::ingest::{self, CreateProjectRequest};
-use syntax_bridge_server::ir::Module;
+use syntax_bridge_server::ir::{Expr, Function, Module, Origin, Param, Stmt, Type};
 
 #[test]
 #[ignore = "slow/diagnostic: transpiles every real Verovio 6.2.0 compilation unit and reports coverage"]
@@ -82,6 +82,17 @@ fn transpiling_the_real_verovio_6_2_0_project_reports_coverage() {
         records: catalog.ir_records,
         enums: catalog.ir_enums,
     };
+    let bailouts = collect_bailouts(&module);
+    eprintln!(
+        "[diagnosis] IR bailouts: {} unsupported type occurrences ({} distinct spellings), \
+         {} unsupported expressions ({} distinct causes), {} unsupported statements ({} distinct causes)",
+        bailouts.type_total(),
+        bailouts.unsupported_types.len(),
+        bailouts.expression_total(),
+        bailouts.unsupported_expressions.len(),
+        bailouts.statement_total(),
+        bailouts.unsupported_statements.len(),
+    );
     let files = dart::emit_module(&module);
     eprintln!("[diagnosis] emitted {} Dart files", files.len());
 
@@ -300,6 +311,7 @@ fn transpiling_the_real_verovio_6_2_0_project_reports_coverage() {
                 reason_first_line: reason.lines().next().unwrap_or(reason).to_owned(),
             })
             .collect(),
+        bailouts,
     };
     write_diagnosis_report(&report, &repo_root().join(".diagnosis"), "verovio-6.2.0")
         .expect("write diagnosis report snapshot");
@@ -335,6 +347,339 @@ fn dynamic_regression_check_ignores_a_safe_identifier_suffix() {
         "dynamic"
     ));
     assert!(!contains_dart_token("int dynamic_ = 0;", "dynamic"));
+}
+
+#[test]
+fn bailout_inventory_collects_types_expressions_and_statements_recursively() {
+    let origin = Origin {
+        file: "fixture.cpp".to_owned(),
+        line: 7,
+        column: 3,
+    };
+    let module = Module {
+        functions: vec![Function {
+            name: "fixture".to_owned(),
+            usr: "fixture".to_owned(),
+            params: vec![Param {
+                name: "input".to_owned(),
+                ty: Type::Unsupported("const void *".to_owned()),
+                default_value: Some(Expr::Unsupported {
+                    reason: "could not lower default value".to_owned(),
+                    origin: origin.clone(),
+                }),
+            }],
+            return_type: Type::Unsupported("std::ostream".to_owned()),
+            body: vec![
+                Stmt::VarDecl {
+                    name: "buffer".to_owned(),
+                    ty: Type::List(Box::new(Type::Unsupported("char_t".to_owned()))),
+                    init: Some(Expr::UnsupportedTyped {
+                        reason: "unsupported implicit conversion".to_owned(),
+                        ty: Type::Unsupported("char_t".to_owned()),
+                        origin: origin.clone(),
+                    }),
+                    origin: origin.clone(),
+                },
+                Stmt::Unsupported {
+                    reason: "unsupported goto".to_owned(),
+                    origin,
+                },
+            ],
+            origin: Origin {
+                file: "fixture.cpp".to_owned(),
+                line: 1,
+                column: 1,
+            },
+        }],
+        records: vec![],
+        enums: vec![],
+    };
+
+    let inventory = collect_bailouts(&module);
+
+    assert_eq!(inventory.unsupported_types["char_t"], 2);
+    assert_eq!(inventory.unsupported_types["const void *"], 1);
+    assert_eq!(inventory.unsupported_types["std::ostream"], 1);
+    assert_eq!(
+        inventory.unsupported_expressions["could not lower default value"],
+        1
+    );
+    assert_eq!(
+        inventory.unsupported_expressions["unsupported implicit conversion"],
+        1
+    );
+    assert_eq!(inventory.unsupported_statements["unsupported goto"], 1);
+}
+
+/// Complete accounting of every IR node that causes the Dart emitter to
+/// produce a bailout. Keeping the source spelling/reason as the map key
+/// makes the diagnosis actionable: it says what the lowerer could not model,
+/// rather than merely counting generated Dart lines after formatting.
+#[derive(Debug, Default, Serialize)]
+struct BailoutInventory {
+    unsupported_types: std::collections::BTreeMap<String, usize>,
+    unsupported_expressions: std::collections::BTreeMap<String, usize>,
+    unsupported_statements: std::collections::BTreeMap<String, usize>,
+}
+
+impl BailoutInventory {
+    fn type_total(&self) -> usize {
+        self.unsupported_types.values().sum()
+    }
+
+    fn expression_total(&self) -> usize {
+        self.unsupported_expressions.values().sum()
+    }
+
+    fn statement_total(&self) -> usize {
+        self.unsupported_statements.values().sum()
+    }
+}
+
+fn collect_bailouts(module: &Module) -> BailoutInventory {
+    let mut inventory = BailoutInventory::default();
+
+    for function in &module.functions {
+        collect_type_bailouts(&function.return_type, &mut inventory);
+        for parameter in &function.params {
+            collect_parameter_bailouts(parameter, &mut inventory);
+        }
+        collect_statement_bailouts(&function.body, &mut inventory);
+    }
+
+    for record in &module.records {
+        for field in record.fields.iter().chain(&record.static_fields) {
+            collect_type_bailouts(&field.ty, &mut inventory);
+        }
+        for constructor in &record.constructors {
+            for parameter in &constructor.params {
+                collect_parameter_bailouts(parameter, &mut inventory);
+            }
+            collect_statement_bailouts(&constructor.body, &mut inventory);
+        }
+        for method in &record.methods {
+            collect_type_bailouts(&method.return_type, &mut inventory);
+            for parameter in &method.params {
+                collect_parameter_bailouts(parameter, &mut inventory);
+            }
+            if let Some(body) = &method.body {
+                collect_statement_bailouts(body, &mut inventory);
+            }
+        }
+        if let Some(destructor) = &record.destructor {
+            collect_statement_bailouts(destructor, &mut inventory);
+        }
+    }
+
+    inventory
+}
+
+fn collect_parameter_bailouts(parameter: &Param, inventory: &mut BailoutInventory) {
+    collect_type_bailouts(&parameter.ty, inventory);
+    if let Some(default_value) = &parameter.default_value {
+        collect_expression_bailouts(default_value, inventory);
+    }
+}
+
+fn collect_type_bailouts(ty: &Type, inventory: &mut BailoutInventory) {
+    match ty {
+        Type::List(inner) | Type::Set(inner) | Type::Nullable(inner) => {
+            collect_type_bailouts(inner, inventory);
+        }
+        Type::Map(key, value) => {
+            collect_type_bailouts(key, inventory);
+            collect_type_bailouts(value, inventory);
+        }
+        Type::Pair(first, second) => {
+            collect_type_bailouts(first, inventory);
+            collect_type_bailouts(second, inventory);
+        }
+        Type::Callback {
+            return_type,
+            params,
+        } => {
+            collect_type_bailouts(return_type, inventory);
+            for parameter in params {
+                collect_type_bailouts(parameter, inventory);
+            }
+        }
+        Type::Tuple(values) => {
+            for value in values {
+                collect_type_bailouts(value, inventory);
+            }
+        }
+        Type::Unsupported(spelling) => {
+            *inventory
+                .unsupported_types
+                .entry(spelling.clone())
+                .or_insert(0) += 1;
+        }
+        Type::Int
+        | Type::Bool
+        | Type::Double
+        | Type::Void
+        | Type::Record { .. }
+        | Type::Enum { .. }
+        | Type::Str
+        | Type::Bytes => {}
+    }
+}
+
+fn collect_expression_bailouts(expression: &Expr, inventory: &mut BailoutInventory) {
+    match expression {
+        Expr::Ref { ty, .. } | Expr::This { ty, .. } => collect_type_bailouts(ty, inventory),
+        Expr::Binary { lhs, rhs, ty, .. } => {
+            collect_type_bailouts(ty, inventory);
+            collect_expression_bailouts(lhs, inventory);
+            collect_expression_bailouts(rhs, inventory);
+        }
+        Expr::Unary { operand, ty, .. } | Expr::Convert { operand, ty, .. } => {
+            collect_type_bailouts(ty, inventory);
+            collect_expression_bailouts(operand, inventory);
+        }
+        Expr::Call {
+            target, args, ty, ..
+        } => {
+            collect_type_bailouts(ty, inventory);
+            if let Some(target) = target {
+                collect_expression_bailouts(target, inventory);
+            }
+            for argument in args {
+                collect_expression_bailouts(argument, inventory);
+            }
+        }
+        Expr::FieldAccess { target, ty, .. } => {
+            collect_type_bailouts(ty, inventory);
+            collect_expression_bailouts(target, inventory);
+        }
+        Expr::RecordConstruct { fields, .. } => {
+            for (_, value) in fields {
+                collect_expression_bailouts(value, inventory);
+            }
+        }
+        Expr::ConstructorCall { args, .. } => {
+            for argument in args {
+                collect_expression_bailouts(argument, inventory);
+            }
+        }
+        Expr::Index {
+            target, index, ty, ..
+        } => {
+            collect_type_bailouts(ty, inventory);
+            collect_expression_bailouts(target, inventory);
+            collect_expression_bailouts(index, inventory);
+        }
+        Expr::StringByteLength { target, .. } => collect_expression_bailouts(target, inventory),
+        Expr::Tuple { values, .. } => {
+            for value in values {
+                collect_expression_bailouts(value, inventory);
+            }
+        }
+        Expr::Unsupported { reason, .. } | Expr::UnsupportedTyped { reason, .. } => {
+            *inventory
+                .unsupported_expressions
+                .entry(reason.clone())
+                .or_insert(0) += 1;
+            if let Expr::UnsupportedTyped { ty, .. } = expression {
+                collect_type_bailouts(ty, inventory);
+            }
+        }
+        Expr::IntLiteral { .. }
+        | Expr::DoubleLiteral { .. }
+        | Expr::BoolLiteral { .. }
+        | Expr::StringLiteral { .. } => {}
+    }
+}
+
+fn collect_statement_bailouts(statements: &[Stmt], inventory: &mut BailoutInventory) {
+    for statement in statements {
+        match statement {
+            Stmt::Return { value, .. } => {
+                if let Some(value) = value {
+                    collect_expression_bailouts(value, inventory);
+                }
+            }
+            Stmt::VarDecl { ty, init, .. } => {
+                collect_type_bailouts(ty, inventory);
+                if let Some(init) = init {
+                    collect_expression_bailouts(init, inventory);
+                }
+            }
+            Stmt::Assign { value, .. }
+            | Stmt::ExprStmt { expr: value, .. }
+            | Stmt::Throw { value, .. } => {
+                collect_expression_bailouts(value, inventory);
+            }
+            Stmt::FieldAssign { target, value, .. } => {
+                collect_expression_bailouts(target, inventory);
+                collect_expression_bailouts(value, inventory);
+            }
+            Stmt::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                collect_expression_bailouts(condition, inventory);
+                collect_statement_bailouts(then_branch, inventory);
+                collect_statement_bailouts(else_branch, inventory);
+            }
+            Stmt::While {
+                condition, body, ..
+            } => {
+                collect_expression_bailouts(condition, inventory);
+                collect_statement_bailouts(body, inventory);
+            }
+            Stmt::For {
+                init,
+                condition,
+                increment,
+                body,
+                ..
+            } => {
+                if let Some(init) = init {
+                    collect_statement_bailouts(std::slice::from_ref(init), inventory);
+                }
+                if let Some(condition) = condition {
+                    collect_expression_bailouts(condition, inventory);
+                }
+                if let Some(increment) = increment {
+                    collect_statement_bailouts(std::slice::from_ref(increment), inventory);
+                }
+                collect_statement_bailouts(body, inventory);
+            }
+            Stmt::TryCatch {
+                try_body,
+                catch_type,
+                catch_body,
+                ..
+            } => {
+                collect_type_bailouts(catch_type, inventory);
+                collect_statement_bailouts(try_body, inventory);
+                collect_statement_bailouts(catch_body, inventory);
+            }
+            Stmt::TryFinally {
+                try_body,
+                finally_body,
+                ..
+            } => {
+                collect_statement_bailouts(try_body, inventory);
+                collect_statement_bailouts(finally_body, inventory);
+            }
+            Stmt::TupleAssign { targets, value, .. } => {
+                for target in targets {
+                    collect_expression_bailouts(target, inventory);
+                }
+                collect_expression_bailouts(value, inventory);
+            }
+            Stmt::Unsupported { reason, .. } => {
+                *inventory
+                    .unsupported_statements
+                    .entry(reason.clone())
+                    .or_insert(0) += 1;
+            }
+        }
+    }
 }
 
 fn current_timestamp_iso8601() -> String {
@@ -385,6 +730,7 @@ struct DiagnosisReport {
     top_rules: Vec<RuleCount>,
     top_rule_occurrences: Vec<AnalyzerDiagnostic>,
     unparseable_files: Vec<UnparseableFile>,
+    bailouts: BailoutInventory,
 }
 
 #[derive(Debug, Serialize)]
@@ -513,6 +859,28 @@ impl DiagnosisReport {
             self.extraction_time_seconds
         ));
 
+        out.push_str("\n## Bailouts por origem no IR\n\n");
+        out.push_str("| Origem | Ocorrências | Causas distintas |\n| --- | ---: | ---: |\n");
+        out.push_str(&format!(
+            "| Tipo C++ sem mapeamento | {} | {} |\n",
+            self.bailouts.type_total(),
+            self.bailouts.unsupported_types.len()
+        ));
+        out.push_str(&format!(
+            "| Expressão sem lowering | {} | {} |\n",
+            self.bailouts.expression_total(),
+            self.bailouts.unsupported_expressions.len()
+        ));
+        out.push_str(&format!(
+            "| Statement sem lowering | {} | {} |\n",
+            self.bailouts.statement_total(),
+            self.bailouts.unsupported_statements.len()
+        ));
+        out.push_str(
+            "\nAs tabelas completas (spelling/razão e contagem) estão no campo `bailouts` \
+             do snapshot JSON correspondente.\n",
+        );
+
         out.push_str("\n## Top 20 regras do `dart analyze`\n\n");
         for (index, rule) in self.top_rules.iter().enumerate() {
             out.push_str(&format!(
@@ -597,6 +965,20 @@ fn write_diagnosis_report_writes_json_and_markdown_snapshots() {
             path: "lib/accid.dart".to_owned(),
             reason_first_line: "Error: Expected ';' after this.".to_owned(),
         }],
+        bailouts: BailoutInventory {
+            unsupported_types: std::collections::BTreeMap::from([(
+                "std::pair<int, int>".to_owned(),
+                2,
+            )]),
+            unsupported_expressions: std::collections::BTreeMap::from([(
+                "unsupported std::vector::resize call".to_owned(),
+                3,
+            )]),
+            unsupported_statements: std::collections::BTreeMap::from([(
+                "unsupported goto".to_owned(),
+                1,
+            )]),
+        },
     };
 
     write_diagnosis_report(&report, workspace.path(), "verovio-6.2.0")
@@ -617,12 +999,17 @@ fn write_diagnosis_report_writes_json_and_markdown_snapshots() {
         "expected a concrete analyzer location"
     );
     assert_eq!(parsed["unparseable_files"][0]["path"], "lib/accid.dart");
+    assert_eq!(
+        parsed["bailouts"]["unsupported_types"]["std::pair<int, int>"],
+        2
+    );
 
     let md_contents = fs::read_to_string(&md_path).expect("read markdown snapshot");
     assert!(md_contents.contains("| Unidades de compilação | 298 |"));
     assert!(md_contents.contains("duplicate_definition"));
     assert!(md_contents.contains("Primeiras ocorrências"));
     assert!(md_contents.contains("lib/accid.dart"));
+    assert!(md_contents.contains("Bailouts por origem no IR"));
 
     // Uma segunda rodada sobrescreve, não acumula.
     let mut second = report;
