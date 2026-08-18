@@ -19,6 +19,7 @@ use crate::ir::{
     BinaryOp, Constructor, Enum, Expr, Function, Method, Module, Origin, Param, Record, Stmt, Type,
     UnaryOp,
 };
+use crate::lower::cpp::dart_operator_bridge_name;
 
 const INDENT: &str = "  ";
 const UNSUPPORTED_HELPER_NAME: &str = "_syntaxBridgeUnsupported";
@@ -588,6 +589,17 @@ fn collect_referenced_usrs_in_stmt<'a>(stmt: &'a Stmt, out: &mut HashSet<&'a str
             collect_referenced_usrs_in_expr(target, out);
             collect_referenced_usrs_in_expr(value, out);
         }
+        Stmt::ExprAssign {
+            target: Expr::MapIndexOrInsert {
+                target: map, index, ..
+            },
+            value,
+            ..
+        } => {
+            collect_referenced_usrs_in_expr(map, out);
+            collect_referenced_usrs_in_expr(index, out);
+            collect_referenced_usrs_in_expr(value, out);
+        }
         Stmt::ExprAssign { target, value, .. } => {
             collect_referenced_usrs_in_expr(target, out);
             collect_referenced_usrs_in_expr(value, out);
@@ -607,6 +619,12 @@ fn collect_referenced_usrs_in_stmt<'a>(stmt: &'a Stmt, out: &mut HashSet<&'a str
         } => {
             collect_referenced_usrs_in_expr(condition, out);
             collect_referenced_usrs_in_stmts(body, out);
+        }
+        Stmt::DoWhile {
+            body, condition, ..
+        } => {
+            collect_referenced_usrs_in_stmts(body, out);
+            collect_referenced_usrs_in_expr(condition, out);
         }
         Stmt::For {
             init,
@@ -669,6 +687,7 @@ fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str
         Expr::IntLiteral { .. }
         | Expr::DoubleLiteral { .. }
         | Expr::BoolLiteral { .. }
+        | Expr::NullLiteral { .. }
         | Expr::StringLiteral { .. }
         | Expr::Unsupported { .. } => {}
         Expr::UnsupportedTyped { ty, .. } => collect_referenced_usrs_in_type(ty, out),
@@ -677,6 +696,18 @@ fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str
             collect_referenced_usrs_in_type(ty, out);
             collect_referenced_usrs_in_expr(lhs, out);
             collect_referenced_usrs_in_expr(rhs, out);
+        }
+        Expr::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+            ty,
+            ..
+        } => {
+            collect_referenced_usrs_in_type(ty, out);
+            collect_referenced_usrs_in_expr(condition, out);
+            collect_referenced_usrs_in_expr(then_expr, out);
+            collect_referenced_usrs_in_expr(else_expr, out);
         }
         Expr::Unary { operand, ty, .. } | Expr::Convert { operand, ty, .. } => {
             collect_referenced_usrs_in_type(ty, out);
@@ -717,6 +748,25 @@ fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str
             }
         }
         Expr::Index {
+            target, index, ty, ..
+        } => {
+            collect_referenced_usrs_in_type(ty, out);
+            collect_referenced_usrs_in_expr(target, out);
+            collect_referenced_usrs_in_expr(index, out);
+        }
+        Expr::MapIndexOrInsert {
+            target,
+            index,
+            default_value,
+            ty,
+            ..
+        } => {
+            collect_referenced_usrs_in_type(ty, out);
+            collect_referenced_usrs_in_expr(target, out);
+            collect_referenced_usrs_in_expr(index, out);
+            collect_referenced_usrs_in_expr(default_value, out);
+        }
+        Expr::StringByteAt {
             target, index, ty, ..
         } => {
             collect_referenced_usrs_in_type(ty, out);
@@ -1259,17 +1309,18 @@ fn emit_method(
         );
     }
     if method.name.starts_with("operator") {
-        // No Dart equivalent exists (`operator<<`, `operator++`, a
-        // conversion operator, ...). Declaring it under a synthesized,
-        // always-valid name keeps the file parseable; the body still bails
-        // out loudly instead of pretending the translation succeeded
-        // ("silêncio é proibido"). Deliberately **not** consulting `mock`
-        // here even if this usr is externally marked: the operator's own
-        // *name* has no Dart equivalent regardless of whose body fills it,
-        // so a bailout is the honest answer either way — a rare enough
-        // combination (external *and* an unrepresentable operator) not to
-        // be worth a second mock path for.
-        return emit_unsupported_operator(method, used_expr_helper, used_utf8_encode);
+        // Dart has no free assignment/increment/stream operators, but a
+        // C++ member operator still has an ordinary method body whose state
+        // changes must be retained. Give it the stable named bridge used by
+        // call lowering and emit that body normally; any unsupported detail
+        // inside remains visible at its actual source location.
+        return emit_method_named(
+            dart_operator_bridge_name(&method.name, method.params.len()),
+            method,
+            mock,
+            used_expr_helper,
+            used_utf8_encode,
+        );
     }
 
     emit_method_named(
@@ -1361,66 +1412,6 @@ fn direct_dart_operator_symbol(method_name: &str, arity: usize) -> Option<&'stat
         .iter()
         .find(|(candidate, arities)| *candidate == symbol && arities.contains(&arity))
         .map(|(candidate, _)| *candidate)
-}
-
-/// A C++ operator overload with no Dart equivalent at all — `operator<<`,
-/// `operator++`/`--` (Dart never lets a type customize those), a compound
-/// assignment (`operator+=`), a conversion operator, or anything else not in
-/// `DIRECT_DART_OPERATOR_ARITIES`. The declaration still needs a valid Dart
-/// identifier in its place (a small, fixed, C++-wide vocabulary — not a
-/// per-project or per-fixture table), and the body bails out with the same
-/// `Stmt::Unsupported` rendering every other unrepresentable construct uses,
-/// instead of either guessing a translation or dropping the member silently.
-fn emit_unsupported_operator(
-    method: &Method,
-    used_expr_helper: &mut bool,
-    used_utf8_encode: &mut bool,
-) -> String {
-    let bridge_name = bridge_name_for_unsupported_operator(&method.name, method.params.len());
-    let params = format_params(&method.params, used_expr_helper, used_utf8_encode);
-    let return_type = emit_type(&method.return_type);
-
-    if method.body.is_none() {
-        return format!("{INDENT}{return_type} {bridge_name}({params});\n");
-    }
-
-    let bailout = Stmt::Unsupported {
-        reason: format!(
-            "`{}` has no Dart operator equivalent; bridged to a named method (`{bridge_name}`)",
-            method.name
-        ),
-        origin: method.origin.clone(),
-    };
-    let body = emit_stmt(&bailout, 2, used_expr_helper, used_utf8_encode);
-    format!("{INDENT}{return_type} {bridge_name}({params}) {{\n{body}{INDENT}}}\n")
-}
-
-fn bridge_name_for_unsupported_operator(method_name: &str, arity: usize) -> &'static str {
-    let symbol = method_name.strip_prefix("operator").unwrap_or(method_name);
-    match symbol {
-        "<<" => "streamInsert",
-        ">>" => "streamExtract",
-        "->" => "arrow",
-        "!" => "logicalNot",
-        "~" => "bitwiseNot",
-        "++" if arity == 0 => "increment",
-        "++" => "incrementPostfix",
-        "--" if arity == 0 => "decrement",
-        "--" => "decrementPostfix",
-        "+=" => "addAssign",
-        "-=" => "subtractAssign",
-        "*=" => "multiplyAssign",
-        "/=" => "divideAssign",
-        "%=" => "moduloAssign",
-        "%" => "modulo",
-        "&" => "bitwiseAnd",
-        "|" => "bitwiseOr",
-        "^" => "bitwiseXor",
-        "&&" => "logicalAnd",
-        "||" => "logicalOr",
-        "," => "comma",
-        _ => "unsupportedOperator",
-    }
 }
 
 /// An operator== member always has exactly one parameter in valid C++ — see
@@ -1586,9 +1577,9 @@ fn emit_function(
     // ordinary, translatable code, though — only the name is the problem —
     // so, unlike the method-side bridge, this is a plain rename, not a body
     // bailout: the same small, C++-wide symbol table
-    // (`bridge_name_for_unsupported_operator`), not a per-project one.
+    // (`dart_operator_bridge_name`), not a per-project one.
     let name = if function.name.starts_with("operator") {
-        bridge_name_for_unsupported_operator(&function.name, function.params.len())
+        dart_operator_bridge_name(&function.name, function.params.len())
     } else {
         &function.name
     };
@@ -1708,6 +1699,15 @@ fn stmt_unsupported_type_spelling(stmt: &Stmt) -> Option<&str> {
         Stmt::FieldAssign { target, value, .. } => {
             expr_unsupported_type_spelling(target).or_else(|| expr_unsupported_type_spelling(value))
         }
+        Stmt::ExprAssign {
+            target: Expr::MapIndexOrInsert {
+                target: map, index, ..
+            },
+            value,
+            ..
+        } => expr_unsupported_type_spelling(map)
+            .or_else(|| expr_unsupported_type_spelling(index))
+            .or_else(|| expr_unsupported_type_spelling(value)),
         Stmt::ExprAssign { target, value, .. } => {
             expr_unsupported_type_spelling(target).or_else(|| expr_unsupported_type_spelling(value))
         }
@@ -1723,6 +1723,10 @@ fn stmt_unsupported_type_spelling(stmt: &Stmt) -> Option<&str> {
             condition, body, ..
         } => expr_unsupported_type_spelling(condition)
             .or_else(|| first_unsupported_type_in_list(body)),
+        Stmt::DoWhile {
+            body, condition, ..
+        } => first_unsupported_type_in_list(body)
+            .or_else(|| expr_unsupported_type_spelling(condition)),
         Stmt::For {
             init,
             condition,
@@ -1774,6 +1778,7 @@ fn expr_unsupported_type_spelling(expr: &Expr) -> Option<&str> {
         Expr::IntLiteral { .. }
         | Expr::DoubleLiteral { .. }
         | Expr::BoolLiteral { .. }
+        | Expr::NullLiteral { .. }
         | Expr::StringLiteral { .. }
         | Expr::Unsupported { .. } => None,
         Expr::UnsupportedTyped { ty, .. } => unsupported_spelling(ty),
@@ -1781,6 +1786,16 @@ fn expr_unsupported_type_spelling(expr: &Expr) -> Option<&str> {
         Expr::Binary { ty, lhs, rhs, .. } => unsupported_spelling(ty)
             .or_else(|| expr_unsupported_type_spelling(lhs))
             .or_else(|| expr_unsupported_type_spelling(rhs)),
+        Expr::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+            ty,
+            ..
+        } => unsupported_spelling(ty)
+            .or_else(|| expr_unsupported_type_spelling(condition))
+            .or_else(|| expr_unsupported_type_spelling(then_expr))
+            .or_else(|| expr_unsupported_type_spelling(else_expr)),
         Expr::Unary { ty, operand, .. } => {
             unsupported_spelling(ty).or_else(|| expr_unsupported_type_spelling(operand))
         }
@@ -1809,9 +1824,24 @@ fn expr_unsupported_type_spelling(expr: &Expr) -> Option<&str> {
         } => unsupported_spelling(ty)
             .or_else(|| expr_unsupported_type_spelling(target))
             .or_else(|| expr_unsupported_type_spelling(index)),
+        Expr::MapIndexOrInsert {
+            target,
+            index,
+            default_value,
+            ty,
+            ..
+        } => unsupported_spelling(ty)
+            .or_else(|| expr_unsupported_type_spelling(target))
+            .or_else(|| expr_unsupported_type_spelling(index))
+            .or_else(|| expr_unsupported_type_spelling(default_value)),
         Expr::StringByteLength { target, .. } => expr_unsupported_type_spelling(target),
         Expr::StringByteIndexOf { target, needle, .. } => expr_unsupported_type_spelling(target)
             .or_else(|| expr_unsupported_type_spelling(needle)),
+        Expr::StringByteAt {
+            target, index, ty, ..
+        } => unsupported_spelling(ty)
+            .or_else(|| expr_unsupported_type_spelling(target))
+            .or_else(|| expr_unsupported_type_spelling(index)),
         Expr::Tuple { values, .. } => values.iter().find_map(expr_unsupported_type_spelling),
     }
 }
@@ -1848,6 +1878,7 @@ fn first_unsupported_in_stmt(stmt: &Stmt) -> Option<&Stmt> {
             .or_else(|| increment.as_deref().and_then(first_unsupported_in_stmt))
             .or_else(|| first_unsupported_in_list(body)),
         Stmt::ForEach { body, .. } => first_unsupported_in_list(body),
+        Stmt::DoWhile { body, .. } => first_unsupported_in_list(body),
         Stmt::TryCatch {
             try_body,
             catch_body,
@@ -1977,6 +2008,19 @@ fn emit_stmt(
                 emit_expr(value, used_expr_helper, used_utf8_encode)
             ),
         },
+        Stmt::ExprAssign {
+            target: Expr::MapIndexOrInsert {
+                target: map, index, ..
+            },
+            value,
+            ..
+        } => format!(
+            "{pad}{}{}[{}] = {};\n",
+            emit_expr(map, used_expr_helper, used_utf8_encode),
+            receiver_bang(map),
+            emit_expr(index, used_expr_helper, used_utf8_encode),
+            emit_expr(value, used_expr_helper, used_utf8_encode)
+        ),
         Stmt::ExprAssign { target, value, .. } => format!(
             "{pad}{} = {};\n",
             emit_expr(target, used_expr_helper, used_utf8_encode),
@@ -2016,14 +2060,64 @@ fn emit_stmt(
             }
             source
         }
+        Stmt::DoWhile {
+            body, condition, ..
+        } => {
+            let mut source = format!("{pad}do {{\n");
+            for inner in body {
+                source.push_str(&emit_stmt(
+                    inner,
+                    depth + 1,
+                    used_expr_helper,
+                    used_utf8_encode,
+                ));
+            }
+            source.push_str(&format!(
+                "{pad}}} while ({});\n",
+                emit_expr(condition, used_expr_helper, used_utf8_encode)
+            ));
+            source
+        }
         Stmt::ForEach {
             name,
             ty,
             is_final,
+            write_back,
             iterable,
             body,
             ..
         } => {
+            if *write_back {
+                const ITERABLE_NAME: &str = "_syntaxBridgeIterable";
+                const INDEX_NAME: &str = "_syntaxBridgeIndex";
+                let mut source = format!(
+                    "{pad}final {ITERABLE_NAME} = {};\n",
+                    emit_expr(iterable, used_expr_helper, used_utf8_encode)
+                );
+                source.push_str(&format!(
+                    "{pad}for (int {INDEX_NAME} = 0; {INDEX_NAME} < {ITERABLE_NAME}.length; ++{INDEX_NAME}) {{\n"
+                ));
+                source.push_str(&format!(
+                    "{pad}{INDENT}{} {name} = {ITERABLE_NAME}[{INDEX_NAME}];\n",
+                    emit_type(ty)
+                ));
+                source.push_str(&format!("{pad}{INDENT}try {{\n"));
+                for inner in body {
+                    source.push_str(&emit_stmt(
+                        inner,
+                        depth + 2,
+                        used_expr_helper,
+                        used_utf8_encode,
+                    ));
+                }
+                source.push_str(&format!("{pad}{INDENT}}} finally {{\n"));
+                source.push_str(&format!(
+                    "{pad}{INDENT}{INDENT}{ITERABLE_NAME}[{INDEX_NAME}] = {name};\n"
+                ));
+                source.push_str(&format!("{pad}{INDENT}}}\n"));
+                source.push_str(&format!("{pad}}}\n"));
+                return source;
+            }
             let binding = if *is_final { "final " } else { "" };
             let mut source = format!(
                 "{pad}for ({binding}{} {name} in {}) {{\n",
@@ -2253,6 +2347,19 @@ fn emit_for_clause(
                 emit_expr(value, used_expr_helper, used_utf8_encode)
             )
         }
+        Stmt::ExprAssign {
+            target: Expr::MapIndexOrInsert {
+                target: map, index, ..
+            },
+            value,
+            ..
+        } => format!(
+            "{}{}[{}] = {}",
+            emit_expr(map, used_expr_helper, used_utf8_encode),
+            receiver_bang(map),
+            emit_expr(index, used_expr_helper, used_utf8_encode),
+            emit_expr(value, used_expr_helper, used_utf8_encode)
+        ),
         Stmt::ExprAssign { target, value, .. } => format!(
             "{} = {}",
             emit_expr(target, used_expr_helper, used_utf8_encode),
@@ -2284,15 +2391,19 @@ fn expr_ty(expr: &Expr) -> Option<&Type> {
     match expr {
         Expr::Ref { ty, .. }
         | Expr::Binary { ty, .. }
+        | Expr::Conditional { ty, .. }
         | Expr::Unary { ty, .. }
         | Expr::Convert { ty, .. }
         | Expr::Call { ty, .. }
         | Expr::FieldAccess { ty, .. }
         | Expr::This { ty, .. }
-        | Expr::Index { ty, .. } => Some(ty),
+        | Expr::Index { ty, .. }
+        | Expr::MapIndexOrInsert { ty, .. }
+        | Expr::StringByteAt { ty, .. } => Some(ty),
         Expr::IntLiteral { .. }
         | Expr::DoubleLiteral { .. }
         | Expr::BoolLiteral { .. }
+        | Expr::NullLiteral { .. }
         | Expr::StringLiteral { .. }
         | Expr::RecordConstruct { .. }
         | Expr::ConstructorCall { .. }
@@ -2356,15 +2467,36 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
         Expr::IntLiteral { value, .. } => value.to_string(),
         Expr::DoubleLiteral { value, .. } => value.to_string(),
         Expr::BoolLiteral { value, .. } => value.to_string(),
+        Expr::NullLiteral { .. } => "null".to_owned(),
         Expr::StringLiteral { value, .. } => dart_string_literal(value),
         Expr::Ref { name, .. } => name.clone(),
         Expr::Binary {
             op, lhs, rhs, ty, ..
+        } => {
+            let lhs_text = emit_expr(lhs, used_expr_helper, used_utf8_encode);
+            let rhs_text = emit_expr(rhs, used_expr_helper, used_utf8_encode);
+            let lhs_text = if matches!(lhs.as_ref(), Expr::Conditional { .. }) {
+                format!("({lhs_text})")
+            } else {
+                lhs_text
+            };
+            let rhs_text = if matches!(rhs.as_ref(), Expr::Conditional { .. }) {
+                format!("({rhs_text})")
+            } else {
+                rhs_text
+            };
+            format!("{lhs_text} {} {rhs_text}", emit_binary_op(*op, ty))
+        }
+        Expr::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+            ..
         } => format!(
-            "{} {} {}",
-            emit_expr(lhs, used_expr_helper, used_utf8_encode),
-            emit_binary_op(*op, ty),
-            emit_expr(rhs, used_expr_helper, used_utf8_encode)
+            "{} ? {} : {}",
+            emit_expr(condition, used_expr_helper, used_utf8_encode),
+            emit_expr(then_expr, used_expr_helper, used_utf8_encode),
+            emit_expr(else_expr, used_expr_helper, used_utf8_encode)
         ),
         Expr::Unary { op, operand, .. } => {
             let op_text = emit_unary_op(*op);
@@ -2394,10 +2526,30 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
                 emit_expr(operand, used_expr_helper, used_utf8_encode)
             ),
             Type::Bool => format!(
-                "{} != 0",
+                "{} != {}",
+                emit_expr(operand, used_expr_helper, used_utf8_encode),
+                if matches!(expr_ty(operand), Some(Type::Nullable(_))) {
+                    "null"
+                } else {
+                    "0"
+                }
+            ),
+            // C++ address-of widens a known Dart reference `T` to its
+            // nullable pointer representation `T?`; Dart performs that
+            // widening implicitly. A dereference goes the other way and
+            // needs the explicit assertion that mirrors C++'s own unchecked
+            // pointer access.
+            Type::Nullable(_) => emit_expr(operand, used_expr_helper, used_utf8_encode),
+            _ if matches!(operand.as_ref(), Expr::This { .. }) => {
+                emit_expr(operand, used_expr_helper, used_utf8_encode)
+            }
+            _ if matches!(expr_ty(operand), Some(Type::Nullable(_))) => format!(
+                "{}!",
                 emit_expr(operand, used_expr_helper, used_utf8_encode)
             ),
-            _ => unreachable!("only represented scalar conversions construct Expr::Convert"),
+            _ => unreachable!(
+                "only represented scalar and nullable-reference conversions construct Expr::Convert"
+            ),
         },
         Expr::Call {
             target,
@@ -2470,6 +2622,18 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
             receiver_bang(target),
             emit_expr(index, used_expr_helper, used_utf8_encode)
         ),
+        Expr::MapIndexOrInsert {
+            target,
+            index,
+            default_value,
+            ..
+        } => format!(
+            "{}{}.putIfAbsent({}, () => {})",
+            emit_expr(target, used_expr_helper, used_utf8_encode),
+            receiver_bang(target),
+            emit_expr(index, used_expr_helper, used_utf8_encode),
+            emit_expr(default_value, used_expr_helper, used_utf8_encode)
+        ),
         Expr::StringByteLength { target, .. } => {
             *used_utf8_encode = true;
             format!(
@@ -2483,6 +2647,14 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
                 "utf8.encode({}).indexOf(utf8.encode({}))",
                 emit_expr(target, used_expr_helper, used_utf8_encode),
                 emit_expr(needle, used_expr_helper, used_utf8_encode)
+            )
+        }
+        Expr::StringByteAt { target, index, .. } => {
+            *used_utf8_encode = true;
+            format!(
+                "utf8.encode({})[{}]",
+                emit_expr(target, used_expr_helper, used_utf8_encode),
+                emit_expr(index, used_expr_helper, used_utf8_encode)
             )
         }
         // A single-element Dart record needs a trailing comma
@@ -2544,6 +2716,12 @@ fn emit_binary_op(op: BinaryOp, ty: &Type) -> &'static str {
         BinaryOp::Eq => "==",
         BinaryOp::Ne => "!=",
         BinaryOp::And => "&&",
+        BinaryOp::Or => "||",
+        BinaryOp::ShiftLeft => "<<",
+        BinaryOp::ShiftRight => ">>",
+        BinaryOp::BitAnd => "&",
+        BinaryOp::BitXor => "^",
+        BinaryOp::BitOr => "|",
     }
 }
 
@@ -2570,6 +2748,11 @@ fn dart_string_literal(text: &str) -> String {
     let escaped = text
         .replace('\\', "\\\\")
         .replace('\'', "\\'")
-        .replace('$', "\\$");
+        .replace('$', "\\$")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+        .replace('\u{08}', "\\b")
+        .replace('\u{0C}', "\\f");
     format!("'{escaped}'")
 }

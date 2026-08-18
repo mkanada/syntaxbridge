@@ -533,6 +533,18 @@ fn collect_expression_bailouts(expression: &Expr, inventory: &mut BailoutInvento
             collect_expression_bailouts(lhs, inventory);
             collect_expression_bailouts(rhs, inventory);
         }
+        Expr::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+            ty,
+            ..
+        } => {
+            collect_type_bailouts(ty, inventory);
+            collect_expression_bailouts(condition, inventory);
+            collect_expression_bailouts(then_expr, inventory);
+            collect_expression_bailouts(else_expr, inventory);
+        }
         Expr::Unary { operand, ty, .. } | Expr::Convert { operand, ty, .. } => {
             collect_type_bailouts(ty, inventory);
             collect_expression_bailouts(operand, inventory);
@@ -569,10 +581,29 @@ fn collect_expression_bailouts(expression: &Expr, inventory: &mut BailoutInvento
             collect_expression_bailouts(target, inventory);
             collect_expression_bailouts(index, inventory);
         }
+        Expr::MapIndexOrInsert {
+            target,
+            index,
+            default_value,
+            ty,
+            ..
+        } => {
+            collect_type_bailouts(ty, inventory);
+            collect_expression_bailouts(target, inventory);
+            collect_expression_bailouts(index, inventory);
+            collect_expression_bailouts(default_value, inventory);
+        }
         Expr::StringByteLength { target, .. } => collect_expression_bailouts(target, inventory),
         Expr::StringByteIndexOf { target, needle, .. } => {
             collect_expression_bailouts(target, inventory);
             collect_expression_bailouts(needle, inventory);
+        }
+        Expr::StringByteAt {
+            target, index, ty, ..
+        } => {
+            collect_type_bailouts(ty, inventory);
+            collect_expression_bailouts(target, inventory);
+            collect_expression_bailouts(index, inventory);
         }
         Expr::Tuple { values, .. } => {
             for value in values {
@@ -591,6 +622,7 @@ fn collect_expression_bailouts(expression: &Expr, inventory: &mut BailoutInvento
         Expr::IntLiteral { .. }
         | Expr::DoubleLiteral { .. }
         | Expr::BoolLiteral { .. }
+        | Expr::NullLiteral { .. }
         | Expr::StringLiteral { .. } => {}
     }
 }
@@ -637,6 +669,12 @@ fn collect_statement_bailouts(statements: &[Stmt], inventory: &mut BailoutInvent
             } => {
                 collect_expression_bailouts(condition, inventory);
                 collect_statement_bailouts(body, inventory);
+            }
+            Stmt::DoWhile {
+                body, condition, ..
+            } => {
+                collect_statement_bailouts(body, inventory);
+                collect_expression_bailouts(condition, inventory);
             }
             Stmt::For {
                 init,

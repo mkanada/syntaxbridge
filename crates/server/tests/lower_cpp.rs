@@ -964,7 +964,7 @@ int count_values() {
 /// dispatcher must normalize that shape before deciding whether it supports
 /// the method itself, so its diagnostic remains specific and actionable.
 #[test]
-fn a_stdlib_operator_call_uses_its_first_argument_as_the_receiver() {
+fn a_std_vector_assignment_copies_its_elements_instead_of_aliasing() {
     let source = lower_and_emit(
         "lower-cpp-stdlib-operator-receiver",
         r#"
@@ -977,9 +977,194 @@ void copy_values(std::vector<int>& destination, const std::vector<int>& source) 
     );
 
     assert!(
-        source.contains("unsupported std::vector::operator= call")
-            && !source.contains("standard-library method call's first child was not"),
-        "an operator-style stdlib call must expose its receiver before dispatch, got:\n{source}"
+        source.contains("destination = List.of(source);")
+            && !source.contains("unsupported std::vector::operator= call"),
+        "a vector assignment must preserve C++ copy semantics, got:\n{source}"
+    );
+}
+
+/// An implicitly generated C++ record assignment copies values. Dart record
+/// instances are references, so the lowering must construct a new record from
+/// the source fields instead of assigning the source object directly.
+#[test]
+fn a_defaulted_record_assignment_constructs_a_value_copy() {
+    let source = lower_and_emit(
+        "lower-cpp-defaulted-record-assignment",
+        r#"
+struct Coordinate {
+    int x;
+    int y;
+};
+
+void copy_coordinate(Coordinate& destination, const Coordinate& source) {
+    destination = source;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("destination = Coordinate(source.x, source.y);"),
+        "defaulted record assignment must construct a distinct Dart value, got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported operator method call: operator="),
+        "a defaulted record copy assignment must not remain an operator bailout, got:\n{source}"
+    );
+}
+
+/// A defaulted record assignment must recursively preserve container value
+/// semantics too: a vector field needs List.of rather than a shared List.
+#[test]
+fn a_defaulted_record_assignment_copies_vector_fields() {
+    let source = lower_and_emit(
+        "lower-cpp-defaulted-record-vector-copy",
+        r#"
+#include <vector>
+
+struct Bucket {
+    std::vector<int> values;
+};
+
+void copy_bucket(Bucket& destination, const Bucket& source) {
+    destination = source;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("destination = Bucket(List.of(source.values));"),
+        "record vector fields must keep C++ copy semantics, got:\n{source}"
+    );
+}
+
+/// A trivial record with text and vector fields is default-constructed in C++
+/// before its fields are used. Dart needs real typed values at construction,
+/// not unsupported placeholders inside the synthetic record constructor.
+#[test]
+fn a_default_constructed_record_gets_typed_text_and_collection_values() {
+    let source = lower_and_emit(
+        "lower-cpp-default-record-text-collection",
+        r#"
+#include <string>
+#include <vector>
+
+struct State {
+    std::string name;
+    std::vector<int> values;
+};
+
+int state_size() {
+    State state;
+    state.name = "ready";
+    return state.values.size();
+}
+"#,
+    );
+
+    assert!(
+        source.contains("State state = State('', List.empty());")
+            && source.contains("state.name = 'ready';")
+            && source.contains("return state.values.length;"),
+        "default record construction must use typed text and collection values, got:\n{source}"
+    );
+    assert!(
+        !source.contains("no default value available for this field's type yet"),
+        "representable text and collection fields must not become default-value bailouts, got:\n{source}"
+    );
+}
+
+/// Default construction of a record nested by value must recursively create
+/// the inner record. A late outer local cannot support immediate field writes.
+#[test]
+fn a_default_constructed_record_recursively_constructs_nested_records() {
+    let source = lower_and_emit(
+        "lower-cpp-default-record-nested",
+        r#"
+struct Point {
+    int x;
+};
+
+struct Holder {
+    Point point;
+};
+
+int set_point() {
+    Holder holder;
+    holder.point.x = 7;
+    return holder.point.x;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("Holder holder = Holder(Point(0));")
+            && source.contains("holder.point.x = 7;"),
+        "nested trivial records must be constructed recursively, got:\n{source}"
+    );
+    assert!(
+        !source.contains("no default value available for this field's type yet"),
+        "a nested representable record must not become a default-value bailout, got:\n{source}"
+    );
+}
+
+/// A nullable C++ value has the sound Dart default null. It must not turn a
+/// trivial containing record into a default-value bailout.
+#[test]
+fn a_default_constructed_record_uses_null_for_nullable_fields() {
+    let source = lower_and_emit(
+        "lower-cpp-default-record-nullable",
+        r#"
+#include <optional>
+
+struct Options {
+    std::optional<int> limit;
+};
+
+void configure() {
+    Options options;
+    options.limit = 3;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("Options options = Options(null);")
+            && source.contains("options.limit = 3;"),
+        "nullable fields must receive a sound null default, got:\n{source}"
+    );
+    assert!(
+        !source.contains("no default value available for this field's type yet"),
+        "nullable fields must not remain default-value bailouts, got:\n{source}"
+    );
+}
+
+/// A Dart enum has no implicit default, unlike the zero-initialized storage a
+/// trivial C++ record can expose. Its first declared value is a deterministic
+/// typed default that keeps the containing record constructible.
+#[test]
+fn a_default_constructed_record_uses_its_first_enum_variant() {
+    let source = lower_and_emit(
+        "lower-cpp-default-record-enum",
+        r#"
+enum Mode { idle, running };
+
+struct Options {
+    Mode mode;
+};
+
+void configure() {
+    Options options;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("Options options = Options(Mode.idle);"),
+        "enum fields must get the first declared typed value, got:\n{source}"
+    );
+    assert!(
+        !source.contains("no default value available for this field's type yet"),
+        "enum fields must not remain default-value bailouts, got:\n{source}"
     );
 }
 
@@ -1028,6 +1213,366 @@ void copy_first(std::vector<int>& values) {
     );
 }
 
+/// The front and back accessors of a non-empty vector have direct indexed
+/// List counterparts. Dart's range error on an empty list remains the same
+/// observable failure shape as the C++ precondition violation.
+#[test]
+fn vector_front_and_back_lower_to_typed_dart_indexes() {
+    let source = lower_and_emit(
+        "lower-cpp-vector-front-back",
+        r#"
+#include <vector>
+
+int first(const std::vector<int>& values) {
+    return values.front();
+}
+
+int last(const std::vector<int>& values) {
+    return values.back();
+}
+"#,
+    );
+
+    assert!(
+        source.contains("return values[0];")
+            && source.contains("return values[values.length - 1];"),
+        "vector front and back must become typed List indexes, got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported std::vector::front call")
+            && !source.contains("unsupported std::vector::back call"),
+        "supported vector endpoint access must not remain bailouts, got:\n{source}"
+    );
+}
+
+/// list and deque already lower to List<T> at the type boundary, so their
+/// common endpoint, mutation and query operations use the same Dart List
+/// adapters as vector without inventing an opaque iterator layer.
+#[test]
+fn list_and_deque_common_operations_lower_to_dart_list_operations() {
+    let source = lower_and_emit(
+        "lower-cpp-list-deque-common-operations",
+        r#"
+#include <deque>
+#include <list>
+
+int mutate_list(std::list<int>& values) {
+    values.push_back(3);
+    int result = values.front() + values.back() + values.size();
+    values.clear();
+    return result;
+}
+
+bool inspect_deque(std::deque<int>& values) {
+    values.push_back(3);
+    return !values.empty() && values.at(0) == values.front();
+}
+"#,
+    );
+
+    assert!(
+        source.contains("values.add(3);")
+            && source.contains("values[0]")
+            && source.contains("values[values.length - 1]")
+            && source.contains("values.length")
+            && source.contains("values.clear();")
+            && source.contains("values.isEmpty"),
+        "list and deque methods must use Dart List operations, got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported std::list::") && !source.contains("unsupported std::deque::"),
+        "supported list and deque methods must not remain bailouts, got:\n{source}"
+    );
+}
+
+/// A map subscript used as an assignment target has the same direct write
+/// operation in Dart. This deliberately does not claim that a standalone
+/// C++ map read, with its insertion-on-miss rule, is equivalent to Dart.
+#[test]
+fn map_index_assignment_lowers_to_a_typed_dart_map_write() {
+    let source = lower_and_emit(
+        "lower-cpp-map-index-assignment",
+        r#"
+#include <map>
+#include <string>
+
+void set_label(std::map<int, std::string>& labels) {
+    labels[4] = "four";
+}
+"#,
+    );
+
+    assert!(
+        source.contains("labels[4] = 'four';"),
+        "map index assignment must become a Dart map write, got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported std::map::operator[] call")
+            && !source.contains("index assignment not supported yet"),
+        "map write must not remain a bailout, got:\n{source}"
+    );
+}
+
+/// Reading through C++ map subscript inserts the value-initialized mapped
+/// value when absent. Dart putIfAbsent is the corresponding typed operation;
+/// a plain nullable lookup would change both the result and the map state.
+#[test]
+fn map_index_read_preserves_cpp_default_insertion() {
+    let source = lower_and_emit(
+        "lower-cpp-map-index-read",
+        r#"
+#include <map>
+#include <string>
+
+std::string label(std::map<int, std::string>& labels) {
+    return labels[4];
+}
+"#,
+    );
+
+    assert!(
+        source.contains("return labels.putIfAbsent(4, () => '');"),
+        "map index reads must retain C++ insertion-on-miss semantics, got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported std::map::operator[] call"),
+        "map reads with a representable default must not remain bailouts, got:\n{source}"
+    );
+}
+
+/// A compound write reads a C++ map subscript before storing back. The read
+/// must retain `operator[]`'s insertion-on-miss behavior while the outer
+/// assignment remains Dart's direct map write.
+#[test]
+fn map_index_compound_assignment_preserves_default_insertion() {
+    let source = lower_and_emit(
+        "lower-cpp-map-index-compound-assignment",
+        r#"
+#include <map>
+
+int increment(std::map<int, int>& values, int key) {
+    values[key] += 2;
+    return values[key];
+}
+"#,
+    );
+
+    assert!(
+        source.contains("values[key] = values.putIfAbsent(key, () => 0) + 2;")
+            && source.contains("return values.putIfAbsent(key, () => 0);")
+            && !source
+                .contains("compound assignment target is not a simple local variable or a field"),
+        "compound map writes must retain C++ insertion semantics, got:\n{source}"
+    );
+}
+
+/// Membership and cardinality queries on map and set have direct Dart core
+/// operations and should remain typed instead of becoming opaque calls.
+#[test]
+fn map_and_set_queries_lower_to_typed_dart_core_operations() {
+    let source = lower_and_emit(
+        "lower-cpp-map-set-queries",
+        r#"
+#include <map>
+#include <set>
+
+bool map_contains(const std::map<int, int>& values, int key) {
+    return values.count(key) > 0;
+}
+
+bool map_empty(const std::map<int, int>& values) {
+    return values.empty();
+}
+
+int map_size(const std::map<int, int>& values) {
+    return values.size();
+}
+
+bool set_contains(const std::set<int>& values, int key) {
+    return values.count(key) > 0;
+}
+
+bool set_empty(const std::set<int>& values) {
+    return values.empty();
+}
+
+int set_size(const std::set<int>& values) {
+    return values.size();
+}
+"#,
+    );
+
+    assert!(
+        source.contains("values.containsKey(key) ? 1 : 0")
+            && source.contains("values.contains(key) ? 1 : 0")
+            && source.contains("values.isEmpty")
+            && source.contains("return values.length;"),
+        "map and set queries must use typed Dart core operations, got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported std::map::count call")
+            && !source.contains("unsupported std::set::count call"),
+        "query adapters must not remain bailouts, got:\n{source}"
+    );
+}
+
+/// Native arrays already lower to typed Dart lists. Their subscript uses a
+/// distinct ArraySubscriptExpr cursor from vector's operator call, but is the
+/// same safe Dart index read/write once the receiver is known to be a list.
+#[test]
+fn a_native_array_index_assignment_lowers_to_a_typed_dart_index_write() {
+    let source = lower_and_emit(
+        "lower-cpp-native-array-index-assignment",
+        r#"
+int replace_first() {
+    int values[2] = {1, 2};
+    values[0] = values[1];
+    return values[0];
+}
+"#,
+    );
+
+    assert!(
+        source.contains("values[0] = values[1];")
+            && source.contains("return values[0];")
+            && !source.contains("unsupported expression cursor kind 113"),
+        "native array subscript must lower as a typed Dart index, got:\n{source}"
+    );
+}
+
+/// Allocating a project record through C++ new is a managed Dart object when
+/// its pointee is already a representable record. The nullable return type
+/// remains valid, while the constructor call carries the actual value.
+#[test]
+fn new_of_a_known_record_lowers_to_a_dart_constructor_call() {
+    let source = lower_and_emit(
+        "lower-cpp-new-known-record",
+        r#"
+struct Point {
+    int value;
+    Point(int input) : value(input) {}
+};
+
+Point* make_point() {
+    return new Point(4);
+}
+"#,
+    );
+
+    assert!(
+        source.contains("Point? make_point()") && source.contains("return Point(4);"),
+        "new of a known record must become its Dart construction, got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported expression cursor kind 134"),
+        "CXXNewExpr must not remain a bailout for a known record, got:\n{source}"
+    );
+}
+
+/// A pointer to an IR-known record already maps to a nullable Dart reference.
+/// Taking the address of a by-reference value is therefore an identity at the
+/// Dart boundary, while dereferencing needs the explicit non-null assertion.
+#[test]
+fn record_pointer_address_and_dereference_lower_to_nullable_dart_references() {
+    let source = lower_and_emit(
+        "lower-cpp-record-pointer-address-and-dereference",
+        r#"
+struct Node {
+    int value;
+};
+
+Node* expose_address(Node& node) {
+    return &node;
+}
+
+int read_node(Node* node) {
+    return (*node).value;
+}
+
+bool has_node(Node* node) {
+    return node;
+}
+
+bool has_no_node(Node* node) {
+    return !node;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("Node? expose_address(Node node)")
+            && source.contains("return node;")
+            && source.contains("return node!.value;")
+            && source.contains("return node != null;")
+            && source.contains("return !(node != null);"),
+        "known record pointers must use nullable Dart references, got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported unary operator kind"),
+        "address and dereference must not remain unary bailouts, got:\n{source}"
+    );
+}
+
+/// Dart's class inheritance preserves C++'s upcast from `Derived*` to
+/// `Base*`; both sides are nullable references after pointer lowering, so the
+/// implicit conversion must not turn into an opaque placeholder.
+#[test]
+fn nullable_record_upcasts_follow_dart_class_inheritance() {
+    let source = lower_and_emit(
+        "lower-cpp-nullable-record-upcast",
+        r#"
+struct Base {};
+struct Derived : Base {};
+
+Base* as_base(Derived* value) {
+    return value;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("class Derived extends Base")
+            && source.contains("Base? as_base(Derived? value)")
+            && source.contains("return value;")
+            && !source.contains("unsupported implicit conversion"),
+        "nullable upcasts must stay represented in Dart, got:\n{source}"
+    );
+}
+
+/// A user-defined C++ assignment operator may carry invariants beyond a
+/// field-for-field copy. Dart has no overloadable assignment, so preserve its
+/// body in a named instance method and route `destination = source` through
+/// that same method instead of discarding it as an opaque operator call.
+#[test]
+fn user_defined_assignment_operator_becomes_a_named_dart_method() {
+    let source = lower_and_emit(
+        "lower-cpp-user-defined-assignment-operator",
+        r#"
+struct Counter {
+    int value;
+
+    Counter& operator=(const Counter& other) {
+        value = other.value;
+        return *this;
+    }
+};
+
+void copy(Counter& destination, const Counter& source) {
+    destination = source;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("Counter assignFrom(Counter other)")
+            && source.contains("value = other.value;")
+            && source.contains("return this;")
+            && source.contains("destination.assignFrom(source);")
+            && !source.contains("unsupported operator method call: operator="),
+        "user-defined assignment must retain its method body, got:\n{source}"
+    );
+}
+
 /// C++ loop control maps directly to Dart. A range-for's collection traversal
 /// must remain typed while `continue` and `break` keep their control-flow
 /// meaning.
@@ -1056,6 +1601,66 @@ int first_nonzero(const std::vector<int>& values) {
             && source.contains("break;")
             && !source.contains("unsupported statement cursor kind 225"),
         "range-for control flow must lower without statement bailouts, got:\n{source}"
+    );
+}
+
+/// A do-while body runs once before its condition is checked; Dart has the
+/// identical construct, so it must not become a plain while-loop bailout.
+#[test]
+fn do_while_lowers_to_darts_equivalent_control_flow() {
+    let source = lower_and_emit(
+        "lower-cpp-do-while",
+        r#"
+int count_once(int limit) {
+    int value = 0;
+    do {
+        value++;
+    } while (value < limit);
+    return value;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("do {")
+            && source.contains("value++;")
+            && source.contains("} while (value < limit);")
+            && !source.contains("unsupported statement cursor kind 208"),
+        "do-while must retain its execution order, got:\n{source}"
+    );
+}
+
+/// A mutable C++ range binding aliases the collection element. Dart's foreach
+/// binding is a local value, so a list-backed lowering must write it back even
+/// when the body exits through continue or break.
+#[test]
+fn mutable_vector_range_for_writes_the_binding_back_on_control_flow_exit() {
+    let source = lower_and_emit(
+        "lower-cpp-mutable-range-for",
+        r#"
+#include <vector>
+
+void increment_all(std::vector<int>& values) {
+    for (int& value : values) {
+        ++value;
+        if (value == 2) {
+            continue;
+        }
+        if (value == 4) {
+            break;
+        }
+    }
+}
+"#,
+    );
+
+    assert!(
+        source.contains("try {")
+            && source.contains("finally {")
+            && source.contains("_syntaxBridgeIterable[_syntaxBridgeIndex] = value;")
+            && !source
+                .contains("mutable range-for reference needs a collection write-through adapter"),
+        "mutable vector range-for must write each changed binding back, got:\n{source}"
     );
 }
 
@@ -1093,6 +1698,87 @@ int count_to(int limit) {
     );
 }
 
+/// Logical-or and integer bitwise operators have direct Dart syntax and must
+/// not become opaque expression bailouts.
+#[test]
+fn logical_or_and_bitwise_compound_assignments_lower_to_dart_operators() {
+    let source = lower_and_emit(
+        "lower-cpp-logical-or-and-bitwise",
+        r#"
+#include <vector>
+
+bool either(bool left, bool right) {
+    return left || right;
+}
+
+int combine(int value, int mask) {
+    value |= mask;
+    value <<= 1;
+    return value;
+}
+
+void increment_first(std::vector<int>& values) {
+    values[0] += 1;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("return left || right;")
+            && source.contains("value = value | mask;")
+            && source.contains("value = value << 1;")
+            && source.contains("values[0] = values[0] + 1;"),
+        "logical-or and bitwise compound assignments must use Dart operators, got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported binary operator kind 21")
+            && !source.contains("unsupported compound assignment operator kind 32")
+            && !source.contains("unsupported compound assignment operator kind 28")
+            && !source
+                .contains("compound assignment target is not a simple local variable or a field"),
+        "direct Dart operators must not remain bailouts, got:\n{source}"
+    );
+}
+
+/// The C++ conditional operator has the same lazy branch semantics as Dart's
+/// ternary expression when all three expressions are already typed.
+#[test]
+fn a_conditional_operator_lowers_to_a_typed_dart_ternary() {
+    let source = lower_and_emit(
+        "lower-cpp-conditional-operator",
+        r#"
+int choose(bool condition, int yes, int no) {
+    return condition ? yes : no;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("return condition ? yes : no;")
+            && !source.contains("unsupported expression cursor kind 116"),
+        "the C++ conditional operator must become a Dart ternary, got:\n{source}"
+    );
+}
+
+/// C++ character literals have integer code-unit type. They must therefore
+/// lower to an integer expression, not a one-character Dart String.
+#[test]
+fn a_character_literal_lowers_to_its_integer_code_unit() {
+    let source = lower_and_emit(
+        "lower-cpp-character-literal",
+        r#"
+int letter_a() {
+    return 'A';
+}
+"#,
+    );
+
+    assert!(
+        source.contains("return 65;") && !source.contains("unsupported expression cursor kind 110"),
+        "a character literal must lower to its code unit, got:\n{source}"
+    );
+}
+
 /// Core string and vector methods have direct, typed Dart counterparts. String
 /// search is deliberately byte-based, matching C++ `basic_string` positions
 /// instead of Dart's UTF-16 code-unit offsets.
@@ -1114,6 +1800,7 @@ int find_byte(const std::string& text) {
 
 void append(std::vector<int>& values, int value) {
     values.push_back(value);
+    values.clear();
 }
 
 int read(const std::vector<int>& values) {
@@ -1126,6 +1813,7 @@ int read(const std::vector<int>& values) {
         source.contains("return text.isEmpty;")
             && source.contains("return utf8.encode(text).indexOf(utf8.encode('x'));")
             && source.contains("values.add(value);")
+            && source.contains("values.clear();")
             && source.contains("return values[0];"),
         "common stdlib methods must use typed Dart adapters, got:\n{source}"
     );
@@ -1133,8 +1821,48 @@ int read(const std::vector<int>& values) {
         !source.contains("unsupported std::basic_string::empty call")
             && !source.contains("unsupported std::basic_string::find call")
             && !source.contains("unsupported std::vector::push_back call")
+            && !source.contains("unsupported std::vector::clear call")
             && !source.contains("unsupported std::vector::at call"),
         "the mapped stdlib methods must not remain bailouts, got:\n{source}"
+    );
+}
+
+/// String indexing and c_str are byte-oriented C++ APIs. The former must use
+/// UTF-8 bytes rather than Dart UTF-16 code units; the latter can stay a Dart
+/// String only in the already-string-typed return boundary.
+#[test]
+fn string_byte_index_and_c_str_lower_without_stdlib_bailouts() {
+    let source = lower_and_emit(
+        "lower-cpp-string-byte-operations",
+        r#"
+#include <string>
+
+int first_byte(const std::string& text) {
+    return text[0];
+}
+
+int byte_at(const std::string& text) {
+    return text.at(1);
+}
+
+const char* text_pointer(const std::string& text) {
+    return text.c_str();
+}
+"#,
+    );
+
+    assert!(
+        source.contains("return utf8.encode(text)[0];")
+            && source.contains("return utf8.encode(text)[1];")
+            && source.contains("String? text_pointer(String text)")
+            && source.contains("return text;"),
+        "string byte operations must use typed Dart bridges, got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported std::basic_string::operator[] call")
+            && !source.contains("unsupported std::basic_string::at call")
+            && !source.contains("unsupported std::basic_string::c_str call"),
+        "the supported string byte operations must not remain bailouts, got:\n{source}"
     );
 }
 
@@ -1157,6 +1885,70 @@ void append_marker(std::string& text) {
         source.contains("text = text + '!';")
             && !source.contains("unsupported std::basic_string::operator+= call"),
         "std::string operator+= must become a typed Dart reassignment, got:\n{source}"
+    );
+}
+
+/// Mutating basic_string calls have to become a reassignment because Dart
+/// String is immutable. clear and one-argument append have that exact value
+/// semantics without needing a byte-buffer bridge.
+#[test]
+fn std_string_mutating_calls_lower_to_typed_reassignments() {
+    let source = lower_and_emit(
+        "lower-cpp-std-string-mutating-calls",
+        r#"
+#include <string>
+
+void reset_and_append(std::string& text) {
+    text.clear();
+    text.append("ok");
+}
+"#,
+    );
+
+    assert!(
+        source.contains("text = '';") && source.contains("text = text + 'ok';"),
+        "mutating string calls must become String reassignments, got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported std::basic_string::clear call")
+            && !source.contains("unsupported std::basic_string::append call"),
+        "supported mutating string calls must not remain bailouts, got:\n{source}"
+    );
+}
+
+/// compare and substr have direct, typed Dart String counterparts. The C++
+/// length overload of substr is translated to an exclusive Dart end index.
+#[test]
+fn std_string_compare_and_substr_lower_to_dart_string_operations() {
+    let source = lower_and_emit(
+        "lower-cpp-std-string-compare-substr",
+        r#"
+#include <string>
+
+int compare_text(const std::string& left, const std::string& right) {
+    return left.compare(right);
+}
+
+std::string tail(const std::string& text) {
+    return text.substr(2);
+}
+
+std::string middle(const std::string& text) {
+    return text.substr(2, 3);
+}
+"#,
+    );
+
+    assert!(
+        source.contains("return left.compareTo(right);")
+            && source.contains("return text.substring(2);")
+            && source.contains("return text.substring(2, 2 + 3);"),
+        "compare and substr must use typed Dart String operations, got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported std::basic_string::compare call")
+            && !source.contains("unsupported std::basic_string::substr call"),
+        "supported String operations must not remain bailouts, got:\n{source}"
     );
 }
 
@@ -1442,9 +2234,8 @@ public:
 /// `operator++` has no Dart equivalent at all (Dart never lets a type
 /// customize `++`/`--`). Emitting it under its literal C++ name is invalid
 /// Dart syntax the same way `operator()` was — the fix bridges it to a
-/// synthesized, always-valid method name and bails the body out loudly
-/// (`// TODO(syntax-bridge)` + `throw UnimplementedError`, "silêncio é
-/// proibido") instead of pretending the translation succeeded.
+/// synthesized, always-valid method name while preserving its ordinary
+/// method body.
 #[test]
 fn an_operator_with_no_dart_equivalent_bridges_to_a_named_method_instead_of_breaking_syntax() {
     let source = lower_and_emit(
@@ -1469,18 +2260,16 @@ public:
         "expected a synthesized, always-valid bridge name, got:\n{source}"
     );
     assert!(
-        source.contains("TODO(syntax-bridge)") && source.contains("UnimplementedError"),
-        "the body must bail out loudly instead of silently dropping the semantics, got:\n{source}"
+        source.contains("valor = valor + 1;")
+            && !source.contains("TODO(syntax-bridge)")
+            && !source.contains("UnimplementedError"),
+        "the named bridge must preserve the operator body, got:\n{source}"
     );
 }
 
-/// A *free* operator overload with no Dart equivalent (`operator<<`, C++'s
-/// idiomatic stream-insertion overload) reaches the same call-lowering path
-/// as `std::string`'s `operator+`/`operator==` (E13) but isn't one of the
-/// ones that path recognizes — before this fix, the fallback built an
-/// ordinary `Expr::Call` naming the callee `operator<<`, and `emit::dart`
-/// printed it verbatim: `operator<<(a, 2)`, a bare invalid Dart identifier
-/// used as a call target.
+/// Dart has no free-standing operators. A free C++ `operator<<` therefore
+/// becomes a consistently named helper both at its declaration and call
+/// sites, retaining its ordinary function body instead of becoming opaque.
 #[test]
 fn a_free_operator_overload_with_no_dart_equivalent_becomes_unsupported_instead_of_an_invalid_call()
 {
@@ -1506,6 +2295,12 @@ Foo usa(Foo a) {
     assert!(
         !source.contains("operator<<("),
         "the raw C++ operator spelling must never be printed as a call target, got:\n{source}"
+    );
+    assert!(
+        source.contains("Foo streamInsert(Foo a, int deslocamento)")
+            && source.contains("return streamInsert(a, 2);")
+            && !source.contains("unsupported free operator overload: operator<<"),
+        "a free operator must use its named Dart bridge at declaration and call sites, got:\n{source}"
     );
 }
 

@@ -998,6 +998,12 @@ impl IrRefVisitor<'_> {
                 self.visit_expr(condition);
                 self.visit_stmts(body);
             }
+            ir::Stmt::DoWhile {
+                body, condition, ..
+            } => {
+                self.visit_stmts(body);
+                self.visit_expr(condition);
+            }
             ir::Stmt::For {
                 init,
                 condition,
@@ -1059,6 +1065,7 @@ impl IrRefVisitor<'_> {
             ir::Expr::IntLiteral { .. }
             | ir::Expr::DoubleLiteral { .. }
             | ir::Expr::BoolLiteral { .. }
+            | ir::Expr::NullLiteral { .. }
             | ir::Expr::StringLiteral { .. }
             | ir::Expr::Unsupported { .. } => {}
             ir::Expr::UnsupportedTyped { ty, .. } => self.visit_type(ty),
@@ -1069,6 +1076,18 @@ impl IrRefVisitor<'_> {
                 self.visit_type(ty);
                 self.visit_expr(lhs);
                 self.visit_expr(rhs);
+            }
+            ir::Expr::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+                ty,
+                ..
+            } => {
+                self.visit_type(ty);
+                self.visit_expr(condition);
+                self.visit_expr(then_expr);
+                self.visit_expr(else_expr);
             }
             ir::Expr::Unary { operand, ty, .. } | ir::Expr::Convert { operand, ty, .. } => {
                 self.visit_type(ty);
@@ -1118,10 +1137,29 @@ impl IrRefVisitor<'_> {
                 self.visit_expr(target);
                 self.visit_expr(index);
             }
+            ir::Expr::MapIndexOrInsert {
+                target,
+                index,
+                default_value,
+                ty,
+                ..
+            } => {
+                self.visit_type(ty);
+                self.visit_expr(target);
+                self.visit_expr(index);
+                self.visit_expr(default_value);
+            }
             ir::Expr::StringByteLength { target, .. } => self.visit_expr(target),
             ir::Expr::StringByteIndexOf { target, needle, .. } => {
                 self.visit_expr(target);
                 self.visit_expr(needle);
+            }
+            ir::Expr::StringByteAt {
+                target, index, ty, ..
+            } => {
+                self.visit_type(ty);
+                self.visit_expr(target);
+                self.visit_expr(index);
             }
             ir::Expr::Tuple { values, .. } => {
                 for value in values {
@@ -1344,6 +1382,9 @@ fn stmt_references_name(stmt: &ir::Stmt, name: &str) -> bool {
         ir::Stmt::While {
             condition, body, ..
         } => expr_references_name(condition, name) || stmts_reference_name(body, name),
+        ir::Stmt::DoWhile {
+            body, condition, ..
+        } => stmts_reference_name(body, name) || expr_references_name(condition, name),
         ir::Stmt::For {
             init,
             condition,
@@ -1394,12 +1435,23 @@ fn expr_references_name(expr: &ir::Expr, name: &str) -> bool {
         ir::Expr::IntLiteral { .. }
         | ir::Expr::DoubleLiteral { .. }
         | ir::Expr::BoolLiteral { .. }
+        | ir::Expr::NullLiteral { .. }
         | ir::Expr::StringLiteral { .. }
         | ir::Expr::This { .. }
         | ir::Expr::Unsupported { .. }
         | ir::Expr::UnsupportedTyped { .. } => false,
         ir::Expr::Binary { lhs, rhs, .. } => {
             expr_references_name(lhs, name) || expr_references_name(rhs, name)
+        }
+        ir::Expr::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            expr_references_name(condition, name)
+                || expr_references_name(then_expr, name)
+                || expr_references_name(else_expr, name)
         }
         ir::Expr::Unary { operand, .. } | ir::Expr::Convert { operand, .. } => {
             expr_references_name(operand, name)
@@ -1416,6 +1468,9 @@ fn expr_references_name(expr: &ir::Expr, name: &str) -> bool {
         ir::Expr::StringByteIndexOf { target, needle, .. } => {
             expr_references_name(target, name) || expr_references_name(needle, name)
         }
+        ir::Expr::StringByteAt { target, index, .. } => {
+            expr_references_name(target, name) || expr_references_name(index, name)
+        }
         ir::Expr::RecordConstruct { fields, .. } => fields
             .iter()
             .any(|(_name, value)| expr_references_name(value, name)),
@@ -1424,6 +1479,16 @@ fn expr_references_name(expr: &ir::Expr, name: &str) -> bool {
         }
         ir::Expr::Index { target, index, .. } => {
             expr_references_name(target, name) || expr_references_name(index, name)
+        }
+        ir::Expr::MapIndexOrInsert {
+            target,
+            index,
+            default_value,
+            ..
+        } => {
+            expr_references_name(target, name)
+                || expr_references_name(index, name)
+                || expr_references_name(default_value, name)
         }
         ir::Expr::Tuple { values, .. } => {
             values.iter().any(|value| expr_references_name(value, name))
@@ -1473,6 +1538,12 @@ fn replace_this_with_ref_in_stmt(stmt: &mut ir::Stmt, var_name: &str) {
         } => {
             replace_this_with_ref_in_expr(condition, var_name);
             replace_this_with_ref_in_stmts(body, var_name);
+        }
+        ir::Stmt::DoWhile {
+            body, condition, ..
+        } => {
+            replace_this_with_ref_in_stmts(body, var_name);
+            replace_this_with_ref_in_expr(condition, var_name);
         }
         ir::Stmt::For {
             init,
@@ -1537,6 +1608,7 @@ fn replace_this_with_ref_in_expr(expr: &mut ir::Expr, var_name: &str) {
         ir::Expr::IntLiteral { .. }
         | ir::Expr::DoubleLiteral { .. }
         | ir::Expr::BoolLiteral { .. }
+        | ir::Expr::NullLiteral { .. }
         | ir::Expr::StringLiteral { .. }
         | ir::Expr::Ref { .. }
         | ir::Expr::Unsupported { .. }
@@ -1544,6 +1616,16 @@ fn replace_this_with_ref_in_expr(expr: &mut ir::Expr, var_name: &str) {
         ir::Expr::Binary { lhs, rhs, .. } => {
             replace_this_with_ref_in_expr(lhs, var_name);
             replace_this_with_ref_in_expr(rhs, var_name);
+        }
+        ir::Expr::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            replace_this_with_ref_in_expr(condition, var_name);
+            replace_this_with_ref_in_expr(then_expr, var_name);
+            replace_this_with_ref_in_expr(else_expr, var_name);
         }
         ir::Expr::Unary { operand, .. } | ir::Expr::Convert { operand, .. } => {
             replace_this_with_ref_in_expr(operand, var_name);
@@ -1563,6 +1645,10 @@ fn replace_this_with_ref_in_expr(expr: &mut ir::Expr, var_name: &str) {
             replace_this_with_ref_in_expr(target, var_name);
             replace_this_with_ref_in_expr(needle, var_name);
         }
+        ir::Expr::StringByteAt { target, index, .. } => {
+            replace_this_with_ref_in_expr(target, var_name);
+            replace_this_with_ref_in_expr(index, var_name);
+        }
         ir::Expr::RecordConstruct { fields, .. } => {
             for (_name, value) in fields {
                 replace_this_with_ref_in_expr(value, var_name);
@@ -1576,6 +1662,16 @@ fn replace_this_with_ref_in_expr(expr: &mut ir::Expr, var_name: &str) {
         ir::Expr::Index { target, index, .. } => {
             replace_this_with_ref_in_expr(target, var_name);
             replace_this_with_ref_in_expr(index, var_name);
+        }
+        ir::Expr::MapIndexOrInsert {
+            target,
+            index,
+            default_value,
+            ..
+        } => {
+            replace_this_with_ref_in_expr(target, var_name);
+            replace_this_with_ref_in_expr(index, var_name);
+            replace_this_with_ref_in_expr(default_value, var_name);
         }
         ir::Expr::Tuple { values, .. } => {
             for value in values {
@@ -1644,6 +1740,12 @@ fn rename_calls_in_stmt(stmt: &mut ir::Stmt, renames: &HashMap<String, String>) 
             rename_calls_in_expr(condition, renames);
             rename_calls_in_stmts(body, renames);
         }
+        ir::Stmt::DoWhile {
+            body, condition, ..
+        } => {
+            rename_calls_in_stmts(body, renames);
+            rename_calls_in_expr(condition, renames);
+        }
         ir::Stmt::For {
             init,
             condition,
@@ -1700,6 +1802,7 @@ fn rename_calls_in_expr(expr: &mut ir::Expr, renames: &HashMap<String, String>) 
         ir::Expr::IntLiteral { .. }
         | ir::Expr::DoubleLiteral { .. }
         | ir::Expr::BoolLiteral { .. }
+        | ir::Expr::NullLiteral { .. }
         | ir::Expr::StringLiteral { .. }
         | ir::Expr::Ref { .. }
         | ir::Expr::This { .. }
@@ -1708,6 +1811,16 @@ fn rename_calls_in_expr(expr: &mut ir::Expr, renames: &HashMap<String, String>) 
         ir::Expr::Binary { lhs, rhs, .. } => {
             rename_calls_in_expr(lhs, renames);
             rename_calls_in_expr(rhs, renames);
+        }
+        ir::Expr::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            rename_calls_in_expr(condition, renames);
+            rename_calls_in_expr(then_expr, renames);
+            rename_calls_in_expr(else_expr, renames);
         }
         ir::Expr::Unary { operand, .. } | ir::Expr::Convert { operand, .. } => {
             rename_calls_in_expr(operand, renames);
@@ -1736,6 +1849,10 @@ fn rename_calls_in_expr(expr: &mut ir::Expr, renames: &HashMap<String, String>) 
             rename_calls_in_expr(target, renames);
             rename_calls_in_expr(needle, renames);
         }
+        ir::Expr::StringByteAt { target, index, .. } => {
+            rename_calls_in_expr(target, renames);
+            rename_calls_in_expr(index, renames);
+        }
         ir::Expr::RecordConstruct { fields, .. } => {
             for (_name, value) in fields {
                 rename_calls_in_expr(value, renames);
@@ -1749,6 +1866,16 @@ fn rename_calls_in_expr(expr: &mut ir::Expr, renames: &HashMap<String, String>) 
         ir::Expr::Index { target, index, .. } => {
             rename_calls_in_expr(target, renames);
             rename_calls_in_expr(index, renames);
+        }
+        ir::Expr::MapIndexOrInsert {
+            target,
+            index,
+            default_value,
+            ..
+        } => {
+            rename_calls_in_expr(target, renames);
+            rename_calls_in_expr(index, renames);
+            rename_calls_in_expr(default_value, renames);
         }
         ir::Expr::Tuple { values, .. } => {
             for value in values {

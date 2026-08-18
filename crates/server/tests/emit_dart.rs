@@ -289,6 +289,44 @@ fn an_unsupported_message_escapes_dollar_signs_so_dart_never_interpolates_it() {
     );
 }
 
+/// C++ string literals may contain a physical newline through an escaped
+/// source sequence. Dart single-quoted literals cannot: writing it literally
+/// leaves the generated package unparsable. Keep every control character in
+/// its escaped Dart spelling instead.
+#[test]
+fn a_string_literal_escapes_control_characters_so_the_dart_file_stays_parseable() {
+    let function = Function {
+        name: "mensagem".to_owned(),
+        usr: "c:@F@mensagem#".to_owned(),
+        params: vec![],
+        return_type: Type::Str,
+        body: vec![Stmt::Return {
+            value: Some(Expr::StringLiteral {
+                value: "primeira\nsegunda\r\tterceira".to_owned(),
+                origin: origin(5),
+            }),
+            origin: origin(5),
+        }],
+        origin: origin(4),
+    };
+    let module = Module {
+        records: Vec::new(),
+        functions: vec![function],
+        enums: Vec::new(),
+    };
+
+    let source = &emit_module(&module)["lib/aritmetica.dart"];
+
+    assert!(
+        source.contains("return 'primeira\\nsegunda\\r\\tterceira';"),
+        "control characters must be escaped in a Dart literal, got:\n{source}"
+    );
+    assert!(
+        !source.contains("primeira\nsegunda"),
+        "a physical newline must never occur inside the Dart literal, got:\n{source}"
+    );
+}
+
 /// A bailout expression still always throws at runtime, but it must not emit
 /// `dynamic`. Real generated code can keep traversing the syntactic expression
 /// around that bailout (`unsupported().x` or `unsupported().method()`), so the

@@ -160,6 +160,12 @@ pub enum BinaryOp {
     Eq,
     Ne,
     And,
+    Or,
+    ShiftLeft,
+    ShiftRight,
+    BitAnd,
+    BitXor,
+    BitOr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,6 +201,9 @@ pub enum Expr {
         value: bool,
         origin: Origin,
     },
+    NullLiteral {
+        origin: Origin,
+    },
     /// A `std::string`-typed literal (`"Ola, "` — a C `const char*`/array in
     /// the raw C++ type, but always used as a `std::string` operand in every
     /// exemplo that reaches this node, so it's normalized to `Type::Str` at
@@ -212,6 +221,13 @@ pub enum Expr {
         op: BinaryOp,
         lhs: Box<Expr>,
         rhs: Box<Expr>,
+        ty: Type,
+        origin: Origin,
+    },
+    Conditional {
+        condition: Box<Expr>,
+        then_expr: Box<Expr>,
+        else_expr: Box<Expr>,
         ty: Type,
         origin: Origin,
     },
@@ -307,6 +323,16 @@ pub enum Expr {
         ty: Type,
         origin: Origin,
     },
+    /// A non-const C++ map subscript. Reading it inserts a typed default
+    /// value on miss; writing it is an ordinary map assignment. The emitter
+    /// needs this distinct from Index so neither behavior is silently lost.
+    MapIndexOrInsert {
+        target: Box<Expr>,
+        index: Box<Expr>,
+        default_value: Box<Expr>,
+        ty: Type,
+        origin: Origin,
+    },
     /// `std::string::size()`/`length()` — E05's armadilha
     /// (`examples/E05-biblioteca-padrao/NOTES.md`): C++ counts UTF-8
     /// *bytes*, Dart's `String.length` counts UTF-16 *code units*, and the
@@ -325,6 +351,12 @@ pub enum Expr {
     StringByteIndexOf {
         target: Box<Expr>,
         needle: Box<Expr>,
+        origin: Origin,
+    },
+    StringByteAt {
+        target: Box<Expr>,
+        index: Box<Expr>,
+        ty: Type,
         origin: Origin,
     },
     /// `(a, b)` — a Dart record value. Only ever synthesized by
@@ -356,9 +388,11 @@ impl Expr {
             Self::IntLiteral { origin, .. }
             | Self::DoubleLiteral { origin, .. }
             | Self::BoolLiteral { origin, .. }
+            | Self::NullLiteral { origin }
             | Self::StringLiteral { origin, .. }
             | Self::Ref { origin, .. }
             | Self::Binary { origin, .. }
+            | Self::Conditional { origin, .. }
             | Self::Unary { origin, .. }
             | Self::Convert { origin, .. }
             | Self::Call { origin, .. }
@@ -367,8 +401,10 @@ impl Expr {
             | Self::ConstructorCall { origin, .. }
             | Self::This { origin, .. }
             | Self::Index { origin, .. }
+            | Self::MapIndexOrInsert { origin, .. }
             | Self::StringByteLength { origin, .. }
             | Self::StringByteIndexOf { origin, .. }
+            | Self::StringByteAt { origin, .. }
             | Self::Tuple { origin, .. }
             | Self::Unsupported { origin, .. }
             | Self::UnsupportedTyped { origin, .. } => origin,
@@ -427,6 +463,14 @@ pub enum Stmt {
         body: Vec<Stmt>,
         origin: Origin,
     },
+    /// `do { body } while (condition);` — unlike a `While`, its body runs at
+    /// least once. Dart has the same control-flow construct, so keeping it
+    /// explicit avoids a lossy desugaring.
+    DoWhile {
+        body: Vec<Stmt>,
+        condition: Expr,
+        origin: Origin,
+    },
     For {
         init: Option<Box<Stmt>>,
         condition: Option<Expr>,
@@ -441,6 +485,7 @@ pub enum Stmt {
         name: String,
         ty: Type,
         is_final: bool,
+        write_back: bool,
         iterable: Expr,
         body: Vec<Stmt>,
         origin: Origin,
@@ -515,6 +560,7 @@ impl Stmt {
             | Self::ExprAssign { origin, .. }
             | Self::If { origin, .. }
             | Self::While { origin, .. }
+            | Self::DoWhile { origin, .. }
             | Self::For { origin, .. }
             | Self::ForEach { origin, .. }
             | Self::Break { origin }
