@@ -570,6 +570,10 @@ fn collect_expression_bailouts(expression: &Expr, inventory: &mut BailoutInvento
             collect_expression_bailouts(index, inventory);
         }
         Expr::StringByteLength { target, .. } => collect_expression_bailouts(target, inventory),
+        Expr::StringByteIndexOf { target, needle, .. } => {
+            collect_expression_bailouts(target, inventory);
+            collect_expression_bailouts(needle, inventory);
+        }
         Expr::Tuple { values, .. } => {
             for value in values {
                 collect_expression_bailouts(value, inventory);
@@ -614,6 +618,10 @@ fn collect_statement_bailouts(statements: &[Stmt], inventory: &mut BailoutInvent
                 collect_expression_bailouts(target, inventory);
                 collect_expression_bailouts(value, inventory);
             }
+            Stmt::ExprAssign { target, value, .. } => {
+                collect_expression_bailouts(target, inventory);
+                collect_expression_bailouts(value, inventory);
+            }
             Stmt::If {
                 condition,
                 then_branch,
@@ -648,6 +656,14 @@ fn collect_statement_bailouts(statements: &[Stmt], inventory: &mut BailoutInvent
                 }
                 collect_statement_bailouts(body, inventory);
             }
+            Stmt::ForEach {
+                ty, iterable, body, ..
+            } => {
+                collect_type_bailouts(ty, inventory);
+                collect_expression_bailouts(iterable, inventory);
+                collect_statement_bailouts(body, inventory);
+            }
+            Stmt::Break { .. } | Stmt::Continue { .. } => {}
             Stmt::TryCatch {
                 try_body,
                 catch_type,

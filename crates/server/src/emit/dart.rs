@@ -382,7 +382,8 @@ fn emit_file(
     mock: &MockContext<'_>,
 ) -> String {
     let mut used_expr_helper = false;
-    // Set by `Expr::StringByteLength` (E05's UTF-8-byte-length bridge for
+    // Set by the UTF-8 string bridge expressions (`StringByteLength` and
+    // `StringByteIndexOf`), which need
     // `std::string::size()` — see that variant's doc comment): needs
     // `dart:convert`'s `utf8`, which nothing else in this emitter uses, so
     // the import is added only when a file actually needs it, the same
@@ -587,6 +588,10 @@ fn collect_referenced_usrs_in_stmt<'a>(stmt: &'a Stmt, out: &mut HashSet<&'a str
             collect_referenced_usrs_in_expr(target, out);
             collect_referenced_usrs_in_expr(value, out);
         }
+        Stmt::ExprAssign { target, value, .. } => {
+            collect_referenced_usrs_in_expr(target, out);
+            collect_referenced_usrs_in_expr(value, out);
+        }
         Stmt::If {
             condition,
             then_branch,
@@ -621,6 +626,14 @@ fn collect_referenced_usrs_in_stmt<'a>(stmt: &'a Stmt, out: &mut HashSet<&'a str
             }
             collect_referenced_usrs_in_stmts(body, out);
         }
+        Stmt::ForEach {
+            ty, iterable, body, ..
+        } => {
+            collect_referenced_usrs_in_type(ty, out);
+            collect_referenced_usrs_in_expr(iterable, out);
+            collect_referenced_usrs_in_stmts(body, out);
+        }
+        Stmt::Break { .. } | Stmt::Continue { .. } => {}
         Stmt::ExprStmt { expr, .. } => collect_referenced_usrs_in_expr(expr, out),
         Stmt::Throw { value, .. } => collect_referenced_usrs_in_expr(value, out),
         Stmt::TryCatch {
@@ -711,6 +724,10 @@ fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str
             collect_referenced_usrs_in_expr(index, out);
         }
         Expr::StringByteLength { target, .. } => collect_referenced_usrs_in_expr(target, out),
+        Expr::StringByteIndexOf { target, needle, .. } => {
+            collect_referenced_usrs_in_expr(target, out);
+            collect_referenced_usrs_in_expr(needle, out);
+        }
         Expr::Tuple { values, .. } => {
             for value in values {
                 collect_referenced_usrs_in_expr(value, out);
@@ -1691,6 +1708,9 @@ fn stmt_unsupported_type_spelling(stmt: &Stmt) -> Option<&str> {
         Stmt::FieldAssign { target, value, .. } => {
             expr_unsupported_type_spelling(target).or_else(|| expr_unsupported_type_spelling(value))
         }
+        Stmt::ExprAssign { target, value, .. } => {
+            expr_unsupported_type_spelling(target).or_else(|| expr_unsupported_type_spelling(value))
+        }
         Stmt::If {
             condition,
             then_branch,
@@ -1719,6 +1739,11 @@ fn stmt_unsupported_type_spelling(stmt: &Stmt) -> Option<&str> {
                     .and_then(stmt_unsupported_type_spelling)
             })
             .or_else(|| first_unsupported_type_in_list(body)),
+        Stmt::ForEach {
+            ty, iterable, body, ..
+        } => unsupported_spelling(ty)
+            .or_else(|| expr_unsupported_type_spelling(iterable))
+            .or_else(|| first_unsupported_type_in_list(body)),
         Stmt::ExprStmt { expr, .. } => expr_unsupported_type_spelling(expr),
         Stmt::Throw { value, .. } => expr_unsupported_type_spelling(value),
         Stmt::TryCatch {
@@ -1739,6 +1764,7 @@ fn stmt_unsupported_type_spelling(stmt: &Stmt) -> Option<&str> {
             .iter()
             .find_map(expr_unsupported_type_spelling)
             .or_else(|| expr_unsupported_type_spelling(value)),
+        Stmt::Break { .. } | Stmt::Continue { .. } => None,
         Stmt::Unsupported { .. } => None,
     }
 }
@@ -1784,6 +1810,8 @@ fn expr_unsupported_type_spelling(expr: &Expr) -> Option<&str> {
             .or_else(|| expr_unsupported_type_spelling(target))
             .or_else(|| expr_unsupported_type_spelling(index)),
         Expr::StringByteLength { target, .. } => expr_unsupported_type_spelling(target),
+        Expr::StringByteIndexOf { target, needle, .. } => expr_unsupported_type_spelling(target)
+            .or_else(|| expr_unsupported_type_spelling(needle)),
         Expr::Tuple { values, .. } => values.iter().find_map(expr_unsupported_type_spelling),
     }
 }
@@ -1819,6 +1847,7 @@ fn first_unsupported_in_stmt(stmt: &Stmt) -> Option<&Stmt> {
             .and_then(first_unsupported_in_stmt)
             .or_else(|| increment.as_deref().and_then(first_unsupported_in_stmt))
             .or_else(|| first_unsupported_in_list(body)),
+        Stmt::ForEach { body, .. } => first_unsupported_in_list(body),
         Stmt::TryCatch {
             try_body,
             catch_body,
@@ -1835,8 +1864,11 @@ fn first_unsupported_in_stmt(stmt: &Stmt) -> Option<&Stmt> {
         | Stmt::VarDecl { .. }
         | Stmt::Assign { .. }
         | Stmt::FieldAssign { .. }
+        | Stmt::ExprAssign { .. }
         | Stmt::ExprStmt { .. }
         | Stmt::TupleAssign { .. }
+        | Stmt::Break { .. }
+        | Stmt::Continue { .. }
         | Stmt::Throw { .. } => None,
     }
 }
@@ -1945,6 +1977,11 @@ fn emit_stmt(
                 emit_expr(value, used_expr_helper, used_utf8_encode)
             ),
         },
+        Stmt::ExprAssign { target, value, .. } => format!(
+            "{pad}{} = {};\n",
+            emit_expr(target, used_expr_helper, used_utf8_encode),
+            emit_expr(value, used_expr_helper, used_utf8_encode)
+        ),
         Stmt::If {
             condition,
             then_branch,
@@ -1977,6 +2014,31 @@ fn emit_stmt(
                 }
                 source.push_str(&format!("{pad}}}\n"));
             }
+            source
+        }
+        Stmt::ForEach {
+            name,
+            ty,
+            is_final,
+            iterable,
+            body,
+            ..
+        } => {
+            let binding = if *is_final { "final " } else { "" };
+            let mut source = format!(
+                "{pad}for ({binding}{} {name} in {}) {{\n",
+                emit_type(ty),
+                emit_expr(iterable, used_expr_helper, used_utf8_encode)
+            );
+            for inner in body {
+                source.push_str(&emit_stmt(
+                    inner,
+                    depth + 1,
+                    used_expr_helper,
+                    used_utf8_encode,
+                ));
+            }
+            source.push_str(&format!("{pad}}}\n"));
             source
         }
         Stmt::While {
@@ -2029,6 +2091,8 @@ fn emit_stmt(
             source.push_str(&format!("{pad}}}\n"));
             source
         }
+        Stmt::Break { .. } => format!("{pad}break;\n"),
+        Stmt::Continue { .. } => format!("{pad}continue;\n"),
         Stmt::ExprStmt { expr, .. } => format!(
             "{pad}{};\n",
             emit_expr(expr, used_expr_helper, used_utf8_encode)
@@ -2157,7 +2221,7 @@ fn emit_stmt(
 
 /// A `for`-clause slot (init/increment) wants inline text with no trailing
 /// `;`/newline of its own — `emit_stmt`'s shape doesn't fit. Only
-/// `VarDecl`/`Assign`/`ExprStmt` are real for-clause shapes from a C++
+/// `VarDecl`/`Assign`/`ExprAssign`/`ExprStmt` are real for-clause shapes from a C++
 /// `ForStmt`; anything else falls back to the same `Never`-returning helper
 /// `Expr::Unsupported` uses, kept syntactically valid rather than emitting
 /// non-expression text into an expression slot.
@@ -2189,6 +2253,11 @@ fn emit_for_clause(
                 emit_expr(value, used_expr_helper, used_utf8_encode)
             )
         }
+        Stmt::ExprAssign { target, value, .. } => format!(
+            "{} = {}",
+            emit_expr(target, used_expr_helper, used_utf8_encode),
+            emit_expr(value, used_expr_helper, used_utf8_encode)
+        ),
         Stmt::ExprStmt { expr, .. } => emit_expr(expr, used_expr_helper, used_utf8_encode),
         other => {
             *used_expr_helper = true;
@@ -2228,6 +2297,7 @@ fn expr_ty(expr: &Expr) -> Option<&Type> {
         | Expr::RecordConstruct { .. }
         | Expr::ConstructorCall { .. }
         | Expr::StringByteLength { .. }
+        | Expr::StringByteIndexOf { .. }
         | Expr::Tuple { .. }
         | Expr::Unsupported { .. } => None,
         Expr::UnsupportedTyped { ty, .. } => Some(ty),
@@ -2299,6 +2369,9 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
         Expr::Unary { op, operand, .. } => {
             let op_text = emit_unary_op(*op);
             let operand_text = emit_expr(operand, used_expr_helper, used_utf8_encode);
+            if matches!(op, UnaryOp::PostIncrement | UnaryOp::PostDecrement) {
+                return format!("{operand_text}{op_text}");
+            }
             // A nested unary minus (Verovio's `-VRV_UNSET`, a macro expanding
             // to `(-2147483647)`) would otherwise print as `--2147483647` —
             // two adjacent `-` characters with nothing between them merge
@@ -2404,6 +2477,14 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
                 emit_expr(target, used_expr_helper, used_utf8_encode)
             )
         }
+        Expr::StringByteIndexOf { target, needle, .. } => {
+            *used_utf8_encode = true;
+            format!(
+                "utf8.encode({}).indexOf(utf8.encode({}))",
+                emit_expr(target, used_expr_helper, used_utf8_encode),
+                emit_expr(needle, used_expr_helper, used_utf8_encode)
+            )
+        }
         // A single-element Dart record needs a trailing comma
         // (`(a,)`) — see `emit_type`'s own `Type::Tuple` arm.
         Expr::Tuple { values, .. } if values.len() == 1 => {
@@ -2470,6 +2551,8 @@ fn emit_unary_op(op: UnaryOp) -> &'static str {
     match op {
         UnaryOp::Neg => "-",
         UnaryOp::Not => "!",
+        UnaryOp::PreIncrement | UnaryOp::PostIncrement => "++",
+        UnaryOp::PreDecrement | UnaryOp::PostDecrement => "--",
     }
 }
 

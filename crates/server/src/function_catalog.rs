@@ -978,6 +978,10 @@ impl IrRefVisitor<'_> {
                 self.visit_expr(target);
                 self.visit_expr(value);
             }
+            ir::Stmt::ExprAssign { target, value, .. } => {
+                self.visit_expr(target);
+                self.visit_expr(value);
+            }
             ir::Stmt::If {
                 condition,
                 then_branch,
@@ -1012,6 +1016,14 @@ impl IrRefVisitor<'_> {
                 }
                 self.visit_stmts(body);
             }
+            ir::Stmt::ForEach {
+                ty, iterable, body, ..
+            } => {
+                self.visit_type(ty);
+                self.visit_expr(iterable);
+                self.visit_stmts(body);
+            }
+            ir::Stmt::Break { .. } | ir::Stmt::Continue { .. } => {}
             ir::Stmt::ExprStmt { expr, .. } => self.visit_expr(expr),
             ir::Stmt::Throw { value, .. } => self.visit_expr(value),
             ir::Stmt::TryCatch {
@@ -1107,6 +1119,10 @@ impl IrRefVisitor<'_> {
                 self.visit_expr(index);
             }
             ir::Expr::StringByteLength { target, .. } => self.visit_expr(target),
+            ir::Expr::StringByteIndexOf { target, needle, .. } => {
+                self.visit_expr(target);
+                self.visit_expr(needle);
+            }
             ir::Expr::Tuple { values, .. } => {
                 for value in values {
                     self.visit_expr(value);
@@ -1312,6 +1328,9 @@ fn stmt_references_name(stmt: &ir::Stmt, name: &str) -> bool {
         ir::Stmt::FieldAssign { target, value, .. } => {
             expr_references_name(target, name) || expr_references_name(value, name)
         }
+        ir::Stmt::ExprAssign { target, value, .. } => {
+            expr_references_name(target, name) || expr_references_name(value, name)
+        }
         ir::Stmt::If {
             condition,
             then_branch,
@@ -1342,6 +1361,10 @@ fn stmt_references_name(stmt: &ir::Stmt, name: &str) -> bool {
                     .is_some_and(|stmt| stmt_references_name(stmt, name))
                 || stmts_reference_name(body, name)
         }
+        ir::Stmt::ForEach { iterable, body, .. } => {
+            expr_references_name(iterable, name) || stmts_reference_name(body, name)
+        }
+        ir::Stmt::Break { .. } | ir::Stmt::Continue { .. } => false,
         ir::Stmt::ExprStmt { expr, .. } | ir::Stmt::Throw { value: expr, .. } => {
             expr_references_name(expr, name)
         }
@@ -1390,6 +1413,9 @@ fn expr_references_name(expr: &ir::Expr, name: &str) -> bool {
         ir::Expr::FieldAccess { target, .. } | ir::Expr::StringByteLength { target, .. } => {
             expr_references_name(target, name)
         }
+        ir::Expr::StringByteIndexOf { target, needle, .. } => {
+            expr_references_name(target, name) || expr_references_name(needle, name)
+        }
         ir::Expr::RecordConstruct { fields, .. } => fields
             .iter()
             .any(|(_name, value)| expr_references_name(value, name)),
@@ -1428,6 +1454,10 @@ fn replace_this_with_ref_in_stmt(stmt: &mut ir::Stmt, var_name: &str) {
             replace_this_with_ref_in_expr(target, var_name);
             replace_this_with_ref_in_expr(value, var_name);
         }
+        ir::Stmt::ExprAssign { target, value, .. } => {
+            replace_this_with_ref_in_expr(target, var_name);
+            replace_this_with_ref_in_expr(value, var_name);
+        }
         ir::Stmt::If {
             condition,
             then_branch,
@@ -1462,6 +1492,11 @@ fn replace_this_with_ref_in_stmt(stmt: &mut ir::Stmt, var_name: &str) {
             }
             replace_this_with_ref_in_stmts(body, var_name);
         }
+        ir::Stmt::ForEach { iterable, body, .. } => {
+            replace_this_with_ref_in_expr(iterable, var_name);
+            replace_this_with_ref_in_stmts(body, var_name);
+        }
+        ir::Stmt::Break { .. } | ir::Stmt::Continue { .. } => {}
         ir::Stmt::ExprStmt { expr, .. } => replace_this_with_ref_in_expr(expr, var_name),
         ir::Stmt::Throw { value, .. } => replace_this_with_ref_in_expr(value, var_name),
         ir::Stmt::TryCatch {
@@ -1524,6 +1559,10 @@ fn replace_this_with_ref_in_expr(expr: &mut ir::Expr, var_name: &str) {
         ir::Expr::FieldAccess { target, .. } | ir::Expr::StringByteLength { target, .. } => {
             replace_this_with_ref_in_expr(target, var_name);
         }
+        ir::Expr::StringByteIndexOf { target, needle, .. } => {
+            replace_this_with_ref_in_expr(target, var_name);
+            replace_this_with_ref_in_expr(needle, var_name);
+        }
         ir::Expr::RecordConstruct { fields, .. } => {
             for (_name, value) in fields {
                 replace_this_with_ref_in_expr(value, var_name);
@@ -1585,6 +1624,10 @@ fn rename_calls_in_stmt(stmt: &mut ir::Stmt, renames: &HashMap<String, String>) 
             rename_calls_in_expr(target, renames);
             rename_calls_in_expr(value, renames);
         }
+        ir::Stmt::ExprAssign { target, value, .. } => {
+            rename_calls_in_expr(target, renames);
+            rename_calls_in_expr(value, renames);
+        }
         ir::Stmt::If {
             condition,
             then_branch,
@@ -1619,6 +1662,11 @@ fn rename_calls_in_stmt(stmt: &mut ir::Stmt, renames: &HashMap<String, String>) 
             }
             rename_calls_in_stmts(body, renames);
         }
+        ir::Stmt::ForEach { iterable, body, .. } => {
+            rename_calls_in_expr(iterable, renames);
+            rename_calls_in_stmts(body, renames);
+        }
+        ir::Stmt::Break { .. } | ir::Stmt::Continue { .. } => {}
         ir::Stmt::ExprStmt { expr, .. } => rename_calls_in_expr(expr, renames),
         ir::Stmt::Throw { value, .. } => rename_calls_in_expr(value, renames),
         ir::Stmt::TryCatch {
@@ -1683,6 +1731,10 @@ fn rename_calls_in_expr(expr: &mut ir::Expr, renames: &HashMap<String, String>) 
         }
         ir::Expr::FieldAccess { target, .. } | ir::Expr::StringByteLength { target, .. } => {
             rename_calls_in_expr(target, renames);
+        }
+        ir::Expr::StringByteIndexOf { target, needle, .. } => {
+            rename_calls_in_expr(target, renames);
+            rename_calls_in_expr(needle, renames);
         }
         ir::Expr::RecordConstruct { fields, .. } => {
             for (_name, value) in fields {

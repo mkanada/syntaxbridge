@@ -127,20 +127,17 @@ fn assert_success(output: Output) {
 /// `emit::dart` trying to hand-replicate `dart_style`'s wrapping decision.
 #[test]
 fn a_long_unsupported_message_still_produces_dart_format_clean_output() {
-    // `break;` — still genuinely unsupported after E02 (PR4), which lowers
-    // `while`/`if`/`DeclStmt` themselves but not loop-control statements.
-    // The while-loop this test used before E02 landed now fully lowers
-    // (progress, not a bug), so it stopped exercising this regression.
-    const BREAK_CPP: &str = r#"
-int primeiro_maior_que(int limite) {
-    int i = 0;
-    while (true) {
-        if (i > limite) {
-            break;
-        }
-        i = i + 1;
+    // `goto` deliberately remains unsupported: unlike `break`, it has no
+    // direct Dart counterpart and still gives this formatting regression its
+    // long, origin-qualified escape-hatch message.
+    const GOTO_CPP: &str = r#"
+int valor_ou_zero(int limite) {
+    if (limite < 0) {
+        goto fim;
     }
-    return i;
+    return limite;
+fim:
+    return 0;
 }
 "#;
 
@@ -148,7 +145,7 @@ int primeiro_maior_que(int limite) {
         TempWorkspace::new("transpile-unsupported-format").expect("create temp workspace");
     fs::create_dir_all(workspace.path()).expect("create project dir");
     let file_path = workspace.path().join("controle.cpp");
-    fs::write(&file_path, BREAK_CPP).expect("write controle.cpp");
+    fs::write(&file_path, GOTO_CPP).expect("write controle.cpp");
     let unit = CompilationUnit {
         directory: workspace.path().display().to_string(),
         file: file_path.display().to_string(),
@@ -157,7 +154,7 @@ int primeiro_maior_que(int limite) {
     };
 
     let package =
-        transpile::transpile(&[unit], workspace.path(), "e02").expect("transpile with break");
+        transpile::transpile(&[unit], workspace.path(), "e02").expect("transpile with goto");
     let source = &package.files["lib/controle.dart"];
     assert!(
         source.contains("UnimplementedError"),

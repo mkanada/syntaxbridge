@@ -167,6 +167,10 @@ pub enum BinaryOp {
 pub enum UnaryOp {
     Neg,
     Not,
+    PreIncrement,
+    PreDecrement,
+    PostIncrement,
+    PostDecrement,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -315,6 +319,14 @@ pub enum Expr {
         target: Box<Expr>,
         origin: Origin,
     },
+    /// `std::basic_string::find(needle)` — searches the UTF-8 bytes rather
+    /// than Dart `String` UTF-16 code units, retaining C++'s offset domain
+    /// and `-1` not-found sentinel through `List<int>.indexOf`.
+    StringByteIndexOf {
+        target: Box<Expr>,
+        needle: Box<Expr>,
+        origin: Origin,
+    },
     /// `(a, b)` — a Dart record value. Only ever synthesized by
     /// `lower::cpp`'s out-param bridge (see `Type::Tuple`), as the trailing
     /// return value of a bridged function/method's body — never lowered
@@ -356,6 +368,7 @@ impl Expr {
             | Self::This { origin, .. }
             | Self::Index { origin, .. }
             | Self::StringByteLength { origin, .. }
+            | Self::StringByteIndexOf { origin, .. }
             | Self::Tuple { origin, .. }
             | Self::Unsupported { origin, .. }
             | Self::UnsupportedTyped { origin, .. } => origin,
@@ -391,6 +404,15 @@ pub enum Stmt {
         value: Expr,
         origin: Origin,
     },
+    /// Assignment through any expression Dart accepts on the left hand side,
+    /// such as an index, or a receiver extracted from an overloaded C++
+    /// assignment operator. `Assign`/`FieldAssign` remain compact forms for
+    /// their common simple cases.
+    ExprAssign {
+        target: Expr,
+        value: Expr,
+        origin: Origin,
+    },
     If {
         condition: Expr,
         then_branch: Vec<Stmt>,
@@ -410,6 +432,23 @@ pub enum Stmt {
         condition: Option<Expr>,
         increment: Option<Box<Stmt>>,
         body: Vec<Stmt>,
+        origin: Origin,
+    },
+    /// `for (T item : iterable)` — a value or const-reference range binding.
+    /// A mutable C++ reference remains unsupported until the collection
+    /// adapter can represent writes through it without losing aliasing.
+    ForEach {
+        name: String,
+        ty: Type,
+        is_final: bool,
+        iterable: Expr,
+        body: Vec<Stmt>,
+        origin: Origin,
+    },
+    Break {
+        origin: Origin,
+    },
+    Continue {
         origin: Origin,
     },
     /// A bare expression evaluated for its side effect (e.g. a call whose
@@ -473,9 +512,13 @@ impl Stmt {
             | Self::VarDecl { origin, .. }
             | Self::Assign { origin, .. }
             | Self::FieldAssign { origin, .. }
+            | Self::ExprAssign { origin, .. }
             | Self::If { origin, .. }
             | Self::While { origin, .. }
             | Self::For { origin, .. }
+            | Self::ForEach { origin, .. }
+            | Self::Break { origin }
+            | Self::Continue { origin }
             | Self::ExprStmt { origin, .. }
             | Self::Throw { origin, .. }
             | Self::TryCatch { origin, .. }

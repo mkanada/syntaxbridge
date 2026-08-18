@@ -163,11 +163,7 @@ double media(int total) {
 }
 
 #[test]
-fn an_unsupported_statement_becomes_an_unsupported_node_with_origin_and_reason() {
-    // `break;` (E02 already lowers `while`/`for` themselves, but not the
-    // loop-control statements inside them) — still genuinely unsupported,
-    // unlike the `DeclStmt`/`WhileStmt` this test used before E02 (PR4)
-    // implemented both.
+fn a_break_statement_keeps_its_control_flow_node_and_origin() {
     const BREAK_CPP: &str = r#"
 int primeiro_maior_que(int limite) {
     int i = 0;
@@ -227,13 +223,12 @@ int primeiro_maior_que(int limite) {
         "expected exactly the break inside the if"
     );
 
-    let Stmt::Unsupported { reason, origin } = &then_branch[0] else {
+    let Stmt::Break { origin } = &then_branch[0] else {
         panic!(
-            "expected `break;` to be Unsupported, got {:?}",
+            "expected `break;` to be its dedicated statement, got {:?}",
             then_branch[0]
         );
     };
-    assert!(!reason.is_empty());
     assert!(origin.file.ends_with("controle.cpp"));
     assert_eq!(origin.line, 6);
 }
@@ -985,6 +980,183 @@ void copy_values(std::vector<int>& destination, const std::vector<int>& source) 
         source.contains("unsupported std::vector::operator= call")
             && !source.contains("standard-library method call's first child was not"),
         "an operator-style stdlib call must expose its receiver before dispatch, got:\n{source}"
+    );
+}
+
+/// Assignment operators on Dart core-backed C++ library values are effects,
+/// not opaque method calls. The receiver normalized from argument zero must
+/// become a real Dart assignment.
+#[test]
+fn a_std_string_assignment_lowers_to_a_typed_dart_assignment() {
+    let source = lower_and_emit(
+        "lower-cpp-std-string-assignment",
+        r#"
+#include <string>
+
+void copy_text(std::string& destination, const std::string& source) {
+    destination = source;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("destination = source;")
+            && !source.contains("unsupported std::basic_string::operator= call"),
+        "std::string assignment must become a Dart assignment, got:\n{source}"
+    );
+}
+
+/// Indexed writes are ordinary Dart assignments once the vector receiver and
+/// its element type are known.
+#[test]
+fn a_vector_index_assignment_lowers_to_a_dart_index_write() {
+    let source = lower_and_emit(
+        "lower-cpp-vector-index-assignment",
+        r#"
+#include <vector>
+
+void copy_first(std::vector<int>& values) {
+    values[0] = values[1];
+}
+"#,
+    );
+
+    assert!(
+        source.contains("values[0] = values[1];")
+            && !source.contains("index assignment not supported yet"),
+        "vector index assignment must preserve the target and value, got:\n{source}"
+    );
+}
+
+/// C++ loop control maps directly to Dart. A range-for's collection traversal
+/// must remain typed while `continue` and `break` keep their control-flow
+/// meaning.
+#[test]
+fn range_for_continue_and_break_lower_to_dart_control_flow() {
+    let source = lower_and_emit(
+        "lower-cpp-range-for-control-flow",
+        r#"
+#include <vector>
+
+int first_nonzero(const std::vector<int>& values) {
+    for (int value : values) {
+        if (!value) {
+            continue;
+        }
+        break;
+    }
+    return 0;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("for (int value in values)")
+            && source.contains("continue;")
+            && source.contains("break;")
+            && !source.contains("unsupported statement cursor kind 225"),
+        "range-for control flow must lower without statement bailouts, got:\n{source}"
+    );
+}
+
+/// Prefix and postfix increments/decrements are valid Dart update expressions
+/// and must not be left as unsupported unary operators in a loop body.
+#[test]
+fn prefix_and_postfix_updates_lower_to_dart_updates() {
+    let source = lower_and_emit(
+        "lower-cpp-increment-updates",
+        r#"
+int count_to(int limit) {
+    int total = 0;
+    for (int index = 0; index < limit; ++index) {
+        total++;
+    }
+    while (total > 0) {
+        --total;
+        total--;
+    }
+    return total;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("for (int index = 0; index < limit; ++index)")
+            && source.contains("total++;")
+            && source.contains("--total;")
+            && source.contains("total--;")
+            && !source.contains("unsupported unary operator kind 1")
+            && !source.contains("unsupported unary operator kind 2")
+            && !source.contains("unsupported unary operator kind 3")
+            && !source.contains("unsupported unary operator kind 4"),
+        "prefix and postfix updates must emit Dart update syntax, got:\n{source}"
+    );
+}
+
+/// Core string and vector methods have direct, typed Dart counterparts. String
+/// search is deliberately byte-based, matching C++ `basic_string` positions
+/// instead of Dart's UTF-16 code-unit offsets.
+#[test]
+fn common_string_and_vector_methods_lower_to_typed_dart_adapters() {
+    let source = lower_and_emit(
+        "lower-cpp-common-stdlib-methods",
+        r#"
+#include <string>
+#include <vector>
+
+bool blank(const std::string& text) {
+    return text.empty();
+}
+
+int find_byte(const std::string& text) {
+    return text.find("x");
+}
+
+void append(std::vector<int>& values, int value) {
+    values.push_back(value);
+}
+
+int read(const std::vector<int>& values) {
+    return values.at(0);
+}
+"#,
+    );
+
+    assert!(
+        source.contains("return text.isEmpty;")
+            && source.contains("return utf8.encode(text).indexOf(utf8.encode('x'));")
+            && source.contains("values.add(value);")
+            && source.contains("return values[0];"),
+        "common stdlib methods must use typed Dart adapters, got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported std::basic_string::empty call")
+            && !source.contains("unsupported std::basic_string::find call")
+            && !source.contains("unsupported std::vector::push_back call")
+            && !source.contains("unsupported std::vector::at call"),
+        "the mapped stdlib methods must not remain bailouts, got:\n{source}"
+    );
+}
+
+/// String concatenation assignment preserves immutable String value semantics
+/// in Dart by expanding to one assignment over the existing value.
+#[test]
+fn std_string_append_assignment_lowers_to_dart_plus_equals() {
+    let source = lower_and_emit(
+        "lower-cpp-std-string-append-assignment",
+        r#"
+#include <string>
+
+void append_marker(std::string& text) {
+    text += "!";
+}
+"#,
+    );
+
+    assert!(
+        source.contains("text = text + '!';")
+            && !source.contains("unsupported std::basic_string::operator+= call"),
+        "std::string operator+= must become a typed Dart reassignment, got:\n{source}"
     );
 }
 

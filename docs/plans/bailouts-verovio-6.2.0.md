@@ -10,10 +10,10 @@ dependem de procurar textos no Dart formatado.
 
 | Origem do bailout | Ocorrências | Causas distintas |
 | --- | ---: | ---: |
-| Tipo C++ sem mapeamento (`Type::Unsupported`) | 1.964 | 222 spellings |
-| Expressão sem lowering (`Expr::Unsupported*`) | 26.917 | 1.990 razões |
-| Statement sem lowering (`Stmt::Unsupported`) | 2.214 | 31 razões |
-| **Total** | **31.095** | — |
+| Tipo C++ sem mapeamento (`Type::Unsupported`) | 2.034 | 228 spellings |
+| Expressão sem lowering (`Expr::Unsupported*`) | 25.312 | 2.015 razões |
+| Statement sem lowering (`Stmt::Unsupported`) | 1.065 | 30 razões |
+| **Total** | **28.411** | — |
 
 Uma ocorrência é um nó do IR, não uma linha do pacote Dart: um mesmo nó pode
 aparecer em mais de um arquivo por inclusão de headers. `SyntaxBridgeOpaque` e
@@ -41,6 +41,47 @@ serão tratadas pela tabela de adaptadores. O total de expressões caiu de
 27.905 para 26.917 (−988); a diferença não é a soma das três causas porque
 um lowering que antes parava cedo passa a expor o próximo nó ainda não
 suportado.
+
+### Atualização de 2026-08-18 — atribuição, fluxo, STL e atualizações
+
+Esta rodada acrescentou atribuição tipada de `basic_string`, escrita indexada,
+controle de fluxo, adaptadores STL frequentes e `++`/`--`. O snapshot atual
+reduziu expressões de 26.917 para 25.312 (−1.605) e statements de 2.214 para
+1.065 (−1.149). Tipos subiram de 1.964 para 2.034: ao atravessar trechos que
+antes paravam em um bailout de expressão/statement, o diagnóstico agora vê os
+tipos ainda sem mapeamento que estavam depois deles. Isso é exposição de
+cobertura, não justificativa para aceitar o tipo como opaco.
+
+| Causa no Verovio | Antes | Agora | Decisão implementada |
+| --- | ---: | ---: | --- |
+| `basic_string::empty` | 379 | 0 | `String.isEmpty` tipado. |
+| `basic_string::find` | 426 | 0 | busca por bytes com `utf8.encode(...).indexOf(...)`, preservando o contrato de posição da string C++. |
+| `vector::push_back` | 335 | 0 | `List<T>.add`. |
+| `vector::at` | 271 | 0 | índice `List<T>[int]` com elemento tipado. |
+| pré/pós-incremento e pré/pós-decremento | 970 | 0 | operadores Dart prefixados/pós-fixados, preservando a posição do efeito. |
+| `continue` | 469 | 0 | `Stmt::Continue` → `continue;`. |
+| `break` | 297 | 0 | `Stmt::Break` → `break;`. |
+| `CXXForRangeStmt` comum | 320 | 0 | `for (T item in itens)`, com binding `final` quando a referência C++ é `const`. |
+| atribuição indexada na forma simples | 417 | 284 | `Expr::Index` passou a ser alvo atribuível; os 284 restantes chegam por outra forma de AST e continuam rastreados. |
+| `basic_string::operator=` | 1.142 | 511 | apenas as formas cujo destino e valor podem ser reatribuídos com segurança como `String`. |
+| `basic_string::operator+=` | 366 | 106 | reatribuição `texto = texto + sufixo`; as sobrecargas restantes não foram presumidas equivalentes. |
+
+Dois limites permanecem intencionais. `operator=` genérico ainda tem 1.159
+ocorrências (e `vector::operator=` tem 50): em C++ ele pode significar cópia
+de valor, enquanto atribuir uma `List` Dart compartilharia a mesma coleção. Um
+lowering direto seria semanticamente errado; o próximo adaptador precisa
+modelar cópia de coleção/record. Há também 46 range-for com referência mutável:
+o item do `for` Dart é um valor local e não escreve de volta na coleção, então
+eles ficam como bailout até existir um adaptador de leitura-escrita.
+
+O pacote emitido tem 1/301 arquivos sintaticamente inválido:
+`iohumdrum.dart` contém um literal C++ com quebra de linha emitida sem escape.
+É o próximo defeito de emissão isolado. O `dart analyze` reportou 11.418 erros
+e 5.022 avisos; parte do aumento em relação ao snapshot anterior é uma
+consequência observada de agora alcançar mais código. A próxima rodada deve
+separar essas causas em adaptadores semânticos, começando pelo literal de
+string e por cópia tipada, sem converter nada para `dynamic` ou
+`SyntaxBridgeOpaque`.
 
 ## 1. Tipos sem mapeamento — snapshot-base de 4.384 ocorrências
 
