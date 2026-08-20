@@ -4434,3 +4434,76 @@ bool has_multiple(ListOfConstObjects staves) {
         "manual iterator loop under c++20 must not bail out, got:\n{source}"
     );
 }
+
+/// `container[i].field.begin()` — a real trigger from `iohumdrum.cpp`
+/// (`ss[staffindex].tieends.begin()`). `same_receiver_ignoring_origin` only
+/// compared `Ref`/`FieldAccess`/`This` shapes; an `Expr::Index` receiver
+/// reached through a `FieldAccess` fell to its final `_ => false` arm even
+/// when the three mentions (`begin`, `end` inside the loop check, `end`
+/// implicitly re-checked) are syntactically identical, so the whole loop
+/// idiom silently failed to match for any indexed receiver.
+#[test]
+fn manual_iterator_loop_recognizes_an_indexed_field_receiver() {
+    let source = lower_and_emit(
+        "lower-cpp-manual-iterator-indexed-receiver",
+        r#"
+#include <list>
+#include <vector>
+
+struct Bag {
+    std::list<int> items;
+};
+
+int sum_all(std::vector<Bag>& bags, int idx) {
+    int total = 0;
+    for (auto it = bags[idx].items.begin(); it != bags[idx].items.end(); ++it) {
+        total += *it;
+    }
+    return total;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("for (final int it in bags[idx].items)")
+            && source.contains("total = total + it;"),
+        "expected the indexed-field receiver to be recognized as the same container across \
+         begin/end, got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "manual iterator loop over an indexed field must not bail out, got:\n{source}"
+    );
+}
+
+/// `container_begin_or_end_receiver`'s scope only listed
+/// `vector`/`list`/`set`/`deque`/`multiset` — `unordered_set` maps to the
+/// same `Type::Set` elsewhere in this module (`lower_type`'s
+/// `CXType_Record` branch), so excluding it here was an oversight, not a
+/// deliberate scope decision the way `map`/`unordered_map` are.
+#[test]
+fn manual_iterator_loop_supports_unordered_set() {
+    let source = lower_and_emit(
+        "lower-cpp-manual-iterator-unordered-set",
+        r#"
+#include <unordered_set>
+
+int sum_all(const std::unordered_set<int>& values) {
+    int total = 0;
+    for (auto it = values.begin(); it != values.end(); ++it) {
+        total += *it;
+    }
+    return total;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("for (final int it in values)") && source.contains("total = total + it;"),
+        "expected unordered_set to be recognized by the manual iterator idiom, got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "manual unordered_set iterator loop must not bail out, got:\n{source}"
+    );
+}

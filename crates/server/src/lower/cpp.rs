@@ -6392,9 +6392,25 @@ unsafe fn container_begin_or_end_receiver(
     }
     let owner = unsafe { clang_sys::clang_getCursorSemanticParent(referenced) };
     let template_name = unsafe { stdlib_template_name(owner) }?;
+    // Every template name `lower_type`'s own `CXType_Record`/
+    // `CXType_Unexposed` branch already maps to `Type::List`/`Type::Set`
+    // (`"array"`/`"initializer_list"` → `List`, `"unordered_set"` → `Set`,
+    // confirmed by grepping that branch directly) belongs here too — this
+    // function only decides *which* containers are safe to treat as one
+    // receiver across `begin`/`end`, not how they're represented. `map`/
+    // `unordered_map` deliberately excluded: their iterator's `first`/
+    // `second` needs a `key`/`value` translation neither this idiom nor
+    // `lower_find_contains_idiom` (this function's other caller) attempts.
     if !matches!(
         template_name.as_str(),
-        "vector" | "list" | "set" | "deque" | "multiset"
+        "vector"
+            | "list"
+            | "set"
+            | "deque"
+            | "multiset"
+            | "array"
+            | "initializer_list"
+            | "unordered_set"
     ) {
         return None;
     }
@@ -6438,6 +6454,27 @@ fn same_receiver_ignoring_origin(a: &ir::Expr, b: &ir::Expr) -> bool {
             },
         ) => {
             field_a == field_b && ty_a == ty_b && same_receiver_ignoring_origin(target_a, target_b)
+        }
+        // `ss[staffindex].tieends.begin()` (real trigger, `iohumdrum.cpp`):
+        // an array/map-subscript receiver reached through `FieldAccess`
+        // above. `ty` intentionally not compared here (unlike `Ref`/
+        // `FieldAccess`): `Index`'s own `ty` is the *element* type, already
+        // covered once by the outer `FieldAccess`/`Ref` comparison that
+        // wraps this — comparing it again would just repeat the same check.
+        (
+            ir::Expr::Index {
+                target: target_a,
+                index: index_a,
+                ..
+            },
+            ir::Expr::Index {
+                target: target_b,
+                index: index_b,
+                ..
+            },
+        ) => {
+            same_receiver_ignoring_origin(target_a, target_b)
+                && same_receiver_ignoring_origin(index_a, index_b)
         }
         (ir::Expr::This { .. }, ir::Expr::This { .. }) => true,
         _ => false,
