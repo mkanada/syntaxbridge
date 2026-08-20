@@ -1216,6 +1216,35 @@ registrado com honestidade em vez de forçar a contagem. O achado de
 metodologia (C++20 vs. fixtures) e a lacuna de métodos ausentes valem mais
 para as próximas rodadas do que mais uma causa reduzida pela metade.
 
+**Segundo lote da mesma rodada, mesma sessão: as duas lacunas acima,
+parcialmente fechadas.** `same_receiver_ignoring_origin` ganhou um braço
+para `Expr::Index` (compara `target`+`index` recursivamente) — a lacuna 1
+identificada acima (`ss[staffindex].tieends.begin()`, receptor por índice).
+`container_begin_or_end_receiver` também ganhou `array`/`initializer_list`/
+`unordered_set` no escopo — já mapeados para `List`/`Set` em `lower_type`,
+mas ausentes desta lista por descuido, não por decisão deliberada como
+`map`/`unordered_map`. Dois novos testes de regressão (receptor indexado,
+`unordered_set`), commit separado (`c3096b5`).
+
+**Medição final da 18ª rodada:** tipos 1.698 → **1.695** (−3); expressões
+5.591 → **5.575** (−16, mesmas 354 causas — nenhuma nova chegou a zero
+neste incremento); statements inalterado (391/16); total 7.680 → **7.661**
+(−19); 1/301 arquivos inválidos (sem mudança); `dart analyze` inalterado
+(16.258/8.856). Quebra: `list::begin` 51→**48** (−3), `_List_iterator::
+operator->` 124→**117** (−7, primeiro movimento desta causa na rodada),
+`operator++` 50→**47** (−3), `operator*` inalterado em 56. `vector::begin`
+(126), `vector::end` (105) e `list::end` (28) seguem inalterados — a
+suspeita registrada acima (uso de `.end()`/`.begin()` fora do idiom
+reconhecido, ex. argumento de `std::sort`/`std::find`, dominando a
+contagem e mascarando qualquer redução do idiom) seguem não auditada,
+próximo passo natural antes de mais uma rodada dedicada a este idiom.
+
+**Total acumulado da 18ª rodada (dois commits, mesma sessão):** 7.942 →
+**7.661** (−281, −3,5%). Uma causa chegou a zero de verdade
+(`List(Int)→Nullable(Bytes)`); as famílias de iterador reduziram sem
+zerar — tratadas como trabalho genuíno, mas parcial, não como as "20
+causas zeradas" que o processo do loop pede idealmente.
+
 ## 1. Tipos sem mapeamento — snapshot-base de 4.384 ocorrências
 
 ### Progresso executado
