@@ -1080,6 +1080,142 @@ Investigado e **adiado nesta rodada**, causa raiz identificada:
   imprimindo `origin` por ocorrência) para achar o padrão real antes de
   tentar mais um filtro às cegas.
 
+### Atualização de 2026-08-20 (18ª rodada) — iterador manual de `list`/`set`, e uma lacuna real de metodologia de teste
+
+Executado pelo loop autônomo. Baseline no início desta rodada (remedido no
+início da sessão para confirmar ausência de divergência): tipos 1.730/240,
+expressões 5.821/355, statements 391/16 — total 7.942; 1/301 arquivos
+inválidos; `dart analyze` 15.298 erros, 8.470 avisos — idêntico ao registrado
+na 17ª rodada, sem divergência.
+
+**Feature principal: `for (auto it = X.begin(); it != X.end(); ++it) { ...*it...it->campo... }`**
+— o item 2 da 8ª rodada, explicitamente adiado então como "bem maior que um
+fix de expressão isolada". Implementado como reconhecimento holístico do
+`ForStmt` inteiro em `lower_iterator_for_loop` (nova função, chamada antes do
+lowering genérico de `for` em `lower_stmt`): quando o `init` é `auto it =
+X.begin()`, a `condition` é `it != X.end()` com o mesmo receptor (reusando
+`container_begin_or_end_receiver`/`same_receiver_ignoring_origin` da 8ª
+rodada) e o `increment` é `++it`/`it++`, o laço inteiro vira o mesmo
+`Stmt::ForEach` que `CXXForRangeStmt` já produz — nenhum nó de IR novo,
+nenhuma mudança em emissão. Dentro do corpo, `*it`/`it->campo` precisam
+resolver para o elemento em vez do iterador nunca-representável: um registro
+`thread_local` (`ACTIVE_ITERATOR_LOOPS`) mapeia o nome da variável do
+iterador ativo para o tipo do elemento enquanto o corpo do laço reconhecido
+está sendo lowered, consultado pelos novos casos `operator*`/`operator->` em
+`lower_stdlib_method_call`. Escopo deliberado: só `vector`/`list`/`set`/
+`deque`/`multiset` (o mesmo escopo de `container_begin_or_end_receiver`);
+iteração de `map`/`unordered_map` (que precisaria traduzir `first`/`second`
+para `key`/`value`) e mutação via iterador (`it = list.erase(it)`) continuam
+bailout, sem tentativa de adivinhar.
+
+**Um bug real de duas causas foi corrigido no caminho, ambos confirmados via
+`-Xclang -ast-dump` antes de implementar:**
+
+- **Incremento pós-fixado (`it++`)** é uma sobrecarga *distinta* de
+  `++it` (`operator++(int)`, parâmetro `int` postiço só para desambiguar
+  overload), mas com a mesma spelling `"operator++"` — a checagem inicial
+  exigia exatamente 1 argumento no cursor de chamada, e a forma pós-fixada
+  reporta 2 (receptor + o `0` sintetizado pelo compilador). Corrigido para
+  aceitar `>= 1` e sempre usar o argumento 0 como receptor — nem prefixo nem
+  sufixo importam aqui, já que o laço inteiro é descartado e reconstruído
+  como `for`-each Dart, então o *valor* do incremento nunca é usado.
+- **A causa raiz real do impacto zero na primeira medição desta rodada** (ver
+  abaixo) — o rewriting de operadores do C++20.
+
+**Achado de metodologia, o resultado mais importante desta rodada.** A
+primeira medição real no Verovio, depois de toda a suíte de testes locais
+passar (116 então 119 testes, incluindo em `just test` dentro do Flatpak),
+não moveu nenhuma das causas-alvo: `vector::begin` (138), `list::begin`
+(84), `_List_iterator::operator*` (93) e `operator++` (83) ficaram
+**idênticos, dígito a dígito**, ao valor pré-rodada. Investigação real (não
+suposição): `grep` direto no `zip_file`/`ossia.cpp`/`iohumdrum.cpp` da fonte
+bundlada confirmou o idioma realmente presente no corpus; uma fixture fiel
+reproduzindo `ossia.cpp`'s `HasMultipleOStaves` (mesmo typedef `std::list<T>`,
+mesmo `auto it =`) **passava** tanto via `cargo test` no host quanto via
+`just test` no Flatpak. A causa raiz só apareceu ao comparar as versões do
+compilador: `clang++ --version` no host é 18.1.3, no Flatpak (`llvm21`) é
+21.1.8 — e, mais importante, `cmake/CMakeLists.txt` do próprio Verovio faz
+`set(CMAKE_CXX_STANDARD 20)`, enquanto **todas as fixtures deste arquivo de
+teste (`write_fixture`/`lower_and_emit`) fixam `-std=c++17` incondicionalmente**.
+Sob C++20, o *rewritten-candidates rule* faz `it != X.end()` compilar
+através de `operator==` (não uma `operator!=` própria — `libstdc++` só
+declara `==` para os iteradores relevantes), envolto num `UnaryOperator '!'`
+real dentro de um `CXXRewrittenBinaryOperator` — confirmado com
+`clang++ -Xclang -ast-dump -std=c++20` real dentro do Flatpak, comparando
+lado a lado com `-std=c++17` (que dá `operator!=` direto, a única forma que
+a primeira versão deste reconhecedor aceitava). Ou seja: **a suíte de testes
+deste módulo inteira roda sob um padrão de C++ diferente do projeto real que
+o loop mede**, um buraco de metodologia que pode ter mascarado impacto real
+de rodadas anteriores sempre que a fixture envolvia comparação de operador
+sobrecarregado. Corrigido de duas formas: (1) `lower_iterator_for_loop`
+ganhou um segundo ramo de reconhecimento para a forma reescrita (`UnaryOperator
+'!'` sobre uma chamada resolvendo a `"operator=="`, tratada como equivalente
+a `!=`, mesmo padrão do parâmetro `is_negated` já usado por
+`lower_find_contains_idiom` desde a 8ª rodada); (2) `lower_cpp.rs` ganhou
+`lower_and_emit_with_std` (parametriza o `-std=`, com `lower_and_emit`
+continuando o atalho para `c++17`) e um teste dedicado,
+`manual_iterator_loop_matches_the_cxx20_rewritten_not_equal_condition`,
+fixado em `-std=c++20` especificamente para nunca deixar essa lacuna
+reabrir silenciosamente. **Toda rodada futura que testar um idioma
+envolvendo comparação/operador sobrecarregado de biblioteca padrão deveria
+considerar fixar `-std=c++20` na fixture, não confiar no default deste
+arquivo.**
+
+**Segunda causa, menor e independente: `List(Int) → Nullable(Bytes)`.** Um
+array `uint8_t[N]` de tamanho fixo decai para `List(Int)` (o ramo
+`CXType_ConstantArray` de `lower_type` não tem caso especial de buffer de
+byte, diferente do próprio tipo de um parâmetro `uint8_t*`); passá-lo onde
+um parâmetro `const uint8_t*`/`Uint8List?` é esperado precisava desse bridge.
+Adicionado ao wrapper de conversão implícita existente, reusando
+`Uint8List.fromList`, o mesmo helper que `clone_value_expr` já usa para
+cópia de valor.
+
+**Medição depois do lote (já com a correção do C++20):** tipos 1.730 →
+**1.698** (−32, mesmas 240 spellings — redução de ocorrência, não de causa);
+expressões 5.821 → **5.591** (−230, mesmas 355→**354** causas — só a família
+`List(Int)→Nullable(Bytes)` chegou a zero de verdade); statements inalterado
+(391/16); total 7.942 → **7.680** (−262, −3,3%); 1/301 arquivos inválidos
+(sem mudança); `dart analyze` 15.298 → 16.258 erros (+960), 8.470 → 8.856
+avisos (+386) — mesmo padrão de exposição de cobertura já registrado em
+quase toda rodada anterior. Quebra por causa (nenhuma zerou, todas
+reduziram): `vector::begin` 138→126 (−12), `vector::end` 105→105 (sem
+mudança medida — resíduo provavelmente é uso fora do idiom, ex.: argumento de
+`std::sort`/`std::find`, não auditado ainda), `list::begin` 84→**51** (−33),
+`list::end` inalterado em 28 (mesma suspeita), `_List_iterator::operator*`
+93→**56** (−37), `operator++` 83→**50** (−33), `operator->` inalterado em
+124. Conferido manualmente: zero tokens `dynamic`, zero panics.
+
+**Por que nenhuma causa chegou a zero — duas lacunas identificadas, não
+implementadas ainda:**
+
+1. **Receptor por índice** (`ss[staffindex].tieends.begin()`, achado real em
+   `iohumdrum.cpp`). `same_receiver_ignoring_origin` só compara as formas
+   `Expr::Ref`/`Expr::FieldAccess`/`Expr::This` — um `Expr::Index` como alvo
+   intermediário cai no `_ => false` final, então o `begin`/`end` desse
+   receptor nunca é reconhecido como o mesmo, mesmo sendo sintaticamente
+   idêntico nas três aparições. Precisa de mais um braço nessa função
+   (comparar `target`+`index` recursivamente).
+2. **Muitos bailouts contados pelo diagnóstico não aparecem no texto do
+   pacote Dart final** (confirmado: `grep` por
+   `"_List_iterator::operator-> call"` no `dart-package` inteiro não bate
+   nenhuma linha, apesar do diagnóstico contar 124) — a mesma classe de
+   problema já visível independentemente (`Ossia::HasMultipleOStaves`,
+   `HumdrumInput::addArpeggio` desaparecem inteiramente da classe emitida,
+   nem como bailout). Isso sugere que uma fração desconhecida — possivelmente
+   grande — de métodos do projeto real nunca chega a ser emitida, o que este
+   inventário de causas não capta (ele conta nós de IR durante o lowering,
+   não o texto final). **Candidato de alta prioridade para a próxima
+   rodada**: instrumentar por que um método inteiro desaparece da classe
+   (provavelmente algo em `function_catalog.rs` descartando o método antes
+   de `emit::dart` vê-lo), antes de continuar perseguindo causas individuais
+   cujo impacto real pode estar sendo subestimado por esse mesmo motivo.
+
+Nenhum token `dynamic` introduzido, nenhuma regressão medida, mas esta
+rodada não atingiu o critério de "20 causas zeradas" do processo do loop —
+registrado com honestidade em vez de forçar a contagem. O achado de
+metodologia (C++20 vs. fixtures) e a lacuna de métodos ausentes valem mais
+para as próximas rodadas do que mais uma causa reduzida pela metade.
+
 ## 1. Tipos sem mapeamento — snapshot-base de 4.384 ocorrências
 
 ### Progresso executado

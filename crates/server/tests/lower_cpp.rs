@@ -541,8 +541,31 @@ impl Drop for TempWorkspace {
 /// declaration and every reference to it end up in the same text, which is
 /// the only place the two can be checked against each other.
 fn lower_and_emit(name: &str, source: &str) -> String {
+    lower_and_emit_with_std(name, source, "c++17")
+}
+
+/// `write_fixture`'s hardcoded `-std=c++17` doesn't match every real
+/// project's own configuration — Verovio 6.2.0 itself builds as C++20
+/// (`cmake/CMakeLists.txt`'s `set(CMAKE_CXX_STANDARD 20)`), and C++20's
+/// rewritten-candidates rule changes the AST shape of every overloaded
+/// comparison (`it != end()` compiles through `operator==` plus a
+/// `CXXRewrittenBinaryOperator`/`UnaryOperator '!'` wrapper, not a direct
+/// `operator!=` call — confirmed with a real `clang++ -Xclang -ast-dump
+/// -std=c++20`, the exact gap that let the general-iterator-loop feature
+/// pass every `-std=c++17` fixture yet match zero real Verovio occurrences
+/// the first time it landed). Use this directly whenever a fixture needs to
+/// pin a specific standard instead of trusting the default.
+fn lower_and_emit_with_std(name: &str, source: &str, std: &str) -> String {
     let workspace = TempWorkspace::new(name).expect("create temporary workspace");
-    let unit = write_fixture(workspace.path(), source, "probe.cpp");
+    fs::create_dir_all(workspace.path()).expect("create project dir");
+    let file_path = workspace.path().join("probe.cpp");
+    fs::write(&file_path, source).expect("write fixture source");
+    let unit = CompilationUnit {
+        directory: workspace.path().display().to_string(),
+        file: file_path.display().to_string(),
+        command: None,
+        arguments: vec!["clang++".to_owned(), format!("-std={std}")],
+    };
     let catalog = function_catalog::extract_function_catalog(&[unit], workspace.path(), None)
         .expect("extract function catalog");
 
@@ -1752,6 +1775,172 @@ void increment_all(std::vector<int>& values) {
             && !source
                 .contains("mutable range-for reference needs a collection write-through adapter"),
         "mutable vector range-for must write each changed binding back, got:\n{source}"
+    );
+}
+
+/// `for (auto it = list.begin(); it != list.end(); ++it) { ...*it... }` —
+/// the classic manual-iterator idiom, common in the real Verovio corpus for
+/// `std::list` (round 18, `docs/prompts/2026-08-20-loop-bailout.md`). Must
+/// lower to the same `for (final ... in ...)` shape range-for already uses,
+/// with `*it` reading as the plain element.
+#[test]
+fn manual_list_iterator_loop_lowers_to_dart_for_each() {
+    let source = lower_and_emit(
+        "lower-cpp-manual-list-iterator-loop",
+        r#"
+#include <list>
+
+int sum_all(const std::list<int>& values) {
+    int total = 0;
+    for (auto it = values.begin(); it != values.end(); ++it) {
+        total += *it;
+    }
+    return total;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("for (final int it in values)") && source.contains("total = total + it;"),
+        "expected the manual iterator loop to lower to a Dart for-each, got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "manual list iterator loop must not bail out, got:\n{source}"
+    );
+}
+
+/// `it++` (postfix) is a distinct overload from `++it` (prefix) — same
+/// spelling, different call-cursor argument count (a dummy `int` parameter
+/// disambiguates it) — and just as common in the real corpus (confirmed by
+/// grepping the bundled Verovio source directly). Since this idiom discards
+/// the whole `for` header and rebuilds it as a Dart `for`-each, the
+/// increment's own value never matters — prefix and postfix must lower
+/// identically.
+#[test]
+fn manual_list_iterator_loop_supports_postfix_increment() {
+    let source = lower_and_emit(
+        "lower-cpp-manual-list-iterator-postfix",
+        r#"
+#include <list>
+
+int sum_all(const std::list<int>& values) {
+    int total = 0;
+    for (auto it = values.begin(); it != values.end(); it++) {
+        total += *it;
+    }
+    return total;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("for (final int it in values)") && source.contains("total = total + it;"),
+        "expected postfix increment to lower to the same Dart for-each as prefix, got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "manual list iterator loop with postfix increment must not bail out, got:\n{source}"
+    );
+}
+
+/// `it->field` — arrow member access through a `std::list<T>::iterator`
+/// where `T` is a project struct, the other half of the idiom
+/// (`std::_List_iterator::operator->`, the single largest residual
+/// expression cause in the round-17 snapshot).
+#[test]
+fn manual_list_iterator_loop_supports_arrow_field_access() {
+    let source = lower_and_emit(
+        "lower-cpp-manual-list-iterator-arrow",
+        r#"
+#include <list>
+
+struct Item {
+    int value;
+};
+
+int sum_values(const std::list<Item>& items) {
+    int total = 0;
+    for (auto it = items.begin(); it != items.end(); ++it) {
+        total += it->value;
+    }
+    return total;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("for (final Item it in items)") && source.contains("total = total + it.value;"),
+        "expected arrow member access through the loop iterator to read the element's field, \
+         got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "manual list iterator loop with arrow access must not bail out, got:\n{source}"
+    );
+}
+
+/// `std::set<T>` uses a different iterator template
+/// (`_Rb_tree_const_iterator`) than `std::list`
+/// (`_List_iterator`) — confirming the loop recognizer and the
+/// `operator*`/`operator->` registry lookup aren't accidentally scoped to
+/// only one container family.
+#[test]
+fn manual_set_iterator_loop_lowers_to_dart_for_each() {
+    let source = lower_and_emit(
+        "lower-cpp-manual-set-iterator-loop",
+        r#"
+#include <set>
+
+int sum_all(const std::set<int>& values) {
+    int total = 0;
+    for (auto it = values.begin(); it != values.end(); ++it) {
+        total += *it;
+    }
+    return total;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("for (final int it in values)") && source.contains("total = total + it;"),
+        "expected the manual set-iterator loop to lower to a Dart for-each, got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "manual set iterator loop must not bail out, got:\n{source}"
+    );
+}
+
+/// A fixed-size `uint8_t[N]` array decays to `List(Int)` (`lower_type`'s
+/// `CXType_ConstantArray` branch has no byte-buffer special case, unlike a
+/// `uint8_t*` parameter's own type); passing it where a `const uint8_t*`
+/// parameter expects `Uint8List?` needs the implicit-conversion wrapper to
+/// bridge the two, the same way `List(Int) → Str` is already bridged for a
+/// wide/UTF character-array literal.
+#[test]
+fn a_fixed_size_byte_array_bridges_to_uint8_list_at_a_buffer_parameter() {
+    let source = lower_and_emit(
+        "lower-cpp-byte-array-to-bytes",
+        r#"
+#include <cstdint>
+
+void consume(const uint8_t* data);
+
+void test() {
+    uint8_t buffer[] = {1, 2, 3};
+    consume(buffer);
+}
+"#,
+    );
+
+    assert!(
+        source.contains("consume(Uint8List.fromList(buffer));"),
+        "expected the fixed-size byte array to bridge to Uint8List.fromList, got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "byte array to buffer parameter must not bail out, got:\n{source}"
     );
 }
 
@@ -4196,5 +4385,52 @@ int classify(int level) {
     assert!(
         source.contains("case 2:\n      result = 20;\n  }"),
         "expected the last case to close the switch with no forced terminator, got:\n{source}"
+    );
+}
+
+/// Under `-std=c++20` — the *real* standard Verovio 6.2.0 itself builds
+/// with (`cmake/CMakeLists.txt`'s `set(CMAKE_CXX_STANDARD 20)`), not the
+/// `-std=c++17` `lower_and_emit`'s fixtures default to — the manual
+/// iterator idiom's `it != X.end()` condition compiles through C++20's
+/// rewritten-candidates rule: `libstdc++`'s iterator classes define
+/// `operator==` but no separate `operator!=`, so the call is to `==`, negated
+/// by a real `UnaryOperator '!'` wrapped in a `CXXRewrittenBinaryOperator`
+/// (confirmed with a real `clang++ -Xclang -ast-dump -std=c++20`). The first
+/// version of this loop recognizer only matched a direct `operator!=` call
+/// and so passed every one of this file's own `-std=c++17` fixtures while
+/// matching *zero* real occurrences in the actual Verovio corpus — this
+/// fixture pins `-std=c++20` specifically to catch that regression again.
+#[test]
+fn manual_iterator_loop_matches_the_cxx20_rewritten_not_equal_condition() {
+    let source = lower_and_emit_with_std(
+        "lower-cpp-manual-iterator-cxx20-rewritten",
+        r#"
+#include <list>
+
+class Object {};
+
+typedef std::list<const Object*> ListOfConstObjects;
+
+bool has_multiple(ListOfConstObjects staves) {
+    int count = 0;
+    for (auto it = staves.begin(); it != staves.end(); ++it) {
+        const Object *staff = *it;
+        if (staff) count++;
+        if (count > 1) return true;
+    }
+    return false;
+}
+"#,
+        "c++20",
+    );
+
+    assert!(
+        source.contains("for (final Object? it in staves)"),
+        "expected the c++20-rewritten condition to still be recognized as the manual \
+         iterator idiom, got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "manual iterator loop under c++20 must not bail out, got:\n{source}"
     );
 }
