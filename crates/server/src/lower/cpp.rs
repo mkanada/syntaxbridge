@@ -1461,6 +1461,20 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
             let stdlib_name = unsafe { stdlib_template_name(decl) };
             match stdlib_name.as_deref() {
                 Some("basic_string") => return ir::Type::Str,
+                // `std::stringstream`/`std::ostringstream` — the read+write
+                // and write-only accumulator streams (round 19, real
+                // trigger `options.cpp`'s `OptionArray::GetStr`: `ss <<
+                // "\"" << value << "\""; ... return ss.str();`). Modeled
+                // directly as `Type::Str` rather than a distinct type:
+                // every operation this bridge supports on one (`<<`
+                // insertion as a statement, `.str()`) reduces to plain
+                // string concatenation/identity, so giving the variable
+                // itself `Type::Str` reuses the entire existing string
+                // machinery (default value, assignment, emission) instead
+                // of inventing a parallel one. `basic_istringstream`
+                // (read/extraction via `>>`, a different idiom entirely)
+                // deliberately excluded — no fixture needs it yet.
+                Some("basic_stringstream") | Some("basic_ostringstream") => return ir::Type::Str,
                 // `std::list<T>`, `std::deque<T>`, `std::array<T, N>` and
                 // `std::initializer_list<T>` preserve the same value shape
                 // Dart exposes as `List<T>`. Their iteration and allocation
@@ -2925,6 +2939,19 @@ unsafe fn lower_stmt(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::St
         };
     }
 
+    // `ss << a << b;` (round 19) — a `std::stringstream` accumulation used
+    // as its own statement. Checked directly on `cursor`, not through
+    // `method_call_cursor_under_wrappers`: the chain's outermost
+    // `operator<<` can resolve to a free function (a literal insertion,
+    // same as the `std::cout` chain's own note on this), not only a
+    // `CXXMethod`, and `lower_stringstream_insertion_stmt` already does its
+    // own cursor-kind/receiver-chain validation.
+    if let Some(statement) =
+        unsafe { lower_stringstream_insertion_stmt(cursor, project_root, &origin) }
+    {
+        return statement;
+    }
+
     // An overloaded assignment is represented as a CallExpr, not the
     // BinaryOperator shape handled above. For immutable Dart-backed values
     // such as `String`, C++ copy assignment has the same value semantics as
@@ -3637,6 +3664,7 @@ unsafe fn lower_one_var_decl(
             )
         })
         .filter(|child| !unsafe { is_default_construct_with_no_args(*child) })
+        .filter(|child| !unsafe { is_default_construct_of_a_known_adapter_type(*child) })
         .collect();
     let init = match init_candidates.as_slice() {
         // `late Ponto p;` alone isn't enough (checked with real `dart
@@ -3646,7 +3674,30 @@ unsafe fn lower_one_var_decl(
         // late local variable". C++'s `Ponto p;` default-constructs in
         // place, so a genuinely equivalent Dart local needs a real
         // (zero-valued) object from the start, not a deferred one.
-        [] => default_record_construct(&ty, cx_type, &origin),
+        // `default_record_construct` only ever handles `Type::Record`
+        // (field-by-field). A default-constructed *library-adapter* class
+        // — `std::string s;`, and since round 19 `std::stringstream ss;`
+        // — reaches this same "no written initializer, but a real
+        // implicit default-constructor call was filtered out above" case
+        // with a `ty` that isn't a `Record`, and `default_scalar_value`
+        // already has the exact zero value each of these types
+        // constructs to in real C++ (`""` for a string, `{}`/empty for a
+        // collection). Never applied to a bare scalar (`Int`/`Double`/
+        // `Bool`): those reach this arm only for a genuinely uninitialized
+        // C++ local (`int a;`, no constructor involved at all), where
+        // C++ itself makes no promise about the value — giving it a real
+        // `0` would be an actual semantic invention, not a translation.
+        [] => default_record_construct(&ty, cx_type, &origin).or_else(|| {
+            matches!(
+                ty,
+                ir::Type::Str
+                    | ir::Type::List(_)
+                    | ir::Type::Set(_)
+                    | ir::Type::Map(_, _)
+                    | ir::Type::Bytes
+            )
+            .then(|| default_scalar_value(&ty, &origin))
+        }),
         [only_child] => Some(unsafe { lower_expr(*only_child, project_root) }),
         _ => Some(ir::Expr::Unsupported {
             reason: format!(
@@ -5236,6 +5287,42 @@ unsafe fn is_default_construct_with_no_args(cursor: clang_sys::CXCursor) -> bool
     is_default && has_no_args && !has_real_body
 }
 
+/// A real, pre-existing bug found while building round 19's stringstream
+/// support (not new to it — confirmed with a bare `std::string s;`
+/// fixture too): `is_default_construct_with_no_args`'s `!has_real_body`
+/// condition doesn't filter out a *library* type's implicit default
+/// constructor (`std::string s;`, `std::stringstream ss;`) — its body is
+/// never instantiated/visible to this translation unit at all, so
+/// `constructor_has_real_body` can't tell "nothing to do" apart from
+/// "unknown" and (conservatively, correctly for a project type) treats it
+/// as if it might do real work. Left unfiltered, the constructor call
+/// lowers through the generic path as `basic_string()`/
+/// `basic_stringstream()` — a call to a Dart function that is never
+/// generated, invalid Dart, confirmed via `dart analyze` on the resulting
+/// package. For these specific known adapters, `default_scalar_value`
+/// already has the *exact* real C++ zero value independent of body
+/// inspection (`""` for a string — C++ guarantees a default-constructed
+/// `std::string` is empty, not "unspecified" the way a bare scalar is) —
+/// so unlike the general case, no body inspection is needed at all here.
+unsafe fn is_default_construct_of_a_known_adapter_type(cursor: clang_sys::CXCursor) -> bool {
+    if unsafe { clang_sys::clang_getCursorKind(cursor) } != clang_sys::CXCursor_CallExpr {
+        return false;
+    }
+    let referenced = unsafe { clang_sys::clang_getCursorReferenced(cursor) };
+    if unsafe { clang_sys::clang_Cursor_isNull(referenced) } != 0
+        || unsafe { clang_sys::clang_getCursorKind(referenced) } != clang_sys::CXCursor_Constructor
+        || unsafe { clang_sys::clang_CXXConstructor_isDefaultConstructor(referenced) } == 0
+        || unsafe { clang_sys::clang_Cursor_getNumArguments(cursor) } != 0
+    {
+        return false;
+    }
+    let owner = unsafe { clang_sys::clang_getCursorSemanticParent(referenced) };
+    matches!(
+        unsafe { stdlib_template_name(owner) }.as_deref(),
+        Some("basic_string") | Some("basic_stringstream") | Some("basic_ostringstream")
+    )
+}
+
 /// Whether `constructor`'s `CompoundStmt` actually contains a statement.
 /// `find_compound_stmt_child(cursor).is_some()` alone isn't enough to tell a
 /// user-written body apart from a compiler-implicit one: confirmed
@@ -6004,6 +6091,167 @@ unsafe fn lower_ostream_insertion_chain(
     Some((stream, pieces))
 }
 
+/// Whether `cursor` is a `DeclRefExpr` to a local `std::stringstream`/
+/// `std::ostringstream` variable — the base case
+/// `lower_stringstream_insertion_chain` bottoms out at, mirroring
+/// `known_ostream_global`'s role for the `std::cout`/`std::cerr` chain.
+/// Checked against the variable's own *declared* clang type
+/// (`stdlib_template_name_of_type`), not `lower_type`'s result: a
+/// stringstream variable already lowers to `Type::Str` (this bridge models
+/// it *as* the accumulated string directly), which would be
+/// indistinguishable from an ordinary `std::string` local otherwise.
+unsafe fn stringstream_variable_name(cursor: clang_sys::CXCursor) -> Option<String> {
+    // `ss`, as the receiver of `operator<<`, is always reached through an
+    // implicit `DerivedToBase` cast (`basic_iostream` → `basic_ostream`,
+    // confirmed via `-ast-dump`: `operator<<` takes `basic_ostream&`, and
+    // `stringstream`'s own inheritance chain is `basic_stringstream` →
+    // `basic_iostream` → `basic_ostream`) — unlike `std::cout`/`std::cerr`,
+    // whose global objects genuinely *are* `basic_ostream` already, no cast
+    // needed. `unwrap_transparent_value_cursor` strips it before the
+    // `DeclRefExpr` check below, the same wrapper class this module
+    // already unwraps in half a dozen other spots.
+    let cursor = unsafe { unwrap_transparent_value_cursor(cursor) };
+    if unsafe { clang_sys::clang_getCursorKind(cursor) } != clang_sys::CXCursor_DeclRefExpr {
+        return None;
+    }
+    let referenced = unsafe { clang_sys::clang_getCursorReferenced(cursor) };
+    if unsafe { clang_sys::clang_Cursor_isNull(referenced) } != 0 {
+        return None;
+    }
+    // `std::stringstream` is itself a typedef for `basic_stringstream<char>`
+    // (the same shape `std::string`/`basic_string<char>` has, and the same
+    // trap `lower_ostream_insertion_chain`'s own `call_type` already
+    // canonicalizes for): `clang_getTypeDeclaration` on the typedef itself
+    // resolves to the `TypedefDecl`, which `stdlib_template_name` correctly
+    // reports as "not a template specialization" — so this needs the
+    // canonical type first, or every real `std::stringstream` variable
+    // would silently never match.
+    let declared_type = unsafe {
+        clang_sys::clang_getCanonicalType(clang_sys::clang_getCursorType(referenced))
+    };
+    match unsafe { stdlib_template_name_of_type(declared_type) }.as_deref() {
+        Some("basic_stringstream") | Some("basic_ostringstream") => {}
+        _ => return None,
+    }
+    Some(dart_safe_identifier(&unsafe {
+        type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced))
+    }))
+}
+
+/// `ss << a << b << ...;` — the `std::stringstream`/`std::ostringstream`
+/// accumulator idiom (round 19, real trigger `options.cpp`'s
+/// `OptionArray::GetStr`: `ss << "\"" << value << "\"";` inside a loop,
+/// then `return ss.str();`). Structurally the *same* left-associative
+/// chain `lower_ostream_insertion_chain` already walks for `std::cout`/
+/// `std::cerr` (same operator-syntax shape, same
+/// `stdlib_template_name_of_type(call_type) == "basic_ostream"` check —
+/// `basic_stringstream` inherits `basic_ostream`'s `operator<<`, so a
+/// chain ending at either resolves through the exact same overloads) —
+/// duplicated rather than sharing one function with
+/// `lower_ostream_insertion_chain`, since the two differ in exactly the
+/// one thing a shared helper would need a parameter for anyway (the base
+/// case: a known global stream object vs. a local variable's own name) and
+/// in what they do with the result (`print`/`stderr.writeln` vs. a
+/// self-reassignment). No `std::endl`/manipulator requirement here, unlike
+/// the `std::cout` chain: a stringstream accumulates across many separate
+/// statements, not one terminal flush, so this fires for *every* insertion
+/// chain into a recognized stringstream variable, used as its own
+/// statement.
+unsafe fn lower_stringstream_insertion_chain(
+    cursor: clang_sys::CXCursor,
+    project_root: &Path,
+    origin: &ir::Origin,
+) -> Option<(String, Vec<ir::Expr>)> {
+    if let Some(name) = unsafe { stringstream_variable_name(cursor) } {
+        return Some((name, Vec::new()));
+    }
+    if unsafe { clang_sys::clang_getCursorKind(cursor) } != clang_sys::CXCursor_CallExpr {
+        return None;
+    }
+    let referenced = unsafe { clang_sys::clang_getCursorReferenced(cursor) };
+    if unsafe { clang_sys::clang_Cursor_isNull(referenced) } != 0 {
+        return None;
+    }
+    let spelling =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced)) };
+    if spelling != "operator<<" {
+        return None;
+    }
+    let call_type =
+        unsafe { clang_sys::clang_getCanonicalType(clang_sys::clang_getCursorType(cursor)) };
+    if unsafe { stdlib_template_name_of_type(call_type) }.as_deref() != Some("basic_ostream") {
+        return None;
+    }
+    if unsafe { clang_sys::clang_Cursor_getNumArguments(cursor) } != 2 {
+        return None;
+    }
+    let receiver_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 0) };
+    let value_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 1) };
+    let (name, mut pieces) =
+        unsafe { lower_stringstream_insertion_chain(receiver_cursor, project_root, origin) }?;
+    let value = unsafe { lower_expr(value_cursor, project_root) };
+    let piece = if matches!(value, ir::Expr::StringLiteral { .. }) {
+        value
+    } else {
+        match lower_type(unsafe { clang_sys::clang_getCursorType(value_cursor) }) {
+            ir::Type::Str => value,
+            ir::Type::Int | ir::Type::Double => ir::Expr::Call {
+                target: Some(Box::new(value)),
+                callee_usr: String::new(),
+                callee_name: "toString".to_owned(),
+                args: Vec::new(),
+                ty: ir::Type::Str,
+                origin: origin.clone(),
+            },
+            _ => return None,
+        }
+    };
+    pieces.push(piece);
+    Some((name, pieces))
+}
+
+/// `ss << a << b;` used as its own statement — builds
+/// `ss = ss + a.toString() + b.toString();`, preserving whatever `ss`
+/// already held (the same reduce-with-`Add` `lower_ostream_insertion_chain`
+/// already uses for `print`'s message, just starting the fold from `ss`
+/// itself instead of the first piece, since this appends rather than
+/// replaces). `None` for anything `lower_stringstream_insertion_chain`
+/// itself doesn't recognize, so the caller falls through to the ordinary
+/// bailout unchanged.
+unsafe fn lower_stringstream_insertion_stmt(
+    cursor: clang_sys::CXCursor,
+    project_root: &Path,
+    origin: &ir::Origin,
+) -> Option<ir::Stmt> {
+    if unsafe { clang_sys::clang_getCursorKind(cursor) } != clang_sys::CXCursor_CallExpr {
+        return None;
+    }
+    let (name, pieces) =
+        unsafe { lower_stringstream_insertion_chain(cursor, project_root, origin) }?;
+    if pieces.is_empty() {
+        return None;
+    }
+    let value = pieces.into_iter().fold(
+        ir::Expr::Ref {
+            name: name.clone(),
+            ty: ir::Type::Str,
+            origin: origin.clone(),
+        },
+        |acc, piece| ir::Expr::Binary {
+            op: ir::BinaryOp::Add,
+            lhs: Box::new(acc),
+            rhs: Box::new(piece),
+            ty: ir::Type::Str,
+            origin: origin.clone(),
+        },
+    );
+    Some(ir::Stmt::Assign {
+        name,
+        value,
+        origin: origin.clone(),
+    })
+}
+
 unsafe fn lower_stdlib_method_call(
     call_cursor: clang_sys::CXCursor,
     referenced: clang_sys::CXCursor,
@@ -6177,6 +6425,17 @@ unsafe fn lower_stdlib_method_call(
     };
 
     match (template_name.as_str(), callee_name.as_str()) {
+        // `ss.str()` — the stringstream variable already *is* `Type::Str`
+        // (round 19: `lower_type`'s `basic_stringstream`/
+        // `basic_ostringstream` case), so reading it back is identity, the
+        // zero-argument form only (`ss.str(newValue)`, a rarer resetting
+        // overload no fixture needs, falls through to the generic bailout
+        // below unchanged).
+        ("basic_stringstream" | "basic_ostringstream", "str")
+            if unsafe { clang_sys::clang_Cursor_getNumArguments(call_cursor) } == 0 =>
+        {
+            Some(target)
+        }
         ("basic_string", "size") | ("basic_string", "length") => Some(ir::Expr::StringByteLength {
             target: Box::new(target),
             origin: origin.clone(),

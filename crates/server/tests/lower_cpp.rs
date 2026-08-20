@@ -4174,6 +4174,83 @@ void only_x(int *a) {
     );
 }
 
+/// `std::stringstream`/`std::ostringstream` accumulation (round 19, real
+/// trigger `options.cpp`'s `OptionArray::GetStr`): `ss << a << b;` used as
+/// its own statement, across several separate insertions (including inside
+/// a loop), then read back with `.str()`. Modeled directly as `Type::Str`
+/// end to end — the declaration, every `<<` statement, and the final
+/// `.str()` read.
+#[test]
+fn a_stringstream_accumulates_across_statements_and_reads_back_with_str() {
+    let source = lower_and_emit(
+        "lower-cpp-stringstream-accumulator",
+        r#"
+#include <sstream>
+#include <string>
+#include <vector>
+
+std::string join(const std::vector<std::string>& values) {
+    std::stringstream ss;
+    int i = 0;
+    for (std::string const& value : values) {
+        if (i != 0) {
+            ss << ", ";
+        }
+        ss << "\"" << value << "\"";
+        ++i;
+    }
+    return ss.str();
+}
+"#,
+    );
+
+    assert!(
+        source.contains("String ss = '';"),
+        "expected the stringstream to start as an empty Dart String, got:\n{source}"
+    );
+    assert!(
+        source.contains("ss = ss + ', ';")
+            && source.contains("ss = ss + '\"' + value + '\"';"),
+        "expected each insertion chain to reassign ss by concatenation, got:\n{source}"
+    );
+    assert!(
+        source.contains("return ss;"),
+        "expected ss.str() to read back the accumulated string directly, got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "stringstream accumulation must not bail out, got:\n{source}"
+    );
+}
+
+/// A numeric insertion into a stringstream needs `.toString()`, the same
+/// way the `std::cout` chain already converts a non-`Str` operand.
+#[test]
+fn a_stringstream_converts_non_string_operands_with_to_string() {
+    let source = lower_and_emit(
+        "lower-cpp-stringstream-numeric",
+        r#"
+#include <sstream>
+#include <string>
+
+std::string describe(int count) {
+    std::stringstream ss;
+    ss << "count=" << count;
+    return ss.str();
+}
+"#,
+    );
+
+    assert!(
+        source.contains("ss = ss + 'count=' + count.toString();"),
+        "expected the int operand to be converted with toString(), got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "stringstream numeric insertion must not bail out, got:\n{source}"
+    );
+}
+
 /// `void*`/`const void*` — the single largest type bailout in the
 /// 2026-08-20 Verovio diagnosis (896 + 253 occurrences), real shapes
 /// confirmed by grepping the extracted Verovio source directly
@@ -4585,5 +4662,35 @@ int sum_all(const std::unordered_set<int>& values) {
     assert!(
         !source.contains("Unsupported") && !source.contains("dynamic"),
         "manual unordered_set iterator loop must not bail out, got:\n{source}"
+    );
+}
+
+/// A pre-existing bug found while building round 19's stringstream support
+/// (not specific to it): `std::string s;` (default-constructed, no written
+/// initializer) lowered to `String s = basic_string();` — a call to a Dart
+/// function that is never generated, invalid Dart. C++ guarantees a
+/// default-constructed `std::string` is empty, so `default_scalar_value`'s
+/// `''` is the exact right value, not a guess.
+#[test]
+fn a_bare_default_constructed_string_starts_as_an_empty_dart_string() {
+    let source = lower_and_emit(
+        "lower-cpp-bare-string-default-construct",
+        r#"
+#include <string>
+std::string f() {
+    std::string s;
+    return s;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("String s = '';"),
+        "expected a default-constructed std::string to start as an empty Dart String, \
+         got:\n{source}"
+    );
+    assert!(
+        !source.contains("basic_string()"),
+        "must never call the nonexistent Dart function basic_string(), got:\n{source}"
     );
 }
