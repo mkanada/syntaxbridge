@@ -117,18 +117,6 @@ prontos (criacao de projeto e ingestao, lista de arquivos fonte, catalogo de
 tipos, usos de tipo, catalogo de funcoes com grafo de chamadas); US-6 em diante
 esta planejado.
 
-Estrutura:
-
-- Servidor Rust em `crates/server` (workspace Cargo na raiz), com os modulos de
-  analise (`ingest.rs`, `type_catalog.rs`, `source_catalog.rs`,
-  `function_catalog.rs`), orquestracao (`jobs.rs`, `progress.rs`,
-  `project_service.rs`), rotas (`server.rs`) e persistencia
-  (`persistence/project_store.rs`).
-- Cliente Flutter em `client/flutter`, com `lib/src/{project,server,ui,io,logging}`.
-- Manifesto Flatpak em `build-aux/flatpak/dev.syntax_bridge.SyntaxBridge.json`,
-  com as extensoes `rust-stable`, `llvm21` e os modulos `dart-sdk` e
-  `googletest`.
-
 ### Comandos
 
 Use as receitas do `justfile`, nao `cargo`/`flutter`/`dart` crus - elas fixam os

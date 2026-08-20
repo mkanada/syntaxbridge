@@ -46,6 +46,11 @@ pub struct CreatedProject {
     /// `project_service::create_project` alongside `type_catalog`, for the
     /// same reason `type_catalog` itself is left empty here.
     pub pointer_catalog: Vec<PointerDeclaration>,
+    /// Whether "Analyse" (item 2, `docs/prompts/2026-08-19-mudanca-interacao.md`)
+    /// has ever completed for this project — always `false` right after
+    /// ingestion (`project_service::create_project`), since ingestion never
+    /// runs it; set by `project_service::is_project_analysed`.
+    pub is_analysed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -247,6 +252,7 @@ pub fn create_project(request: CreateProjectRequest) -> Result<CreatedProject, I
         type_dependencies: Vec::new(),
         source_files: Vec::new(),
         pointer_catalog: Vec::new(),
+        is_analysed: false,
     })
 }
 

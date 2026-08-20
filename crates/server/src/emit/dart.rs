@@ -25,6 +25,8 @@ const INDENT: &str = "  ";
 const UNSUPPORTED_HELPER_NAME: &str = "_syntaxBridgeUnsupported";
 const OPAQUE_TYPE_NAME: &str = "SyntaxBridgeOpaque";
 const PAIR_TYPE_NAME: &str = "SyntaxBridgePair";
+/// Must read the same literal name as `lower::cpp::NATIVE_HANDLE_TYPE_NAME`.
+const NATIVE_HANDLE_TYPE_NAME: &str = "SyntaxBridgeNativeHandle";
 const SUPPORT_FILE_NAME: &str = "syntax_bridge_support.dart";
 
 /// Groups `module`'s records and functions by the C++ source file they came
@@ -183,8 +185,22 @@ pub fn emit_module_with_externals(
             )
         })
         .collect();
-    if files.values().any(|source| source.contains(PAIR_TYPE_NAME)) {
-        files.insert(format!("lib/{SUPPORT_FILE_NAME}"), emit_pair_support());
+    let needs_pair_support = files.values().any(|source| source.contains(PAIR_TYPE_NAME));
+    let needs_native_handle_support = files
+        .values()
+        .any(|source| source.contains(NATIVE_HANDLE_TYPE_NAME));
+    if needs_pair_support || needs_native_handle_support {
+        let mut support = String::new();
+        if needs_pair_support {
+            support.push_str(&emit_pair_support());
+        }
+        if needs_native_handle_support {
+            if !support.is_empty() {
+                support.push('\n');
+            }
+            support.push_str(&emit_native_handle_support());
+        }
+        files.insert(format!("lib/{SUPPORT_FILE_NAME}"), support);
     }
     files
 }
@@ -454,7 +470,10 @@ fn emit_file(
     if source.contains("Uint8List") {
         import_lines.push("import 'dart:typed_data';".to_owned());
     }
-    if source.contains(PAIR_TYPE_NAME) {
+    if source.contains("stderr.") {
+        import_lines.push("import 'dart:io';".to_owned());
+    }
+    if source.contains(PAIR_TYPE_NAME) || source.contains(NATIVE_HANDLE_TYPE_NAME) {
         import_lines.push(format!("import '{SUPPORT_FILE_NAME}';"));
     }
     for other_stem in &needed_imports {
@@ -483,6 +502,27 @@ fn emit_opaque_type() -> String {
 fn emit_pair_support() -> String {
     format!(
         "final class {PAIR_TYPE_NAME}<A, B> {{\n{INDENT}const {PAIR_TYPE_NAME}(this.first, this.second);\n\n{INDENT}final A first;\n{INDENT}final B second;\n}}\n"
+    )
+}
+
+/// A named bridge for a C++ `void*`/`const void*` value — an opaque native
+/// pointer this project never dereferences or does address arithmetic on,
+/// only ever holds and passes along (`mapping::pointer_options_for`'s
+/// `"ponte-dart-ffi"` option, `docs/plans/bailouts-verovio-6.2.0.md`'s
+/// phase-4 "void* → handle de domínio nomeado"). Unlike `SyntaxBridgeOpaque`
+/// (§ "Definições" of `docs/prompts/2026-08-20-loop-bailout.md` — a
+/// placeholder with no connection to the C++ type it replaced), this class
+/// *is* the honest Dart shape of a `void*`: identity-only, nothing more,
+/// documented as such rather than hiding an unmapped type.
+fn emit_native_handle_support() -> String {
+    format!(
+        "/// An opaque native pointer (`void*`/`const void*` in the original C++)\n\
+         /// that Syntax Bridge never dereferences or does address arithmetic on —\n\
+         /// only holds and forwards it. Two handles are the same handle only by\n\
+         /// identity (`==` is the default `Object` identity check).\n\
+         final class {NATIVE_HANDLE_TYPE_NAME} {{\n\
+         {INDENT}const {NATIVE_HANDLE_TYPE_NAME}();\n\
+         }}\n"
     )
 }
 
@@ -651,7 +691,7 @@ fn collect_referenced_usrs_in_stmt<'a>(stmt: &'a Stmt, out: &mut HashSet<&'a str
             collect_referenced_usrs_in_expr(iterable, out);
             collect_referenced_usrs_in_stmts(body, out);
         }
-        Stmt::Break { .. } | Stmt::Continue { .. } => {}
+        Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::ContinueLabel { .. } => {}
         Stmt::ExprStmt { expr, .. } => collect_referenced_usrs_in_expr(expr, out),
         Stmt::Throw { value, .. } => collect_referenced_usrs_in_expr(value, out),
         Stmt::TryCatch {
@@ -677,6 +717,23 @@ fn collect_referenced_usrs_in_stmt<'a>(stmt: &'a Stmt, out: &mut HashSet<&'a str
                 collect_referenced_usrs_in_expr(target, out);
             }
             collect_referenced_usrs_in_expr(value, out);
+        }
+        Stmt::Switch {
+            scrutinee,
+            cases,
+            default,
+            ..
+        } => {
+            collect_referenced_usrs_in_expr(scrutinee, out);
+            for case in cases {
+                for value in &case.values {
+                    collect_referenced_usrs_in_expr(value, out);
+                }
+                collect_referenced_usrs_in_stmts(&case.body, out);
+            }
+            if let Some(default) = default {
+                collect_referenced_usrs_in_stmts(default, out);
+            }
         }
         Stmt::Unsupported { .. } => {}
     }
@@ -783,6 +840,34 @@ fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str
                 collect_referenced_usrs_in_expr(value, out);
             }
         }
+        Expr::ListLiteral { items, ty, .. } => {
+            collect_referenced_usrs_in_type(ty, out);
+            for item in items {
+                collect_referenced_usrs_in_expr(item, out);
+            }
+        }
+        Expr::MapLiteral { entries, ty, .. } => {
+            collect_referenced_usrs_in_type(ty, out);
+            for (key, value) in entries {
+                collect_referenced_usrs_in_expr(key, out);
+                collect_referenced_usrs_in_expr(value, out);
+            }
+        }
+        Expr::Is {
+            operand,
+            target_type,
+            ..
+        } => {
+            collect_referenced_usrs_in_type(target_type, out);
+            collect_referenced_usrs_in_expr(operand, out);
+        }
+        Expr::Assign {
+            target, value, ty, ..
+        } => {
+            collect_referenced_usrs_in_type(ty, out);
+            collect_referenced_usrs_in_expr(target, out);
+            collect_referenced_usrs_in_expr(value, out);
+        }
     }
 }
 
@@ -800,18 +885,34 @@ fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str
 /// build one (`enum Vazio {};` is legal C++ but has no Dart form), so this
 /// only guards IR that didn't come from the C++ lowering pass — visible in
 /// the output if it ever happens, never a file that won't parse.
+///
+/// Every enumerator carries its real C++ value explicitly
+/// (`Vermelho(0), Verde(1), Azul(2)`, plus a `const` constructor and a
+/// `value` field) rather than relying on Dart's own `.index` — see
+/// `ir::Enum::values`'s doc comment for why: C++ enumerators aren't
+/// guaranteed 0-based/sequential/gapless, so `.index` alone would silently
+/// disagree with the C++ program for any enum that isn't (Verovio itself
+/// declares several that aren't). `Expr::Convert` to `Type::Int` with an
+/// `Enum`-typed operand (`emit_expr`) reads this same `.value`.
 fn emit_enum(enum_decl: &Enum) -> String {
     if enum_decl.variants.is_empty() {
         return format!(
-            "// TODO(syntax-bridge): `{}` declares no constants; Dart has no empty enum.\nenum {} {{ unsupportedEmptyEnum }}\n",
-            enum_decl.name, enum_decl.name
+            "// TODO(syntax-bridge): `{}` declares no constants; Dart has no empty enum.\nenum {} {{ unsupportedEmptyEnum(0);\n  const {}(this.value);\n  final int value;\n}}\n",
+            enum_decl.name, enum_decl.name, enum_decl.name
         );
     }
 
+    let constants = enum_decl
+        .variants
+        .iter()
+        .zip(&enum_decl.values)
+        .map(|(name, value)| format!("{name}({value})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     format!(
-        "enum {} {{ {} }}\n",
-        enum_decl.name,
-        enum_decl.variants.join(", ")
+        "enum {name} {{\n  {constants};\n\n  const {name}(this.value);\n  final int value;\n}}\n",
+        name = enum_decl.name,
     )
 }
 
@@ -1768,7 +1869,22 @@ fn stmt_unsupported_type_spelling(stmt: &Stmt) -> Option<&str> {
             .iter()
             .find_map(expr_unsupported_type_spelling)
             .or_else(|| expr_unsupported_type_spelling(value)),
-        Stmt::Break { .. } | Stmt::Continue { .. } => None,
+        Stmt::Switch {
+            scrutinee,
+            cases,
+            default,
+            ..
+        } => expr_unsupported_type_spelling(scrutinee)
+            .or_else(|| {
+                cases.iter().find_map(|case| {
+                    case.values
+                        .iter()
+                        .find_map(expr_unsupported_type_spelling)
+                        .or_else(|| first_unsupported_type_in_list(&case.body))
+                })
+            })
+            .or_else(|| default.as_deref().and_then(first_unsupported_type_in_list)),
+        Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::ContinueLabel { .. } => None,
         Stmt::Unsupported { .. } => None,
     }
 }
@@ -1843,6 +1959,24 @@ fn expr_unsupported_type_spelling(expr: &Expr) -> Option<&str> {
             .or_else(|| expr_unsupported_type_spelling(target))
             .or_else(|| expr_unsupported_type_spelling(index)),
         Expr::Tuple { values, .. } => values.iter().find_map(expr_unsupported_type_spelling),
+        Expr::ListLiteral { items, ty, .. } => unsupported_spelling(ty)
+            .or_else(|| items.iter().find_map(expr_unsupported_type_spelling)),
+        Expr::MapLiteral { entries, ty, .. } => unsupported_spelling(ty).or_else(|| {
+            entries.iter().find_map(|(key, value)| {
+                expr_unsupported_type_spelling(key)
+                    .or_else(|| expr_unsupported_type_spelling(value))
+            })
+        }),
+        Expr::Is {
+            operand,
+            target_type,
+            ..
+        } => unsupported_spelling(target_type).or_else(|| expr_unsupported_type_spelling(operand)),
+        Expr::Assign {
+            target, value, ty, ..
+        } => unsupported_spelling(ty)
+            .or_else(|| expr_unsupported_type_spelling(target))
+            .or_else(|| expr_unsupported_type_spelling(value)),
     }
 }
 
@@ -1891,6 +2025,10 @@ fn first_unsupported_in_stmt(stmt: &Stmt) -> Option<&Stmt> {
         } => {
             first_unsupported_in_list(try_body).or_else(|| first_unsupported_in_list(finally_body))
         }
+        Stmt::Switch { cases, default, .. } => cases
+            .iter()
+            .find_map(|case| first_unsupported_in_list(&case.body))
+            .or_else(|| default.as_deref().and_then(first_unsupported_in_list)),
         Stmt::Return { .. }
         | Stmt::VarDecl { .. }
         | Stmt::Assign { .. }
@@ -1900,6 +2038,7 @@ fn first_unsupported_in_stmt(stmt: &Stmt) -> Option<&Stmt> {
         | Stmt::TupleAssign { .. }
         | Stmt::Break { .. }
         | Stmt::Continue { .. }
+        | Stmt::ContinueLabel { .. }
         | Stmt::Throw { .. } => None,
     }
 }
@@ -2019,6 +2158,29 @@ fn emit_stmt(
             emit_expr(map, used_expr_helper, used_utf8_encode),
             receiver_bang(map),
             emit_expr(index, used_expr_helper, used_utf8_encode),
+            emit_expr(value, used_expr_helper, used_utf8_encode)
+        ),
+        // Assigning *through* a `T*` out-param (`(*out) = value;`, C++'s
+        // idiom for a mutable output parameter — Verovio's real
+        // `ParseAddSylAction`/`ParseDragAction`/`ParseInsertAction`, among
+        // others) lowers its target through the same `lower_expr` every
+        // *read* of `*out` goes through, which represents the dereference as
+        // `Expr::Convert` and renders it with the `!` a read needs. An
+        // assignment target is a write, not a read: this model has no
+        // separate pointee storage to write into — the "pointer" *is* the
+        // nullable slot — so the target is just `operand` reassigned
+        // directly, never `operand!` (a bare `!` is a read-only null-assertion,
+        // never valid syntax on an assignment's left side; two real Verovio
+        // files fail to parse as Dart without this case, see
+        // `assigning_through_a_string_out_param_reassigns_the_nullable_local_without_a_bang`
+        // in `crates/server/tests/lower_cpp.rs`).
+        Stmt::ExprAssign {
+            target: Expr::Convert { operand, .. },
+            value,
+            ..
+        } if operand.is_assignable_lvalue() => format!(
+            "{pad}{} = {};\n",
+            emit_expr(operand, used_expr_helper, used_utf8_encode),
             emit_expr(value, used_expr_helper, used_utf8_encode)
         ),
         Stmt::ExprAssign { target, value, .. } => format!(
@@ -2187,6 +2349,7 @@ fn emit_stmt(
         }
         Stmt::Break { .. } => format!("{pad}break;\n"),
         Stmt::Continue { .. } => format!("{pad}continue;\n"),
+        Stmt::ContinueLabel { label, .. } => format!("{pad}continue {label};\n"),
         Stmt::ExprStmt { expr, .. } => format!(
             "{pad}{};\n",
             emit_expr(expr, used_expr_helper, used_utf8_encode)
@@ -2306,6 +2469,57 @@ fn emit_stmt(
                 emit_expr(value, used_expr_helper, used_utf8_encode)
             )
         }
+        // `lower::cpp::lower_switch_stmt` already guarantees every case's
+        // `body` ends in a jump (`break`/`continue`/`continue <label>;`/
+        // `return`/`throw`) or is empty (pure label-stacking) — Dart's own
+        // requirement for a non-empty `case`. A `case.label`, when present,
+        // is what a preceding case's `Stmt::ContinueLabel` jumps into —
+        // Dart's own explicit-fallthrough syntax — printed on its own line
+        // right before the `case` line(s) it labels.
+        Stmt::Switch {
+            scrutinee,
+            cases,
+            default,
+            ..
+        } => {
+            let mut source = format!(
+                "{pad}switch ({}) {{\n",
+                emit_expr(scrutinee, used_expr_helper, used_utf8_encode)
+            );
+            let case_pad = INDENT.repeat(depth + 1);
+            for case in cases {
+                if let Some(label) = &case.label {
+                    source.push_str(&format!("{case_pad}{label}:\n"));
+                }
+                for value in &case.values {
+                    source.push_str(&format!(
+                        "{case_pad}case {}:\n",
+                        emit_expr(value, used_expr_helper, used_utf8_encode)
+                    ));
+                }
+                for inner in &case.body {
+                    source.push_str(&emit_stmt(
+                        inner,
+                        depth + 2,
+                        used_expr_helper,
+                        used_utf8_encode,
+                    ));
+                }
+            }
+            if let Some(default) = default {
+                source.push_str(&format!("{case_pad}default:\n"));
+                for inner in default {
+                    source.push_str(&emit_stmt(
+                        inner,
+                        depth + 2,
+                        used_expr_helper,
+                        used_utf8_encode,
+                    ));
+                }
+            }
+            source.push_str(&format!("{pad}}}\n"));
+            source
+        }
         Stmt::Unsupported { reason, origin } => format!(
             "{pad}// TODO(syntax-bridge): {reason}\n{pad}throw UnimplementedError({message});\n",
             message = dart_string_literal(&unsupported_message(reason, origin)),
@@ -2360,6 +2574,17 @@ fn emit_for_clause(
             emit_expr(index, used_expr_helper, used_utf8_encode),
             emit_expr(value, used_expr_helper, used_utf8_encode)
         ),
+        // Same out-param dereference-assignment case `emit_stmt`'s
+        // `Stmt::ExprAssign` handles — see its doc comment.
+        Stmt::ExprAssign {
+            target: Expr::Convert { operand, .. },
+            value,
+            ..
+        } if operand.is_assignable_lvalue() => format!(
+            "{} = {}",
+            emit_expr(operand, used_expr_helper, used_utf8_encode),
+            emit_expr(value, used_expr_helper, used_utf8_encode)
+        ),
         Stmt::ExprAssign { target, value, .. } => format!(
             "{} = {}",
             emit_expr(target, used_expr_helper, used_utf8_encode),
@@ -2393,6 +2618,9 @@ fn expr_ty(expr: &Expr) -> Option<&Type> {
         | Expr::Binary { ty, .. }
         | Expr::Conditional { ty, .. }
         | Expr::Unary { ty, .. }
+        | Expr::ListLiteral { ty, .. }
+        | Expr::MapLiteral { ty, .. }
+        | Expr::Assign { ty, .. }
         | Expr::Convert { ty, .. }
         | Expr::Call { ty, .. }
         | Expr::FieldAccess { ty, .. }
@@ -2410,6 +2638,7 @@ fn expr_ty(expr: &Expr) -> Option<&Type> {
         | Expr::StringByteLength { .. }
         | Expr::StringByteIndexOf { .. }
         | Expr::Tuple { .. }
+        | Expr::Is { .. }
         | Expr::Unsupported { .. } => None,
         Expr::UnsupportedTyped { ty, .. } => Some(ty),
     }
@@ -2525,6 +2754,26 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
                 "{}.toDouble()",
                 emit_expr(operand, used_expr_helper, used_utf8_encode)
             ),
+            // `bool` → `int` (C++ implicitly reads a `bool` as `1`/`0`
+            // wherever an integer is expected), `enum` → `int` (the
+            // enumerator's real C++ value — `ir::Enum::values`'s doc
+            // comment on why this is `.value`, never Dart's `.index`), and
+            // the narrowing `double` → `int` (truncates toward zero, same
+            // direction as `.toInt()`) — `lower::cpp`'s three
+            // `child_ty`/`outer_ty` arms that construct this with
+            // `ty: Type::Int`.
+            Type::Int if matches!(expr_ty(operand), Some(Type::Bool)) => format!(
+                "{} ? 1 : 0",
+                emit_expr(operand, used_expr_helper, used_utf8_encode)
+            ),
+            Type::Int if matches!(expr_ty(operand), Some(Type::Enum { .. })) => format!(
+                "{}.value",
+                emit_expr(operand, used_expr_helper, used_utf8_encode)
+            ),
+            Type::Int => format!(
+                "{}.toInt()",
+                emit_expr(operand, used_expr_helper, used_utf8_encode)
+            ),
             Type::Bool => format!(
                 "{} != {}",
                 emit_expr(operand, used_expr_helper, used_utf8_encode),
@@ -2548,7 +2797,9 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
                 emit_expr(operand, used_expr_helper, used_utf8_encode)
             ),
             _ => unreachable!(
-                "only represented scalar and nullable-reference conversions construct Expr::Convert"
+                "only represented scalar and nullable-reference conversions construct \
+                 Expr::Convert, got ty={ty:?} operand={operand:?} at {:?}",
+                expr.origin()
             ),
         },
         Expr::Call {
@@ -2665,6 +2916,55 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
                 emit_expr(&values[0], used_expr_helper, used_utf8_encode)
             )
         }
+        Expr::ListLiteral { items, ty, .. } => format!(
+            "<{}>[{}]",
+            emit_type(match ty {
+                Type::List(element) => element,
+                _ => ty,
+            }),
+            items
+                .iter()
+                .map(|item| emit_expr(item, used_expr_helper, used_utf8_encode))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Expr::MapLiteral { entries, ty, .. } => {
+            let (key_ty, value_ty) = match ty {
+                Type::Map(key, value) => (key.as_ref(), value.as_ref()),
+                _ => (ty, ty),
+            };
+            format!(
+                "<{}, {}>{{{}}}",
+                emit_type(key_ty),
+                emit_type(value_ty),
+                entries
+                    .iter()
+                    .map(|(key, value)| format!(
+                        "{}: {}",
+                        emit_expr(key, used_expr_helper, used_utf8_encode),
+                        emit_expr(value, used_expr_helper, used_utf8_encode)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+        Expr::Is {
+            operand,
+            target_type,
+            ..
+        } => format!(
+            "{} is {}",
+            emit_expr(operand, used_expr_helper, used_utf8_encode),
+            emit_type(target_type)
+        ),
+        // Always parenthesized: Dart's `=` has the same low precedence
+        // C++'s does, so an unparenthesized `x = y != null` would parse as
+        // `x = (y != null)`, not the intended `(x = y) != null`.
+        Expr::Assign { target, value, .. } => format!(
+            "({} = {})",
+            emit_expr(target, used_expr_helper, used_utf8_encode),
+            emit_expr(value, used_expr_helper, used_utf8_encode)
+        ),
         Expr::Tuple { values, .. } => format!(
             "({})",
             values

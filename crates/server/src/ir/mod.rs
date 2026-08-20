@@ -237,6 +237,74 @@ pub enum Expr {
         ty: Type,
         origin: Origin,
     },
+    /// A brace-enclosed initializer list (`{1, 2, 3}`) lowered to a Dart
+    /// list literal — only when `ty` (`clang_getCursorType` on the
+    /// `InitListExpr` cursor, already resolved by `lower::cpp`) is
+    /// `Type::List`; every other destination (aggregate struct, `Set`,
+    /// fixed C array) stays a bailout rather than guessing a Dart literal
+    /// shape from an unverified type. `Type::Map` gets its own
+    /// `Expr::MapLiteral` below instead, since a `std::map`'s brace
+    /// initializer doesn't share this variant's flat "one value per
+    /// element" shape. See `lower::cpp::lower_expr`'s
+    /// `CXCursor_InitListExpr` branch.
+    ListLiteral {
+        items: Vec<Expr>,
+        ty: Type,
+        origin: Origin,
+    },
+    /// `std::map<K, V> m{ {k1, v1}, {k2, v2} };` (also `unordered_map`) —
+    /// real Verovio trigger: static const lookup tables declared this way
+    /// throughout the corpus (`midifunctor.cpp`, `iocmme.cpp`, ...). Unlike
+    /// `ListLiteral`'s flat elements, a `std::map`'s initializer-list
+    /// constructor wraps each entry in its own `std::pair<const K, V>`
+    /// construction (2 args, key then value) — `lower::cpp` extracts those
+    /// two arguments directly rather than routing through a general
+    /// `std::pair` construction path this module doesn't otherwise need.
+    /// `ty` is always `Type::Map(K, V)`, matching the destination's own
+    /// resolved type — this only ever gets built from a construct call
+    /// libclang already resolved to that owner, never guessed.
+    MapLiteral {
+        entries: Vec<(Expr, Expr)>,
+        ty: Type,
+        origin: Origin,
+    },
+    /// Dart's `operand is T` runtime type check — the check's own value is
+    /// always `bool`. Currently produced only by `dynamic_cast<T*>(operand)`'s
+    /// translation (see `lower::cpp::lower_dynamic_cast_expr`, which wraps
+    /// this as the condition of an `Expr::Conditional`: `operand is T ?
+    /// operand : null` — Dart's flow-sensitive type promotion inside a
+    /// ternary's condition→then branch means the `then` branch needs no
+    /// separate cast), never emitted from any other C++ construct.
+    Is {
+        operand: Box<Expr>,
+        target_type: Type,
+        origin: Origin,
+    },
+    /// C++ assignment used as an *expression*, not a whole statement
+    /// (`while ((x = foo()) != nullptr)`, or the same shape reached
+    /// indirectly when an intervening `libclang` wrapper cursor — e.g. a
+    /// template-instantiated call's cleanup node — keeps a plain-looking
+    /// `x = foo();` statement from being recognized as
+    /// `CXCursor_BinaryOperator` at the statement level, confirmed as the
+    /// real Verovio trigger in `adjustarticfunctor.cpp`'s `yIn =
+    /// std::max(yAboveStem, -staffHeight);`). Dart's own `=` is a real
+    /// expression too, evaluating to the assigned value — confirmed with a
+    /// real `dart analyze`/`dart run` before this was assumed, not
+    /// guessed — so this maps 1:1 onto Dart's assignment expression rather
+    /// than needing a hoisted temporary statement. Always parenthesized on
+    /// emission (`(target = value)`): Dart's `=` has the same low
+    /// precedence C++'s does, so an unparenthesized `x = y != null` would
+    /// parse as `x = (y != null)`, not `(x = y) != null`. Scoped to the
+    /// same two simple target shapes `Stmt::Assign`/`Stmt::FieldAssign`
+    /// already support (a bare local/field) — anything else stays an
+    /// honest bailout, the same restriction `lower_assign_stmt` already
+    /// enforces for the statement form.
+    Assign {
+        target: Box<Expr>,
+        value: Box<Expr>,
+        ty: Type,
+        origin: Origin,
+    },
     /// An implicit scalar conversion C++ inserted on `operand` — currently
     /// `int` → `double` and C++ truthiness `int` → `bool`. `lower::cpp` must
     /// keep it explicit rather than discarding it as sugar: Dart neither
@@ -394,6 +462,10 @@ impl Expr {
             | Self::Binary { origin, .. }
             | Self::Conditional { origin, .. }
             | Self::Unary { origin, .. }
+            | Self::ListLiteral { origin, .. }
+            | Self::MapLiteral { origin, .. }
+            | Self::Is { origin, .. }
+            | Self::Assign { origin, .. }
             | Self::Convert { origin, .. }
             | Self::Call { origin, .. }
             | Self::FieldAccess { origin, .. }
@@ -409,6 +481,25 @@ impl Expr {
             | Self::Unsupported { origin, .. }
             | Self::UnsupportedTyped { origin, .. } => origin,
         }
+    }
+
+    /// Whether this expression is a shape Dart actually allows on the left
+    /// of `=` — a bare reference, a field access, or an index write. Used
+    /// to guard the "unwrap `Expr::Convert` to reach the real out-param
+    /// dereference target" shortcut (`emit::dart`'s `Stmt::ExprAssign`
+    /// handling): `Expr::Convert`'s own operand is usually one of these
+    /// three, but since `Expr::Assign` (assignment used as an expression)
+    /// was added, a doubly-nested case became representable where it
+    /// wasn't before — `*(field = new T()) = value;`, whose dereference's
+    /// operand is itself `field = new T()`, an `Expr::Assign` that is a
+    /// valid Dart *value* but never a valid Dart assignment *target*
+    /// (`(x = y) = z;` doesn't compile). Without this guard, that shape
+    /// would unwrap into exactly that invalid Dart.
+    pub fn is_assignable_lvalue(&self) -> bool {
+        matches!(
+            self,
+            Self::Ref { .. } | Self::FieldAccess { .. } | Self::Index { .. }
+        )
     }
 }
 
@@ -496,6 +587,16 @@ pub enum Stmt {
     Continue {
         origin: Origin,
     },
+    /// `continue <label>;` — Dart's own explicit-fallthrough syntax for a
+    /// `switch` `case` that falls into the next one without a `break`
+    /// (`docs/plans/bailouts-verovio-6.2.0.md`'s "a case falls through..."
+    /// family). Distinct from `Continue` (a loop's own jump) — this always
+    /// targets a label on a sibling `SwitchCase`/`default`
+    /// (`SwitchCase::label`), never a loop.
+    ContinueLabel {
+        label: String,
+        origin: Origin,
+    },
     /// A bare expression evaluated for its side effect (e.g. a call whose
     /// result is discarded) — not yet produced by any E01–E03 fixture, but
     /// listed in the plan's PR4 scope as a statement kind the IR needs.
@@ -544,10 +645,45 @@ pub enum Stmt {
         value: Expr,
         origin: Origin,
     },
+    /// `switch (scrutinee) { case v: body... case w: ... default: ... }`.
+    /// Each `SwitchCase` already carries every stacked label it shares a
+    /// body with (`case 2: case 3: baz(); break;` → one `SwitchCase` with
+    /// `values: [2, 3]`) — `lower::cpp::lower_switch_stmt`'s own doc comment
+    /// has the empirically-confirmed reason `libclang` needs that unwrapping
+    /// (a `CaseStmt`'s single child is only ever the *next* statement, which
+    /// is itself another `CaseStmt` when labels stack, not a flat list).
+    /// `default` is `None` when the C++ switch has no `default:` label —
+    /// distinct from `Some(vec![])`, an empty-but-present default.
+    ///
+    /// Every case's `body` must already end in a jump (`Break`/`Continue`/
+    /// `Return`/`Throw`) or be empty — Dart, unlike C++, rejects implicit
+    /// fallthrough out of a non-empty case as a compile error, so
+    /// `lower_switch_stmt` never constructs one that doesn't; a switch
+    /// containing genuine C++ fallthrough stays a `Stmt::Unsupported`
+    /// instead.
+    Switch {
+        scrutinee: Expr,
+        cases: Vec<SwitchCase>,
+        default: Option<Vec<Stmt>>,
+        origin: Origin,
+    },
     Unsupported {
         reason: String,
         origin: Origin,
     },
+}
+
+/// One `case`/stacked-`case`-group of a [`Stmt::Switch`] — see its own doc
+/// comment for `values`/`body`'s exact shape and the fallthrough rule both
+/// must already satisfy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SwitchCase {
+    pub values: Vec<Expr>,
+    pub body: Vec<Stmt>,
+    /// A label a preceding, falling-through case's `Stmt::ContinueLabel`
+    /// jumps to (`docs/plans/bailouts-verovio-6.2.0.md`'s "a case falls
+    /// through..." family). `None` when nothing falls into this case.
+    pub label: Option<String>,
 }
 
 impl Stmt {
@@ -565,11 +701,13 @@ impl Stmt {
             | Self::ForEach { origin, .. }
             | Self::Break { origin }
             | Self::Continue { origin }
+            | Self::ContinueLabel { origin, .. }
             | Self::ExprStmt { origin, .. }
             | Self::Throw { origin, .. }
             | Self::TryCatch { origin, .. }
             | Self::TryFinally { origin, .. }
             | Self::TupleAssign { origin, .. }
+            | Self::Switch { origin, .. }
             | Self::Unsupported { origin, .. } => origin,
         }
     }
@@ -755,6 +893,16 @@ pub struct Enum {
     /// by `qualified_static_member_name` at the reference site
     /// (`EnumName.enumerator`), not by how it was declared.
     pub variants: Vec<String>,
+    /// Each enumerator's real C++ value (`clang_getEnumConstantDeclValue`),
+    /// same index alignment as `variants`. C++ enumerators are not
+    /// guaranteed to be 0-based/sequential/gapless — Verovio itself declares
+    /// enums that are neither — so Dart's own `.index` (always the
+    /// declaration position) is only an accident away from being a
+    /// different number than the C++ program actually computes. `emit::dart`
+    /// gives every Dart enum an explicit `value` field carrying this number,
+    /// so a C++-to-`int` conversion (`Expr::Convert` to `Type::Int` with an
+    /// `Enum`-typed operand) reads `.value`, never `.index`.
+    pub values: Vec<i64>,
     pub origin: Origin,
 }
 

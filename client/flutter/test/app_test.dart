@@ -150,8 +150,8 @@ void main() {
     expect(fakeClient.createdProjectName, 'counter');
     expect(find.text('Execution log'), findsOneWidget);
     expect(find.text('Source files'), findsOneWidget);
-    expect(find.text('input-source/fixture/main.cpp'), findsOneWidget);
-    expect(find.text('input-source/fixture/types.h'), findsOneWidget);
+    expect(find.text('main.cpp'), findsOneWidget);
+    expect(find.text('types.h'), findsOneWidget);
     expect(
       find.text('/tmp/projects/counter/input-source/fixture/main.cpp'),
       findsNothing,
@@ -590,7 +590,7 @@ void main() {
     await tester.tap(find.widgetWithText(FilledButton, 'Create project'));
     await tester.pumpAndSettle();
 
-    await tester.tap(find.text('input-source/fixture/types.h'));
+    await tester.tap(find.text('types.h'));
     await tester.pumpAndSettle();
 
     expect(
@@ -634,7 +634,7 @@ void main() {
       await tester.pumpAndSettle();
       await _skipToIde(tester);
 
-      await tester.tap(find.text('input-source/src/aritmetica.cpp'));
+      await tester.tap(find.text('aritmetica.cpp'));
       await tester.pumpAndSettle();
 
       await tester.tap(find.byTooltip('Transpile'));
@@ -697,6 +697,42 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.text('    return a + naoexiste;'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'runs Analyse from the toolbar and flips the icon to done on success',
+    (tester) async {
+      final fakeClient = _FakeServerClient(
+        const ServerStatus(service: 'syntax-bridge-server', status: 'ok'),
+        project: const CreatedProject(
+          name: 'counter',
+          projectDir: '/tmp/projects/counter',
+          inputSourceDir: '/tmp/projects/counter/input-source',
+          compilationUnits: [],
+        ),
+        analysisJobStatuses: const [
+          AnalysisJobStatus(state: AnalysisJobState.running),
+          AnalysisJobStatus(state: AnalysisJobState.succeeded),
+        ],
+      );
+
+      await tester.pumpWidget(SyntaxBridgeApp(serverClient: fakeClient));
+      await tester.pumpAndSettle();
+      await _skipToIde(tester);
+
+      expect(find.byTooltip('Analyse'), findsOneWidget);
+
+      await tester.tap(find.byTooltip('Analyse'));
+      await tester.pump();
+
+      expect(fakeClient.analysedProjectDir, '/tmp/projects/counter');
+      expect(find.byTooltip('Analysing...'), findsOneWidget);
+
+      await tester.pumpAndSettle(const Duration(milliseconds: 500));
+
+      expect(fakeClient.analysedProjectDir, '/tmp/projects/counter');
+      expect(find.byTooltip('Re-analyse'), findsOneWidget);
     },
   );
 
@@ -933,7 +969,7 @@ void main() {
 
     expect(fakeClient.openedProjectDir, '/tmp/projects/counter');
     expect(find.text('Source Files'), findsOneWidget);
-    expect(find.text('input-source/fixture/main.cpp'), findsOneWidget);
+    expect(find.text('main.cpp'), findsOneWidget);
   });
 
   testWidgets('offers to drop a recent project whose folder is gone', (
@@ -1176,6 +1212,9 @@ class _FakeServerClient implements ServerClient {
     this.callsByFile = const <String, List<CallEdge>>{},
     this.transpiledPackage,
     this.diagnostics = const <DartDiagnostic>[],
+    this.analysisJobStatuses = const [
+      AnalysisJobStatus(state: AnalysisJobState.succeeded),
+    ],
   });
 
   final ServerStatus status;
@@ -1194,12 +1233,18 @@ class _FakeServerClient implements ServerClient {
   final Map<String, List<CallEdge>> callsByFile;
   final TranspiledPackage? transpiledPackage;
   final List<DartDiagnostic> diagnostics;
+
+  /// Returned by [pollAnalyseProjectJob], one per call (in order), holding
+  /// on the last entry once exhausted.
+  final List<AnalysisJobStatus> analysisJobStatuses;
   String? createdProjectName;
   String? readSourceFilePath;
   String? openedProjectDir;
   String? forgottenProjectDir;
   String? transpileProjectDir;
   String? validateProjectDir;
+  String? analysedProjectDir;
+  int _analysePollCount = 0;
   late List<RecentProject> _remainingProjects = recentProjects;
 
   @override
@@ -1251,6 +1296,21 @@ class _FakeServerClient implements ServerClient {
 
   @override
   Future<List<RecentProject>> listRecentProjects() async => _remainingProjects;
+
+  @override
+  Future<String> startAnalyseProject(String projectDir) async {
+    analysedProjectDir = projectDir;
+    return 'analyse-job-1';
+  }
+
+  @override
+  Future<AnalysisJobStatus> pollAnalyseProjectJob(String jobId) async {
+    final index = _analysePollCount < analysisJobStatuses.length
+        ? _analysePollCount
+        : analysisJobStatuses.length - 1;
+    _analysePollCount++;
+    return analysisJobStatuses[index];
+  }
 
   @override
   Future<CreatedProject> openProject(String projectDir) async {
@@ -1337,10 +1397,11 @@ class _FakeServerClient implements ServerClient {
   }) async {}
 
   @override
-  Future<List<String>> markFileExternal({
+  Future<void> markFileExternal({
     required String projectDir,
     required String file,
-  }) async => const <String>[];
+    required bool external,
+  }) async {}
 
   @override
   Future<List<String>> markTypeExternal({

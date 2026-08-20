@@ -15,7 +15,7 @@ use serde_json::Value;
 use syntax_bridge_server::function_catalog::{
     CallEdge, CallResolution, FunctionDeclaration, FunctionDeclarationKind,
 };
-use syntax_bridge_server::persistence::ProjectStore;
+use syntax_bridge_server::persistence::{ExternalsStore, ProjectStore};
 use syntax_bridge_server::server::SyntaxBridgeServer;
 use syntax_bridge_server::type_catalog::{TypeDeclaration, TypeDeclarationKind};
 
@@ -85,7 +85,7 @@ fn list_externals_route_reports_manual_regex_and_auto_detected_sources() {
     store
         .replace_call_edges(&[sample_call_to_undefined()])
         .expect("persist call edges");
-    store
+    ExternalsStore::open(&project_dir)
         .add_path_regex("^/workspace/src/third_party/", "0")
         .expect("persist path regex");
 
@@ -155,15 +155,21 @@ fn mark_external_route_persists_a_manual_decision() {
         "unexpected response: {status}"
     );
 
-    let store = ProjectStore::open(&project_dir.join("project.db")).expect("reopen store");
-    let marks = store.list_external_marks().expect("list external marks");
+    let marks = ExternalsStore::open(&project_dir)
+        .list_marks()
+        .expect("list external marks");
     assert_eq!(marks.len(), 1);
     assert_eq!(marks[0].usr, "c:@F@f#");
     assert!(marks[0].external);
 }
 
+/// Item 3 (`docs/prompts/2026-08-19-mudanca-interacao.md`) reversed decision
+/// 3's "cascata é foto" for files: marking a file external now creates a
+/// persistent [`FileMark`] rather than expanding into per-usr marks, so the
+/// declaration it covers (`Shape`) shows up as effective via the
+/// `file_mark` source, and unmarking the file removes it again in one call.
 #[test]
-fn mark_file_external_route_expands_and_marks_every_declaration_in_the_file() {
+fn mark_file_external_route_persists_and_clears_a_file_mark() {
     let workspace = TempWorkspace::new("externals-route-mark-file").expect("create temp workspace");
     let project_dir = workspace.path().join("projects/counter");
     fs::create_dir_all(&project_dir).expect("create project dir");
@@ -180,20 +186,59 @@ fn mark_file_external_route_expands_and_marks_every_declaration_in_the_file() {
     let addr = server.local_addr().expect("read server address");
     let handle = server.spawn().expect("spawn test server");
 
-    let body = serde_json::json!({
+    let mark_body = serde_json::json!({
         "project_dir": project_dir,
         "file": "/workspace/src/shapes.h",
+        "external": true,
     });
-    let (status, response_body) = http_post(addr, "/projects/externals/mark-file", &body);
+    let (mark_status, mark_response_body) =
+        http_post(addr, "/projects/externals/mark-file", &mark_body);
+    assert!(
+        mark_status.starts_with("HTTP/1.1 200"),
+        "unexpected response: {mark_status} body={mark_response_body}"
+    );
+
+    let file_marks = ExternalsStore::open(&project_dir)
+        .list_file_marks()
+        .expect("list file marks");
+    assert_eq!(file_marks.len(), 1);
+    assert_eq!(file_marks[0].file, "/workspace/src/shapes.h");
+
+    let query = format!(
+        "/projects/externals?project_dir={}",
+        percent_encode(&project_dir.display().to_string())
+    );
+    let (list_status, list_body) = http_get(addr, &query);
+    assert!(list_status.starts_with("HTTP/1.1 200"), "{list_status}");
+    let json: Value = serde_json::from_str(&list_body).expect("parse response body");
+    let statuses = json["statuses"].as_array().expect("statuses array");
+    let shape = statuses
+        .iter()
+        .find(|status| status["usr"] == "c:@S@Shape")
+        .expect("Shape should be in the effective set via its file mark");
+    assert_eq!(shape["effective"], true);
+    let sources = shape["sources"].as_array().expect("sources array");
+    assert!(
+        sources.iter().any(|source| source["kind"] == "file_mark"),
+        "{sources:?}"
+    );
+
+    let unmark_body = serde_json::json!({
+        "project_dir": project_dir,
+        "file": "/workspace/src/shapes.h",
+        "external": false,
+    });
+    let (unmark_status, _) = http_post(addr, "/projects/externals/mark-file", &unmark_body);
     handle.shutdown().expect("stop test server");
+    assert!(unmark_status.starts_with("HTTP/1.1 200"), "{unmark_status}");
 
     assert!(
-        status.starts_with("HTTP/1.1 200"),
-        "unexpected response: {status} body={response_body}"
+        ExternalsStore::open(&project_dir)
+            .list_file_marks()
+            .expect("list file marks")
+            .is_empty(),
+        "unmarking the file should remove its file mark"
     );
-    let json: Value = serde_json::from_str(&response_body).expect("parse response body");
-    let marked = json["marked_usrs"].as_array().expect("marked_usrs array");
-    assert_eq!(marked, &vec![Value::from("c:@S@Shape")]);
 }
 
 #[test]
@@ -275,9 +320,8 @@ fn name_regex_route_adds_and_then_removes_a_rule() {
         "unexpected response: {remove_status}"
     );
 
-    let store = ProjectStore::open(&project_dir.join("project.db")).expect("reopen store");
     assert!(
-        store
+        ExternalsStore::open(&project_dir)
             .list_name_regexes()
             .expect("list name regexes")
             .is_empty()
@@ -310,9 +354,8 @@ fn add_name_regex_route_rejects_an_invalid_pattern() {
         "unexpected response: {status} body={response_body}"
     );
 
-    let store = ProjectStore::open(&project_dir.join("project.db")).expect("reopen store");
     assert!(
-        store
+        ExternalsStore::open(&project_dir)
             .list_name_regexes()
             .expect("list name regexes")
             .is_empty(),

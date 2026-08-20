@@ -27,8 +27,10 @@ class ScreenshotFakeServerClient implements ServerClient {
       nameRegexes: <NameRegexRule>[],
       pathRegexes: <PathRegexRule>[],
     ),
-    this.fileMarkResult = const <String>[],
     this.typeMarkResult = const <String>[],
+    this.analysisJobStatuses = const [
+      AnalysisJobStatus(state: AnalysisJobState.succeeded),
+    ],
     // ignore: prefer_initializing_formals
   }) : _externalListing = externalListing;
 
@@ -50,16 +52,19 @@ class ScreenshotFakeServerClient implements ServerClient {
   final TranspiledPackage? transpiledPackage;
   final List<DartDiagnostic> diagnostics;
 
-  /// Returned by [markFileExternal]/[markTypeExternal] — the fake doesn't
-  /// replicate the server's `expand_file_mark`/`expand_type_mark`
-  /// expansion, so a screenshot test that needs to show the *result* of
-  /// marking a file/type should construct [ExternalListing] with that
-  /// result already reflected, rather than relying on these calls to
-  /// mutate it.
-  final List<String> fileMarkResult;
+  /// Returned by [markTypeExternal] — the fake doesn't replicate the
+  /// server's `expand_type_mark` expansion, so a screenshot test that needs
+  /// to show the *result* of marking a type should construct
+  /// [ExternalListing] with that result already reflected, rather than
+  /// relying on this call to mutate it.
   final List<String> typeMarkResult;
+
+  /// Returned by [pollAnalyseProjectJob], one per call (in order), holding
+  /// on the last entry once exhausted.
+  final List<AnalysisJobStatus> analysisJobStatuses;
   ExternalListing _externalListing;
   String? markedFile;
+  bool? markedFileExternal;
   String? markedTypeUsr;
   String? createdProjectName;
   String? readSourceFilePath;
@@ -67,6 +72,8 @@ class ScreenshotFakeServerClient implements ServerClient {
   String? forgottenProjectDir;
   String? transpileProjectDir;
   String? validateProjectDir;
+  String? analysedProjectDir;
+  int _analysePollCount = 0;
   late List<RecentProject> _remainingProjects = recentProjects;
 
   @override
@@ -118,6 +125,21 @@ class ScreenshotFakeServerClient implements ServerClient {
 
   @override
   Future<List<RecentProject>> listRecentProjects() async => _remainingProjects;
+
+  @override
+  Future<String> startAnalyseProject(String projectDir) async {
+    analysedProjectDir = projectDir;
+    return 'analyse-job-1';
+  }
+
+  @override
+  Future<AnalysisJobStatus> pollAnalyseProjectJob(String jobId) async {
+    final index = _analysePollCount < analysisJobStatuses.length
+        ? _analysePollCount
+        : analysisJobStatuses.length - 1;
+    _analysePollCount++;
+    return analysisJobStatuses[index];
+  }
 
   @override
   Future<CreatedProject> openProject(String projectDir) async {
@@ -222,12 +244,13 @@ class ScreenshotFakeServerClient implements ServerClient {
   }
 
   @override
-  Future<List<String>> markFileExternal({
+  Future<void> markFileExternal({
     required String projectDir,
     required String file,
+    required bool external,
   }) async {
     markedFile = file;
-    return fileMarkResult;
+    markedFileExternal = external;
   }
 
   @override

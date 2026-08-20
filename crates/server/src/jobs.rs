@@ -1,23 +1,30 @@
-//! In-memory registry of in-flight/completed project-creation jobs, so
-//! `POST /projects` can start the (potentially minutes-long) ingest plus
-//! `libclang` extraction in the background and return immediately with a job
-//! id, while `GET /projects/jobs/{id}` reports real progress by reading the
-//! same [`crate::progress::ExtractionProgress`] atomics
-//! `project_service::create_project` updates as it runs — see
+//! In-memory registry of in-flight/completed background jobs — project
+//! creation (ingestion) and, since item 2
+//! (`docs/prompts/2026-08-19-mudanca-interacao.md`), analysis — so
+//! `POST /projects`/`POST /projects/analyse` can start the (potentially
+//! minutes-long) `libclang` work in the background and return immediately
+//! with a job id, while `GET /projects/jobs/{id}`/`GET /projects/analyse-jobs/{id}`
+//! report real progress by reading the same [`crate::progress::ExtractionProgress`]
+//! atomics the running job updates — see
 //! `crates/server/tests/verovio_5_7_0_import_diagnosis.rs` for why blocking
 //! the request on it is not acceptable for a real-world-sized project.
 //!
+//! [`Job`]/[`JobRegistry`] are generic over the outcome type so ingestion and
+//! analysis share this machinery instead of duplicating it — the two kinds
+//! never mix (each gets its own [`JobRegistry`] instance in `AppState`), the
+//! generic parameter just avoids writing the same struct twice.
+//!
 //! Jobs are kept in memory only and never evicted — a long-running server
-//! accumulates one entry per project created during its lifetime. Acceptable
-//! for now (see `docs/plans/User Steps.md`'s open item on long-running
-//! work); revisit if that ever matters in practice.
+//! accumulates one entry per project created/analysed during its lifetime.
+//! Acceptable for now (see `docs/plans/User Steps.md`'s open item on
+//! long-running work); revisit if that ever matters in practice.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::ingest::CreatedProject;
-use crate::project_service::{CreationProgress, ProjectCreationError};
+use crate::project_service::{AnalyseProjectError, CreationProgress, ProjectCreationError};
 
 /// Where a job stands, derived from live progress rather than stored
 /// explicitly, so there's no separate state to keep in sync with the
@@ -61,12 +68,12 @@ pub fn derive_phase(
     }
 }
 
-pub struct ProjectCreationJob {
+pub struct Job<T, E> {
     pub progress: CreationProgress,
-    outcome: Mutex<Option<Result<CreatedProject, ProjectCreationError>>>,
+    outcome: Mutex<Option<Result<T, E>>>,
 }
 
-impl ProjectCreationJob {
+impl<T, E> Job<T, E> {
     pub fn new() -> Self {
         Self {
             progress: CreationProgress::default(),
@@ -75,8 +82,9 @@ impl ProjectCreationJob {
     }
 
     /// Records the terminal result. Called once, from the background thread
-    /// that ran `project_service::create_project`.
-    pub fn finish(&self, outcome: Result<CreatedProject, ProjectCreationError>) {
+    /// that ran the job's work (`project_service::create_project` or
+    /// `project_service::analyse_project`).
+    pub fn finish(&self, outcome: Result<T, E>) {
         *self.outcome.lock().unwrap() = Some(outcome);
     }
 
@@ -99,53 +107,94 @@ impl ProjectCreationJob {
     }
 
     /// Gives the caller access to the terminal outcome, if any, without
-    /// requiring `CreatedProject`/`ProjectCreationError` to be `Clone` (the
-    /// latter wraps non-`Clone` I/O and SQLite errors) — the caller builds
-    /// whatever it needs (e.g. a JSON response) inside the closure, while
-    /// the lock is held.
-    pub fn with_outcome<R>(
-        &self,
-        f: impl FnOnce(Option<&Result<CreatedProject, ProjectCreationError>>) -> R,
-    ) -> R {
+    /// requiring `T`/`E` to be `Clone` (both wrap non-`Clone` I/O and SQLite
+    /// errors in practice) — the caller builds whatever it needs (e.g. a
+    /// JSON response) inside the closure, while the lock is held.
+    pub fn with_outcome<R>(&self, f: impl FnOnce(Option<&Result<T, E>>) -> R) -> R {
         f(self.outcome.lock().unwrap().as_ref())
     }
 }
 
-impl Default for ProjectCreationJob {
+impl<T, E> Default for Job<T, E> {
     fn default() -> Self {
         Self::new()
     }
 }
 
+/// A project-creation (ingestion) job — [`Job`] specialized the way
+/// `POST /projects` has always used it.
+pub type ProjectCreationJob = Job<CreatedProject, ProjectCreationError>;
+
+/// An analysis job (item 2, `docs/prompts/2026-08-19-mudanca-interacao.md`)
+/// — [`Job`] specialized for `POST /projects/analyse`. No payload to hand
+/// back on success: the client already has the project's identity from
+/// ingestion and re-fetches whatever listing it needs (types, functions,
+/// pointers, externals) once analysis lands, the same way every other
+/// mutation in this server works.
+pub type AnalysisJob = Job<(), AnalyseProjectError>;
+
+/// [`JobRegistry`] specialized for [`ProjectCreationJob`]s — what
+/// `AppState` holds for `POST /projects`.
+pub type ProjectCreationJobRegistry = JobRegistry<CreatedProject, ProjectCreationError>;
+
+/// [`JobRegistry`] specialized for [`AnalysisJob`]s — what `AppState` holds
+/// for `POST /projects/analyse`, kept separate from
+/// [`ProjectCreationJobRegistry`] so an id from one kind is never confused
+/// for the other's.
+pub type AnalysisJobRegistry = JobRegistry<(), AnalyseProjectError>;
+
 /// Generates a process-unique job id. Doesn't need to survive a restart —
 /// jobs themselves don't (see the module doc) — so a simple in-process
-/// counter is enough, no need for a UUID dependency.
+/// counter is enough, no need for a UUID dependency. Shared by every
+/// [`JobRegistry`] instance (one counter, not one per job kind), so ids
+/// stay unique even though ingestion and analysis jobs live in separate
+/// registries.
 fn generate_job_id() -> String {
     static NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
     format!("job-{}", NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed))
 }
 
-#[derive(Clone, Default)]
-pub struct JobRegistry {
-    jobs: Arc<Mutex<HashMap<String, Arc<ProjectCreationJob>>>>,
+pub struct JobRegistry<T, E> {
+    jobs: Arc<Mutex<HashMap<String, Arc<Job<T, E>>>>>,
 }
 
-impl JobRegistry {
+// Written by hand instead of `#[derive(Clone)]`: the derive would require
+// `T: Clone, E: Clone` even though cloning this type only ever clones the
+// outer `Arc` (a registry handle, shared by every request), never a `T`/`E`
+// value itself — a real limitation of derived `Clone` on generic structs,
+// not a rule this type actually needs to follow.
+impl<T, E> Clone for JobRegistry<T, E> {
+    fn clone(&self) -> Self {
+        Self {
+            jobs: self.jobs.clone(),
+        }
+    }
+}
+
+impl<T, E> JobRegistry<T, E> {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// Creates a new job, registers it, and returns both its id and a handle
     /// to it for the caller to run the work against.
-    pub fn start(&self) -> (String, Arc<ProjectCreationJob>) {
+    pub fn start(&self) -> (String, Arc<Job<T, E>>) {
         let id = generate_job_id();
-        let job = Arc::new(ProjectCreationJob::new());
+        let job = Arc::new(Job::new());
         self.jobs.lock().unwrap().insert(id.clone(), job.clone());
         (id, job)
     }
 
-    pub fn get(&self, id: &str) -> Option<Arc<ProjectCreationJob>> {
+    pub fn get(&self, id: &str) -> Option<Arc<Job<T, E>>> {
         self.jobs.lock().unwrap().get(id).cloned()
+    }
+}
+
+impl<T, E> Default for JobRegistry<T, E> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -212,7 +261,7 @@ mod tests {
 
     #[test]
     fn registry_starts_a_job_and_finds_it_by_id() {
-        let registry = JobRegistry::new();
+        let registry = ProjectCreationJobRegistry::new();
         let (id, job) = registry.start();
 
         assert!(Arc::ptr_eq(
@@ -223,7 +272,7 @@ mod tests {
 
     #[test]
     fn unknown_job_id_is_not_found() {
-        let registry = JobRegistry::new();
+        let registry = ProjectCreationJobRegistry::new();
         assert!(registry.get("does-not-exist").is_none());
     }
 
@@ -261,6 +310,7 @@ mod tests {
             type_dependencies: Vec::new(),
             source_files: Vec::new(),
             pointer_catalog: Vec::new(),
+            is_analysed: false,
         }));
 
         job.cancel();
@@ -286,6 +336,7 @@ mod tests {
             type_dependencies: Vec::new(),
             source_files: Vec::new(),
             pointer_catalog: Vec::new(),
+            is_analysed: false,
         };
 
         job.finish(Ok(project));

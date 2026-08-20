@@ -162,6 +162,58 @@ double media(int total) {
     assert_eq!(*operand_ty, Type::Int);
 }
 
+/// C++ implicitly converts `bool` to `int` (`1`/`0`) wherever an integer is
+/// expected — the mirror image of the already-handled `int` truthiness
+/// (`!integer`) and `int` → `double` promotion above. Dart has no such
+/// conversion; the ternary is the direct, honest translation of what the
+/// implicit conversion actually computes.
+#[test]
+fn lowers_an_implicit_bool_to_int_conversion_into_an_explicit_ternary() {
+    let source = lower_and_emit(
+        "lower-cpp-bool-to-int",
+        r#"
+int as_int(bool flag) {
+    int total = flag;
+    return total;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("flag ? 1 : 0"),
+        "expected an explicit bool-to-int ternary, got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported implicit conversion from Bool to Int"),
+        "got:\n{source}"
+    );
+}
+
+/// The narrowing counterpart of the already-handled `int` → `double`
+/// promotion: C++ implicitly truncates a `double` toward zero wherever an
+/// `int` is expected, the same direction Dart's `.toInt()` truncates.
+#[test]
+fn lowers_an_implicit_double_to_int_conversion_into_a_to_int_call() {
+    let source = lower_and_emit(
+        "lower-cpp-double-to-int",
+        r#"
+int truncated(double value) {
+    int whole = value;
+    return whole;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("value.toInt()"),
+        "expected an explicit .toInt() truncation, got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported implicit conversion from Double to Int"),
+        "got:\n{source}"
+    );
+}
+
 #[test]
 fn a_break_statement_keeps_its_control_flow_node_and_origin() {
     const BREAK_CPP: &str = r#"
@@ -785,8 +837,10 @@ void consume(std::pair<int, std::string> value) {}
 
 /// A `void*` only becomes a Dart byte buffer when its surrounding signature
 /// proves the buffer contract: a named payload plus its matching scalar
-/// length. An unrelated `void*` must remain an explicit bailout instead of
-/// being silently guessed as bytes.
+/// length. An unrelated `void*` still gets a precise type — the named
+/// identity-only bridge (`SyntaxBridgeNativeHandle?`, see the
+/// `a_void_pointer_lowers_to_a_named_native_handle_bridge_instead_of_a_bailout`
+/// test below) — rather than being silently guessed as bytes.
 #[test]
 fn a_void_pointer_with_a_matching_length_parameter_lowers_to_bytes() {
     let source = lower_and_emit(
@@ -805,8 +859,8 @@ void keep_opaque(void* context) {}
         "a void buffer with an explicit matching length must become Uint8List?, got:\n{source}"
     );
     assert!(
-        source.contains("void keep_opaque(SyntaxBridgeOpaque"),
-        "an unclassified void pointer must stay an explicit bailout, got:\n{source}"
+        source.contains("void keep_opaque(SyntaxBridgeNativeHandle? context)"),
+        "an unclassified void pointer must still get a precise, named bridge type, got:\n{source}"
     );
 }
 
@@ -1188,6 +1242,43 @@ void copy_text(std::string& destination, const std::string& source) {
         source.contains("destination = source;")
             && !source.contains("unsupported std::basic_string::operator= call"),
         "std::string assignment must become a Dart assignment, got:\n{source}"
+    );
+}
+
+/// Assigning *through* a `std::string*` out-param (Verovio's real idiom —
+/// `editortoolkit_neume.cpp`'s `ParseAddSylAction`: `(*elementId) =
+/// param.get<jsonxx::String>("elementId");`) must reassign the underlying
+/// nullable local, not read-dereference it. `lower_stdlib_assignment_stmt`
+/// lowers the assignment target the same way it lowers any other operand —
+/// through `lower_expr`, which represents `*out` as `Expr::Convert` (a
+/// dereference read, `out!`) — and the Dart emitter's `Stmt::ExprAssign`
+/// fallback then renders that read-oriented node verbatim as the assignment
+/// target, producing `out! = value;`, which `dart format` rejects outright
+/// ("Illegal assignment to non-assignable expression"): `!` is a read-only
+/// null-assertion operator, never a valid part of an lvalue. Two real
+/// Verovio files fail to parse for exactly this reason as of the
+/// 2026-08-20 diagnosis run.
+#[test]
+fn assigning_through_a_string_out_param_reassigns_the_nullable_local_without_a_bang() {
+    let source = lower_and_emit(
+        "lower-cpp-out-param-deref-assign",
+        r#"
+#include <string>
+
+void fill(std::string value, std::string* out) {
+    (*out) = value;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("out = value;"),
+        "dereference-assignment through an out-param must reassign the nullable \
+         local directly, with no `!`, got:\n{source}"
+    );
+    assert!(
+        !source.contains("out! ="),
+        "`!` is never valid on an assignment target, got:\n{source}"
     );
 }
 
@@ -1916,6 +2007,68 @@ void reset_and_append(std::string& text) {
     );
 }
 
+/// `std::basic_string::push_back(char)` — a real Verovio idiom, confirmed
+/// by grepping the extracted source directly: `toolkit.cpp`'s
+/// `option_str.push_back(option->GetShortOption())` and `iopae.cpp`'s
+/// `paeStr.push_back(token.m_char)`. The single-`char` argument is this
+/// IR's `Type::Int` (a code unit), so the reassignment goes through
+/// `String.fromCharCode` rather than `append`'s direct `Str + Str`.
+#[test]
+fn std_string_push_back_appends_a_char_code_via_string_from_char_code() {
+    let source = lower_and_emit(
+        "lower-cpp-std-string-push-back",
+        r#"
+#include <string>
+
+void append_char(std::string& text, char c) {
+    text.push_back(c);
+}
+"#,
+    );
+
+    assert!(
+        source.contains("text = text + String.fromCharCode(c);"),
+        "push_back must become a typed Dart reassignment, got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported std::basic_string::push_back call"),
+        "got:\n{source}"
+    );
+}
+
+/// `std::vector<T>::resize` — real Verovio idiom, confirmed by grepping
+/// the extracted source directly: `staff.cpp`'s `lines.resize(count)` and
+/// `iohumdrum.cpp`'s repeated `m_placement.resize(1000)`. Dart's own
+/// `List.length` setter only shrinks safely (growing pads with `null`,
+/// which throws at runtime for a non-nullable element type like `int`), so
+/// growth goes through `addAll(List.filled(...))` instead — both real
+/// branches are exercised here (shrink and grow) against the same target.
+#[test]
+fn vector_resize_shrinks_via_length_and_grows_via_list_filled() {
+    let source = lower_and_emit(
+        "lower-cpp-vector-resize",
+        r#"
+#include <vector>
+
+void shrink(std::vector<int>& values, int count) {
+    values.resize(count);
+}
+"#,
+    );
+
+    assert!(
+        source.contains("if (count < values.length) {")
+            && source.contains("values.length = count;")
+            && source.contains("} else {")
+            && source.contains("values.addAll(List.filled(count - values.length, 0));"),
+        "expected an explicit shrink/grow split with a typed default fill, got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported std::vector::resize call"),
+        "got:\n{source}"
+    );
+}
+
 /// compare and substr have direct, typed Dart String counterparts. The C++
 /// length overload of substr is translated to an exclusive Dart end index.
 #[test]
@@ -2043,6 +2196,1151 @@ public:
     assert!(
         source.contains("Vermelho"),
         "expected the enumerator to survive lowering, got:\n{source}"
+    );
+}
+
+/// A bare `;` (`CXCursor_NullStmt`) — a stray empty statement, C++'s idiom
+/// for "nothing happens here" (a loop with all its work in the clauses, or
+/// simply a redundant semicolon) — has no Dart form worth bailing out on: it
+/// contributes nothing to any statement list, so it should just vanish
+/// rather than becoming a `Stmt::Unsupported` TODO+throw that fails the
+/// *whole enclosing function*.
+#[test]
+fn a_null_statement_is_omitted_rather_than_becoming_a_bailout() {
+    let source = lower_and_emit(
+        "lower-cpp-null-stmt",
+        r#"
+void tick(int n) {
+    for (int i = 0; i < n; i++)
+        ;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("unsupported statement cursor kind"),
+        "a bare `;` must never become a bailout, got:\n{source}"
+    );
+}
+
+/// A bare `{ ... }` scoping block used as an ordinary statement (not an
+/// `if`/`while`/`for` body, which `lower_branch` already unwraps) — C++
+/// allows one anywhere a statement is expected, usually just to scope a
+/// local's lifetime. Dart accepts a bare block too, but this IR has no
+/// nested-block statement node, so the block's own statements are inlined
+/// directly into the enclosing list instead — flattening loses C++'s block
+/// scoping, but every name this IR lowers already has a scope no narrower
+/// than its enclosing function in practice (no fixture shadows a name across
+/// a nested block), so the flatten is observationally the same program.
+#[test]
+fn a_nested_bare_block_is_flattened_into_its_enclosing_statement_list() {
+    let source = lower_and_emit(
+        "lower-cpp-nested-block",
+        r#"
+int scoped() {
+    {
+        int x = 1;
+        return x;
+    }
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("unsupported statement cursor kind"),
+        "a nested bare block must never become a bailout, got:\n{source}"
+    );
+    assert!(
+        source.contains("int x = 1;") && source.contains("return x;"),
+        "expected the block's statements to survive, flattened, got:\n{source}"
+    );
+}
+
+/// `int a = 1, b = 2;` — one `DeclStmt` cursor with multiple `VarDecl`
+/// children, C++'s comma-separated multi-declarator form. `DeclStmt had N
+/// declarators, expected exactly 1` was the single largest statement-level
+/// bailout family (136+ occurrences of exactly 2 declarators, plus smaller
+/// counts for 3–22) in the 2026-08-20 real-Verovio diagnosis run. Each
+/// declarator becomes its own ordinary `VarDecl` statement, in source
+/// order, with the exact same per-declarator lowering a single-declarator
+/// `DeclStmt` already gets — nothing new to prove about *how* one variable
+/// lowers, only that N of them in one C++ statement produce N Dart
+/// statements instead of one combined bailout.
+#[test]
+fn a_multi_declarator_decl_statement_splits_into_one_var_decl_per_declarator() {
+    let source = lower_and_emit(
+        "lower-cpp-multi-declarator",
+        r#"
+int sum_of_two() {
+    int a = 1, b = 2;
+    return a + b;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("unsupported statement cursor kind") && !source.contains("DeclStmt had"),
+        "a multi-declarator DeclStmt must never become a bailout, got:\n{source}"
+    );
+    assert!(
+        source.contains("int a = 1;") && source.contains("int b = 2;"),
+        "expected one VarDecl statement per declarator, got:\n{source}"
+    );
+}
+
+/// `switch`/`case`/`default` — the largest single unmapped statement cursor
+/// kind in the 2026-08-20 real-Verovio diagnosis run (148 occurrences).
+/// Covers a stacked label sharing one body (`case 2: case 3: ...`, C++'s
+/// idiom for "these values do the same thing") and `default`, each
+/// break-terminated the way Dart requires.
+#[test]
+fn a_switch_statement_lowers_to_darts_switch_including_a_stacked_case_label() {
+    let source = lower_and_emit(
+        "lower-cpp-switch",
+        r#"
+int classify(int level) {
+    int result = 0;
+    switch (level) {
+        case 1:
+            result = 10;
+            break;
+        case 2:
+        case 3:
+            result = 20;
+            break;
+        default:
+            result = -1;
+            break;
+    }
+    return result;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("unsupported statement cursor kind")
+            && !source.contains("SwitchStmt")
+            && !source.contains("falls through"),
+        "a well-formed switch must never become a bailout, got:\n{source}"
+    );
+    assert!(
+        source.contains("switch (level) {"),
+        "expected a Dart switch statement, got:\n{source}"
+    );
+    assert!(
+        source.contains("case 1:") && source.contains("case 2:") && source.contains("case 3:"),
+        "expected every case label to survive, including the stacked one, got:\n{source}"
+    );
+    assert!(
+        source.contains("default:"),
+        "expected the default label to survive, got:\n{source}"
+    );
+}
+
+/// A case whose body doesn't end in `break`/`continue`/`return`/`throw`
+/// really does fall through into the next one in C++ — Dart has no
+/// implicit-fallthrough form to lower that into (yet), so the honest
+/// outcome is a bailout, not Dart that `dart format`/`dart analyze` would
+/// reject for exactly the reason the C++ itself is unusual.
+#[test]
+fn a_switch_with_genuine_fallthrough_stays_an_honest_bailout() {
+    // Case-to-case fallthrough (`case 1` into `case 2`) is now supported
+    // via Dart's own `continue <label>;` syntax — see
+    // `a_case_that_falls_through_into_the_next_one_uses_darts_own_continue_label_syntax`.
+    // Falling through *into* `default` specifically stays unsupported:
+    // `default` has no label slot to target (`emit::dart` always prints it
+    // last, and `Stmt::Switch.default` is a bare `Vec<Stmt>`, not a
+    // `SwitchCase`) — a narrower, real gap.
+    let source = lower_and_emit(
+        "lower-cpp-switch-fallthrough-into-default",
+        r#"
+int log_level(int level) {
+    int result = 0;
+    switch (level) {
+        case 1:
+            result = 1;
+        default:
+            result = 2;
+            break;
+    }
+    return result;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("falls through"),
+        "expected an honest bailout naming the fallthrough, got:\n{source}"
+    );
+    assert!(
+        !source.contains("dynamic"),
+        "a bailout must never use `dynamic`, got:\n{source}"
+    );
+}
+
+/// C++ implicitly converts an enumerator to its underlying integer value
+/// wherever an `int` is expected — one of the highest-volume bailout
+/// families in the real Verovio 6.2.0 corpus (`data_DURATION`,
+/// `data_BEAMPLACE`, `data_STEMDIRECTION`, 453 occurrences across just
+/// those three enums as of the 2026-08-20 diagnosis run). The naive Dart
+/// translation, `.index`, is *only* correct when the C++ enumerators are
+/// declared with no explicit values, in source order, starting at 0 — never
+/// guaranteed, and Verovio itself declares gapped/non-sequential values.
+/// This fixture's `Segundo = 5` (not `1`) is exactly the case a `.index`-based
+/// conversion would get silently wrong: `dart format`-clean, `dart
+/// analyze`-clean, and a different number than the C++ program computes —
+/// precisely the "compiles and is wrong" failure `Type::Unsupported`'s
+/// design exists to rule out. The Dart enum must therefore carry its real
+/// C++ value explicitly, not rely on declaration order.
+#[test]
+fn lowers_an_implicit_enum_to_int_conversion_using_the_enums_real_cpp_value_not_its_dart_index() {
+    let source = lower_and_emit(
+        "lower-cpp-enum-to-int",
+        r#"
+enum Nivel { Primeiro = 0, Segundo = 5, Terceiro = 6 };
+
+int as_int(Nivel nivel) {
+    int codigo = nivel;
+    return codigo;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("nivel.value"),
+        "expected the conversion to read the enum's explicit backing value, got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported implicit conversion from Enum"),
+        "got:\n{source}"
+    );
+    assert!(
+        source.contains("Segundo(5)"),
+        "expected the enum declaration to carry its real C++ value (5), not \
+         its Dart declaration index (1), got:\n{source}"
+    );
+}
+
+/// A qualified member call (`Base::foo()`, `this->Base::foo()`,
+/// `ns::Base::foo()`) disambiguates *which* base implementation to call —
+/// common in Verovio wherever a derived class explicitly re-invokes a base
+/// method instead of relying on virtual dispatch. Confirmed via `clang++
+/// -Xclang -ast-dump`: the qualifier attaches to the `MemberExpr`/
+/// `MemberRefExpr` as a `NestedNameSpecifier`, which `libclang`'s cursor API
+/// surfaces as a `TypeRef` (and, when namespace-qualified, a `NamespaceRef`
+/// too) sibling cursor of the (usually implicit, so invisible to
+/// `clang_visitChildren`) receiver. For an implicit-`this` qualified call,
+/// that `TypeRef` is the *only* child `member_ref_receiver` sees — it took
+/// the one-child branch and tried to `lower_expr` the `TypeRef` cursor
+/// itself as if it were the receiver, landing on "unsupported expression
+/// cursor kind 43" (206 occurrences in the 2026-08-20 Verovio diagnosis)
+/// instead of resolving to `this`. The qualifier is disambiguation
+/// information already resolved by `clang_getCursorReferenced` on the call
+/// itself; it should be filtered out like the `TypeRef`/`NamespaceRef`/
+/// `TemplateRef` noise already filtered elsewhere in this file (E03/E07/
+/// `is_transparent_wrapper`), leaving 0 children (implicit `this`) or 1
+/// (the real receiver).
+#[test]
+fn a_qualified_base_member_call_ignores_the_disambiguating_namespace_and_type_refs() {
+    let source = lower_and_emit(
+        "lower-cpp-qualified-member-call",
+        r#"
+class Base {
+public:
+    int Foo() { return 1; }
+};
+
+class Derived : public Base {
+public:
+    int Bar() {
+        return Base::Foo();
+    }
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("member reference had") && !source.contains("cursor kind 43"),
+        "expected the qualified base call to resolve to `this`/the receiver, got:\n{source}"
+    );
+    assert!(
+        source.contains("Foo()"),
+        "expected the qualified call itself to still lower, got:\n{source}"
+    );
+}
+
+/// `std::vector<int> v = {1, 2, 3};` — a brace initializer for a
+/// `vector`/`array`/`deque`, invoking their `initializer_list` constructor.
+/// `lower::cpp` had no `Expr` shape for a brace-enclosed initializer list at
+/// all (`unsupported expression cursor kind 119`, 181 occurrences in the
+/// 2026-08-20 Verovio diagnosis), and the *outer* constructor call — reached
+/// even after the list itself lowers — named a Dart function/class that
+/// never exists (`vector(<int>[1, 2, 3])`, since `std::vector` maps to
+/// `Type::List` and was deliberately never `lower_record`'d, the same
+/// reasoning `Type::Str`/`basic_string` already documents). Both had to be
+/// fixed together: the list becomes a Dart list literal
+/// (`Expr::ListLiteral`, only ever produced when `clang_getCursorType` on
+/// the `InitListExpr` cursor itself already resolves to `List<T>`), and the
+/// `initializer_list` constructor call recognizes that shape and returns the
+/// literal directly instead of wrapping it in a call to a nonexistent
+/// `vector`/`array`/`deque` function.
+#[test]
+fn a_vector_initializer_list_lowers_to_a_dart_list_literal_without_a_bogus_constructor_call() {
+    let source = lower_and_emit(
+        "lower-cpp-vector-init-list",
+        r#"
+#include <vector>
+std::vector<int> f() {
+    std::vector<int> v = {1, 2, 3};
+    return v;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("<int>[1, 2, 3]"),
+        "expected a real Dart list literal, got:\n{source}"
+    );
+    assert!(
+        !source.contains("vector("),
+        "the initializer-list constructor call must not name a nonexistent `vector` function, got:\n{source}"
+    );
+    assert!(!source.contains("cursor kind 119"), "got:\n{source}");
+}
+
+/// Real trigger: `midifunctor.cpp`/`iocmme.cpp`'s static const lookup
+/// tables, `static const std::map<int, data_DURATION> durationEq{ { a, b },
+/// ... };`. Unlike `std::vector`'s flat initializer list, each of
+/// `std::map`'s entries is itself a nested 2-element `{ key, value }`
+/// list — a shape `lower_expr`'s generic `InitListExpr` handling (scoped
+/// to `Type::List`'s flat elements) never reaches.
+#[test]
+fn a_map_initializer_list_lowers_to_a_dart_map_literal() {
+    let source = lower_and_emit(
+        "lower-cpp-map-init-list",
+        r#"
+#include <map>
+std::map<int, int> f() {
+    static const std::map<int, int> lookup{
+        { 1, 10 },
+        { 2, 20 },
+    };
+    return lookup;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("<int, int>{1: 10, 2: 20}"),
+        "expected a real Dart map literal, got:\n{source}"
+    );
+    assert!(
+        !source.contains("map("),
+        "the initializer-list constructor call must not name a nonexistent `map` function, got:\n{source}"
+    );
+    assert!(!source.contains("cursor kind 119"), "got:\n{source}");
+}
+
+/// Same real-corpus shape, but with `unordered_map` (the other container
+/// this applies to) and an enum-constant value, matching
+/// `iocmme.cpp`'s `stemDirMap`/`accidMap` exactly (string/int key,
+/// `data_*` enum value).
+#[test]
+fn an_unordered_map_initializer_list_with_enum_values_lowers_to_a_dart_map_literal() {
+    let source = lower_and_emit(
+        "lower-cpp-unordered-map-init-list-enum",
+        r#"
+#include <unordered_map>
+enum Color { RED, GREEN, BLUE };
+Color f(int i) {
+    static const std::unordered_map<int, Color> m{
+        { 1, RED },
+        { 2, GREEN },
+    };
+    return m.at(i);
+}
+"#,
+    );
+
+    assert!(
+        source.contains("Color.RED") && source.contains("Color.GREEN"),
+        "expected the enum-constant values to survive as real Dart enum references, got:\n{source}"
+    );
+    assert!(!source.contains("cursor kind 119"), "got:\n{source}");
+    assert!(!source.contains("unordered_map("), "got:\n{source}");
+}
+
+/// Real trigger: `adjustaccidxfunctor.cpp:25`'s `m_currentMeasure = NULL;`
+/// (a constructor field-init assignment), plus the same idiom in a
+/// comparison and a local-variable initializer — the pre-`nullptr`
+/// null-pointer-constant style used throughout the corpus. `<cstddef>`
+/// defines `NULL` as GNU's `__null` builtin (confirmed via `clang -E`, not
+/// assumed) — a distinct `CXCursor_GNUNullExpr` cursor, reported with type
+/// `long` rather than folding to a plain integer literal the way a bare
+/// `0` already does.
+#[test]
+fn a_null_pointer_constant_lowers_to_a_dart_null_literal() {
+    let source = lower_and_emit(
+        "lower-cpp-null-pointer-constant",
+        r#"
+#include <cstddef>
+struct Measure {};
+
+struct Functor {
+    Measure* m_currentMeasure;
+    Functor() {
+        m_currentMeasure = NULL;
+    }
+};
+
+Measure* find_last(Measure* measure) {
+    if (measure != NULL) {
+        return measure;
+    }
+    Measure* none = NULL;
+    return none;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("m_currentMeasure = null;")
+            && source.contains("measure != null")
+            && source.contains("Measure? none = null;"),
+        "expected every NULL idiom to lower to Dart's own null literal, got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported implicit conversion from Int to Nullable")
+            && !source.contains("unsupported expression cursor kind 123"),
+        "got:\n{source}"
+    );
+}
+
+/// `m_data[i]` where `m_data` is a fixed-size array *field*
+/// (`int m_data[10];`) — very common in Verovio's own C-style buffers.
+/// `lower_array_subscript_expr` already recovered the true declared type
+/// (bypassing C++'s array-to-pointer decay, which would otherwise make the
+/// subscript's target look like a raw pointer instead of the `List<int>`
+/// the field itself lowers to) for a bare local/global variable
+/// (`DeclRefExpr`), but not for a field accessed via `MemberRefExpr` —
+/// implicit `this` (`m_data[i]`, inside a method) or explicit
+/// (`this->m_data[i]`) alike. Both hit "array subscript receiver is not a
+/// lowered Dart collection" (359 occurrences in the 2026-08-20 Verovio
+/// diagnosis) even though the field declaration right above it already
+/// prints as `List<int> m_data`.
+#[test]
+fn a_fixed_array_field_indexed_through_implicit_or_explicit_this_is_indexable() {
+    let source = lower_and_emit(
+        "lower-cpp-array-field-index",
+        r#"
+class Holder {
+public:
+    int m_data[10];
+    int First() { return m_data[0]; }
+    int Second(int i) { return this->m_data[i]; }
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("array subscript receiver"),
+        "expected both forms to index the field directly, got:\n{source}"
+    );
+    assert!(
+        source.contains("return m_data[0];") && source.contains("return m_data[i];"),
+        "expected a plain Dart index expression (implicit `this` needs no prefix), got:\n{source}"
+    );
+}
+
+/// `m_rows[i][j]` — a multidimensional fixed array field, indexed twice.
+/// Even after a single-level field index works (see the sibling test
+/// above), the outer subscript's target is the *already-lowered* inner
+/// `m_rows[i]` result — but C++ wraps it in an implicit array-to-pointer
+/// decay conversion first, since the built-in `E1[E2]` requires `E1` to be
+/// a pointer. Lowering that wrapper the generic way (comparing its outer
+/// pointer-decayed type against the inner `List` type) doesn't know the
+/// decay is moot once the inner subscript is already a Dart `List` — it
+/// only recognizes real scalar/pointer/enum conversions, so it bailed.
+#[test]
+fn a_nested_array_subscript_on_a_multidimensional_fixed_array_field_lowers_directly() {
+    let source = lower_and_emit(
+        "lower-cpp-nested-array-field-index",
+        r#"
+class Grid {
+public:
+    int m_rows[4][4];
+    int At(int i, int j) { return m_rows[i][j]; }
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("array subscript receiver")
+            && !source.contains("unsupported implicit conversion"),
+        "expected the nested index to lower directly, got:\n{source}"
+    );
+    assert!(source.contains("return m_rows[i][j];"), "got:\n{source}");
+}
+
+/// Calling a value *held* by a field/parameter, rather than a named
+/// function — `m_callback(value)`/`this->m_callback(value)` (a callback
+/// field, common for observer/visitor hooks in Verovio) and `cb(value)` (a
+/// callback parameter). `clang_getCursorReferenced` on the call resolves to
+/// the `FieldDecl`/`ParmDecl` holding the value, not a `FunctionDecl` — the
+/// only call-target shape `lower_call_expr` recognized before this fix
+/// ("unsupported call target cursor kind 6/10", 96+5 occurrences in the
+/// 2026-08-20 Verovio diagnosis). When that declaration's own type already
+/// lowers to a representable `Type::Callback` (a real C function pointer),
+/// Dart's own call syntax needs no adapter at all.
+#[test]
+fn calling_a_callback_held_in_a_field_or_parameter_needs_no_adapter() {
+    let source = lower_and_emit(
+        "lower-cpp-callable-value-call",
+        r#"
+struct Holder {
+    void (*m_callback)(int);
+    void Fire(int value) {
+        m_callback(value);
+        this->m_callback(value);
+    }
+};
+void call_param(void (*cb)(int), int value) {
+    cb(value);
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("unsupported call target cursor kind"),
+        "got:\n{source}"
+    );
+    assert!(
+        source.matches("m_callback(value);").count() == 2,
+        "expected both the implicit- and explicit-`this` calls to lower identically, got:\n{source}"
+    );
+    assert!(source.contains("cb(value);"), "got:\n{source}");
+}
+
+/// A user-defined conversion operator to `std::string` (`operator
+/// std::string() const`) — the dominant shape behind Verovio's
+/// `HumdrumToken`, whose implicit conversion to `std::string` was the
+/// single largest bailout family in the 2026-08-20 diagnosis (~750 combined
+/// occurrences of "unsupported implicit conversion from/to
+/// Record{HumdrumToken}" and "call target cursor kind 26"). Confirmed via
+/// `clang++ -Xclang -ast-dump` before writing the fix (not assumed): an
+/// *implicit* conversion (`std::string s = t;`) already lowers to a real
+/// `CXXMemberCallExpr` referencing the same `CXXConversionDecl` an
+/// *explicit* call (`t.operator std::string()`) does — both reach
+/// `lower_call_expr` the same way, so one fix (naming the operator
+/// `toStr`, since its real C++ spelling has characters no Dart identifier
+/// can) covers both call forms.
+#[test]
+fn a_conversion_operator_to_string_lowers_both_implicitly_and_explicitly_to_a_named_dart_method() {
+    let source = lower_and_emit(
+        "lower-cpp-conversion-operator-to-str",
+        r#"
+#include <string>
+class Token {
+public:
+    Token(const std::string& s): m_s(s) {}
+    operator std::string() const { return m_s; }
+private:
+    std::string m_s;
+};
+std::string implicit_use(Token t) {
+    std::string s = t;
+    return s;
+}
+std::string explicit_use(Token t) {
+    return t.operator std::string();
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("unsupported")
+            && !source.contains("cursor kind 26")
+            && !source.contains("dynamic"),
+        "got:\n{source}"
+    );
+    assert!(
+        source.contains("String toStr() {"),
+        "expected the conversion operator to be declared as a named Dart method, got:\n{source}"
+    );
+    assert!(
+        source.matches("t.toStr()").count() == 2,
+        "expected both the implicit and explicit call forms to lower identically, got:\n{source}"
+    );
+}
+
+/// A user-defined conversion operator to `bool` (`operator bool() const`) —
+/// the "unsupported conversion operator target: Bool" family (52
+/// occurrences in the 2026-08-20 diagnosis), same mechanism as the `toStr`
+/// test above (`conversion_operator_dart_method_name` is the shared source
+/// of truth for both), just a different target type and synthesized name.
+#[test]
+fn a_conversion_operator_to_bool_lowers_both_implicitly_and_explicitly_to_a_named_dart_method() {
+    let source = lower_and_emit(
+        "lower-cpp-conversion-operator-to-bool",
+        r#"
+class OptionalFlag {
+public:
+    OptionalFlag(bool set): m_set(set) {}
+    operator bool() const { return m_set; }
+private:
+    bool m_set;
+};
+bool implicit_use(OptionalFlag flag) {
+    if (flag) {
+        return true;
+    }
+    return false;
+}
+bool explicit_use(OptionalFlag flag) {
+    return flag.operator bool();
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("unsupported") && !source.contains("dynamic"),
+        "got:\n{source}"
+    );
+    assert!(
+        source.contains("bool toBool() {"),
+        "expected the conversion operator to be declared as a named Dart method, got:\n{source}"
+    );
+    assert!(
+        source.matches("flag.toBool()").count() == 2,
+        "expected both the implicit (`if (flag)`) and explicit call forms to lower identically, got:\n{source}"
+    );
+}
+
+/// `sizeof(T)` for a well-known, fixed-width type — the real, common shape
+/// found by grepping the Verovio source directly (`test-resources/verovio-
+/// version-6.2.0.tar.gz`, unpacked locally to check the exact triggering
+/// line instead of guessing): `crc.cpp`'s `8 * sizeof(crc)` (CRC bit width)
+/// and `zip_file.hpp`'s `p + sizeof(mz_uint32)` (pointer-offset by a known
+/// type's byte width). `sizeof`/`alignof`/other C++ type-trait unary
+/// expressions all share one `libclang` cursor kind (136,
+/// `CXCursor_UnaryExpr`) with no sub-kind exposed on the cursor API to
+/// distinguish which — but `clang_Cursor_Evaluate` (already used by
+/// `evaluate_int_eval_result` for integer/bool literals) already
+/// constant-folds a `sizeof`/`alignof` whose *operand type* is complete and
+/// has a known layout, exactly the "map only when the size is well-defined"
+/// scope the backlog calls for — so evaluating first and only falling back
+/// to a bailout when that fails covers `sizeof(T)` without needing to name
+/// every possible type-trait shape up front.
+#[test]
+fn a_sizeof_expression_on_a_known_fixed_width_type_evaluates_to_a_constant() {
+    let source = lower_and_emit(
+        "lower-cpp-sizeof-known-type",
+        r#"
+typedef unsigned int crc;
+unsigned int width() {
+    return 8 * sizeof(crc);
+}
+"#,
+    );
+
+    assert!(
+        source.contains("8 * 4"),
+        "expected sizeof(unsigned int) to fold to the constant 4, got:\n{source}"
+    );
+    assert!(!source.contains("cursor kind 136"), "got:\n{source}");
+}
+
+/// `str.compare(pos, len, other)` — the real shape found by grepping the
+/// Verovio source directly (`test-resources/verovio-version-6.2.0.tar.gz`):
+/// `iohumdrum.cpp`'s `current->compare(0, 4, "*fs:")`, comparing a substring
+/// starting at `pos` of length `len` against `other`. `lower_stdlib_method_
+/// call`'s `("basic_string", "compare")` arm only accepted the 1-argument
+/// overload (`compare(other)`); the 3-argument overload has a direct Dart
+/// equivalent using the same `substring(start, start + count)` shape
+/// `("basic_string", "substr")` right below it already establishes.
+#[test]
+fn a_three_argument_string_compare_lowers_to_a_substring_comparison() {
+    let source = lower_and_emit(
+        "lower-cpp-string-compare-3-arg",
+        r#"
+#include <string>
+bool starts_with_fs(std::string s) {
+    return s.compare(0, 4, "*fs:") == 0;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("s.substring(0, 0 + 4).compareTo('*fs:')"),
+        "expected the 3-argument compare to become a substring comparison, got:\n{source}"
+    );
+    assert!(!source.contains("compare had"), "got:\n{source}");
+}
+
+/// `std::cout << "text" << value << std::endl;` — the classic chained
+/// insertion idiom, confirmed as the real trigger by grepping the Verovio
+/// source directly (`tools/main.cpp`'s `DisplayVersion`:
+/// `std::cout << "Verovio " << vrv::GetVersion() << std::endl;`).
+/// `std::cout` is a genuine 1:1 external boundary (real process stdout),
+/// not a stand-in for an arbitrary `std::ostream` — narrowly bridged to
+/// Dart's `print`, which needs no import and already appends the trailing
+/// newline `std::endl` asks for. Scoped to chains that visibly end in
+/// `std::endl` (the only case where `print`'s automatic newline is
+/// semantically correct) and to `Str`/`Int`/`Double` operands (`Bool` is
+/// excluded: C++'s default `operator<<(bool)` prints `0`/`1`, not Dart's
+/// `"true"`/`"false"`, and this bridge can't know whether `std::boolalpha`
+/// was set). `std::cerr` gets the same bridge (see the sibling test below,
+/// to `dart:io`'s `stderr.writeln`); a chain without a trailing `std::endl`
+/// stays bailout — that's the only case where the automatic newline
+/// `print`/`stderr.writeln` both append is a semantic mismatch.
+#[test]
+fn a_cout_insertion_chain_ending_in_endl_lowers_to_print() {
+    let source = lower_and_emit(
+        "lower-cpp-cout-chain",
+        r#"
+#include <iostream>
+void display_version(int major) {
+    std::cout << "Verovio " << major << std::endl;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("print('Verovio ' + major.toString());"),
+        "expected the chain to fold into one `print` call, got:\n{source}"
+    );
+    assert!(!source.contains("operator<<"), "got:\n{source}");
+}
+
+/// `std::cerr << "text" << std::endl;` — grepping the Verovio source
+/// directly shows `std::cerr` is actually **more common** than `std::cout`
+/// in this idiom (231 vs. 68 occurrences), almost always for the same
+/// warning/error-message-then-newline shape — so it earns the same bridge,
+/// to Dart's `stderr.writeln` (`dart:io`) rather than `print` (which only
+/// ever reaches stdout). The import itself is added by a post-hoc scan of
+/// the emitted source (`source.contains("stderr.")`), the same mechanism
+/// already used for `Uint8List` → `dart:typed_data`, not a new threaded
+/// flag through every `emit_expr`/`emit_stmt` call site.
+#[test]
+fn a_cerr_insertion_chain_ending_in_endl_lowers_to_stderr_writeln() {
+    let source = lower_and_emit(
+        "lower-cpp-cerr-chain",
+        r#"
+#include <iostream>
+void warn(int code) {
+    std::cerr << "Warning " << code << std::endl;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("stderr.writeln('Warning ' + code.toString());"),
+        "expected the chain to fold into one `stderr.writeln` call, got:\n{source}"
+    );
+    assert!(
+        source.contains("import 'dart:io';"),
+        "expected the dart:io import to be added, got:\n{source}"
+    );
+    assert!(!source.contains("operator<<"), "got:\n{source}");
+}
+
+/// `std::find(X.begin(), X.end(), v) != X.end()` — "does `X` contain
+/// `v`?", confirmed as a real, common shape by grepping the Verovio source
+/// directly: `adjustbeamsfunctor.cpp:326`'s `std::find(dotLocs.cbegin(),
+/// dotLocs.cend(), dotLoc) != dotLocs.cend()`. `std::find`'s own iterator
+/// return value has no representation this bridge gives it on its own —
+/// the *whole comparison* is recognized as one idiom instead, since every
+/// `begin`/`end` mention has to agree on the exact same receiver for the
+/// rewrite to be sound. Also covers the negated form (`==`, "is absent").
+#[test]
+fn a_find_against_end_comparison_lowers_to_a_dart_contains_call() {
+    let source = lower_and_emit(
+        "lower-cpp-find-contains",
+        r#"
+#include <set>
+#include <algorithm>
+bool has_dot(std::set<int>& dotLocs, int dotLoc) {
+    if (std::find(dotLocs.cbegin(), dotLocs.cend(), dotLoc) != dotLocs.cend()) {
+        return true;
+    }
+    return false;
+}
+bool missing_dot(std::set<int>& dotLocs, int dotLoc) {
+    return std::find(dotLocs.begin(), dotLocs.end(), dotLoc) == dotLocs.end();
+}
+"#,
+    );
+
+    assert!(
+        source.contains("if (dotLocs.contains(dotLoc)) {"),
+        "expected the != form to become a plain contains call, got:\n{source}"
+    );
+    assert!(
+        source.contains("return !(dotLocs.contains(dotLoc));"),
+        "expected the == form to become a negated contains call, got:\n{source}"
+    );
+    assert!(
+        !source.contains("operator!=") && !source.contains("operator=="),
+        "got:\n{source}"
+    );
+}
+
+/// `dynamic_cast<T*>(operand)` — a checked downcast, confirmed as a real,
+/// common Verovio shape by grepping the source directly
+/// (`options.cpp:184`'s `dynamic_cast<OptionBool *>(option)`,
+/// `options.cpp:115`'s `dynamic_cast<const OptionDbl *>(this)`). Scoped to
+/// a *simple* operand (`this` or a bare local/parameter): `operand is T`
+/// evaluates `operand` twice by construction (once as the ternary
+/// condition, once implicitly via Dart's own flow-sensitive promotion
+/// inside the `then` branch), so anything with a side effect (a call, or a
+/// field access reached through one) has to stay a bailout rather than
+/// risk duplicating it — this bridge has no way to hoist a temporary from
+/// pure-expression lowering yet (the same gap that already defers
+/// `binary operator kind 22`).
+#[test]
+fn a_dynamic_cast_on_a_simple_operand_lowers_to_a_type_check_ternary() {
+    let source = lower_and_emit(
+        "lower-cpp-dynamic-cast",
+        r#"
+class Base {
+public:
+    virtual ~Base() {}
+    Base* Self() { return this; }
+};
+class OptionBool : public Base {
+public:
+    bool m_value = false;
+};
+OptionBool* from_param(Base* option) {
+    return dynamic_cast<OptionBool*>(option);
+}
+class Derived : public Base {
+public:
+    OptionBool* from_this() {
+        return dynamic_cast<OptionBool*>(this);
+    }
+    OptionBool* from_call() {
+        return dynamic_cast<OptionBool*>(Self());
+    }
+};
+"#,
+    );
+
+    assert!(
+        source.contains("return option is OptionBool ? option : null;"),
+        "expected a simple parameter operand to lower to a type-check ternary, got:\n{source}"
+    );
+    assert!(
+        source.contains("return this is OptionBool ? this : null;"),
+        "expected `this` to lower the same way, got:\n{source}"
+    );
+    assert!(
+        source.contains("dynamic_cast operand is not a simple reference"),
+        "expected a call operand (side-effect risk from double evaluation) to stay a bailout, got:\n{source}"
+    );
+}
+
+/// `return new Abbr(*this);` — Verovio's own `Clone()` idiom
+/// (`include/vrv/abbr.h`'s `Object *Clone() const override { return new
+/// Abbr(*this); }`, confirmed as the real trigger by grepping the source
+/// directly). `lower_call_expr` already treats a copy-constructor call as
+/// transparent sugar (E03), recursing straight into `*this`/`other`
+/// itself — so the construction never lowers to a `ConstructorCall`/
+/// `RecordConstruct` the way `lower_new_expr` originally expected, even
+/// though it's a completely representable allocation. Rebuilt as a
+/// field-by-field `RecordConstruct` off the copy source instead — the same
+/// construction `collect_params_with_clone_prelude` already builds for a
+/// by-value parameter's own copy-on-entry clone, just keyed to an
+/// arbitrary receiver expression.
+#[test]
+fn a_new_expression_copy_constructing_from_this_clones_every_field() {
+    let source = lower_and_emit(
+        "lower-cpp-new-copy-construct",
+        r#"
+class Abbr {
+public:
+    Abbr() {}
+    Abbr(const Abbr& other) {}
+    int m_x = 0;
+    Abbr* Clone() const { return new Abbr(*this); }
+};
+"#,
+    );
+
+    assert!(
+        source.contains("return Abbr(this.m_x);"),
+        "expected a field-by-field clone from `this`, got:\n{source}"
+    );
+    assert!(!source.contains("CXX new child"), "got:\n{source}");
+}
+
+/// `U"x"` (a `char32_t[N]` string literal) — Verovio's own `Dynam::
+/// IsSymbolOnly` (`return U"x";`/`m_symbolStr = U"";`, confirmed real via
+/// grepping the source). `std::u32string` already lowers to `Type::Str`
+/// (`stdlib_template_name` keys on the primary template name
+/// `"basic_string"` regardless of its character-type argument, already
+/// correct), but `string_literal_text` read the token spelling by
+/// stripping a *bare* `"` prefix/suffix — for `U"x"` the token spelling is
+/// literally `U"x"`, so `strip_prefix('"')` failed on the leading `U` and
+/// the whole literal came back `None`. The resulting `Expr::Unsupported`
+/// then got silently discarded by the implicit-conversion wrapper's own
+/// type-mismatch fallback (the array-to-pointer-decayed `char32_t[N]`
+/// lowers to `List(Int)`, disagreeing with the `Str` context), surfacing
+/// as "unsupported implicit conversion from List(Int) to Nullable(Str)"
+/// instead of the real, more specific failure. Also covers `u"..."`
+/// (UTF-16), `L"..."` (wide) and `u8"..."` (explicit UTF-8) — every C++
+/// string-literal encoding prefix, not just `U`.
+#[test]
+fn a_prefixed_string_literal_of_every_encoding_evaluates_its_text() {
+    let source = lower_and_emit(
+        "lower-cpp-prefixed-string-literal",
+        r#"
+#include <string>
+class Dynam {
+public:
+    std::u32string GetText() const { return U"x"; }
+    bool IsSymbolOnly() const {
+        m_symbolStr = U"";
+        std::u32string str = this->GetText();
+        m_symbolStr = str;
+        return true;
+    }
+    mutable std::u32string m_symbolStr;
+};
+std::u16string utf16() { return u"y"; }
+std::wstring wide() { return L"z"; }
+std::string explicit_utf8() { return u8"w"; }
+"#,
+    );
+
+    assert!(
+        source.contains("String GetText() {\n    return 'x';\n  }"),
+        "expected the U-prefixed literal to evaluate to 'x', got:\n{source}"
+    );
+    assert!(
+        source.contains("m_symbolStr = '';"),
+        "expected the empty U-prefixed literal to evaluate too, got:\n{source}"
+    );
+    assert!(
+        source.contains("return 'y';"),
+        "expected the u-prefixed (UTF-16) literal to evaluate, got:\n{source}"
+    );
+    assert!(
+        source.contains("return 'z';"),
+        "expected the L-prefixed (wide) literal to evaluate, got:\n{source}"
+    );
+    assert!(
+        source.contains("return 'w';"),
+        "expected the u8-prefixed literal to evaluate, got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported implicit conversion")
+            && !source.contains("could not evaluate string literal"),
+        "got:\n{source}"
+    );
+}
+
+/// An anonymous top-level `enum { NAME = value, ... }` — a common C idiom
+/// for a group of named integer constants, not a real type. Confirmed as
+/// the real Verovio shape by grepping the source directly
+/// (`include/vrv/smufl.h`'s `enum { SMUFL_0020_space = 0x0020,
+/// SMUFL_266D_musicFlatSign = 0x266D, ... }`). `lower_enum`/`enum_identity`
+/// already refuse to declare a Dart type for an anonymous enum (correctly
+/// — there's no usable name), so a reference to one of its enumerators has
+/// no stable binding to name either; inlining the enumerator's own known
+/// compile-time value instead is exact, not a guess.
+#[test]
+fn an_anonymous_enum_constant_inlines_to_its_literal_value() {
+    let source = lower_and_emit(
+        "lower-cpp-anonymous-enum-constant",
+        r#"
+enum {
+    SMUFL_0020_space = 0x0020,
+    SMUFL_266D_musicFlatSign = 0x266D,
+};
+int glyph_code() {
+    return SMUFL_266D_musicFlatSign;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("return 9837;"),
+        "expected the anonymous enum constant to inline to its real value (0x266D = 9837), got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported implicit conversion"),
+        "got:\n{source}"
+    );
+}
+
+/// `*(field = new T()) = value;` — a real crash found in the Verovio
+/// corpus itself (`include/json/jsonxx.h:275`'s bundled JSON library,
+/// `*( array_value_ = new Array() ) = a;`), not just a bailout: the
+/// dereference's operand is `field = new T()`, an assignment used as an
+/// expression. At the time this test was written, that operand was itself
+/// an unconditional `Expr::Unsupported` (`binary operator kind 22` had no
+/// lowering yet) that the *dereference* wrapped in `Expr::Convert`
+/// unconditionally, without checking whether the wrapped operand was
+/// representable — `emit::dart`'s `Expr::Convert` renderer had no case for
+/// an operand with no statically-known type, so it hit its own
+/// `unreachable!()`, a real emitter panic confirmed via a fresh `just
+/// verovio-diagnosis` run against the real corpus. Assignment-as-expression
+/// is representable now (`Expr::Assign`, confirmed against real `dart
+/// analyze`/`dart run` — Dart's own `=` is a real expression too), so the
+/// *inner* assignment succeeds — but the outer dereference's `Convert` now
+/// wraps an `Expr::Assign`, which is a valid Dart *value* but never a valid
+/// Dart assignment *target* (`(x = y) = z;` doesn't compile); this stays an
+/// honest bailout for that reason instead, never reaching emission.
+#[test]
+fn a_dereference_of_an_unassignable_operand_stays_an_honest_bailout() {
+    let source = lower_and_emit(
+        "lower-cpp-deref-of-unsupported-operand",
+        r#"
+struct Array {};
+struct Holder {
+    Array* array_value_;
+    void import(const Array& a) {
+        *(array_value_ = new Array()) = a;
+    }
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("panicked")
+            && source.contains("assignment target's dereference operand is not a simple"),
+        "expected an honest bailout, not a panic, got:\n{source}"
+    );
+}
+
+/// Unary `+` (`CXUnaryOperator_Plus`) — confirmed as the real Verovio
+/// trigger by grepping the source directly (`iohumdrum.cpp:915`'s
+/// `m_fbstates[staffindex] = +1;`, an explicit-positive-sign idiom). Unlike
+/// every other unary operator, `+x` is a true no-op for an arithmetic
+/// value in both C++ and Dart (no promotion Dart's own arbitrary-precision
+/// `int`/`double` needs modeling for) — the operand lowers directly,
+/// exactly as transparent as a parenthesized wrapper.
+#[test]
+fn unary_plus_lowers_to_its_bare_operand() {
+    let source = lower_and_emit(
+        "lower-cpp-unary-plus",
+        r#"
+int positive_one() {
+    return +1;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("return 1;"),
+        "expected unary plus to lower to its bare operand, got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported unary operator"),
+        "got:\n{source}"
+    );
+}
+
+/// Assignment used as an *expression*, not a whole statement — confirmed
+/// as a real Verovio trigger by grepping the source directly
+/// (`adjustarticfunctor.cpp:47`'s `yIn = std::max(yAboveStem,
+/// -staffHeight);`, a *plain-looking statement* that nonetheless reaches
+/// `lower_binary_expr` — not `lower_stmt`'s own statement-level assignment
+/// recognition — because `std::max`'s template instantiation wraps the
+/// whole statement in an intervening `libclang` cursor first). Dart's own
+/// `=` is a real expression too, evaluating to the assigned value — proven
+/// against real `dart analyze`/`dart run` before implementing, not
+/// assumed — so this needs no hoisted temporary statement, contrary to
+/// this bailout's original (incorrect) deferral reasoning.
+#[test]
+fn assignment_used_as_an_expression_lowers_to_darts_own_assignment_expression() {
+    let source = lower_and_emit(
+        "lower-cpp-assignment-as-expression",
+        r#"
+#include <algorithm>
+int via_wrapped_statement(int yAboveStem, int staffHeight) {
+    int yIn;
+    yIn = std::max(yAboveStem, -staffHeight);
+    return yIn;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("(yIn = max(yAboveStem, -staffHeight));"),
+        "expected the wrapped-statement assignment to lower to a parenthesized assignment expression, got:\n{source}"
+    );
+    assert!(
+        !source.contains("unsupported binary operator kind 22"),
+        "got:\n{source}"
+    );
+}
+
+/// Real trigger: `jsonxx.h`'s `import(const String&)`,
+/// `*( string_value_ = new String() ) = s;` — the assignment-as-expression
+/// used as a dereference target wraps an inner `new` allocation that itself
+/// bails out (`new String()`'s pointee isn't a known project record). The
+/// inner `Expr::Assign` must propagate that bailout instead of silently
+/// building a well-formed-looking assignment expression around a broken
+/// value, which previously reached `dart format` as
+/// `(value_ = _syntaxBridgeUnsupported<int?>(...))! = v;` — invalid Dart
+/// ("Illegal assignment to non-assignable expression").
+#[test]
+fn an_assignment_expression_with_an_unsupported_right_hand_side_stays_an_honest_bailout() {
+    let source = lower_and_emit(
+        "lower-cpp-assignment-expression-unsupported-rhs",
+        r#"
+struct Holder {
+    int* value_;
+    void import(int v) {
+        *( value_ = new int() ) = v;
+    }
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("panicked"),
+        "expected an honest bailout, not a panic, got:\n{source}"
+    );
+    assert!(
+        !source.contains("= _syntaxBridgeUnsupported"),
+        "an unsupported assignment-expression rhs must not reach emission as a live \
+         assignment target, got:\n{source}"
+    );
+}
+
+/// Real trigger: `svgdevicecontext.cpp`'s `GetColor`. Dart's switch-case
+/// patterns only accept a literal or a named-constant reference, and
+/// reject an inline operator expression outright (`dart analyze`: "The
+/// binary operator << is not supported as a constant pattern"), even
+/// though C++ accepts any integer-constant-expression as a case label.
+/// Each label here must fold to its compile-time integer value instead of
+/// being emitted as the (Dart-illegal) source expression.
+#[test]
+fn a_case_label_that_is_a_constant_expression_folds_to_its_integer_value() {
+    let source = lower_and_emit(
+        "lower-cpp-case-label-constant-expression",
+        r##"
+const char* get_color(int color) {
+    switch (color) {
+        case 255 << 16 | 255 << 8 | 255:
+            return "#FFFFFF";
+        case 255 << 16:
+            return "#FF0000";
+        default:
+            return "#000000";
+    }
+}
+"##,
+    );
+    assert!(source.contains("case 16777215:"), "got:\n{source}");
+    assert!(source.contains("case 16711680:"), "got:\n{source}");
+    assert!(
+        !source.contains("<<") && !source.contains("|"),
+        "case label should be folded to a literal, not emitted as an operator expression, \
+         got:\n{source}"
     );
 }
 
@@ -2604,5 +3902,299 @@ public:
         source.contains("info!.proportNum =") && source.contains("info!.proportDen ="),
         "expected each target assigned individually, with ordinary (non-pattern) \
          null-assertion syntax, got:\n{source}"
+    );
+}
+
+/// `void*`/`const void*` — the single largest type bailout in the
+/// 2026-08-20 Verovio diagnosis (896 + 253 occurrences), real shapes
+/// confirmed by grepping the extracted Verovio source directly
+/// (`test-resources/verovio-version-6.2.0.tar.gz`):
+/// `include/vrv/floatingobject.h`'s `SetDrawingGrpObject(void
+/// *drawingGrpObject)` (a parameter), `include/pugi/pugixml.hpp`'s `void*
+/// _impl;` (a field). `mapping::pointer_options_for` already answers
+/// `"ponte-dart-ffi"` for an opaque pointee (`void`, a scalar, or an
+/// already-unrepresentable pointee) — this only finishes that option's own
+/// Dart realization for the `void` case specifically: a named, documented
+/// bridge (`SyntaxBridgeNativeHandle`, identity-only, never dereferenced or
+/// arithmetic'd) instead of the generic `Type::Unsupported` bailout. Scoped
+/// to a `void` pointee only — a pointer to an unrepresentable scalar/record
+/// pointee still needs its own future decision and stays `Unsupported`.
+#[test]
+fn a_void_pointer_lowers_to_a_named_native_handle_bridge_instead_of_a_bailout() {
+    let source = lower_and_emit(
+        "lower-cpp-void-pointer-native-handle",
+        r#"
+struct Holder {
+    void *_impl;
+    int SetDrawingGrpObject(void *drawingGrpObject) {
+        _impl = drawingGrpObject;
+        return _impl == nullptr ? 0 : 1;
+    }
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "got:\n{source}"
+    );
+    assert!(
+        source.contains("SyntaxBridgeNativeHandle? _impl;"),
+        "expected the field to keep a precise, named nullable type, got:\n{source}"
+    );
+    assert!(
+        source.contains("int SetDrawingGrpObject(SyntaxBridgeNativeHandle? drawingGrpObject)"),
+        "expected the parameter to keep the same named type, got:\n{source}"
+    );
+    assert!(
+        source.contains("_impl = drawingGrpObject;") && source.contains("_impl == null"),
+        "expected assignment and null-comparison to keep working without any adapter, got:\n{source}"
+    );
+}
+
+/// A `const void*` uses the exact same bridge as a plain `void*` — C++'s
+/// `const` here only restricts writes through the pointer, which this
+/// bridge (identity-only, no dereference) never does anyway.
+#[test]
+fn a_const_void_pointer_uses_the_same_native_handle_bridge_as_a_plain_void_pointer() {
+    let source = lower_and_emit(
+        "lower-cpp-const-void-pointer-native-handle",
+        r#"
+struct Writer {
+    virtual void Write(const void *data, unsigned long size) = 0;
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "got:\n{source}"
+    );
+    assert!(
+        source.contains("SyntaxBridgeNativeHandle? data"),
+        "got:\n{source}"
+    );
+}
+
+/// A `case` that falls through into the next one without an explicit
+/// `break`/`continue`/`return`/`throw` — genuine C++ fallthrough, which
+/// used to bail out the whole `switch` (`docs/plans/bailouts-verovio-6.2.0.md`'s
+/// "a case falls through..." family, 36 occurrences in the 2026-08-20
+/// diagnosis). Dart has its own explicit fallthrough syntax
+/// (`continue <label>;` into a labeled sibling `case`), confirmed real Dart
+/// syntax, not guessed. Exercises a chain of two falls-through (`1` into
+/// `2`, `2` into `3`) so a fixture only covering one hop can't hide a
+/// bug that only shows up in a longer chain.
+#[test]
+fn a_case_that_falls_through_into_the_next_one_uses_darts_own_continue_label_syntax() {
+    let source = lower_and_emit(
+        "lower-cpp-switch-fallthrough",
+        r#"
+#include <string>
+std::string describe(int level) {
+    std::string result = "";
+    switch (level) {
+        case 1:
+            result += "low ";
+        case 2:
+            result += "mid ";
+        case 3:
+            result += "high";
+            break;
+        default:
+            result = "unknown";
+            break;
+    }
+    return result;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("Unsupported")
+            && !source.contains("a case falls through")
+            && !source.contains("dynamic"),
+        "got:\n{source}"
+    );
+    assert!(
+        source.contains("continue _syntaxBridgeCase1;")
+            && source.contains("continue _syntaxBridgeCase2;"),
+        "expected each falling-through case to jump via Dart's own continue-label syntax, got:\n{source}"
+    );
+    assert!(
+        source.contains("_syntaxBridgeCase1:\n    case 2:")
+            && source.contains("_syntaxBridgeCase2:\n    case 3:"),
+        "expected each label printed right before the case it targets, got:\n{source}"
+    );
+}
+
+/// A `for` header missing one or more of its three clauses
+/// (`for (;;)`-shaped) — `clang_visitChildren` silently skips an absent
+/// clause with no positional marker, ambiguous from cursor kinds alone.
+/// Real family: "ForStmt had 3/1 children" (28+20 occurrences in the
+/// 2026-08-20 diagnosis). Exercises every combination a single fixture
+/// reasonably can: missing increment, missing init, missing both init and
+/// condition, and the fully-empty `for (;;)`.
+#[test]
+fn a_for_loop_missing_one_or_more_clauses_still_lowers_correctly() {
+    let source = lower_and_emit(
+        "lower-cpp-for-missing-clauses",
+        r#"
+void f() {
+    int i;
+    for (i = 0; i < 10; ) {
+        i++;
+    }
+    for (; i < 10; i++) {
+    }
+    for (i = 0; ; i++) {
+        if (i >= 10) break;
+    }
+    for (;;) {
+        break;
+    }
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "got:\n{source}"
+    );
+    assert!(
+        source.contains("for (i = 0; i < 10; ) {"),
+        "expected the missing-increment loop to keep its init/condition, got:\n{source}"
+    );
+    assert!(
+        source.contains("for (; i < 10; i++) {"),
+        "expected the missing-init loop to keep its condition/increment, got:\n{source}"
+    );
+    assert!(
+        source.contains("for (i = 0; ; i++) {"),
+        "expected the missing-condition loop to keep its init/increment, got:\n{source}"
+    );
+    assert!(
+        source.contains("for (; ; ) {"),
+        "expected the fully-empty header to lower with no clauses at all, got:\n{source}"
+    );
+}
+
+/// `std::multiset<T>` — allows duplicates, unlike `std::set`/
+/// `std::unordered_set`, so it lowers to `List<T>` (which preserves
+/// duplicates) rather than `Set<T>` (which would silently drop them). Real
+/// trigger family: "std::multiset (spelling: multiset<int>)" (9 occurrences
+/// in the 2026-08-20 diagnosis).
+#[test]
+fn a_multiset_lowers_to_a_list_to_preserve_duplicate_elements() {
+    let source = lower_and_emit(
+        "lower-cpp-multiset",
+        r#"
+#include <set>
+void f(std::multiset<int> values) { }
+"#,
+    );
+
+    assert!(
+        source.contains("void f(List<int> values)"),
+        "expected multiset to lower to List<int>, got:\n{source}"
+    );
+    assert!(!source.contains("Unsupported"), "got:\n{source}");
+}
+
+/// `struct { ... } s, *ps;` — an inline struct definition followed by one
+/// or more variable declarators using it, in the same `DeclStmt`. Confirmed
+/// via `clang++ -Xclang -ast-dump` (not guessed): the `DeclStmt`'s direct
+/// children are `[CXXRecordDecl, VarDecl(s), VarDecl(ps)]` — the type
+/// declaration is a sibling of the real declarators, not their parent. Real
+/// family: "DeclStmt's declarator is not a VarDecl" (44 occurrences in the
+/// 2026-08-20 diagnosis).
+#[test]
+fn an_inline_struct_definition_alongside_its_declarators_lowers_only_the_variables() {
+    let source = lower_and_emit(
+        "lower-cpp-inline-struct-declarators",
+        r#"
+void f() {
+    struct Point { int x; int y; } p, *pp;
+    p.x = 1;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("Unsupported")
+            && !source.contains("dynamic")
+            && !source.contains("declarator is not a VarDecl"),
+        "got:\n{source}"
+    );
+    assert!(
+        source.contains("Point p = Point(0, 0);") || source.contains("Point p"),
+        "expected the first declarator to still lower, got:\n{source}"
+    );
+    assert!(source.contains("Point? pp"), "got:\n{source}");
+}
+
+/// `delete ptr;` — real triggers found by grepping the extracted Verovio
+/// source directly (`layer.cpp`'s `delete m_staffDefClef;`, `toolkit.cpp`'s
+/// `delete m_editorToolkit;`). This IR's pointers are plain GC-managed
+/// Dart references with no ownership tracking yet, so manual deletion is a
+/// no-op — omitted the same way a bare `;` already is.
+#[test]
+fn a_delete_statement_is_omitted_as_a_no_op() {
+    let source = lower_and_emit(
+        "lower-cpp-delete-statement",
+        r#"
+struct Clef {};
+struct Layer {
+    Clef *m_staffDefClef = nullptr;
+    void ResetStaffDefObjects() {
+        delete m_staffDefClef;
+        m_staffDefClef = nullptr;
+    }
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("Unsupported")
+            && !source.contains("dynamic")
+            && !source.contains("delete"),
+        "expected the delete statement to vanish as a no-op, got:\n{source}"
+    );
+    assert!(
+        source.contains("m_staffDefClef = null;"),
+        "expected the surrounding statement to still lower normally, got:\n{source}"
+    );
+}
+
+/// The textually last clause of a `switch` (here, the last `case` since
+/// there is no `default`) needs no terminator at all — falling out the
+/// bottom of a `switch` is already valid in both C++ and Dart, unlike
+/// falling into the *next* case.
+#[test]
+fn the_last_case_of_a_switch_needs_no_terminator() {
+    let source = lower_and_emit(
+        "lower-cpp-switch-last-case-no-terminator",
+        r#"
+int classify(int level) {
+    int result = 0;
+    switch (level) {
+        case 1:
+            result = 10;
+            break;
+        case 2:
+            result = 20;
+    }
+    return result;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "got:\n{source}"
+    );
+    assert!(
+        source.contains("case 2:\n      result = 20;\n  }"),
+        "expected the last case to close the switch with no forced terminator, got:\n{source}"
     );
 }

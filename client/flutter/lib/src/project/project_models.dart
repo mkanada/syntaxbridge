@@ -72,6 +72,7 @@ class CreatedProject {
     required this.inputSourceDir,
     required this.compilationUnits,
     this.sourceFiles = const <SourceFile>[],
+    this.isAnalysed = false,
   });
 
   factory CreatedProject.fromJson(Map<String, Object?> json) {
@@ -92,6 +93,7 @@ class CreatedProject {
           .whereType<Map<String, Object?>>()
           .map(SourceFile.fromJson)
           .toList(),
+      isAnalysed: json['is_analysed'] as bool? ?? false,
     );
   }
 
@@ -100,6 +102,14 @@ class CreatedProject {
   final String inputSourceDir;
   final List<CompilationUnit> compilationUnits;
   final List<SourceFile> sourceFiles;
+
+  /// Whether "Analyse" (item 2, `docs/prompts/2026-08-19-mudanca-interacao.md`)
+  /// has completed for this project — before it has, usages/calls/pointers
+  /// are simply empty rather than unavailable, so nothing else in the IDE
+  /// treats this as a precondition to enforce; it only drives whether the
+  /// "Analyse" action shows as done or pending. Mirrors
+  /// `ingest::CreatedProject.is_analysed` / `project_service::LoadedProject.is_analysed`.
+  final bool isAnalysed;
 }
 
 class CompilationUnit {
@@ -804,6 +814,44 @@ class ProjectCreationJobStatus {
   final bool isClientError;
 }
 
+/// Where a background analysis job (started by `startAnalyseProject`,
+/// item 2 `docs/prompts/2026-08-19-mudanca-interacao.md`) stands. No
+/// `cancelling` state to keep this simpler than [ProjectCreationJobState]:
+/// `"cancelling"` from the server is treated the same as `running` here
+/// (still in flight from this UI's point of view), since the "Analyse"
+/// action doesn't offer a separate cancel button.
+enum AnalysisJobState { running, succeeded, failed, cancelled }
+
+/// A snapshot of `GET /projects/analyse-jobs/{id}`. Deliberately lighter
+/// than [ProjectCreationJobStatus]: no per-catalog progress detail, since
+/// the "Analyse" action shows only a spinner and a terminal outcome, not a
+/// phase-by-phase progress bar.
+class AnalysisJobStatus {
+  const AnalysisJobStatus({
+    required this.state,
+    this.errorMessage,
+    this.isClientError = false,
+  });
+
+  factory AnalysisJobStatus.fromJson(Map<String, Object?> json) {
+    final state = switch (json['status'] as String?) {
+      'succeeded' => AnalysisJobState.succeeded,
+      'failed' => AnalysisJobState.failed,
+      'cancelled' => AnalysisJobState.cancelled,
+      _ => AnalysisJobState.running,
+    };
+    return AnalysisJobStatus(
+      state: state,
+      errorMessage: json['message'] as String?,
+      isClientError: json['is_client_error'] as bool? ?? false,
+    );
+  }
+
+  final AnalysisJobState state;
+  final String? errorMessage;
+  final bool isClientError;
+}
+
 /// The response of `POST /projects/transpile` (US-8, E01–E03 scope): the
 /// Dart package emitted from the project's free functions and `struct`s.
 /// Mirrors `transpile::TranspiledPackage` in `crates/server/src/transpile.rs`.
@@ -909,6 +957,7 @@ enum ExternalSourceKind {
   manualExclude,
   nameRegex,
   pathRegex,
+  fileMark,
   autoUndefinedFunction;
 
   static ExternalSourceKind fromJson(String? value) {
@@ -917,6 +966,7 @@ enum ExternalSourceKind {
       'manual_exclude' => ExternalSourceKind.manualExclude,
       'name_regex' => ExternalSourceKind.nameRegex,
       'path_regex' => ExternalSourceKind.pathRegex,
+      'file_mark' => ExternalSourceKind.fileMark,
       'auto_undefined_function' => ExternalSourceKind.autoUndefinedFunction,
       _ => ExternalSourceKind.autoUndefinedFunction,
     };
@@ -930,23 +980,30 @@ enum ExternalSourceKind {
       ExternalSourceKind.manualExclude => 'excluído manualmente',
       ExternalSourceKind.nameRegex => 'regexp de nome',
       ExternalSourceKind.pathRegex => 'regexp de caminho',
+      ExternalSourceKind.fileMark => 'arquivo marcado',
       ExternalSourceKind.autoUndefinedFunction => 'detectado automaticamente',
     };
   }
 }
 
 class ExternalSource {
-  const ExternalSource({required this.kind, this.pattern});
+  const ExternalSource({required this.kind, this.pattern, this.file});
 
   factory ExternalSource.fromJson(Map<String, Object?> json) {
     return ExternalSource(
       kind: ExternalSourceKind.fromJson(json['kind'] as String?),
       pattern: json['pattern'] as String?,
+      file: json['file'] as String?,
     );
   }
 
   final ExternalSourceKind kind;
   final String? pattern;
+
+  /// Only set for [kind] `fileMark` — the file whose persistent mark
+  /// (item 3, `docs/prompts/2026-08-19-mudanca-interacao.md`) put this usr
+  /// in the effective set. Mirrors `externals::ExternalSource::FileMark`.
+  final String? file;
 }
 
 /// One usr's full external status — whether it's currently in the effective
@@ -1020,14 +1077,32 @@ class PathRegexRule {
   final String createdAt;
 }
 
+/// A whole file marked external — persistent, unlike the one-time snapshot
+/// marking a type still uses. Mirrors `externals::FileMark`. Item 3,
+/// `docs/prompts/2026-08-19-mudanca-interacao.md`.
+class FileMark {
+  const FileMark({required this.file, required this.decidedAt});
+
+  factory FileMark.fromJson(Map<String, Object?> json) {
+    return FileMark(
+      file: json['file'] as String? ?? '',
+      decidedAt: json['decided_at'] as String? ?? '',
+    );
+  }
+
+  final String file;
+  final String decidedAt;
+}
+
 /// The response of `GET /projects/externals`: the effective external set
-/// plus both live regexp rule lists. Mirrors
+/// plus both live regexp rule lists and the persistent file marks. Mirrors
 /// `project_service::ExternalListing`.
 class ExternalListing {
   const ExternalListing({
     required this.statuses,
     required this.nameRegexes,
     required this.pathRegexes,
+    this.fileMarks = const <FileMark>[],
   });
 
   factory ExternalListing.fromJson(Map<String, Object?> json) {
@@ -1037,6 +1112,8 @@ class ExternalListing {
         json['name_regexes'] as List<Object?>? ?? const <Object?>[];
     final pathRegexesJson =
         json['path_regexes'] as List<Object?>? ?? const <Object?>[];
+    final fileMarksJson =
+        json['file_marks'] as List<Object?>? ?? const <Object?>[];
 
     return ExternalListing(
       statuses: statusesJson
@@ -1051,10 +1128,15 @@ class ExternalListing {
           .whereType<Map<String, Object?>>()
           .map(PathRegexRule.fromJson)
           .toList(),
+      fileMarks: fileMarksJson
+          .whereType<Map<String, Object?>>()
+          .map(FileMark.fromJson)
+          .toList(),
     );
   }
 
   final List<ExternalStatus> statuses;
   final List<NameRegexRule> nameRegexes;
   final List<PathRegexRule> pathRegexes;
+  final List<FileMark> fileMarks;
 }

@@ -362,8 +362,18 @@ fn create_project_catalogs_project_pointers_with_libclang() {
         None,
     )
     .expect("ingest project and extract pointer catalog");
+    // Item 2 (`docs/prompts/2026-08-19-mudanca-interacao.md`): ingestion
+    // only persists declarations now — the pointer catalog needs "Analyse"
+    // to run before it's in `project.db`.
+    project_service::analyse_project(&project.project_dir, None).expect("analyse project");
 
-    let catalog = &project.pointer_catalog;
+    let project_store = syntax_bridge_server::persistence::ProjectStore::open(
+        &project.project_dir.join("project.db"),
+    )
+    .expect("open project store");
+    let catalog = project_store
+        .list_pointer_declarations()
+        .expect("list persisted pointer declarations");
     let return_type_pointer = catalog
         .iter()
         .find(|declaration| {
@@ -385,21 +395,6 @@ fn create_project_catalogs_project_pointers_with_libclang() {
         local_pointer.pointee_usr, return_type_pointer.pointee_usr,
         "origem and fabrica's return type both point at Forma"
     );
-
-    let project_store = syntax_bridge_server::persistence::ProjectStore::open(
-        &project.project_dir.join("project.db"),
-    )
-    .expect("open project store");
-    let persisted = project_store
-        .list_pointer_declarations()
-        .expect("list persisted pointer declarations");
-    assert_eq!(persisted.len(), catalog.len());
-    for declaration in catalog {
-        assert!(
-            persisted.contains(declaration),
-            "expected persisted catalog to contain {declaration:?}"
-        );
-    }
 }
 
 const NARROWING_MAIN_CPP: &str = r#"
@@ -486,6 +481,10 @@ fn list_pointers_narrows_return_type_pointers_using_the_persisted_call_graph() {
         None,
     )
     .expect("ingest project and extract catalogs");
+    // Item 2 (`docs/prompts/2026-08-19-mudanca-interacao.md`): ingestion
+    // only persists declarations now — the pointer catalog and the call
+    // graph narrowing both need "Analyse" to run first.
+    project_service::analyse_project(&project.project_dir, None).expect("analyse project");
 
     let listing = project_service::list_pointers(&project.project_dir)
         .expect("list pointers from the persisted store");
@@ -581,6 +580,10 @@ fn list_pointers_maps_c_string_pointers_to_dart_string() {
         None,
     )
     .expect("ingest project and extract catalogs");
+    // Item 2 (`docs/prompts/2026-08-19-mudanca-interacao.md`): ingestion
+    // only persists declarations now — the pointer catalog needs "Analyse"
+    // to run before it's in `project.db`.
+    project_service::analyse_project(&project.project_dir, None).expect("analyse project");
 
     let listing = project_service::list_pointers(&project.project_dir)
         .expect("list pointers from the persisted store");

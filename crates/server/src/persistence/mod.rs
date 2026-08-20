@@ -1,6 +1,8 @@
+mod externals_store;
 mod global_store;
 mod project_store;
 
+pub use externals_store::ExternalsStore;
 pub use global_store::{GlobalStore, ProjectRecord};
 pub use project_store::{ProjectCatalogs, ProjectStore};
 

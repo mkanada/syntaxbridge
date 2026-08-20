@@ -1029,7 +1029,8 @@ impl IrRefVisitor<'_> {
                 self.visit_expr(iterable);
                 self.visit_stmts(body);
             }
-            ir::Stmt::Break { .. } | ir::Stmt::Continue { .. } => {}
+            ir::Stmt::Break { .. } | ir::Stmt::Continue { .. } | ir::Stmt::ContinueLabel { .. } => {
+            }
             ir::Stmt::ExprStmt { expr, .. } => self.visit_expr(expr),
             ir::Stmt::Throw { value, .. } => self.visit_expr(value),
             ir::Stmt::TryCatch {
@@ -1055,6 +1056,23 @@ impl IrRefVisitor<'_> {
                     self.visit_expr(target);
                 }
                 self.visit_expr(value);
+            }
+            ir::Stmt::Switch {
+                scrutinee,
+                cases,
+                default,
+                ..
+            } => {
+                self.visit_expr(scrutinee);
+                for case in cases {
+                    for value in &mut case.values {
+                        self.visit_expr(value);
+                    }
+                    self.visit_stmts(&mut case.body);
+                }
+                if let Some(default) = default {
+                    self.visit_stmts(default);
+                }
             }
             ir::Stmt::Unsupported { .. } => {}
         }
@@ -1165,6 +1183,34 @@ impl IrRefVisitor<'_> {
                 for value in values {
                     self.visit_expr(value);
                 }
+            }
+            ir::Expr::ListLiteral { items, ty, .. } => {
+                self.visit_type(ty);
+                for item in items {
+                    self.visit_expr(item);
+                }
+            }
+            ir::Expr::MapLiteral { entries, ty, .. } => {
+                self.visit_type(ty);
+                for (key, value) in entries {
+                    self.visit_expr(key);
+                    self.visit_expr(value);
+                }
+            }
+            ir::Expr::Is {
+                operand,
+                target_type,
+                ..
+            } => {
+                self.visit_type(target_type);
+                self.visit_expr(operand);
+            }
+            ir::Expr::Assign {
+                target, value, ty, ..
+            } => {
+                self.visit_type(ty);
+                self.visit_expr(target);
+                self.visit_expr(value);
             }
         }
     }
@@ -1405,7 +1451,9 @@ fn stmt_references_name(stmt: &ir::Stmt, name: &str) -> bool {
         ir::Stmt::ForEach { iterable, body, .. } => {
             expr_references_name(iterable, name) || stmts_reference_name(body, name)
         }
-        ir::Stmt::Break { .. } | ir::Stmt::Continue { .. } => false,
+        ir::Stmt::Break { .. } | ir::Stmt::Continue { .. } | ir::Stmt::ContinueLabel { .. } => {
+            false
+        }
         ir::Stmt::ExprStmt { expr, .. } | ir::Stmt::Throw { value: expr, .. } => {
             expr_references_name(expr, name)
         }
@@ -1424,6 +1472,23 @@ fn stmt_references_name(stmt: &ir::Stmt, name: &str) -> bool {
                 .iter()
                 .any(|target| expr_references_name(target, name))
                 || expr_references_name(value, name)
+        }
+        ir::Stmt::Switch {
+            scrutinee,
+            cases,
+            default,
+            ..
+        } => {
+            expr_references_name(scrutinee, name)
+                || cases.iter().any(|case| {
+                    case.values
+                        .iter()
+                        .any(|value| expr_references_name(value, name))
+                        || stmts_reference_name(&case.body, name)
+                })
+                || default
+                    .as_deref()
+                    .is_some_and(|default| stmts_reference_name(default, name))
         }
         ir::Stmt::Unsupported { .. } => false,
     }
@@ -1492,6 +1557,16 @@ fn expr_references_name(expr: &ir::Expr, name: &str) -> bool {
         }
         ir::Expr::Tuple { values, .. } => {
             values.iter().any(|value| expr_references_name(value, name))
+        }
+        ir::Expr::ListLiteral { items, .. } => {
+            items.iter().any(|item| expr_references_name(item, name))
+        }
+        ir::Expr::MapLiteral { entries, .. } => entries.iter().any(|(key, value)| {
+            expr_references_name(key, name) || expr_references_name(value, name)
+        }),
+        ir::Expr::Is { operand, .. } => expr_references_name(operand, name),
+        ir::Expr::Assign { target, value, .. } => {
+            expr_references_name(target, name) || expr_references_name(value, name)
         }
     }
 }
@@ -1567,7 +1642,7 @@ fn replace_this_with_ref_in_stmt(stmt: &mut ir::Stmt, var_name: &str) {
             replace_this_with_ref_in_expr(iterable, var_name);
             replace_this_with_ref_in_stmts(body, var_name);
         }
-        ir::Stmt::Break { .. } | ir::Stmt::Continue { .. } => {}
+        ir::Stmt::Break { .. } | ir::Stmt::Continue { .. } | ir::Stmt::ContinueLabel { .. } => {}
         ir::Stmt::ExprStmt { expr, .. } => replace_this_with_ref_in_expr(expr, var_name),
         ir::Stmt::Throw { value, .. } => replace_this_with_ref_in_expr(value, var_name),
         ir::Stmt::TryCatch {
@@ -1591,6 +1666,23 @@ fn replace_this_with_ref_in_stmt(stmt: &mut ir::Stmt, var_name: &str) {
                 replace_this_with_ref_in_expr(target, var_name);
             }
             replace_this_with_ref_in_expr(value, var_name);
+        }
+        ir::Stmt::Switch {
+            scrutinee,
+            cases,
+            default,
+            ..
+        } => {
+            replace_this_with_ref_in_expr(scrutinee, var_name);
+            for case in cases {
+                for value in &mut case.values {
+                    replace_this_with_ref_in_expr(value, var_name);
+                }
+                replace_this_with_ref_in_stmts(&mut case.body, var_name);
+            }
+            if let Some(default) = default {
+                replace_this_with_ref_in_stmts(default, var_name);
+            }
         }
         ir::Stmt::Unsupported { .. } => {}
     }
@@ -1677,6 +1769,22 @@ fn replace_this_with_ref_in_expr(expr: &mut ir::Expr, var_name: &str) {
             for value in values {
                 replace_this_with_ref_in_expr(value, var_name);
             }
+        }
+        ir::Expr::ListLiteral { items, .. } => {
+            for item in items {
+                replace_this_with_ref_in_expr(item, var_name);
+            }
+        }
+        ir::Expr::MapLiteral { entries, .. } => {
+            for (key, value) in entries {
+                replace_this_with_ref_in_expr(key, var_name);
+                replace_this_with_ref_in_expr(value, var_name);
+            }
+        }
+        ir::Expr::Is { operand, .. } => replace_this_with_ref_in_expr(operand, var_name),
+        ir::Expr::Assign { target, value, .. } => {
+            replace_this_with_ref_in_expr(target, var_name);
+            replace_this_with_ref_in_expr(value, var_name);
         }
     }
 }
@@ -1768,7 +1876,7 @@ fn rename_calls_in_stmt(stmt: &mut ir::Stmt, renames: &HashMap<String, String>) 
             rename_calls_in_expr(iterable, renames);
             rename_calls_in_stmts(body, renames);
         }
-        ir::Stmt::Break { .. } | ir::Stmt::Continue { .. } => {}
+        ir::Stmt::Break { .. } | ir::Stmt::Continue { .. } | ir::Stmt::ContinueLabel { .. } => {}
         ir::Stmt::ExprStmt { expr, .. } => rename_calls_in_expr(expr, renames),
         ir::Stmt::Throw { value, .. } => rename_calls_in_expr(value, renames),
         ir::Stmt::TryCatch {
@@ -1792,6 +1900,23 @@ fn rename_calls_in_stmt(stmt: &mut ir::Stmt, renames: &HashMap<String, String>) 
                 rename_calls_in_expr(target, renames);
             }
             rename_calls_in_expr(value, renames);
+        }
+        ir::Stmt::Switch {
+            scrutinee,
+            cases,
+            default,
+            ..
+        } => {
+            rename_calls_in_expr(scrutinee, renames);
+            for case in cases {
+                for value in &mut case.values {
+                    rename_calls_in_expr(value, renames);
+                }
+                rename_calls_in_stmts(&mut case.body, renames);
+            }
+            if let Some(default) = default {
+                rename_calls_in_stmts(default, renames);
+            }
         }
         ir::Stmt::Unsupported { .. } => {}
     }
@@ -1881,6 +2006,22 @@ fn rename_calls_in_expr(expr: &mut ir::Expr, renames: &HashMap<String, String>) 
             for value in values {
                 rename_calls_in_expr(value, renames);
             }
+        }
+        ir::Expr::ListLiteral { items, .. } => {
+            for item in items {
+                rename_calls_in_expr(item, renames);
+            }
+        }
+        ir::Expr::MapLiteral { entries, .. } => {
+            for (key, value) in entries {
+                rename_calls_in_expr(key, renames);
+                rename_calls_in_expr(value, renames);
+            }
+        }
+        ir::Expr::Is { operand, .. } => rename_calls_in_expr(operand, renames),
+        ir::Expr::Assign { target, value, .. } => {
+            rename_calls_in_expr(target, renames);
+            rename_calls_in_expr(value, renames);
         }
     }
 }
@@ -2711,7 +2852,9 @@ fn record_call(cursor: clang_sys::CXCursor, state: &mut CallVisitorState<'_>) {
 fn function_declaration_kind_for(kind: clang_sys::CXCursorKind) -> Option<FunctionDeclarationKind> {
     match kind {
         clang_sys::CXCursor_FunctionDecl => Some(FunctionDeclarationKind::FreeFunction),
-        clang_sys::CXCursor_CXXMethod => Some(FunctionDeclarationKind::Method),
+        clang_sys::CXCursor_CXXMethod | clang_sys::CXCursor_ConversionFunction => {
+            Some(FunctionDeclarationKind::Method)
+        }
         clang_sys::CXCursor_Constructor => Some(FunctionDeclarationKind::Constructor),
         clang_sys::CXCursor_Destructor => Some(FunctionDeclarationKind::Destructor),
         clang_sys::CXCursor_FunctionTemplate => Some(FunctionDeclarationKind::FunctionTemplate),

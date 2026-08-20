@@ -29,7 +29,19 @@
       "Bash(flatpak info *)",
       "Bash(cargo bench *)",
       "Bash(cargo metadata *)",
-      "Bash(just --dry-run *)"
+      "Bash(just --dry-run *)",
+      "Bash(just flutter-analyze *)",
+      "Bash(just fmt-check *)",
+      "Bash(just verovio-diagnosis *)",
+      "Bash(just rust-test *)",
+      "Bash(just lint *)",
+      "Bash(just check *)",
+      "Bash(just package-build *)",
+      "Bash(just examples *)",
+      "Bash(just test-host *)",
+      "Bash(git fetch *)",
+      "Bash(curl -s http://127.0.0.1:*)",
+      "Bash(curl -sv http://127.0.0.1:*)"
     ]
   }
 }

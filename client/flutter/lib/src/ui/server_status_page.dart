@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../io/screenshot_storage.dart';
@@ -93,6 +95,19 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
   /// first resolves and again after every mark/regex action refreshes it.
   Set<String> _externalUsrs = {};
 
+  /// Same idea as [_externalUsrs], for `SourceFilesView`'s per-row toggle —
+  /// every file currently holding a persistent external mark (item 3,
+  /// `docs/prompts/2026-08-19-mudanca-interacao.md`).
+  Set<String> _externalFiles = {};
+
+  /// Whether "Analyse" (item 2, `docs/prompts/2026-08-19-mudanca-interacao.md`)
+  /// has completed for this project — seeded from [widget.project], then
+  /// kept in sync locally once [_analyseProject] finishes, so a reopen isn't
+  /// needed to see the toolbar icon flip.
+  late bool _isAnalysed = widget.project.isAnalysed;
+  bool _isAnalysing = false;
+  Timer? _analysePollTimer;
+
   @override
   void initState() {
     super.initState();
@@ -101,6 +116,12 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     _functions = _loadFunctions();
     _externals = _loadExternals();
     _pointers = _loadPointers();
+  }
+
+  @override
+  void dispose() {
+    _analysePollTimer?.cancel();
+    super.dispose();
   }
 
   void _refresh() {
@@ -169,6 +190,109 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
       );
       rethrow;
     }
+  }
+
+  /// Runs "Analyse" (item 2, `docs/prompts/2026-08-19-mudanca-interacao.md`)
+  /// as a background job, polling until it finishes — usages/calls/pointers
+  /// simply stay empty in every other panel until this completes, so
+  /// there's no "blocked" state to show elsewhere, only this toolbar icon's
+  /// own pending → analysing → done progression. A no-op while already
+  /// running, since the toolbar icon is disabled for the duration.
+  Future<void> _analyseProject() async {
+    if (_isAnalysing) {
+      return;
+    }
+
+    setState(() => _isAnalysing = true);
+    _addLog('Analysing project');
+    try {
+      final jobId = await widget.serverClient.startAnalyseProject(
+        widget.project.projectDir,
+      );
+      await _pollAnalyseJob(jobId);
+    } catch (error, stackTrace) {
+      if (!mounted) {
+        return;
+      }
+      cliLog('start analyse project exception: $error');
+      cliLog('start analyse project stack: $stackTrace');
+      _addLog(
+        'Failed to start analysis: ${projectErrorMessage(error)}',
+        level: ExecutionLogLevel.error,
+      );
+      setState(() => _isAnalysing = false);
+    }
+  }
+
+  Future<void> _pollAnalyseJob(String jobId) async {
+    final completer = Completer<void>();
+    _analysePollTimer = Timer.periodic(const Duration(milliseconds: 400), (
+      timer,
+    ) async {
+      AnalysisJobStatus status;
+      try {
+        status = await widget.serverClient.pollAnalyseProjectJob(jobId);
+      } catch (error, stackTrace) {
+        timer.cancel();
+        if (!mounted) {
+          if (!completer.isCompleted) {
+            completer.complete();
+          }
+          return;
+        }
+        cliLog('poll analyse job exception: $error');
+        cliLog('poll analyse job stack: $stackTrace');
+        _addLog(
+          'Failed to check analysis status: ${projectErrorMessage(error)}',
+          level: ExecutionLogLevel.error,
+        );
+        setState(() => _isAnalysing = false);
+        if (!completer.isCompleted) {
+          completer.complete();
+        }
+        return;
+      }
+
+      if (!mounted) {
+        timer.cancel();
+        if (!completer.isCompleted) {
+          completer.complete();
+        }
+        return;
+      }
+
+      switch (status.state) {
+        case AnalysisJobState.running:
+          return;
+        case AnalysisJobState.succeeded:
+          timer.cancel();
+          setState(() {
+            _isAnalysing = false;
+            _isAnalysed = true;
+          });
+          _addLog('Project analysed', level: ExecutionLogLevel.success);
+          _refreshTypes();
+          _refreshFunctions();
+          _refreshPointers();
+          _refreshExternals();
+        case AnalysisJobState.failed:
+          timer.cancel();
+          setState(() => _isAnalysing = false);
+          _addLog(
+            'Analysis failed: ${status.errorMessage ?? 'unknown error'}',
+            level: ExecutionLogLevel.error,
+          );
+        case AnalysisJobState.cancelled:
+          timer.cancel();
+          setState(() => _isAnalysing = false);
+          _addLog('Analysis cancelled', level: ExecutionLogLevel.info);
+      }
+      if (!completer.isCompleted) {
+        completer.complete();
+      }
+    });
+
+    return completer.future;
   }
 
   /// Transpiles the project and runs `dart analyze` against the result
@@ -573,6 +697,9 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
               .where((status) => status.effective)
               .map((status) => status.usr)
               .toSet();
+          _externalFiles = listing.fileMarks
+              .map((fileMark) => fileMark.file)
+              .toSet();
         });
       }
       _addLog(
@@ -599,6 +726,28 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     });
   }
 
+  /// Re-fetches types/functions/pointers — called once "Analyse" (item 2,
+  /// `docs/prompts/2026-08-19-mudanca-interacao.md`) succeeds, since usage
+  /// counts, caller counts, and the pointer catalog itself only exist in
+  /// `project.db` from that point on.
+  void _refreshTypes() {
+    setState(() {
+      _types = _loadTypes();
+    });
+  }
+
+  void _refreshFunctions() {
+    setState(() {
+      _functions = _loadFunctions();
+    });
+  }
+
+  void _refreshPointers() {
+    setState(() {
+      _pointers = _loadPointers();
+    });
+  }
+
   Future<void> _toggleExternal(String usr, bool external) async {
     try {
       await widget.serverClient.markExternal(
@@ -621,14 +770,18 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
     _refreshExternals();
   }
 
-  Future<void> _markFileExternal(SourceFile file) async {
+  Future<void> _toggleFileExternal(SourceFile file) async {
+    final external = !_externalFiles.contains(file.path);
     try {
-      final marked = await widget.serverClient.markFileExternal(
+      await widget.serverClient.markFileExternal(
         projectDir: widget.project.projectDir,
         file: file.path,
+        external: external,
       );
       _addLog(
-        'Marked ${marked.length} declaration(s) in ${file.path} as external',
+        external
+            ? 'Marked ${file.path} as external'
+            : 'Unmarked ${file.path} as external',
         level: ExecutionLogLevel.success,
       );
     } catch (error, stackTrace) {
@@ -795,6 +948,9 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
               onCaptureScreen: _captureScreen,
               onTranspile: _transpileProject,
               onValidate: _validateProject,
+              onAnalyse: _analyseProject,
+              isAnalysed: _isAnalysed,
+              isAnalysing: _isAnalysing,
               panels: descriptors,
               openPanelIds: _openPanels,
               onTogglePanel: _togglePanel,
@@ -874,7 +1030,8 @@ class _ServerStatusPageState extends State<ServerStatusPage> {
           project: widget.project,
           onFileSelected: _selectSourceFile,
           selectedPath: _selectedSourceFile?.path,
-          onMarkFileExternal: _markFileExternal,
+          externalFiles: _externalFiles,
+          onToggleFileExternal: _toggleFileExternal,
         ),
       ),
       PanelDescriptor(
@@ -1409,6 +1566,9 @@ class _TitleBar extends StatelessWidget {
     required this.onCaptureScreen,
     required this.onTranspile,
     required this.onValidate,
+    required this.onAnalyse,
+    required this.isAnalysed,
+    required this.isAnalysing,
     required this.panels,
     required this.openPanelIds,
     required this.onTogglePanel,
@@ -1418,6 +1578,12 @@ class _TitleBar extends StatelessWidget {
   final VoidCallback onCaptureScreen;
   final VoidCallback onTranspile;
   final VoidCallback onValidate;
+  final VoidCallback onAnalyse;
+
+  /// Item 2 (`docs/prompts/2026-08-19-mudanca-interacao.md`): drives the
+  /// "Analyse" icon's pending/analysing/done appearance.
+  final bool isAnalysed;
+  final bool isAnalysing;
 
   /// Every registered panel, open or closed — what the Panels menu lists.
   final List<PanelDescriptor> panels;
@@ -1460,6 +1626,18 @@ class _TitleBar extends StatelessWidget {
                   child: Text(panel.title),
                 ),
             ],
+          ),
+          IdeToolbarIcon(
+            icon: isAnalysing
+                ? Icons.hourglass_top_rounded
+                : (isAnalysed
+                      ? Icons.fact_check_rounded
+                      : Icons.pending_actions_outlined),
+            tooltip: isAnalysing
+                ? 'Analysing...'
+                : (isAnalysed ? 'Re-analyse' : 'Analyse'),
+            color: isAnalysed ? IdePalette.green : IdePalette.amber,
+            onPressed: isAnalysing ? null : onAnalyse,
           ),
           IdeToolbarIcon(
             icon: Icons.code,

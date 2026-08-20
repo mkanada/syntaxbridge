@@ -6,14 +6,14 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::externals::{self, ExternalMark, NameRegexRule, PathRegexRule};
+use crate::externals::{self, ExternalMark, FileMark, NameRegexRule, PathRegexRule};
 use crate::extraction::{self, ExtractionError};
 use crate::function_catalog::{self, CallEdge, FunctionDeclaration};
 use crate::ingest::{self, CompilationUnit, CreateProjectRequest, CreatedProject, IngestError};
 use crate::ir;
 use crate::mapping;
 use crate::persistence::{
-    GlobalStore, PersistenceError, ProjectCatalogs, ProjectRecord, ProjectStore,
+    ExternalsStore, GlobalStore, PersistenceError, ProjectCatalogs, ProjectRecord, ProjectStore,
 };
 use crate::pointer_catalog::{self, PointerDeclaration};
 use crate::progress::{Cancellation, ExtractionProgress};
@@ -100,10 +100,24 @@ impl From<ExtractionError> for ProjectCreationError {
     }
 }
 
-/// Ingests a project from an archive and persists it: the project's own
-/// compilation units go into a database inside its project directory, and
-/// the project is registered into the shared global database so it can be
-/// listed and reopened later.
+/// Ingests a project from an archive and persists its declarations: the
+/// project's own compilation units, type declarations, source files, and
+/// function declarations go into a database inside its project directory,
+/// and the project is registered into the shared global database so it can
+/// be listed and reopened later.
+///
+/// Item 2 (`docs/prompts/2026-08-19-mudanca-interacao.md`), "ingestão
+/// mínima": this deliberately persists only what's needed to browse
+/// files/types/functions and decide what's external — usages, dependencies,
+/// the call graph, IR, and the pointer catalog are *computed* here (the same
+/// `extraction::extract_project_catalogs_cancellable` pass this always ran)
+/// but not written to `project.db`; [`analyse_project`] recomputes and
+/// persists them once the user asks to continue. Running the full
+/// `libclang` extraction here anyway, only to discard most of it, is
+/// deliberately the simple choice over teaching `extraction.rs`'s
+/// already-delicate shared-parse optimization (module doc: two passes
+/// instead of four) a "declarations only" mode — revisit only if ingest-time
+/// performance on a real project turns out to need it.
 pub fn create_project(
     request: CreateProjectRequest,
     global_db_path: &Path,
@@ -121,27 +135,30 @@ pub fn create_project(
         progress.map(|progress| &progress.cancellation),
     )?;
     project.type_catalog = extracted.type_catalog.declarations;
-    project.type_dependencies = extracted.type_catalog.dependencies;
-    let type_usages = extracted.type_catalog.usages;
     project.source_files = extracted.source_files;
-    let function_catalog = extracted.function_catalog;
-    project.pointer_catalog = extracted.pointer_catalog;
+    let function_declarations = extracted.function_catalog.declarations;
 
     let project_db_path = project.project_dir.join("project.db");
     let mut project_store = ProjectStore::open(&project_db_path)?;
-    project_store.replace_all(&ProjectCatalogs {
-        compilation_units: &project.compilation_units,
-        type_declarations: &project.type_catalog,
-        type_dependencies: &project.type_dependencies,
-        type_usages: &type_usages,
-        source_files: &project.source_files,
-        function_declarations: &function_catalog.declarations,
-        call_edges: &function_catalog.calls,
-        ir_functions: &function_catalog.ir_functions,
-        ir_records: &function_catalog.ir_records,
-        ir_enums: &function_catalog.ir_enums,
-        pointer_declarations: &project.pointer_catalog,
-    })?;
+    project_store.replace_compilation_units(&project.compilation_units)?;
+    project_store.replace_type_declarations(&project.type_catalog)?;
+    project_store.replace_source_files(&project.source_files)?;
+    project_store.replace_function_declarations(&function_declarations)?;
+
+    prune_externals_store(
+        &project.project_dir,
+        &project.type_catalog,
+        &project.source_files,
+        &function_declarations,
+    )?;
+
+    // Always false right after ingestion: `ingest::create_project` requires
+    // a not-yet-existing project directory (no re-ingest-in-place today), so
+    // a freshly ingested project can never already carry a marker from a
+    // previous `analyse_project` run. Computed via the same helper
+    // `open_project` uses, rather than hardcoded, so both stay correct
+    // together if that constraint ever changes.
+    project.is_analysed = is_project_analysed(&project.project_dir);
 
     let global_store = GlobalStore::open(global_db_path)?;
     global_store.register_project(
@@ -153,6 +170,172 @@ pub fn create_project(
     )?;
 
     Ok(project)
+}
+
+fn analysis_marker_path(project_dir: &Path) -> PathBuf {
+    project_dir.join("analysis-status.txt")
+}
+
+/// Whether "Analyse" (item 2, `docs/prompts/2026-08-19-mudanca-interacao.md`)
+/// has ever completed for this project — a plain marker file rather than a
+/// database column, so it needs no migration of its own. `ingest::create_project`
+/// requires a not-yet-existing project directory (no re-ingest-in-place
+/// today), so there's no live case where a stale marker from a previous
+/// ingest could survive to mislead this check.
+pub fn is_project_analysed(project_dir: &Path) -> bool {
+    analysis_marker_path(project_dir).is_file()
+}
+
+#[derive(Debug)]
+pub enum AnalyseProjectError {
+    NotFound(PathBuf),
+    Persistence(PersistenceError),
+    Extraction(ExtractionError),
+}
+
+impl AnalyseProjectError {
+    pub fn is_client_error(&self) -> bool {
+        matches!(self, Self::NotFound(_))
+    }
+
+    /// Mirrors `ProjectCreationError::is_cancelled`: lets `jobs.rs`/the HTTP
+    /// layer report `"cancelled"` instead of `"failed"` for a
+    /// user-requested stop (US-4 criterion 7, extended to this job kind).
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Extraction(ExtractionError::Cancelled))
+    }
+}
+
+impl fmt::Display for AnalyseProjectError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound(path) => {
+                write!(
+                    formatter,
+                    "no syntax-bridge project found at {}",
+                    path.display()
+                )
+            }
+            Self::Persistence(error) => write!(formatter, "{error}"),
+            Self::Extraction(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for AnalyseProjectError {}
+
+impl From<PersistenceError> for AnalyseProjectError {
+    fn from(error: PersistenceError) -> Self {
+        Self::Persistence(error)
+    }
+}
+
+impl From<ExtractionError> for AnalyseProjectError {
+    fn from(error: ExtractionError) -> Self {
+        Self::Extraction(error)
+    }
+}
+
+impl From<io::Error> for AnalyseProjectError {
+    fn from(error: io::Error) -> Self {
+        Self::Persistence(PersistenceError::Io(error))
+    }
+}
+
+/// The "Analyse" step (item 2, `docs/prompts/2026-08-19-mudanca-interacao.md`):
+/// re-extracts and persists everything [`create_project`] deliberately left
+/// out — `type_dependencies`, `type_usages`, the call graph, IR, and the
+/// pointer catalog — from the compilation units [`create_project`] already
+/// persisted. Optional for the user (same principle US-6's characterization
+/// already established in `AGENTS.md`): before this ever runs, every
+/// listing/transpile endpoint simply sees empty usages/calls/pointers rather
+/// than failing, since nothing but this function ever expected them to be
+/// there yet.
+pub fn analyse_project(
+    project_dir: &Path,
+    progress: Option<&CreationProgress>,
+) -> Result<(), AnalyseProjectError> {
+    if !is_openable_project(project_dir) {
+        return Err(AnalyseProjectError::NotFound(project_dir.to_path_buf()));
+    }
+
+    let project_db_path = project_dir.join("project.db");
+    let mut project_store = ProjectStore::open(&project_db_path)?;
+    let compilation_units = project_store.list_compilation_units()?;
+    let input_source_dir = project_dir.join("input-source");
+
+    let extracted = extraction::extract_project_catalogs_cancellable(
+        &compilation_units,
+        &input_source_dir,
+        progress.map(|progress| &progress.type_catalog),
+        progress.map(|progress| &progress.source_catalog),
+        progress.map(|progress| &progress.function_catalog),
+        progress.map(|progress| &progress.pointer_catalog),
+        progress.map(|progress| &progress.cancellation),
+    )?;
+    let type_catalog = extracted.type_catalog.declarations;
+    let source_files = extracted.source_files;
+    let function_catalog = extracted.function_catalog;
+
+    project_store.replace_all(&ProjectCatalogs {
+        compilation_units: &compilation_units,
+        type_declarations: &type_catalog,
+        type_dependencies: &extracted.type_catalog.dependencies,
+        type_usages: &extracted.type_catalog.usages,
+        source_files: &source_files,
+        function_declarations: &function_catalog.declarations,
+        call_edges: &function_catalog.calls,
+        ir_functions: &function_catalog.ir_functions,
+        ir_records: &function_catalog.ir_records,
+        ir_enums: &function_catalog.ir_enums,
+        pointer_declarations: &extracted.pointer_catalog,
+    })?;
+
+    prune_externals_store(
+        project_dir,
+        &type_catalog,
+        &source_files,
+        &function_catalog.declarations,
+    )?;
+
+    fs::write(
+        analysis_marker_path(project_dir),
+        format!("success\n{}\n", now_timestamp()),
+    )?;
+
+    Ok(())
+}
+
+/// Drops externals-store entries left over from a previous ingest whose
+/// usr/file no longer exists in the fresh catalogs — the text-file
+/// equivalent of the old `project_store::prune_external_marks_tx`, now also
+/// covering the persistent file marks item 3 adds
+/// (`docs/prompts/2026-08-19-mudanca-interacao.md`). Called after every
+/// catalog replace (ingest and, once item 2 lands, analysis) so a manual
+/// mark or file mark for something the project no longer declares doesn't
+/// linger forever.
+fn prune_externals_store(
+    project_dir: &Path,
+    type_declarations: &[TypeDeclaration],
+    source_files: &[SourceFile],
+    function_declarations: &[FunctionDeclaration],
+) -> Result<(), PersistenceError> {
+    let valid_usrs: std::collections::HashSet<&str> = type_declarations
+        .iter()
+        .map(|declaration| declaration.usr.as_str())
+        .chain(
+            function_declarations
+                .iter()
+                .map(|declaration| declaration.usr.as_str()),
+        )
+        .collect();
+    let valid_files: std::collections::HashSet<&str> =
+        source_files.iter().map(|file| file.path.as_str()).collect();
+
+    let externals_store = ExternalsStore::open(project_dir);
+    externals_store.prune_marks(&valid_usrs)?;
+    externals_store.prune_file_marks(&valid_files)?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -196,6 +379,7 @@ pub struct LoadedProject {
     pub input_source_dir: PathBuf,
     pub compilation_units: Vec<CompilationUnit>,
     pub source_files: Vec<SourceFile>,
+    pub is_analysed: bool,
 }
 
 #[derive(Debug)]
@@ -331,6 +515,7 @@ pub fn open_project(
         input_source_dir,
         compilation_units,
         source_files,
+        is_analysed: is_project_analysed(project_dir),
     })
 }
 
@@ -591,16 +776,19 @@ pub fn list_pointers(project_dir: &Path) -> Result<PointerCatalogListing, ListTy
 }
 
 /// Serves the effective "extern" set (`docs/plans/lista-de-externos.md`)
-/// plus both live regex rule lists, computed fresh from the already-
-/// persisted catalogs on every request — mirrors `list_types`/`list_pointers`
-/// in never reparsing, and mirrors `externals::effective_external_set`'s own
-/// doc comment in never materializing the result: this function's whole job
-/// is to gather that pure function's five inputs from the store.
+/// plus both live regex rule lists and the persistent file marks (item 1/3,
+/// `docs/prompts/2026-08-19-mudanca-interacao.md`), computed fresh from the
+/// already-persisted catalogs on every request — mirrors
+/// `list_types`/`list_pointers` in never reparsing, and mirrors
+/// `externals::effective_external_set`'s own doc comment in never
+/// materializing the result: this function's whole job is to gather that
+/// pure function's six inputs from the store.
 #[derive(Debug, Serialize)]
 pub struct ExternalListing {
     pub statuses: Vec<externals::ExternalStatus>,
     pub name_regexes: Vec<NameRegexRule>,
     pub path_regexes: Vec<PathRegexRule>,
+    pub file_marks: Vec<FileMark>,
 }
 
 pub fn list_externals(project_dir: &Path) -> Result<ExternalListing, ListTypesError> {
@@ -613,9 +801,12 @@ pub fn list_externals(project_dir: &Path) -> Result<ExternalListing, ListTypesEr
     let type_declarations = project_store.list_type_declarations()?;
     let function_declarations = project_store.list_function_declarations()?;
     let call_edges = project_store.list_call_edges()?;
-    let name_regexes = project_store.list_name_regexes()?;
-    let path_regexes = project_store.list_path_regexes()?;
-    let manual_marks = project_store.list_external_marks()?;
+
+    let externals_store = ExternalsStore::open(project_dir);
+    let name_regexes = externals_store.list_name_regexes()?;
+    let path_regexes = externals_store.list_path_regexes()?;
+    let file_marks = externals_store.list_file_marks()?;
+    let manual_marks = externals_store.list_marks()?;
 
     let statuses = externals::effective_external_set(
         &type_declarations,
@@ -623,6 +814,7 @@ pub fn list_externals(project_dir: &Path) -> Result<ExternalListing, ListTypesEr
         &call_edges,
         &name_regexes,
         &path_regexes,
+        &file_marks,
         &manual_marks,
     );
 
@@ -630,6 +822,7 @@ pub fn list_externals(project_dir: &Path) -> Result<ExternalListing, ListTypesEr
         statuses,
         name_regexes,
         path_regexes,
+        file_marks,
     })
 }
 
@@ -641,9 +834,7 @@ pub fn mark_external(project_dir: &Path, usr: &str, external: bool) -> Result<()
         return Err(ListTypesError::NotFound(project_dir.to_path_buf()));
     }
 
-    let project_db_path = project_dir.join("project.db");
-    let mut project_store = ProjectStore::open(&project_db_path)?;
-    project_store.set_external_mark(&ExternalMark {
+    ExternalsStore::open(project_dir).set_mark(&ExternalMark {
         usr: usr.to_owned(),
         external,
         decided_at: now_timestamp(),
@@ -651,31 +842,24 @@ pub fn mark_external(project_dir: &Path, usr: &str, external: bool) -> Result<()
     Ok(())
 }
 
-/// Marks every type/function declared in `file` external — decision 3's
-/// "cascata é foto": expands to the file's usrs *now*
-/// (`externals::expand_file_mark`) and writes one independent mark per usr;
-/// nothing links them back to the file afterward. Returns the usrs marked,
-/// so the caller can show the user what just happened.
-pub fn mark_file_external(project_dir: &Path, file: &str) -> Result<Vec<String>, ListTypesError> {
+/// Sets or clears a whole file's persistent external mark (item 3,
+/// `docs/prompts/2026-08-19-mudanca-interacao.md` — reverses decision 3's
+/// "cascata é foto" from `docs/plans/lista-de-externos.md` for files):
+/// every declaration currently in `file`, and any declared there later,
+/// becomes external for as long as this mark stands, computed live by
+/// `externals::effective_external_set` rather than expanded into individual
+/// marks at write time.
+pub fn mark_file_external(
+    project_dir: &Path,
+    file: &str,
+    external: bool,
+) -> Result<(), ListTypesError> {
     if !is_openable_project(project_dir) {
         return Err(ListTypesError::NotFound(project_dir.to_path_buf()));
     }
 
-    let project_db_path = project_dir.join("project.db");
-    let mut project_store = ProjectStore::open(&project_db_path)?;
-    let type_declarations = project_store.list_type_declarations()?;
-    let function_declarations = project_store.list_function_declarations()?;
-    let usrs = externals::expand_file_mark(file, &type_declarations, &function_declarations);
-
-    let decided_at = now_timestamp();
-    for usr in &usrs {
-        project_store.set_external_mark(&ExternalMark {
-            usr: usr.clone(),
-            external: true,
-            decided_at: decided_at.clone(),
-        })?;
-    }
-    Ok(usrs)
+    ExternalsStore::open(project_dir).set_file_mark(file, external, &now_timestamp())?;
+    Ok(())
 }
 
 /// Same shape as [`mark_file_external`], expanding a type to itself plus
@@ -690,13 +874,14 @@ pub fn mark_type_external(
     }
 
     let project_db_path = project_dir.join("project.db");
-    let mut project_store = ProjectStore::open(&project_db_path)?;
+    let project_store = ProjectStore::open(&project_db_path)?;
     let function_declarations = project_store.list_function_declarations()?;
     let usrs = externals::expand_type_mark(type_usr, &function_declarations);
 
+    let externals_store = ExternalsStore::open(project_dir);
     let decided_at = now_timestamp();
     for usr in &usrs {
-        project_store.set_external_mark(&ExternalMark {
+        externals_store.set_mark(&ExternalMark {
             usr: usr.clone(),
             external: true,
             decided_at: decided_at.clone(),
@@ -747,10 +932,8 @@ pub fn add_name_regex(project_dir: &Path, pattern: &str) -> Result<NameRegexRule
     }
     externals::validate_regex_pattern(pattern).map_err(AddRegexError::InvalidPattern)?;
 
-    let project_db_path = project_dir.join("project.db");
-    let mut project_store = ProjectStore::open(&project_db_path)?;
     let created_at = now_timestamp();
-    let id = project_store.add_name_regex(pattern, &created_at)?;
+    let id = ExternalsStore::open(project_dir).add_name_regex(pattern, &created_at)?;
     Ok(NameRegexRule {
         id,
         pattern: pattern.to_owned(),
@@ -762,9 +945,7 @@ pub fn remove_name_regex(project_dir: &Path, id: i64) -> Result<(), ListTypesErr
     if !is_openable_project(project_dir) {
         return Err(ListTypesError::NotFound(project_dir.to_path_buf()));
     }
-    let project_db_path = project_dir.join("project.db");
-    let mut project_store = ProjectStore::open(&project_db_path)?;
-    project_store.remove_name_regex(id)?;
+    ExternalsStore::open(project_dir).remove_name_regex(id)?;
     Ok(())
 }
 
@@ -775,10 +956,8 @@ pub fn add_path_regex(project_dir: &Path, pattern: &str) -> Result<PathRegexRule
     }
     externals::validate_regex_pattern(pattern).map_err(AddRegexError::InvalidPattern)?;
 
-    let project_db_path = project_dir.join("project.db");
-    let mut project_store = ProjectStore::open(&project_db_path)?;
     let created_at = now_timestamp();
-    let id = project_store.add_path_regex(pattern, &created_at)?;
+    let id = ExternalsStore::open(project_dir).add_path_regex(pattern, &created_at)?;
     Ok(PathRegexRule {
         id,
         pattern: pattern.to_owned(),
@@ -790,9 +969,7 @@ pub fn remove_path_regex(project_dir: &Path, id: i64) -> Result<(), ListTypesErr
     if !is_openable_project(project_dir) {
         return Err(ListTypesError::NotFound(project_dir.to_path_buf()));
     }
-    let project_db_path = project_dir.join("project.db");
-    let mut project_store = ProjectStore::open(&project_db_path)?;
-    project_store.remove_path_regex(id)?;
+    ExternalsStore::open(project_dir).remove_path_regex(id)?;
     Ok(())
 }
 
@@ -924,15 +1101,18 @@ fn build_transpiled_package(
     // also present here are harmless, never looked up.
     let external_function_declarations = project_store.list_function_declarations()?;
     let external_call_edges = project_store.list_call_edges()?;
-    let name_regexes = project_store.list_name_regexes()?;
-    let path_regexes = project_store.list_path_regexes()?;
-    let external_marks = project_store.list_external_marks()?;
+    let externals_store = ExternalsStore::open(project_dir);
+    let name_regexes = externals_store.list_name_regexes()?;
+    let path_regexes = externals_store.list_path_regexes()?;
+    let file_marks = externals_store.list_file_marks()?;
+    let external_marks = externals_store.list_marks()?;
     let external_usrs: std::collections::HashSet<String> = externals::effective_external_set(
         &type_catalog,
         &external_function_declarations,
         &external_call_edges,
         &name_regexes,
         &path_regexes,
+        &file_marks,
         &external_marks,
     )
     .into_iter()
@@ -1018,4 +1198,109 @@ pub fn validate_project(project_dir: &Path) -> Result<Vec<DartDiagnostic>, Valid
     let (module, package) = build_transpiled_package(project_dir)?;
     validate_dart::analyze_package(&module, &package, &project_dir.join("transpiled"))
         .map_err(ValidateProjectError::Validate)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source_catalog::SourceFileKind;
+    use crate::type_catalog::TypeDeclarationKind;
+
+    fn temp_project_dir(label: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "syntax-bridge-project-service-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        path
+    }
+
+    fn sample_type(usr: &str) -> TypeDeclaration {
+        TypeDeclaration {
+            name: "Shape".to_owned(),
+            kind: TypeDeclarationKind::Class,
+            namespace: String::new(),
+            file: "/project/shapes.h".to_owned(),
+            line: 1,
+            column: 1,
+            end_line: 5,
+            end_column: 1,
+            usr: usr.to_owned(),
+        }
+    }
+
+    /// Mirrors what `project_store::prune_external_marks_tx` used to test
+    /// before item 1 (`docs/prompts/2026-08-19-mudanca-interacao.md`) moved
+    /// manual marks out to `externals_store::ExternalsStore` — pruning is
+    /// now this function's job, called after every catalog replace.
+    #[test]
+    fn prune_externals_store_drops_marks_for_usrs_no_longer_in_either_catalog() {
+        let project_dir = temp_project_dir("prune-marks");
+        let externals_store = ExternalsStore::open(&project_dir);
+        externals_store
+            .set_mark(&ExternalMark {
+                usr: "c:@S@Ponto".to_owned(),
+                external: true,
+                decided_at: "2026-08-19T00:00:00Z".to_owned(),
+            })
+            .expect("mark the surviving type external");
+        externals_store
+            .set_mark(&ExternalMark {
+                usr: "c:@S@ClasseRenomeada".to_owned(),
+                external: true,
+                decided_at: "2026-08-19T00:00:00Z".to_owned(),
+            })
+            .expect("mark a type about to disappear external");
+
+        prune_externals_store(&project_dir, &[sample_type("c:@S@Ponto")], &[], &[])
+            .expect("prune externals store");
+
+        let marks = externals_store.list_marks().expect("list marks");
+        assert_eq!(
+            marks.len(),
+            1,
+            "the orphaned mark should be pruned, the surviving one kept"
+        );
+        assert_eq!(marks[0].usr, "c:@S@Ponto");
+
+        let _ = fs::remove_dir_all(&project_dir);
+    }
+
+    #[test]
+    fn prune_externals_store_drops_file_marks_for_files_no_longer_in_the_catalog() {
+        let project_dir = temp_project_dir("prune-file-marks");
+        let externals_store = ExternalsStore::open(&project_dir);
+        externals_store
+            .set_file_mark("/project/stale.cpp", true, "2026-08-19T00:00:00Z")
+            .expect("mark a file about to disappear external");
+        externals_store
+            .set_file_mark("/project/fresh.cpp", true, "2026-08-19T00:00:00Z")
+            .expect("mark the surviving file external");
+
+        let surviving_file = SourceFile {
+            path: "/project/fresh.cpp".to_owned(),
+            kind: SourceFileKind::TranslationUnit,
+        };
+        prune_externals_store(
+            &project_dir,
+            &[],
+            std::slice::from_ref(&surviving_file),
+            &[],
+        )
+        .expect("prune externals store");
+
+        let file_marks = externals_store.list_file_marks().expect("list file marks");
+        assert_eq!(
+            file_marks.len(),
+            1,
+            "the orphaned file mark should be pruned, the surviving one kept"
+        );
+        assert_eq!(file_marks[0].file, "/project/fresh.cpp");
+
+        let _ = fs::remove_dir_all(&project_dir);
+    }
 }

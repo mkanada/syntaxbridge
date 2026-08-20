@@ -610,6 +610,34 @@ fn collect_expression_bailouts(expression: &Expr, inventory: &mut BailoutInvento
                 collect_expression_bailouts(value, inventory);
             }
         }
+        Expr::ListLiteral { items, ty, .. } => {
+            collect_type_bailouts(ty, inventory);
+            for item in items {
+                collect_expression_bailouts(item, inventory);
+            }
+        }
+        Expr::MapLiteral { entries, ty, .. } => {
+            collect_type_bailouts(ty, inventory);
+            for (key, value) in entries {
+                collect_expression_bailouts(key, inventory);
+                collect_expression_bailouts(value, inventory);
+            }
+        }
+        Expr::Is {
+            operand,
+            target_type,
+            ..
+        } => {
+            collect_type_bailouts(target_type, inventory);
+            collect_expression_bailouts(operand, inventory);
+        }
+        Expr::Assign {
+            target, value, ty, ..
+        } => {
+            collect_type_bailouts(ty, inventory);
+            collect_expression_bailouts(target, inventory);
+            collect_expression_bailouts(value, inventory);
+        }
         Expr::Unsupported { reason, .. } | Expr::UnsupportedTyped { reason, .. } => {
             *inventory
                 .unsupported_expressions
@@ -701,7 +729,7 @@ fn collect_statement_bailouts(statements: &[Stmt], inventory: &mut BailoutInvent
                 collect_expression_bailouts(iterable, inventory);
                 collect_statement_bailouts(body, inventory);
             }
-            Stmt::Break { .. } | Stmt::Continue { .. } => {}
+            Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::ContinueLabel { .. } => {}
             Stmt::TryCatch {
                 try_body,
                 catch_type,
@@ -725,6 +753,23 @@ fn collect_statement_bailouts(statements: &[Stmt], inventory: &mut BailoutInvent
                     collect_expression_bailouts(target, inventory);
                 }
                 collect_expression_bailouts(value, inventory);
+            }
+            Stmt::Switch {
+                scrutinee,
+                cases,
+                default,
+                ..
+            } => {
+                collect_expression_bailouts(scrutinee, inventory);
+                for case in cases {
+                    for value in &case.values {
+                        collect_expression_bailouts(value, inventory);
+                    }
+                    collect_statement_bailouts(&case.body, inventory);
+                }
+                if let Some(default) = default {
+                    collect_statement_bailouts(default, inventory);
+                }
             }
             Stmt::Unsupported { reason, .. } => {
                 *inventory

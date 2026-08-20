@@ -33,6 +33,16 @@ abstract class ServerClient {
   /// import a project that already exists on disk from a prior ingest.
   Future<CreatedProject> openProject(String projectDir);
 
+  /// Starts the "Analyse" step (item 2, `docs/prompts/2026-08-19-mudanca-interacao.md`)
+  /// as a background job on the server — the same shape as
+  /// [startCreateProject]: re-extracts and persists usages, dependencies,
+  /// the call graph, IR, and the pointer catalog, which ingestion
+  /// deliberately leaves out. Poll with [pollAnalyseProjectJob].
+  Future<String> startAnalyseProject(String projectDir);
+
+  /// A snapshot of a job started by [startAnalyseProject].
+  Future<AnalysisJobStatus> pollAnalyseProjectJob(String jobId);
+
   Future<String> readSourceFile({
     required String projectDir,
     required String path,
@@ -101,12 +111,15 @@ abstract class ServerClient {
     required bool external,
   });
 
-  /// Marks every type/function declared in [file] external — decision 3's
-  /// "cascata é foto": expands to that file's usrs *now* and writes one
-  /// independent mark per usr. Returns the usrs marked.
-  Future<List<String>> markFileExternal({
+  /// Sets or clears a whole file's persistent external mark (item 3,
+  /// `docs/prompts/2026-08-19-mudanca-interacao.md`): every declaration
+  /// currently in [file], and any declared there later, becomes external
+  /// for as long as this mark stands — unlike [markTypeExternal], which
+  /// still expands to a one-time snapshot of individual marks.
+  Future<void> markFileExternal({
     required String projectDir,
     required String file,
+    required bool external,
   });
 
   /// Same shape as [markFileExternal], expanding a type to itself plus

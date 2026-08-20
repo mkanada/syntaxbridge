@@ -48,6 +48,21 @@ pub struct PathRegexRule {
     pub created_at: String,
 }
 
+/// A whole file marked external — persistent, unlike the one-time
+/// `expand_file_mark`/`expand_type_mark` snapshot a "mark this type
+/// external" action still uses. Reverses decision 3 of the design doc
+/// (`docs/plans/lista-de-externos.md`, "Cascata é foto, não vínculo") for
+/// files specifically, per `docs/prompts/2026-08-19-mudanca-interacao.md`
+/// item 3: every declaration currently in `file`, *and any declared there
+/// later*, is external for as long as this mark exists. Presence in the
+/// list is the mark — there is no `external: false` entry, unlike
+/// [`ExternalMark`]; removing the file's entry is how you unmark it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileMark {
+    pub file: String,
+    pub decided_at: String,
+}
+
 /// Why a usr is (or would be) external — a usr can carry more than one at
 /// once (e.g. matched by a name regex *and* manually excluded); `sources`
 /// on [`ExternalStatus`] keeps every one of them, not just the one that
@@ -67,6 +82,11 @@ pub enum ExternalSource {
     },
     PathRegex {
         pattern: String,
+    },
+    /// The declaration's file has a persistent [`FileMark`] (item 3,
+    /// `docs/prompts/2026-08-19-mudanca-interacao.md`).
+    FileMark {
+        file: String,
     },
     /// A free function this project declares but never defines in any
     /// parsed compilation unit (`function_catalog`'s prototype cataloging,
@@ -152,26 +172,27 @@ fn auto_undefined_function_usrs(
 ///
 /// ```text
 /// effective(usr) =
-///     ( name_regex_matches(usr) OR path_regex_matches(usr) OR auto_detected(usr)
-///       OR manual_mark(usr) == true )
+///     ( name_regex_matches(usr) OR path_regex_matches(usr) OR file_mark_matches(usr)
+///       OR auto_detected(usr) OR manual_mark(usr) == true )
 ///     AND NOT manual_mark(usr) == false
 /// ```
 ///
 /// Returns one [`ExternalStatus`] per usr that has *any* source at all
-/// (manual, regex, or auto-detected) — a usr nothing here ever mentions is
-/// simply not part of the result, not an entry with `effective: false` and
-/// an empty `sources`. Regex patterns are assumed already valid
-/// (`validate_regex_pattern` is what the write path — not this pure
-/// function — calls to guarantee that before a pattern is ever persisted);
-/// a pattern that still somehow fails to compile is skipped rather than
-/// panicking or failing the whole computation, consistent with this
-/// function never returning a `Result`.
+/// (manual, regex, file mark, or auto-detected) — a usr nothing here ever
+/// mentions is simply not part of the result, not an entry with
+/// `effective: false` and an empty `sources`. Regex patterns are assumed
+/// already valid (`validate_regex_pattern` is what the write path — not
+/// this pure function — calls to guarantee that before a pattern is ever
+/// persisted); a pattern that still somehow fails to compile is skipped
+/// rather than panicking or failing the whole computation, consistent with
+/// this function never returning a `Result`.
 pub fn effective_external_set(
     type_declarations: &[TypeDeclaration],
     function_declarations: &[FunctionDeclaration],
     call_edges: &[CallEdge],
     name_regexes: &[NameRegexRule],
     path_regexes: &[PathRegexRule],
+    file_marks: &[FileMark],
     manual_marks: &[ExternalMark],
 ) -> Vec<ExternalStatus> {
     let types_by_usr: HashMap<&str, &TypeDeclaration> = type_declarations
@@ -197,6 +218,7 @@ pub fn effective_external_set(
         .collect();
 
     let auto_undefined = auto_undefined_function_usrs(function_declarations, call_edges);
+    let marked_files: HashSet<&str> = file_marks.iter().map(|mark| mark.file.as_str()).collect();
 
     let mut sources_by_usr: HashMap<String, Vec<ExternalSource>> = HashMap::new();
 
@@ -222,6 +244,14 @@ pub fn effective_external_set(
                     });
             }
         }
+        if marked_files.contains(declaration.file.as_str()) {
+            sources_by_usr
+                .entry(declaration.usr.clone())
+                .or_default()
+                .push(ExternalSource::FileMark {
+                    file: declaration.file.clone(),
+                });
+        }
     }
 
     for declaration in function_declarations {
@@ -245,6 +275,14 @@ pub fn effective_external_set(
                         pattern: (*pattern).to_owned(),
                     });
             }
+        }
+        if marked_files.contains(declaration.file.as_str()) {
+            sources_by_usr
+                .entry(declaration.usr.clone())
+                .or_default()
+                .push(ExternalSource::FileMark {
+                    file: declaration.file.clone(),
+                });
         }
         if auto_undefined.contains(&declaration.usr) {
             sources_by_usr
@@ -314,36 +352,12 @@ pub fn effective_external_set(
     statuses
 }
 
-/// Every usr declared in `file_path` — a free function, a method, or a type
-/// — used to expand a "mark this file external" action
-/// (`docs/plans/lista-de-externos.md` decision 3: the expansion is a
-/// one-time snapshot, not an ongoing link back to the file) into the
-/// individual usrs to write as manual marks.
-pub fn expand_file_mark(
-    file_path: &str,
-    type_declarations: &[TypeDeclaration],
-    function_declarations: &[FunctionDeclaration],
-) -> Vec<String> {
-    let mut usrs: Vec<String> = type_declarations
-        .iter()
-        .filter(|declaration| declaration.file == file_path)
-        .map(|declaration| declaration.usr.clone())
-        .chain(
-            function_declarations
-                .iter()
-                .filter(|declaration| declaration.file == file_path)
-                .map(|declaration| declaration.usr.clone()),
-        )
-        .collect();
-    usrs.sort();
-    usrs.dedup();
-    usrs
-}
-
 /// `type_usr` itself, plus every method `function_declarations` attributes
 /// to it (`owning_class_usr == type_usr`) — used to expand a "mark this
-/// type external" action the same way [`expand_file_mark`] expands a file
-/// (same one-time-snapshot semantics).
+/// type external" action into the individual usrs to write as manual marks.
+/// Types keep decision 3's original one-time-snapshot semantics
+/// (`docs/plans/lista-de-externos.md`); only files were reversed to a
+/// persistent [`FileMark`] (item 3, `docs/prompts/2026-08-19-mudanca-interacao.md`).
 pub fn expand_type_mark(
     type_usr: &str,
     function_declarations: &[FunctionDeclaration],
@@ -458,6 +472,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             &[manual_mark("c:@F@f#", true)],
         );
         assert_eq!(statuses.len(), 1);
@@ -470,6 +485,7 @@ mod tests {
         let statuses = effective_external_set(
             &[],
             &[free_function("c:@F@f#", "f", "", "/project/f.cpp")],
+            &[],
             &[],
             &[],
             &[],
@@ -490,6 +506,7 @@ mod tests {
             &[],
             &[],
             &[name_regex("^humlib::")],
+            &[],
             &[],
             &[],
         );
@@ -519,6 +536,7 @@ mod tests {
             &[name_regex("^Shape::area$")],
             &[],
             &[],
+            &[],
         );
         let area_status = statuses
             .iter()
@@ -541,6 +559,7 @@ mod tests {
             &[],
             &[path_regex("^/project/input-source/third_party/")],
             &[],
+            &[],
         );
         assert_eq!(statuses.len(), 1);
         assert!(statuses[0].effective);
@@ -555,6 +574,7 @@ mod tests {
             &[],
             &[],
             &[path_regex("^/project/third_party/")],
+            &[],
             &[manual_mark(usr, false)],
         );
         assert_eq!(statuses.len(), 1);
@@ -578,6 +598,7 @@ mod tests {
             &[],
             &[],
             &[path_regex("^/project/third_party/")],
+            &[],
             &[manual_mark(usr, true)],
         );
         assert_eq!(statuses.len(), 1);
@@ -599,7 +620,7 @@ mod tests {
             line: 3,
             column: 5,
         };
-        let statuses = effective_external_set(&[], &[undefined], &[call], &[], &[], &[]);
+        let statuses = effective_external_set(&[], &[undefined], &[call], &[], &[], &[], &[]);
 
         let status = statuses
             .iter()
@@ -631,6 +652,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         );
         assert!(statuses.is_empty(), "{statuses:#?}");
     }
@@ -646,12 +668,19 @@ mod tests {
             line: 3,
             column: 5,
         };
-        let statuses = effective_external_set(&[], &[], &[call], &[], &[], &[]);
+        let statuses = effective_external_set(&[], &[], &[call], &[], &[], &[], &[]);
         assert!(statuses.is_empty(), "{statuses:#?}");
     }
 
+    fn file_mark(file: &str) -> FileMark {
+        FileMark {
+            file: file.to_owned(),
+            decided_at: "2026-08-19T00:00:00Z".to_owned(),
+        }
+    }
+
     #[test]
-    fn expand_file_mark_collects_every_type_and_function_declared_in_the_file() {
+    fn a_file_mark_makes_every_declaration_in_that_file_effective() {
         let file = "/project/input-source/third_party/humlib/humlib.cpp";
         let types = [type_declaration("c:@S@Foo", "Foo", "", file)];
         let functions = [
@@ -659,8 +688,54 @@ mod tests {
             free_function("c:@F@elsewhere#", "elsewhere", "", "/project/other.cpp"),
         ];
 
-        let usrs = expand_file_mark(file, &types, &functions);
-        assert_eq!(usrs, vec!["c:@F@bar#".to_owned(), "c:@S@Foo".to_owned()]);
+        let statuses =
+            effective_external_set(&types, &functions, &[], &[], &[], &[file_mark(file)], &[]);
+
+        let foo = statuses
+            .iter()
+            .find(|status| status.usr == "c:@S@Foo")
+            .expect("expected Foo to be marked external via its file");
+        assert!(foo.effective);
+        assert_eq!(
+            foo.sources,
+            vec![ExternalSource::FileMark {
+                file: file.to_owned()
+            }]
+        );
+
+        let bar = statuses
+            .iter()
+            .find(|status| status.usr == "c:@F@bar#")
+            .expect("expected bar to be marked external via its file");
+        assert!(bar.effective);
+
+        assert!(
+            statuses
+                .iter()
+                .all(|status| status.usr != "c:@F@elsewhere#"),
+            "a declaration outside the marked file must not be affected: {statuses:#?}"
+        );
+    }
+
+    #[test]
+    fn a_manual_exclude_overrides_a_file_mark() {
+        let file = "/project/input-source/third_party/humlib/humlib.cpp";
+        let usr = "c:@F@bar#";
+        let statuses = effective_external_set(
+            &[],
+            &[free_function(usr, "bar", "", file)],
+            &[],
+            &[],
+            &[],
+            &[file_mark(file)],
+            &[manual_mark(usr, false)],
+        );
+        assert_eq!(statuses.len(), 1);
+        assert!(
+            !statuses[0].effective,
+            "manual exclude must win over a file mark: {:#?}",
+            statuses[0]
+        );
     }
 
     #[test]

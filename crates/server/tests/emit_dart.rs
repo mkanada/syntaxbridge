@@ -166,12 +166,19 @@ fn set_and_map_types_emit_as_their_dart_core_equivalents() {
 /// without this, a function returning/taking an enum would reference a
 /// Dart type that's never declared anywhere in the emitted package,
 /// `dart analyze`'s `undefined_class` territory.
+///
+/// Every enumerator carries its real C++ value explicitly (`(0)`, `(1)`,
+/// `(2)` here) rather than relying on Dart's own `.index` — see
+/// `ir::Enum::values`'s doc comment for why: C++ enumerators aren't
+/// guaranteed 0-based/sequential/gapless, so `.index` alone would silently
+/// disagree with the C++ program for any enum that isn't.
 #[test]
-fn an_enum_emits_as_a_plain_dart_enum_declaration() {
+fn an_enum_emits_as_a_dart_enum_declaration_with_its_real_cpp_values() {
     let cor = Enum {
         name: "Cor".to_owned(),
         usr: "c:@E@Cor".to_owned(),
         variants: vec!["Vermelho".to_owned(), "Verde".to_owned(), "Azul".to_owned()],
+        values: vec![0, 1, 2],
         origin: origin(2),
     };
     let module = Module {
@@ -182,10 +189,15 @@ fn an_enum_emits_as_a_plain_dart_enum_declaration() {
 
     let files = emit_module(&module);
     assert!(
-        files
-            .values()
-            .any(|source| source.contains("enum Cor { Vermelho, Verde, Azul }")),
-        "expected a plain `enum Cor {{ ... }}` declaration, got:\n{files:?}"
+        files.values().any(|source| {
+            source.contains("enum Cor")
+                && source.contains("Vermelho(0)")
+                && source.contains("Verde(1)")
+                && source.contains("Azul(2)")
+                && source.contains("const Cor(this.value)")
+                && source.contains("final int value")
+        }),
+        "expected an enum declaration with explicit backing values, got:\n{files:?}"
     );
 }
 
@@ -879,6 +891,7 @@ fn a_field_without_a_sound_zero_literal_is_late_not_a_fabricated_zero() {
         name: "Cor".to_owned(),
         usr: "c:@E@Cor".to_owned(),
         variants: vec!["vermelho".to_owned(), "azul".to_owned()],
+        values: vec![0, 1],
         origin: origin(1),
     };
 
@@ -993,6 +1006,7 @@ fn an_enum_without_constants_still_emits_parseable_dart() {
             name: "Vazio".to_owned(),
             usr: "c:@E@Vazio".to_owned(),
             variants: vec![],
+            values: vec![],
             origin: origin(1),
         }],
     };

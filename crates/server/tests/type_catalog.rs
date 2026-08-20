@@ -209,9 +209,20 @@ fn create_project_extracts_type_dependencies_with_libclang() {
         None,
     )
     .expect("ingest project and extract type dependencies");
+    // Item 2 (`docs/prompts/2026-08-19-mudanca-interacao.md`): ingestion
+    // only persists declarations now — type dependencies need "Analyse" to
+    // run before they're in `project.db`.
+    project_service::analyse_project(&project.project_dir, None).expect("analyse project");
 
     let catalog = &project.type_catalog;
-    let dependencies = &project.type_dependencies;
+    let project_store = syntax_bridge_server::persistence::ProjectStore::open(
+        &project.project_dir.join("project.db"),
+    )
+    .expect("open project store");
+    let dependencies = project_store
+        .list_type_dependencies()
+        .expect("list persisted type dependencies");
+    let dependencies = &dependencies;
 
     let find = |name: &str, kind: TypeDeclarationKind| {
         catalog

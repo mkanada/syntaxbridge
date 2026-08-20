@@ -43,7 +43,7 @@ void main() {
     );
     await _createProject(tester);
 
-    await tester.tap(find.text('input-source/fixture/types.h'));
+    await tester.tap(find.text('types.h'));
     await tester.pumpAndSettle();
 
     final artifact = await captureTestScreen(

@@ -18,7 +18,7 @@ use tokio::runtime;
 use tokio::sync::oneshot;
 
 use crate::ingest::CreateProjectRequest;
-use crate::jobs::{JobPhase, JobRegistry};
+use crate::jobs::{AnalysisJobRegistry, JobPhase, ProjectCreationJobRegistry};
 use crate::persistence;
 use crate::project_service::{
     self, AddRegexError, ListTypesError, OpenProjectError, ReadSourceFileError,
@@ -135,13 +135,15 @@ async fn serve_with_axum(
 #[derive(Clone)]
 struct AppState {
     global_db_path: Arc<PathBuf>,
-    job_registry: JobRegistry,
+    job_registry: ProjectCreationJobRegistry,
+    analysis_job_registry: AnalysisJobRegistry,
 }
 
 fn app(global_db_path: PathBuf) -> Router {
     let state = AppState {
         global_db_path: Arc::new(global_db_path),
-        job_registry: JobRegistry::new(),
+        job_registry: ProjectCreationJobRegistry::new(),
+        analysis_job_registry: AnalysisJobRegistry::new(),
     };
 
     Router::new()
@@ -155,6 +157,11 @@ fn app(global_db_path: PathBuf) -> Router {
         .route(
             "/projects/jobs/{job_id}",
             get(poll_project_creation_job_from_http).delete(cancel_project_creation_job_from_http),
+        )
+        .route("/projects/analyse", post(analyse_project_from_http))
+        .route(
+            "/projects/analyse-jobs/{job_id}",
+            get(poll_analysis_job_from_http).delete(cancel_analysis_job_from_http),
         )
         .route("/projects/open", post(open_project_from_http))
         .route("/projects/source-file", get(read_source_file_from_http))
@@ -382,6 +389,151 @@ fn phase_str(phase: JobPhase) -> &'static str {
         JobPhase::CatalogingPointers => "cataloging_pointers",
         JobPhase::Persisting => "persisting",
     }
+}
+
+#[derive(Deserialize)]
+struct AnalyseProjectRequest {
+    project_dir: PathBuf,
+}
+
+/// Starts the "Analyse" step (item 2, `docs/prompts/2026-08-19-mudanca-interacao.md`)
+/// as a background job, same shape as `create_project_from_http`: the
+/// `libclang` re-extraction this runs can take just as long as ingestion
+/// did, so this returns immediately with a job id to poll
+/// (`poll_analysis_job_from_http`) instead of blocking the request.
+async fn analyse_project_from_http(
+    State(state): State<AppState>,
+    payload: Result<Json<AnalyseProjectRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(request) => request,
+        Err(error) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error":"invalid_json","message":error.body_text()}),
+            );
+        }
+    };
+
+    log_server(format_args!(
+        "analysis job starting: project_dir={}",
+        request.project_dir.display()
+    ));
+
+    let (job_id, job) = state.analysis_job_registry.start();
+    let log_job_id = job_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let outcome = project_service::analyse_project(&request.project_dir, Some(&job.progress));
+        match &outcome {
+            Ok(()) => log_server(format_args!("analysis job succeeded: job_id={log_job_id}")),
+            Err(error) => log_server(format_args!(
+                "analysis job failed: job_id={log_job_id} error={error:?}"
+            )),
+        }
+        job.finish(outcome);
+    });
+
+    json_response(StatusCode::ACCEPTED, json!({"job_id": job_id}))
+}
+
+/// Reports an analysis job's status — same shape as
+/// `poll_project_creation_job_from_http`, minus a `project` payload on
+/// success (`jobs::AnalysisJob`'s own doc comment on why).
+async fn poll_analysis_job_from_http(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Response {
+    let Some(job) = state.analysis_job_registry.get(&job_id) else {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            json!({"error":"job_not_found","message": format!("no analysis job with id {job_id}")}),
+        );
+    };
+
+    job.with_outcome(|outcome| match outcome {
+        Some(Ok(())) => json_response(StatusCode::OK, json!({"status": "succeeded"})),
+        Some(Err(error)) if error.is_cancelled() => {
+            json_response(StatusCode::OK, json!({"status": "cancelled"}))
+        }
+        Some(Err(error)) => json_response(
+            StatusCode::OK,
+            json!({
+                "status": "failed",
+                "message": error.to_string(),
+                "is_client_error": error.is_client_error(),
+            }),
+        ),
+        None => {
+            let type_catalog_completed = job.progress.type_catalog.completed();
+            let type_catalog_total = job.progress.type_catalog.total();
+            let source_catalog_completed = job.progress.source_catalog.completed();
+            let source_catalog_total = job.progress.source_catalog.total();
+            let function_catalog_completed = job.progress.function_catalog.completed();
+            let function_catalog_total = job.progress.function_catalog.total();
+            let pointer_catalog_completed = job.progress.pointer_catalog.completed();
+            let pointer_catalog_total = job.progress.pointer_catalog.total();
+            let phase = crate::jobs::derive_phase(
+                type_catalog_completed,
+                type_catalog_total,
+                source_catalog_completed,
+                source_catalog_total,
+                function_catalog_completed,
+                function_catalog_total,
+                pointer_catalog_completed,
+                pointer_catalog_total,
+            );
+            let status = if job.cancel_requested() {
+                "cancelling"
+            } else {
+                "running"
+            };
+
+            json_response(
+                StatusCode::OK,
+                json!({
+                    "status": status,
+                    "phase": phase_str(phase),
+                    "type_catalog": {
+                        "completed": type_catalog_completed,
+                        "total": type_catalog_total,
+                    },
+                    "source_catalog": {
+                        "completed": source_catalog_completed,
+                        "total": source_catalog_total,
+                    },
+                    "function_catalog": {
+                        "completed": function_catalog_completed,
+                        "total": function_catalog_total,
+                    },
+                    "pointer_catalog": {
+                        "completed": pointer_catalog_completed,
+                        "total": pointer_catalog_total,
+                    },
+                }),
+            )
+        }
+    })
+}
+
+/// Requests cancellation of an in-flight analysis job — same shape as
+/// `cancel_project_creation_job_from_http`.
+async fn cancel_analysis_job_from_http(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Response {
+    let Some(job) = state.analysis_job_registry.get(&job_id) else {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            json!({"error":"job_not_found","message": format!("no analysis job with id {job_id}")}),
+        );
+    };
+
+    job.cancel();
+    log_server(format_args!(
+        "analysis cancellation requested: job_id={job_id}"
+    ));
+
+    json_response(StatusCode::ACCEPTED, json!({"status": "cancel_requested"}))
 }
 
 async fn list_recent_projects_from_http(State(state): State<AppState>) -> Response {
@@ -696,11 +848,12 @@ async fn mark_external_from_http(
 struct MarkFileExternalRequest {
     project_dir: PathBuf,
     file: String,
+    external: bool,
 }
 
-/// Expands a file into every usr it declares and marks each one external
-/// (decision 3's "cascata é foto") — the request `SourceFilesView`'s
-/// per-row action sends.
+/// Sets or clears a whole file's persistent external mark (item 3,
+/// `docs/prompts/2026-08-19-mudanca-interacao.md`) — the request
+/// `SourceFilesView`'s per-row toggle sends.
 async fn mark_file_external_from_http(
     payload: Result<Json<MarkFileExternalRequest>, JsonRejection>,
 ) -> Response {
@@ -715,17 +868,18 @@ async fn mark_file_external_from_http(
     };
 
     log_server(format_args!(
-        "marking file external: project_dir={} file={}",
+        "marking file external: project_dir={} file={} external={}",
         request.project_dir.display(),
-        request.file
+        request.file,
+        request.external
     ));
 
     match tokio::task::spawn_blocking(move || {
-        project_service::mark_file_external(&request.project_dir, &request.file)
+        project_service::mark_file_external(&request.project_dir, &request.file, request.external)
     })
     .await
     {
-        Ok(Ok(usrs)) => json_response(StatusCode::OK, json!({"marked_usrs": usrs})),
+        Ok(Ok(())) => json_response(StatusCode::OK, json!({"status": "ok"})),
         Ok(Err(error)) => list_types_error_response(error),
         Err(error) => {
             log_server(format_args!("mark file external task failed: {error}"));

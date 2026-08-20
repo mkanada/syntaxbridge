@@ -134,9 +134,7 @@ class _StatusRow extends StatelessWidget {
           for (final source in status.sources)
             Chip(
               label: Text(
-                source.pattern == null
-                    ? source.kind.label
-                    : '${source.kind.label}: ${source.pattern}',
+                _sourceLabel(source),
                 style: const TextStyle(fontSize: 11),
               ),
               visualDensity: VisualDensity.compact,
@@ -149,6 +147,11 @@ class _StatusRow extends StatelessWidget {
         child: Text(status.effective ? 'Excluir' : 'Incluir'),
       ),
     );
+  }
+
+  String _sourceLabel(ExternalSource source) {
+    final detail = source.pattern ?? source.file;
+    return detail == null ? source.kind.label : '${source.kind.label}: $detail';
   }
 }
 

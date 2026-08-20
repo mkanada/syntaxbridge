@@ -152,6 +152,43 @@ class HttpServerClient implements ServerClient {
   }
 
   @override
+  Future<String> startAnalyseProject(String projectDir) async {
+    final url = baseUrl.resolve('/projects/analyse');
+    final payload = jsonEncode({'project_dir': projectDir});
+    cliLog('HTTP POST $url payload=$payload');
+    final request = await _httpClient.postUrl(url);
+    request.headers.contentType = ContentType.json;
+    request.write(payload);
+
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP POST $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.accepted) {
+      throw HttpException(_errorMessageFromBody(body));
+    }
+
+    final json = jsonDecode(body) as Map<String, Object?>;
+    return json['job_id'] as String? ?? '';
+  }
+
+  @override
+  Future<AnalysisJobStatus> pollAnalyseProjectJob(String jobId) async {
+    final url = baseUrl.resolve('/projects/analyse-jobs/$jobId');
+    cliLog('HTTP GET $url');
+    final request = await _httpClient.getUrl(url);
+    final response = await request.close();
+    final body = await utf8.decoder.bind(response).join();
+    cliLog('HTTP GET $url -> ${response.statusCode} body=$body');
+
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException(_errorMessageFromBody(body));
+    }
+
+    return AnalysisJobStatus.fromJson(jsonDecode(body) as Map<String, Object?>);
+  }
+
+  @override
   Future<String> readSourceFile({
     required String projectDir,
     required String path,
@@ -403,12 +440,17 @@ class HttpServerClient implements ServerClient {
   }
 
   @override
-  Future<List<String>> markFileExternal({
+  Future<void> markFileExternal({
     required String projectDir,
     required String file,
+    required bool external,
   }) async {
     final url = baseUrl.resolve('/projects/externals/mark-file');
-    final payload = jsonEncode({'project_dir': projectDir, 'file': file});
+    final payload = jsonEncode({
+      'project_dir': projectDir,
+      'file': file,
+      'external': external,
+    });
     cliLog('HTTP POST $url payload=$payload');
     final request = await _httpClient.postUrl(url);
     request.headers.contentType = ContentType.json;
@@ -420,11 +462,6 @@ class HttpServerClient implements ServerClient {
     if (response.statusCode != HttpStatus.ok) {
       throw HttpException(_errorMessageFromBody(body));
     }
-
-    final json = jsonDecode(body) as Map<String, Object?>;
-    final markedJson =
-        json['marked_usrs'] as List<Object?>? ?? const <Object?>[];
-    return markedJson.whereType<String>().toList();
   }
 
   @override

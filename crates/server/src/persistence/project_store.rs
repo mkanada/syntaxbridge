@@ -47,11 +47,15 @@ pub struct ProjectCatalogs<'a> {
 pub type PersistedIr = (Vec<ir::Function>, Vec<ir::Record>, Vec<ir::Enum>);
 
 /// Bumped whenever `migrate_type_columns`/`migrate_function_columns` gains a
-/// new column to add. Guards those migrations behind `PRAGMA user_version`
-/// (checked once per `open`) so a database already at the current version
-/// skips the `PRAGMA table_info` probing entirely instead of re-running it on
-/// every open — including the read-only routes that call `open` per request.
-const SCHEMA_VERSION: i32 = 1;
+/// new column to add, or a one-time migration like
+/// `migrate_externals_to_text_file` (version 2: moved `external_marks`/
+/// `external_name_regexes`/`external_path_regexes` out to
+/// `externals_store::ExternalsStore`'s text file) is added. Guards those
+/// migrations behind `PRAGMA user_version` (checked once per `open`) so a
+/// database already at the current version skips the `PRAGMA table_info`
+/// probing entirely instead of re-running it on every open — including the
+/// read-only routes that call `open` per request.
+const SCHEMA_VERSION: i32 = 2;
 
 impl ProjectStore {
     pub fn open(path: &Path) -> Result<Self, PersistenceError> {
@@ -182,21 +186,6 @@ impl ProjectStore {
                 line INTEGER NOT NULL,
                 column INTEGER NOT NULL,
                 usr TEXT NOT NULL DEFAULT ''
-            );
-            CREATE TABLE IF NOT EXISTS external_marks (
-                usr TEXT PRIMARY KEY,
-                external INTEGER NOT NULL,
-                decided_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS external_name_regexes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                pattern TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS external_path_regexes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                pattern TEXT NOT NULL,
-                created_at TEXT NOT NULL
             );",
         )?;
 
@@ -205,6 +194,9 @@ impl ProjectStore {
         if current_version < SCHEMA_VERSION {
             migrate_type_columns(&connection)?;
             migrate_function_columns(&connection)?;
+            if current_version < 2 {
+                migrate_externals_to_text_file(&connection, path)?;
+            }
             connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
 
@@ -847,136 +839,6 @@ impl ProjectStore {
         Ok(decisions)
     }
 
-    /// Records (or updates) a manual external/not-external decision for one
-    /// usr — same upsert-by-usr shape as [`Self::set_type_mapping`], and for
-    /// the same reason: `external_marks` is a user decision, never
-    /// wholesale-replaced, only pruned (see `prune_external_marks_tx`) when
-    /// the usr itself stops existing in either catalog.
-    /// `docs/plans/lista-de-externos.md` decision 5: `external: true` forces
-    /// a usr into the effective set, `external: false` forces it out — both
-    /// override whatever a regex rule or auto-detection would otherwise say.
-    pub fn set_external_mark(&mut self, mark: &ExternalMark) -> Result<(), PersistenceError> {
-        self.connection.execute(
-            "INSERT INTO external_marks (usr, external, decided_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(usr) DO UPDATE SET
-                 external = excluded.external,
-                 decided_at = excluded.decided_at",
-            params![mark.usr, mark.external, mark.decided_at],
-        )?;
-        Ok(())
-    }
-
-    pub fn list_external_marks(&self) -> Result<Vec<ExternalMark>, PersistenceError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT usr, external, decided_at FROM external_marks ORDER BY usr")?;
-
-        let rows = statement.query_map([], |row| {
-            Ok(ExternalMark {
-                usr: row.get(0)?,
-                external: row.get(1)?,
-                decided_at: row.get(2)?,
-            })
-        })?;
-
-        let mut marks = Vec::new();
-        for row in rows {
-            marks.push(row?);
-        }
-
-        Ok(marks)
-    }
-
-    /// Adds a name-regex rule (`docs/plans/lista-de-externos.md` decision 6)
-    /// — unlike a mark, there is no upsert here: two rules with the same
-    /// pattern text are two independent rows (removing one never silently
-    /// removes the other), and the effective set only ever cares about the
-    /// *union* of every rule's matches, not their count.
-    pub fn add_name_regex(
-        &mut self,
-        pattern: &str,
-        created_at: &str,
-    ) -> Result<i64, PersistenceError> {
-        self.connection.execute(
-            "INSERT INTO external_name_regexes (pattern, created_at) VALUES (?1, ?2)",
-            params![pattern, created_at],
-        )?;
-        Ok(self.connection.last_insert_rowid())
-    }
-
-    pub fn remove_name_regex(&mut self, id: i64) -> Result<(), PersistenceError> {
-        self.connection.execute(
-            "DELETE FROM external_name_regexes WHERE id = ?1",
-            params![id],
-        )?;
-        Ok(())
-    }
-
-    pub fn list_name_regexes(&self) -> Result<Vec<NameRegexRule>, PersistenceError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT id, pattern, created_at FROM external_name_regexes ORDER BY id")?;
-
-        let rows = statement.query_map([], |row| {
-            Ok(NameRegexRule {
-                id: row.get(0)?,
-                pattern: row.get(1)?,
-                created_at: row.get(2)?,
-            })
-        })?;
-
-        let mut rules = Vec::new();
-        for row in rows {
-            rules.push(row?);
-        }
-
-        Ok(rules)
-    }
-
-    /// Same shape as [`Self::add_name_regex`], matching file paths instead
-    /// (`docs/plans/lista-de-externos.md` decision 6).
-    pub fn add_path_regex(
-        &mut self,
-        pattern: &str,
-        created_at: &str,
-    ) -> Result<i64, PersistenceError> {
-        self.connection.execute(
-            "INSERT INTO external_path_regexes (pattern, created_at) VALUES (?1, ?2)",
-            params![pattern, created_at],
-        )?;
-        Ok(self.connection.last_insert_rowid())
-    }
-
-    pub fn remove_path_regex(&mut self, id: i64) -> Result<(), PersistenceError> {
-        self.connection.execute(
-            "DELETE FROM external_path_regexes WHERE id = ?1",
-            params![id],
-        )?;
-        Ok(())
-    }
-
-    pub fn list_path_regexes(&self) -> Result<Vec<PathRegexRule>, PersistenceError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT id, pattern, created_at FROM external_path_regexes ORDER BY id")?;
-
-        let rows = statement.query_map([], |row| {
-            Ok(PathRegexRule {
-                id: row.get(0)?,
-                pattern: row.get(1)?,
-                created_at: row.get(2)?,
-            })
-        })?;
-
-        let mut rules = Vec::new();
-        for row in rows {
-            rules.push(row?);
-        }
-
-        Ok(rules)
-    }
-
     /// Persists the IR `lower::cpp` produced alongside the
     /// declarations/calls stored by [`Self::replace_function_declarations`]/
     /// [`Self::replace_call_edges`] — reused by `project_service::transpile_project`
@@ -1011,20 +873,11 @@ impl ProjectStore {
         replace_type_usages_tx(&transaction, catalogs.type_usages)?;
         replace_source_files_tx(&transaction, catalogs.source_files)?;
         replace_function_declarations_tx(&transaction, catalogs.function_declarations)?;
-        // Deliberately *not* inside `replace_type_declarations_tx`/
-        // `replace_function_declarations_tx` themselves, unlike
-        // `type_mappings`'s prune inside `replace_type_declarations_tx`:
-        // `external_marks` is keyed by usrs from *both* catalogs (a type or
-        // a function), so pruning it correctly needs both tables already in
-        // their final, post-replace state — running it from either
-        // individual `_tx` function would prune against a catalog that's
-        // still mid-replace (or not yet replaced at all) in the other. Only
-        // safe here, after both have run in this same transaction. The
-        // standalone `replace_type_declarations`/`replace_function_declarations`
-        // methods (each their own transaction, only ever seeding one table
-        // at a time — mainly used by tests) deliberately never prune
-        // `external_marks` at all, for the same reason.
-        prune_external_marks_tx(&transaction)?;
+        // Manual marks/file marks (`externals_store::ExternalsStore`) live
+        // in their own text file now, not this database, so pruning them
+        // after a fresh set of type/function declarations lands is the
+        // caller's job (`project_service::prune_externals_store`), not this
+        // method's.
         replace_call_edges_tx(&transaction, catalogs.call_edges)?;
         replace_ir_tx(
             &transaction,
@@ -1267,26 +1120,6 @@ fn replace_function_declarations_tx(
         ])?;
     }
 
-    Ok(())
-}
-
-/// Prunes `external_marks` rows whose usr no longer names anything in
-/// either catalog — see the call site in `replace_all` for why this can't
-/// live inside `replace_type_declarations_tx`/`replace_function_declarations_tx`
-/// themselves. Same known limitation as `type_mappings`'s prune in
-/// `replace_type_declarations_tx`: this is a silent `DELETE`, not the
-/// "sinalizar decisão órfã" US-12 (still `planejado`) eventually wants —
-/// replicating an existing gap, not introducing a new one
-/// (`docs/plans/lista-de-externos.md`).
-fn prune_external_marks_tx(transaction: &Transaction) -> Result<(), PersistenceError> {
-    transaction.execute(
-        "DELETE FROM external_marks WHERE usr NOT IN (
-             SELECT usr FROM type_declarations
-             UNION
-             SELECT usr FROM function_declarations
-         )",
-        [],
-    )?;
     Ok(())
 }
 
@@ -1550,6 +1383,95 @@ fn migrate_function_columns(connection: &Connection) -> Result<(), PersistenceEr
     )
 }
 
+/// One-time migration off `external_marks`/`external_name_regexes`/
+/// `external_path_regexes` — this database's own storage for
+/// `externals.rs`'s manual marks and regex rules before
+/// `docs/prompts/2026-08-19-mudanca-interacao.md` item 1 moved them to a
+/// text file (`externals_store::ExternalsStore`) next to `project.db`. Runs
+/// once per database (guarded by `SCHEMA_VERSION` in [`ProjectStore::open`]):
+/// harvests whatever rows the three tables still have (an older `project.db`
+/// created before this migration existed), hands them to
+/// [`ExternalsStore::migrate_from_legacy`], then drops the tables — nothing
+/// reads them anymore, so keeping them around would just be a silent second
+/// copy of data the text file now owns. A brand-new database never had these
+/// tables (removed from the `CREATE TABLE IF NOT EXISTS` batch in
+/// [`ProjectStore::open`] once this migration existed), so every query here
+/// is guarded by [`table_exists`].
+fn migrate_externals_to_text_file(
+    connection: &Connection,
+    project_db_path: &Path,
+) -> Result<(), PersistenceError> {
+    let marks = if table_exists(connection, "external_marks")? {
+        let mut statement =
+            connection.prepare("SELECT usr, external, decided_at FROM external_marks")?;
+        let rows = statement.query_map([], |row| {
+            Ok(ExternalMark {
+                usr: row.get(0)?,
+                external: row.get(1)?,
+                decided_at: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+
+    let name_regexes = if table_exists(connection, "external_name_regexes")? {
+        let mut statement =
+            connection.prepare("SELECT id, pattern, created_at FROM external_name_regexes")?;
+        let rows = statement.query_map([], |row| {
+            Ok(NameRegexRule {
+                id: row.get(0)?,
+                pattern: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+
+    let path_regexes = if table_exists(connection, "external_path_regexes")? {
+        let mut statement =
+            connection.prepare("SELECT id, pattern, created_at FROM external_path_regexes")?;
+        let rows = statement.query_map([], |row| {
+            Ok(PathRegexRule {
+                id: row.get(0)?,
+                pattern: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+
+    if let Some(project_dir) = project_db_path.parent() {
+        super::ExternalsStore::open(project_dir).migrate_from_legacy(
+            marks,
+            name_regexes,
+            path_regexes,
+        )?;
+    }
+
+    connection.execute_batch(
+        "DROP TABLE IF EXISTS external_marks;
+         DROP TABLE IF EXISTS external_name_regexes;
+         DROP TABLE IF EXISTS external_path_regexes;",
+    )?;
+
+    Ok(())
+}
+
+fn table_exists(connection: &Connection, name: &str) -> Result<bool, PersistenceError> {
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        params![name],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 fn ensure_column(
     connection: &Connection,
     table: &str,
@@ -1799,6 +1721,86 @@ mod tests {
         assert!(declarations[0].has_definition);
 
         let _ = fs::remove_file(&db_path);
+    }
+
+    /// A database created before `docs/prompts/2026-08-19-mudanca-interacao.md`
+    /// item 1 still has its own `external_marks`/`external_name_regexes`/
+    /// `external_path_regexes` tables — `ProjectStore::open` must harvest
+    /// them into the sibling `externals.txt` text file
+    /// (`externals_store::ExternalsStore`) and drop the tables, so a second
+    /// open of the same database never sees them again.
+    #[test]
+    fn opening_a_pre_text_file_externals_database_migrates_marks_and_regexes_then_drops_the_tables()
+    {
+        let db_path = temp_db_path("project-pre-externals-text-file-migration");
+        let project_dir = db_path
+            .parent()
+            .expect("db path has a parent")
+            .to_path_buf();
+        {
+            let connection = Connection::open(&db_path).expect("create legacy database");
+            connection
+                .execute_batch(
+                    "CREATE TABLE external_marks (
+                        usr TEXT PRIMARY KEY,
+                        external INTEGER NOT NULL,
+                        decided_at TEXT NOT NULL
+                    );
+                    CREATE TABLE external_name_regexes (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        pattern TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE TABLE external_path_regexes (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        pattern TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );",
+                )
+                .expect("create legacy externals tables");
+            connection
+                .execute(
+                    "INSERT INTO external_marks (usr, external, decided_at)
+                     VALUES ('c:@S@Humlib', 1, '2026-08-17T00:00:00Z')",
+                    [],
+                )
+                .expect("insert legacy mark");
+            connection
+                .execute(
+                    "INSERT INTO external_name_regexes (pattern, created_at)
+                     VALUES ('^humlib::', '2026-08-17T00:00:00Z')",
+                    [],
+                )
+                .expect("insert legacy name regex");
+        }
+
+        ProjectStore::open(&db_path).expect("open and migrate legacy database");
+
+        let externals_store = super::super::ExternalsStore::open(&project_dir);
+        let marks = externals_store.list_marks().expect("list migrated marks");
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].usr, "c:@S@Humlib");
+        let name_regexes = externals_store
+            .list_name_regexes()
+            .expect("list migrated name regexes");
+        assert_eq!(name_regexes.len(), 1);
+        assert_eq!(name_regexes[0].pattern, "^humlib::");
+
+        let reopened = Connection::open(&db_path).expect("reopen migrated database");
+        let legacy_table_count: i64 = reopened
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'external_%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count legacy tables");
+        assert_eq!(
+            legacy_table_count, 0,
+            "the legacy externals tables should be dropped after migration"
+        );
+
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(project_dir.join("externals.txt"));
     }
 
     #[test]
@@ -2392,220 +2394,6 @@ mod tests {
         let _ = fs::remove_file(&db_path);
     }
 
-    fn sample_external_mark() -> ExternalMark {
-        ExternalMark {
-            usr: "c:@S@Humlib".to_owned(),
-            external: true,
-            decided_at: "2026-08-17T00:00:00Z".to_owned(),
-        }
-    }
-
-    #[test]
-    fn round_trips_external_marks() {
-        let db_path = temp_db_path("project-external-marks");
-        let mut store = ProjectStore::open(&db_path).expect("open project store");
-
-        store
-            .set_external_mark(&sample_external_mark())
-            .expect("persist external mark");
-
-        let marks = store.list_external_marks().expect("list external marks");
-        assert_eq!(marks, vec![sample_external_mark()]);
-
-        let _ = fs::remove_file(&db_path);
-    }
-
-    /// Setting a mark twice for the same usr updates it in place (upsert on
-    /// the primary key) — this is also how a user flips an item from
-    /// "forced external" to "forced not-external" (decision 5,
-    /// `docs/plans/lista-de-externos.md`), not just how a duplicate write
-    /// is deduplicated.
-    #[test]
-    fn setting_an_external_mark_again_updates_it_in_place() {
-        let db_path = temp_db_path("project-external-marks-update");
-        let mut store = ProjectStore::open(&db_path).expect("open project store");
-
-        store
-            .set_external_mark(&sample_external_mark())
-            .expect("persist external mark");
-        let flipped = ExternalMark {
-            external: false,
-            decided_at: "2026-08-18T00:00:00Z".to_owned(),
-            ..sample_external_mark()
-        };
-        store
-            .set_external_mark(&flipped)
-            .expect("update external mark");
-
-        let marks = store.list_external_marks().expect("list external marks");
-        assert_eq!(marks, vec![flipped]);
-
-        let _ = fs::remove_file(&db_path);
-    }
-
-    #[test]
-    fn round_trips_name_and_path_regexes() {
-        let db_path = temp_db_path("project-external-regexes");
-        let mut store = ProjectStore::open(&db_path).expect("open project store");
-
-        let name_id = store
-            .add_name_regex("^humlib::", "2026-08-17T00:00:00Z")
-            .expect("persist name regex");
-        let path_id = store
-            .add_path_regex("^third_party/", "2026-08-17T00:00:00Z")
-            .expect("persist path regex");
-
-        let name_rules = store.list_name_regexes().expect("list name regexes");
-        assert_eq!(
-            name_rules,
-            vec![NameRegexRule {
-                id: name_id,
-                pattern: "^humlib::".to_owned(),
-                created_at: "2026-08-17T00:00:00Z".to_owned(),
-            }]
-        );
-
-        let path_rules = store.list_path_regexes().expect("list path regexes");
-        assert_eq!(
-            path_rules,
-            vec![PathRegexRule {
-                id: path_id,
-                pattern: "^third_party/".to_owned(),
-                created_at: "2026-08-17T00:00:00Z".to_owned(),
-            }]
-        );
-
-        store.remove_name_regex(name_id).expect("remove name regex");
-        store.remove_path_regex(path_id).expect("remove path regex");
-        assert!(
-            store
-                .list_name_regexes()
-                .expect("list name regexes")
-                .is_empty()
-        );
-        assert!(
-            store
-                .list_path_regexes()
-                .expect("list path regexes")
-                .is_empty()
-        );
-
-        let _ = fs::remove_file(&db_path);
-    }
-
-    /// Mirrors `replacing_type_declarations_prunes_mappings_for_types_no_longer_in_the_catalog`,
-    /// but for `external_marks`, and exercised through `replace_all` rather
-    /// than the standalone `replace_type_declarations` — see
-    /// `prune_external_marks_tx`'s doc comment for why pruning only ever
-    /// runs there: `external_marks` spans both the type and the function
-    /// catalog, so it can only be pruned correctly once both are already in
-    /// their final, post-replace state.
-    #[test]
-    fn replace_all_prunes_external_marks_for_usrs_no_longer_in_either_catalog() {
-        let db_path = temp_db_path("project-external-marks-prune");
-        let mut store = ProjectStore::open(&db_path).expect("open project store");
-
-        let surviving_type = TypeDeclaration {
-            usr: "c:@S@Ponto".to_owned(),
-            ..sample_type_declarations()[0].clone()
-        };
-        store
-            .replace_all(&ProjectCatalogs {
-                compilation_units: &[],
-                type_declarations: std::slice::from_ref(&surviving_type),
-                type_dependencies: &[],
-                type_usages: &[],
-                source_files: &[],
-                function_declarations: &[],
-                call_edges: &[],
-                ir_functions: &[],
-                ir_records: &[],
-                ir_enums: &[],
-                pointer_declarations: &[],
-            })
-            .expect("seed initial catalog");
-
-        store
-            .set_external_mark(&ExternalMark {
-                usr: surviving_type.usr.clone(),
-                ..sample_external_mark()
-            })
-            .expect("mark the surviving type external");
-        store
-            .set_external_mark(&ExternalMark {
-                usr: "c:@S@ClasseRenomeada".to_owned(),
-                ..sample_external_mark()
-            })
-            .expect("mark a type about to disappear external");
-
-        // Re-ingestion: `Ponto` survives, `ClasseRenomeada` doesn't exist in
-        // the fresh catalog (renamed/removed).
-        store
-            .replace_all(&ProjectCatalogs {
-                compilation_units: &[],
-                type_declarations: std::slice::from_ref(&surviving_type),
-                type_dependencies: &[],
-                type_usages: &[],
-                source_files: &[],
-                function_declarations: &[],
-                call_edges: &[],
-                ir_functions: &[],
-                ir_records: &[],
-                ir_enums: &[],
-                pointer_declarations: &[],
-            })
-            .expect("replace with a catalog missing the renamed type");
-
-        let marks = store.list_external_marks().expect("list external marks");
-        assert_eq!(
-            marks,
-            vec![ExternalMark {
-                usr: surviving_type.usr.clone(),
-                ..sample_external_mark()
-            }],
-            "the orphaned mark should be pruned, the surviving one kept"
-        );
-
-        let _ = fs::remove_file(&db_path);
-    }
-
-    /// Regression guard for the asymmetry `prune_external_marks_tx`'s doc
-    /// comment describes: the standalone single-catalog `replace_*` methods
-    /// must **not** prune `external_marks` on their own — each only ever
-    /// sees one of the two catalogs `external_marks` spans, so pruning
-    /// there would incorrectly drop a mark for a usr that only exists in
-    /// the *other*, untouched catalog.
-    #[test]
-    fn replacing_only_type_declarations_does_not_prune_external_marks() {
-        let db_path = temp_db_path("project-external-marks-no-prune-on-partial-replace");
-        let mut store = ProjectStore::open(&db_path).expect("open project store");
-
-        // A mark for a function usr — `replace_type_declarations` below
-        // never touches `function_declarations`, so this usr is never
-        // actually gone, even though `type_declarations` alone knows
-        // nothing about it.
-        store
-            .set_external_mark(&ExternalMark {
-                usr: "c:@F@add#I#I#".to_owned(),
-                ..sample_external_mark()
-            })
-            .expect("mark a function usr external");
-
-        store
-            .replace_type_declarations(&sample_type_declarations())
-            .expect("replace type declarations only");
-
-        let marks = store.list_external_marks().expect("list external marks");
-        assert_eq!(
-            marks.len(),
-            1,
-            "a partial replace must never prune a mark belonging to the \
-             catalog it didn't touch: {marks:?}"
-        );
-
-        let _ = fs::remove_file(&db_path);
-    }
-
     fn sample_ir_origin() -> ir::Origin {
         ir::Origin {
             file: "/project/input-source/src/aritmetica.cpp".to_owned(),
@@ -2683,6 +2471,7 @@ mod tests {
             name: "Cor".to_owned(),
             usr: "c:@E@Cor".to_owned(),
             variants: vec!["Vermelho".to_owned(), "Verde".to_owned(), "Azul".to_owned()],
+            values: vec![0, 1, 2],
             origin: sample_ir_origin(),
         }
     }

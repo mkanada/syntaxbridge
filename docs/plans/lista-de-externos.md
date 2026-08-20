@@ -33,20 +33,34 @@ quebra silenciosamente só quando `dart analyze` roda sobre o pacote inteiro.
    com o tipo — nunca `throw`, nunca trava. Rejeita explicitamente o padrão
    `Unsupported` (que é para "o produto não sabe", não para "o usuário
    decidiu que não quer").
-2. **Quatro fontes alimentam um único conjunto de "externo", nunca
+2. **Cinco fontes alimentam um único conjunto de "externo", nunca
    persistido como lista materializada — sempre recomputado:**
-   - Marcação manual em Tipos, em Source Files e em Funções (mesma
-     mecânica nas três).
+   - Marcação manual em Tipos e em Funções (mesma mecânica nas duas: marca
+     por usr).
+   - Marca de arquivo inteiro, em Source Files — mecânica própria desde a
+     revisão de 2026-08-19 (decisão 3 abaixo), não mais uma marcação manual
+     por usr expandida.
    - Regexp sobre nome C++ qualificado (`namespace::Classe::metodo`).
    - Regexp sobre caminho de arquivo.
    - Auto-detecção: símbolo chamado mas nunca definido em nenhuma unidade de
      compilação do projeto.
-3. **Cascata é foto, não vínculo.** Marcar um arquivo ou um tipo inteiro
-   expande, no momento da marcação, para os usrs que ele contém *agora*
-   (arquivo → tudo declarado nele; tipo → o próprio tipo + todos os seus
-   métodos). Depois da expansão, cada usr é uma marca solta — removível
-   individualmente, sem relação retroativa com o arquivo/tipo de origem.
-   Marcar uma função é sempre direto (ela já é atômica, sem cascata).
+3. **Cascata é foto, não vínculo — só para tipos.** Marcar um tipo inteiro
+   expande, no momento da marcação, para os usrs que ele contém *agora* (o
+   próprio tipo + todos os seus métodos). Depois da expansão, cada usr é uma
+   marca solta — removível individualmente, sem relação retroativa com o
+   tipo de origem. Marcar uma função é sempre direto (ela já é atômica, sem
+   cascata).
+
+   **Revisto em 2026-08-19** (`docs/prompts/2026-08-19-mudanca-interacao.md`
+   item 3) para **arquivo**, por decisão explícita do usuário: desfazer uma
+   marcação de arquivo item por item era incômodo demais na prática, e um
+   arquivo inteiro (ao contrário de um tipo) já é uma unidade natural do
+   produto (aparece como uma linha só em Source Files). Marcar um arquivo
+   agora cria um vínculo persistente (`externals::FileMark`, item 1 do mesmo
+   prompt) — toda declaração atualmente naquele arquivo, e qualquer uma
+   declarada nele depois, é externa enquanto a marca existir; desmarcar o
+   arquivo desmarca tudo de uma vez. Tipo continua "foto": a assimetria é
+   intencional, não uma inconsistência a corrigir depois.
 4. **Regexp edita-se na regexp, não no item — exceto override manual.** Os
    itens que uma regexp casa não são editáveis um a um; para tirar um falso
    positivo, reescreve-se o padrão. A única exceção é uma marcação manual
@@ -70,22 +84,35 @@ quebra silenciosamente só quando `dart analyze` roda sobre o pacote inteiro.
 
 ```
 efetivo(usr) =
-    ( nome_regexp_casa(usr) OU caminho_regexp_casa(usr) OU auto_detectado(usr)
-      OU marca_manual(usr) == true )
+    ( nome_regexp_casa(usr) OU caminho_regexp_casa(usr) OU marca_de_arquivo_casa(usr)
+      OU auto_detectado(usr) OU marca_manual(usr) == true )
     E NÃO marca_manual(usr) == false
 ```
 
-Só duas coisas são persistidas por projeto: a marca manual (upsert por usr,
-tabela `external_marks`) e as duas listas de padrão regex. Tudo mais —
+Quatro coisas são persistidas por projeto: a marca manual (upsert por usr),
+as duas listas de padrão regex, e a marca de arquivo (item 3). Tudo mais —
 inclusive a auto-detecção — é derivado a cada leitura dos catálogos já
 existentes (`type_declarations`, `function_declarations`, `call_edges`).
 Mesmo padrão que `type_mappings` (US-7) já usa para "decisão persistida,
-efeito computado": `usr` como chave, upsert em vez de substituição, nunca
-apagado por inteiro num re-ingest — só podado quando o próprio usr some
-(mesma limitação conhecida de `type_mappings` frente a US-12, ainda
-`planejado`: a poda hoje é um `DELETE` silencioso, não uma "decisão órfã"
-sinalizada; replicar esse padrão aqui não é uma regressão nova, é o mesmo
-gap já existente em produção).
+efeito computado": `usr` (ou, para a marca de arquivo, o caminho do arquivo)
+como chave, upsert em vez de substituição, nunca apagado por inteiro num
+re-ingest — só podado quando o próprio usr/arquivo some (mesma limitação
+conhecida de `type_mappings` frente a US-12, ainda `planejado`: a poda hoje é
+um `DELETE`/remoção silenciosa, não uma "decisão órfã" sinalizada; replicar
+esse padrão aqui não é uma regressão nova, é o mesmo gap já existente em
+produção).
+
+**Revisto em 2026-08-19** (`docs/prompts/2026-08-19-mudanca-interacao.md`
+item 1): as quatro coisas acima não vivem mais em `project.db` (tabelas
+`external_marks`/`external_name_regexes`/`external_path_regexes`). Vivem em
+`externals.txt`, um arquivo texto dentro do diretório do projeto
+(`externals_store::ExternalsStore`), editável fora do syntax-bridge —
+diferente de `type_mappings` e do resto do `project.db`, que continuam em
+SQLite. Motivo: o usuário quer poder versionar/inspecionar/editar essa lista
+por fora, algo que um arquivo SQLite não oferece de forma prática. Um
+`project.db` de uma versão anterior é migrado automaticamente na primeira
+abertura (`ProjectStore::open`, `SCHEMA_VERSION` 2): as três tabelas são lidas
+uma vez, viram o `externals.txt` inicial, e são descartadas.
 
 ## Onde isso mora na UI, frente a `docs/plans/ui-lists.md`
 

@@ -350,6 +350,14 @@ class _ScriptedServerClient implements ServerClient {
       throw UnimplementedError('not used by this screen');
 
   @override
+  Future<String> startAnalyseProject(String projectDir) =>
+      throw UnimplementedError('not used by this screen');
+
+  @override
+  Future<AnalysisJobStatus> pollAnalyseProjectJob(String jobId) =>
+      throw UnimplementedError('not used by this screen');
+
+  @override
   Future<String> readSourceFile({
     required String projectDir,
     required String path,
@@ -405,9 +413,10 @@ class _ScriptedServerClient implements ServerClient {
   }) => throw UnimplementedError('not used by this screen');
 
   @override
-  Future<List<String>> markFileExternal({
+  Future<void> markFileExternal({
     required String projectDir,
     required String file,
+    required bool external,
   }) => throw UnimplementedError('not used by this screen');
 
   @override

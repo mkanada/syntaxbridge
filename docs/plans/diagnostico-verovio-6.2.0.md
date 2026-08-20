@@ -193,6 +193,525 @@ faltam adaptadores específicos. As próximas pontes a priorizar são ponteiros 
 buffers, produtos/coleções STL, callbacks e as fronteiras de stream/regex;
 elas devem substituir `SyntaxBridgeOpaque` por contratos Dart nomeados.
 
+## Medição mais recente (2026-08-20, switch/case, enum tipado, decl múltiplo, bug de parse em out-param)
+
+Lote executado pelo loop autônomo descrito em
+`docs/prompts/2026-08-20-loop-bailout.md`. Detalhe de causa raiz, fixture
+mínima e decisão de cada item está em
+`docs/plans/bailouts-verovio-6.2.0.md` (seção "Atualização de 2026-08-20");
+esta entrada só registra o efeito agregado medido.
+
+| Métrica | Antes do lote | Depois do lote |
+| --- | ---: | ---: |
+| Bailouts de tipo (ocorrências / spellings) | 2.437 / 238 | 2.616 / 244 |
+| Bailouts de expressão (ocorrências / causas) | 11.153 / 644 | 9.611 / 553 |
+| Bailouts de statement (ocorrências / causas) | 887 / 24 | 486 / 17 |
+| Total de bailouts | 14.477 | 12.713 |
+| Arquivos `.dart` que não parseiam | 2 / 301 | 2 / 301 |
+| Erros do `dart analyze` | 12.960 | 14.639 |
+| Avisos do `dart analyze` | 7.179 | 7.862 |
+| Tokens `dynamic` emitidos | 0 | 0 |
+
+O aumento em bailouts de tipo e em erros/avisos do `dart analyze` é o mesmo
+efeito de exposição de cobertura já registrado nas medições de 2026-08-18:
+statements e expressões que antes paravam num bailout grosso (`switch`
+inteiro, `DeclStmt` de múltiplos declaradores, `NullStmt`) agora são
+percorridos e emitidos de verdade, revelando bailouts e diagnósticos que já
+existiam dentro deles. Confirmado manualmente: zero tokens `dynamic`, e as
+únicas causas novas do lote (36 casos de *switch* com *fallthrough* genuíno,
+10 resíduos de `DeclStmt` multi-declarador em `for.init`) são nomeadas e
+rastreáveis — não bailout opaco genérico. Detalhe completo na atualização
+correspondente em `bailouts-verovio-6.2.0.md`.
+
+## Medição mais recente (2026-08-20, 2ª rodada: `MemberRefExpr` normalizado, literal de `vector`/`array`/`deque`)
+
+Segundo lote do mesmo loop autônomo, mesma sessão. Detalhe completo em
+`docs/plans/bailouts-verovio-6.2.0.md` ("Atualização de 2026-08-20 (2ª
+rodada)"); esta entrada só registra o efeito agregado.
+
+| Métrica | Antes do lote | Depois do lote |
+| --- | ---: | ---: |
+| Bailouts de expressão (ocorrências / causas) | 9.611 / 553 | 9.107 / 550 |
+| Bailouts de tipo / statement | 2.616/244, 486/17 | inalterados |
+| Total de bailouts | 12.713 | 12.209 |
+| Arquivos `.dart` que não parseiam | 2 / 301 | 2 / 301 |
+| Erros do `dart analyze` | 14.639 | 14.588 |
+| Avisos do `dart analyze` | 7.862 | 7.871 |
+| Tokens `dynamic` emitidos | 0 | 0 |
+
+Dois fixes: `member_ref_receiver` filtrando `TypeRef`/`NamespaceRef` como o
+`is_transparent_wrapper` já filtra em outros três pontos deste arquivo
+(elimina "cursor kind 43", 206 → 0), e `Expr::ListLiteral` para
+`InitListExpr` cujo tipo já resolve a `List<T>`, mais o desvio do
+`ConstructorCall` de `vector`/`array`/`deque` para esse literal quando o
+argumento é um deles — corrige um segundo bug pré-existente (nunca
+exercitado antes: `vector(...)` nomeando uma função Dart inexistente).
+Nenhuma causa nova; nenhum token `dynamic`.
+
+## Medição mais recente (2026-08-20, 3ª rodada: índice de campo/array aninhado)
+
+Terceiro lote do mesmo loop autônomo, mesma sessão. Detalhe completo em
+`docs/plans/bailouts-verovio-6.2.0.md` ("Atualização de 2026-08-20 (3ª
+rodada)").
+
+| Métrica | Antes do lote | Depois do lote |
+| --- | ---: | ---: |
+| Bailouts de expressão (ocorrências / causas) | 9.107 / 550 | 9.032 / 550 |
+| Bailouts de statement (ocorrências / causas) | 486 / 17 | 430 / 17 |
+| Bailouts de tipo | 2.616/244 | inalterado |
+| Total de bailouts | 12.209 | 12.078 |
+| Erros do `dart analyze` | 14.588 | 14.590 |
+| Avisos do `dart analyze` | 7.871 | 7.865 |
+| Tokens `dynamic` emitidos | 0 | 0 |
+
+`lower_array_subscript_expr` só recuperava o tipo declarado real (contornando
+o decay de array-para-ponteiro) para uma variável local/global
+(`DeclRefExpr`); um campo array de tamanho fixo indexado via `this`
+(implícito ou explícito) e a indexação aninhada (`m_rows[i][j]`) caíam no
+bailout genérico mesmo com o campo já emitido como `List<int>`. Efeito
+colateral bem-vindo: atribuição indexada por esse mesmo alvo (`m_data[i] =
+x`) também passou a funcionar, por reusar a mesma resolução — daí a queda em
+statements também. Nenhuma causa nova; nenhum token `dynamic`.
+
+## Medição mais recente (2026-08-20, 4ª rodada: chamada de valor callback)
+
+Quarto lote do mesmo loop autônomo, mesma sessão. Detalhe completo em
+`docs/plans/bailouts-verovio-6.2.0.md` ("Atualização de 2026-08-20 (4ª
+rodada)"). Nota: a primeira tentativa de remedir (task `br5sdjsbq`) produziu
+um arquivo de saída vazio por falha de captura — a medição abaixo vem de
+uma repetição limpa da mesma rodada.
+
+| Métrica | Antes do lote | Depois do lote |
+| --- | ---: | ---: |
+| Bailouts de expressão (ocorrências / causas) | 9.032 / 550 | 9.020 / 556 |
+| Bailouts de tipo (ocorrências / spellings) | 2.616 / 244 | 2.837 / 244 |
+| Bailouts de statement | 430/17 | inalterado |
+| `dart analyze` erros/avisos | 14.590/7.865 | 14.580/7.835 |
+| Tokens `dynamic` emitidos | 0 | 0 |
+
+`lower_call_expr` só reconhecia `FunctionDecl`/`CXXMethod`/`Constructor`
+como alvo de chamada; `m_callback(value)`/`this->m_callback(value)` (campo
+callback) e `cb(value)` (parâmetro callback) resolvem para um
+`FieldDecl`/`ParmDecl`/`VarDecl` via `clang_getCursorReferenced`. "call
+target cursor kind 6/9/10": **96+22+5 → 0**. O aumento em tipos (mesmo
+padrão de exposição de cobertura já registrado nas rodadas anteriores: mais
+código passa a ser percorrido, revelando bailouts de tipo que já existiam
+dentro dele) supera a queda em expressões neste lote isolado — o total de
+bailouts desta rodada isolada não caiu, mas a causa em si (chamada de
+callback) foi eliminada por completo, e as spellings de tipo distintas não
+mudaram (244 → 244), nem apareceu spelling vazio novo (as 5 já eram
+conhecidas) nem token `dynamic`.
+
+## Medição mais recente (2026-08-20, 5ª rodada: operador de conversão para `std::string`)
+
+Quinto lote do mesmo loop autônomo, mesma sessão. Detalhe completo em
+`docs/plans/bailouts-verovio-6.2.0.md` ("Atualização de 2026-08-20 (5ª
+rodada)").
+
+| Métrica | Antes do lote | Depois do lote |
+| --- | ---: | ---: |
+| "call target cursor kind 26" | 81 | **0** |
+| Bailouts de expressão (causas distintas) | 550 | 556 |
+| Bailouts de tipo/statement | 2.837/244, 430/17 | inalterados |
+| Tokens `dynamic` emitidos | 0 | 0 |
+
+`CXXConversionDecl` (`operator T() const`) nunca era coletado como método
+de `Record`; ganhou nome sintético `toStr` (escopado só ao alvo `Str`) e
+`lower_call_expr` passou a reconhecer `CXCursor_ConversionFunction` como
+alvo de chamada — cobrindo, com o mesmo fix, tanto a conversão explícita
+(`t.operator std::string()`) quanto a implícita (`std::string s = t;`),
+confirmado via `-Xclang -ast-dump` que ambas compartilham a mesma forma de
+`CXXMemberCallExpr`.
+
+**Descoberta importante, corrigindo a hipótese que motivou este lote:** a
+maior família visível no diagnóstico (`HumdrumToken`↔`Str`, ~756
+ocorrências) foi originalmente atribuída a um operador de conversão — mas a
+fonte real do Verovio (extraída de `test-resources/verovio-version-6.2.0.tar.gz`,
+já bundlada no repositório, sem precisar do checkout temporário do
+diagnóstico) mostra que `HumdrumToken` **herda publicamente de
+`std::string`** (`include/hum/humlib.h:1473`), sem nenhum operador de
+conversão declarado. É um mecanismo diferente — métodos `std::string`
+herdados diretamente, não uma conversão — que este lote não tinha como
+corrigir. A causa raiz real e a direção de solução recomendada (campo de
+suporte sintetizado, já que `HumdrumToken` armazena seu próprio texto como
+a sub-instância `std::string` herdada, sem campo visível para
+`record_fields_of` capturar) estão registradas na íntegra em
+`bailouts-verovio-6.2.0.md`.
+
+## Medição mais recente (2026-08-20, 6ª rodada: `sizeof`/`alignof` de tipo com layout conhecido — fecha a sessão)
+
+Sexto e último lote desta sessão do loop autônomo. Detalhe completo em
+`docs/plans/bailouts-verovio-6.2.0.md` ("Atualização de 2026-08-20 (6ª
+rodada)").
+
+| Métrica | Antes do lote | Depois do lote |
+| --- | ---: | ---: |
+| "cursor kind 136" (`sizeof`/`alignof`) | 254 | **0** |
+| Bailouts de expressão | 9.020 | **8.766** |
+| Bailouts de tipo/statement | 2.837/244, 430/17 | inalterados |
+| Tokens `dynamic` emitidos | 0 | 0 |
+
+`clang_Cursor_Evaluate` (já usado para literais inteiros/booleanos) já
+constant-folda `sizeof(T)`/`alignof(T)` para qualquer tipo com layout
+completo e conhecido — a mesma resolução de ABI que o `clang++` real usaria
+para compilar o C++ original, sem risco de valor errado. Confirmado com os
+dois usos reais encontrados na fonte extraída do Verovio (`crc.cpp`,
+`zip_file.hpp`).
+
+### Resumo da sessão (6 rodadas, mesmo dia)
+
+| Rodada | Causa corrigida | Efeito medido |
+| --- | --- | ---: |
+| 1 | switch/case, enum tipado, decl múltiplo, bug de parse em out-param | −1.764 bailouts |
+| 2 | `MemberRefExpr` normalizado (TypeRef/NamespaceRef vazando) | −504 expressões |
+| 3 | índice de campo/array aninhado | −131 bailouts |
+| 4 | chamada de valor callback (campo/parâmetro/variável) | causa eliminada (96+22+5→0) |
+| 5 | operador de conversão para `std::string` (genérico) | "cursor kind 26": 81→0 |
+| 6 | `sizeof`/`alignof` de tipo com layout conhecido | −254 expressões |
+
+Total: 14.477 → 12.033 bailouts (−17%), zero regressões, zero tokens
+`dynamic` introduzidos. A descoberta mais importante não foi uma correção,
+mas uma correção de rota: a maior família ainda aberta (`HumdrumToken`↔
+`Str`, ~756 ocorrências) não é conversão implícita — é herança pública de
+`std::string` (achado da 5ª rodada), uma decisão de mapeamento de tipo, não
+um bailout pontual. Fica registrada como o próximo alvo de maior
+alavancagem, com a causa raiz já confirmada na fonte real.
+
+## Medição mais recente (2026-08-20, 7ª rodada: `compare` de 3 args + cadeia `cout`/`cerr`)
+
+Sétimo lote do mesmo loop autônomo, mesma sessão. Detalhe completo em
+`docs/plans/bailouts-verovio-6.2.0.md` ("Atualização de 2026-08-20 (7ª
+rodada)").
+
+| Métrica | Antes do lote | Depois do lote |
+| --- | ---: | ---: |
+| "compare had 3 arguments" | 102 | **0** |
+| "basic_ostream::operator<< call" | 308 | **189** |
+| Bailouts de expressão | 8.766 | **8.623** |
+| Bailouts de tipo/statement | 2.837/244, 430/17 | inalterados |
+| Tokens `dynamic` emitidos | 0 | 0 |
+
+Três fixes: `std::string::compare(pos, len, other)` (a sobrecarga de 3
+argumentos, vira `substring(...).compareTo(...)`); `std::cout << ... <<
+std::endl` vira `print(...)`; `std::cerr << ... << std::endl` vira
+`stderr.writeln(...)` (`dart:io`, import via a mesma varredura pós-emissão
+já usada para `Uint8List`). Descoberta ao inspecionar a fonte real:
+`std::cerr` é mais comum que `std::cout` neste corpus (231 vs. 68). "operator<<
+free" (360) ficou inalterado — cadeias cujo elo mais externo já resolve como
+função livre não passam pelo ponto de entrada deste fix; próximo candidato
+natural. Nenhuma causa nova; nenhum token `dynamic`.
+
+### Progresso acumulado da sessão (7 rodadas)
+
+14.477 → **12.033 − 143 = 11.890** bailouts totais (tipos 2.837 + expressões
+8.623 + statements 430), uma redução de 2.587 ocorrências (−17,9%) desde o
+início da sessão, zero regressões em qualquer uma das sete remedições.
+
+## Medição mais recente (2026-08-20, 8ª rodada: idioma `std::find(...) != end()` vira `contains`)
+
+Oitavo lote do mesmo loop autônomo, mesma sessão. Detalhe completo em
+`docs/plans/bailouts-verovio-6.2.0.md` ("Atualização de 2026-08-20 (8ª
+rodada)").
+
+| Métrica | Antes do lote | Depois do lote |
+| --- | ---: | ---: |
+| "operator!= free" | (eliminado) | **0** |
+| "operator==" free | 254 | **223** |
+| Bailouts de expressão | 8.623 | **8.592** |
+| Bailouts de tipo/statement | 2.837/244, 430/17 | inalterados |
+| Tokens `dynamic` emitidos | 0 | 0 |
+
+`std::find(X.begin(), X.end(), v) != X.end()` reconhecido como uma
+comparação inteira e traduzido para `X.contains(v)` (forma negada `==` vira
+`!X.contains(v)`). Precisou de uma igualdade estrutural própria
+(`same_receiver_ignoring_origin`) porque o `PartialEq` derivado de `Expr`
+compara `Origin` também, e a mesma variável mencionada em três pontos do
+código-fonte tem três origens diferentes. Nenhuma causa nova; nenhum token
+`dynamic`.
+
+### Progresso acumulado da sessão (8 rodadas)
+
+14.477 → **11.859** bailouts totais (tipos 2.837 + expressões 8.592 +
+statements 430) — uma redução de 2.618 ocorrências (−18,1%) desde o início
+da sessão, zero regressões em qualquer uma das oito remedições.
+
+## Medição mais recente (2026-08-20, 9ª rodada: `dynamic_cast<T*>` em operando simples)
+
+Nono lote do mesmo loop autônomo, mesma sessão. Detalhe completo em
+`docs/plans/bailouts-verovio-6.2.0.md` ("Atualização de 2026-08-20 (9ª
+rodada)").
+
+| Métrica | Antes do lote | Depois do lote |
+| --- | ---: | ---: |
+| "cursor kind 125" (`CXXDynamicCastExpr`) | 195 | **0** |
+| Bailouts de expressão | 8.592 | **8.516** |
+| Bailouts de tipo/statement | 2.837/244, 430/17 | inalterados |
+| Tokens `dynamic` emitidos | 0 | 0 |
+
+`dynamic_cast<T*>(operand)` com operando simples (`this` ou referência
+local/parâmetro nua — a maioria real, confirmado via grep na fonte) vira
+`operand is T ? operand : null`, usando a promoção de tipo por fluxo do
+Dart dentro do ternário. Operando complexo (chamada, acesso de campo
+via chamada) fica de fora — avaliar `operand` duas vezes arriscaria
+duplicar efeito colateral, e este bridge não tem como hospedar uma
+temporária a partir do lowering puro de expressão. Nova variante de IR
+`Expr::Is`. Nenhuma causa nova além da esperada; nenhum token `dynamic`
+real.
+
+### Progresso acumulado da sessão (9 rodadas)
+
+14.477 → **11.783** bailouts totais (tipos 2.837 + expressões 8.516 +
+statements 430) — uma redução de 2.694 ocorrências (−18,6%) desde o início
+da sessão, zero regressões em qualquer uma das nove remedições.
+
+## Medição mais recente (2026-08-20, 10ª rodada: `new T(*this)`, idioma `Clone()` — fecha a sessão)
+
+Décimo lote do mesmo loop autônomo, mesma sessão. Detalhe completo em
+`docs/plans/bailouts-verovio-6.2.0.md` ("Atualização de 2026-08-20 (10ª
+rodada)").
+
+| Métrica | Antes do lote | Depois do lote |
+| --- | ---: | ---: |
+| "CXX new child was not a representable record construction" | 131 | **0** |
+| Bailouts de expressão | 8.516 | **8.385** |
+| Bailouts de tipo/statement | 2.837/244, 430/17 | inalterados |
+| Tokens `dynamic` emitidos | 0 | 0 |
+
+`new T(*this)` (o idioma `Clone()` do Verovio, achado real via grep na
+fonte) reconstruído como `RecordConstruct` campo a campo, reusando a mesma
+lógica de clone que `collect_params_with_clone_prelude` já usa para
+parâmetros por valor. Nenhuma causa nova; nenhum token `dynamic`.
+
+### Resumo da sessão (10 rodadas, mesmo dia)
+
+| Rodada | Causa corrigida | Efeito medido |
+| --- | --- | ---: |
+| 1 | switch/case, enum tipado, decl múltiplo, bug de parse em out-param | −1.764 bailouts |
+| 2 | `MemberRefExpr` normalizado (TypeRef/NamespaceRef vazando) | −504 expressões |
+| 3 | índice de campo/array aninhado | −131 bailouts |
+| 4 | chamada de valor callback (campo/parâmetro/variável) | causa eliminada (123→0) |
+| 5 | operador de conversão para `std::string` (genérico) | "cursor kind 26": 81→0 |
+| 6 | `sizeof`/`alignof` de tipo com layout conhecido | −254 expressões |
+| 7 | `compare` de 3 args + cadeia `cout`/`cerr` → `print`/`stderr.writeln` | −143 expressões |
+| 8 | idioma `std::find(...) != end()` → `contains` | "operator!=": eliminado |
+| 9 | `dynamic_cast<T*>` em operando simples | "cursor kind 125": 195→0 |
+| 10 | `new T(*this)` (idioma `Clone()`) | −131 expressões (família inteira) |
+
+Total: 14.477 → **8.385 + 2.837 + 430 = 11.652** bailouts (−19,5% desde o
+início da sessão), zero regressões em qualquer uma das dez remedições, zero
+tokens `dynamic` introduzidos. A descoberta mais importante da sessão não
+foi uma correção, mas uma correção de rota: a maior família ainda aberta
+(`HumdrumToken`↔`Str`, ~450+231+152 ocorrências) não é conversão implícita
+— é herança pública de `std::string` (achado da 5ª rodada), uma decisão de
+mapeamento de tipo, não um bailout pontual; fica registrada em
+`bailouts-verovio-6.2.0.md` como o próximo alvo de maior alavancagem, com a
+causa raiz já confirmada na fonte real. Dois outros itens grandes ficam
+deliberadamente adiados, ambos por precisarem de mudança arquitetural (não
+um fix de expressão isolada): suporte geral a iterador (`for (auto it =
+c.begin(); ...)`) e atribuição usada como expressão (`binary operator kind
+22`, 286 ocorrências) — ambos exigem hospedar uma statement-prelúdio a
+partir do lowering puro de expressão, algo que `lower_expr` hoje não tem
+como fazer.
+
+## Medição mais recente (2026-08-20, 11ª rodada: prefixo de codificação em literal de string)
+
+Décimo primeiro lote do mesmo loop autônomo, mesma sessão (continuação após
+uma pausa). Detalhe completo em `docs/plans/bailouts-verovio-6.2.0.md`
+("Atualização de 2026-08-20 (11ª rodada)").
+
+| Métrica | Antes do lote | Depois do lote |
+| --- | ---: | ---: |
+| "List(Int) to Nullable(Str)" | 336 | **63** |
+| Bailouts de expressão | 8.385 | **8.111** |
+| Bailouts de tipo/statement | 2.837/244, 430/17 | inalterados |
+| Tokens `dynamic` emitidos | 0 | 0 |
+
+`string_literal_text` não reconhecia o prefixo de codificação (`u8`/`u`/`U`/
+`L`) antes das aspas de abertura — `U"x"` (achado real:
+`Dynam::IsSymbolOnly`'s `return U"x";`) falhava a avaliação, cujo
+`Expr::Unsupported` era descartado silenciosamente pelo fallback do
+embrulho de conversão implícita, surgindo como uma mensagem sem relação
+com a causa raiz ("List(Int) to Nullable(Str)", já que o array decaído
+`char32_t[N]` lowera para `List(Int)`). Fix: achar as aspas pelo
+primeiro/último `"`, não presumir índice 0 — cobre os quatro prefixos de
+uma vez, sem introduzir nenhuma decisão de mapeamento nova (`u32string`
+etc. já eram `Type::Str`). Nenhuma causa nova; nenhum token `dynamic`.
+
+### Progresso acumulado da sessão (11 rodadas)
+
+14.477 → **11.378** bailouts totais (tipos 2.837 + expressões 8.111 +
+statements 430) — uma redução de 3.099 ocorrências (−21,4%) desde o início
+da sessão, zero regressões em qualquer uma das onze remedições.
+
+## Medição mais recente (2026-08-20, 12ª rodada: constante de enum anônimo + crash real corrigido no emissor)
+
+Décimo segundo lote do mesmo loop autônomo, mesma sessão. Detalhe completo
+em `docs/plans/bailouts-verovio-6.2.0.md` ("Atualização de 2026-08-20 (12ª
+rodada)").
+
+**Nota de processo importante:** esta rodada expôs um `unreachable!()` real
+em `emit::dart` (não um bailout, um pane de verdade), que interrompeu duas
+tentativas anteriores de medição — o `| tail -450` do pipe de diagnóstico
+mascarava a falha como saída bem-sucedida (`exit code 0`), fazendo a
+notificação de "completed" parecer confiável quando não era. Detectado só
+porque o log foi inspecionado por linhas de `panicked at`/`dart analyze`/
+`summary`, não só pelo status da tarefa. Causa raiz e fix documentados
+inteiramente no arquivo de bailouts; resumo: `lower_unary_expr` embrulhava
+um operando já `Expr::Unsupported` em `Expr::Convert` sem checar
+representabilidade — achado real em `json/jsonxx.h:275`.
+
+| Métrica | Antes do lote | Depois do lote |
+| --- | ---: | ---: |
+| Família "unnamed enum" em conversão implícita | ~330 | **11** |
+| Bailouts de expressão | 8.111 | **7.409** |
+| Bailouts de tipo | 2.837 | **2.802** |
+| Bailouts de statement | 430/17 | inalterado |
+| Panics no emissor | 1 (novo, corrigido) | **0** |
+| Tokens `dynamic` emitidos | 0 | 0 |
+
+### Progresso acumulado da sessão (12 rodadas)
+
+14.477 → **10.641** bailouts totais (tipos 2.802 + expressões 7.409 +
+statements 430) — uma redução de 3.836 ocorrências (−26,5%) desde o início
+da sessão, zero regressões em qualquer uma das doze remedições, e um crash
+real no emissor encontrado e corrigido (a única vez nesta sessão em que o
+pipeline de diagnóstico falhou de verdade, não só reportou um bailout).
+
+## Medição mais recente (2026-08-20, 13ª rodada: unário `+` — no-op)
+
+Décimo terceiro lote do mesmo loop autônomo, mesma sessão. Detalhe completo
+em `docs/plans/bailouts-verovio-6.2.0.md` ("Atualização de 2026-08-20 (13ª
+rodada)").
+
+| Métrica | Antes do lote | Depois do lote |
+| --- | ---: | ---: |
+| "unsupported unary operator kind 7" | 70 | **0** |
+| Bailouts de expressão | 7.409 | **7.339** |
+| Bailouts de tipo/statement | 2.802/241, 430/17 | inalterados |
+| Panics no emissor | 0 | 0 |
+| Tokens `dynamic` emitidos | 0 | 0 |
+
+Unário `+` (`m_fbstates[staffindex] = +1;`, achado real em
+`iohumdrum.cpp`) é um no-op verdadeiro; o operando lowera direto, sem
+embrulho. Também confirmado fora de escopo: o resíduo de "array subscript
+receiver..." (267) é aritmética de ponteiro/buffer cru em `pugixml.cpp` —
+família já deliberadamente adiada, não uma oportunidade nova. Nenhuma causa
+nova; nenhum panic; nenhum token `dynamic`.
+
+### Progresso acumulado da sessão (13 rodadas)
+
+14.477 → **10.571** bailouts totais (tipos 2.802 + expressões 7.339 +
+statements 430) — uma redução de 3.906 ocorrências (−27,0%) desde o início
+da sessão, zero regressões em qualquer uma das treze remedições.
+
+## Medição mais recente (2026-08-20, 14ª rodada: atribuição como expressão + rótulo de `case` constante)
+
+Décimo quarto lote do mesmo loop autônomo, mesma sessão. Detalhe completo em
+`docs/plans/bailouts-verovio-6.2.0.md` ("Atualização de 2026-08-20 (14ª
+rodada)").
+
+| Métrica | Antes do lote | Depois do lote |
+| --- | ---: | ---: |
+| Bailouts de tipo | 2.802/241 | **2.831/242** |
+| Bailouts de expressão | 7.339 | **7.125** |
+| Bailouts de statement | 430/17 | **437/18** |
+| Arquivos não-parseáveis | 2/301 | **1/301** |
+| Erros do `dart analyze` | 14.512 | **14.369** |
+| Avisos do `dart analyze` | 7.844 | 7.864 |
+| Panics no emissor | 0 | 0 |
+| Tokens `dynamic` emitidos | 0 | 0 |
+
+Três correções relacionadas, medidas juntas: (1) atribuição usada como
+expressão (`Expr::Assign`, achado real em `adjustarticfunctor.cpp:47`) —
+corrige a premissa registrada na 13ª rodada de que isso precisaria de
+"hoisting de statement"; verificado empiricamente que o `=` do Dart já é
+expressão de verdade; (2) rótulo de `case` que é expressão constante, não
+literal (achado real em `svgdevicecontext.cpp`'s `GetColor`, `case 255 <<
+16 | 255 << 8 | 255:`) — dobrado para seu valor inteiro via
+`clang_Cursor_Evaluate`; descoberto como regressão real durante a
+remedição desta rodada (`svgdevicecontext.dart` ficou não-parseável),
+provavelmente um bug latente pré-existente só agora exposto; (3)
+`Expr::Assign` não propagava um lado direito `Unsupported` (achado real em
+`jsonxx.h`'s `import(const String&)`), o que também fez `jsonxx.dart`
+ficar não-parseável na primeira remedição desta rodada — corrigido antes de
+confiar em qualquer medição. **1/301 arquivos não-parseáveis** ao final —
+melhor que a base histórica de 2/301 (`pugixml.dart` sozinho permanece,
+aritmética de ponteiro cru já deliberadamente adiada).
+
+### Progresso acumulado da sessão (14 rodadas)
+
+14.477 → **10.393** bailouts totais (tipos 2.831 + expressões 7.125 +
+statements 437) — uma redução de 4.084 ocorrências (−28,2%) desde o início
+da sessão, com duas regressões reais encontradas e corrigidas dentro da
+mesma remedição (não deixadas para uma rodada futura) antes do resultado
+final ser aceito.
+
+## Medição mais recente (2026-08-20, 15ª rodada: literal de `std::map`/`unordered_map`)
+
+Décimo quinto lote do mesmo loop autônomo, mesma sessão. Detalhe completo
+em `docs/plans/bailouts-verovio-6.2.0.md` ("Atualização de 2026-08-20 (15ª
+rodada)").
+
+| Métrica | Antes do lote | Depois do lote |
+| --- | ---: | ---: |
+| "unsupported expression cursor kind 119" (`InitListExpr`) | 150 | **45** |
+| Bailouts de expressão | 7.125 | **7.020** |
+| Bailouts de tipo/statement | 2.831/242, 437/18 | inalterados |
+| Arquivos não-parseáveis | 1/301 | 1/301 (inalterado) |
+| Erros do `dart analyze` | 14.369 | **14.287** |
+| Avisos do `dart analyze` | 7.864 | 7.864 |
+| Panics no emissor | 0 | 0 |
+| Tokens `dynamic` emitidos | 0 | 0 |
+
+Tabelas de consulta `static const std::map<K, V> nome{ {k1, v1}, ... };`
+(achado real em `midifunctor.cpp`/`iocmme.cpp`) — segundo maior
+contribuinte da família `InitListExpr`, atrás só do padrão de
+inicialização agregada como argumento/retorno (`push_back({a,b,c})`,
+`return {a,b,...}`), esse mantido fora de escopo. Novo nó de IR
+`Expr::MapLiteral`, emitido como `<K, V>{k1: v1, ...}` nativo do Dart.
+
+### Progresso acumulado da sessão (15 rodadas)
+
+14.477 → **10.288** bailouts totais (tipos 2.831 + expressões 7.020 +
+statements 437) — uma redução de 4.189 ocorrências (−28,9%) desde o início
+da sessão.
+
+## Medição mais recente (2026-08-20, 16ª rodada: constante `NULL`/`__null`)
+
+Décimo sexto lote do mesmo loop autônomo, mesma sessão. Detalhe completo em
+`docs/plans/bailouts-verovio-6.2.0.md` ("Atualização de 2026-08-20 (16ª
+rodada)").
+
+| Métrica | Antes do lote | Depois do lote |
+| --- | ---: | ---: |
+| "Int → Nullable(Record...)" (soma de todas as variantes) | ~1.013 | **0** |
+| Bailouts de expressão | 7.020 | **6.007** |
+| Causas distintas de expressão | 541 | **409** |
+| Bailouts de tipo/statement | 2.831/242, 437/18 | inalterados |
+| Arquivos não-parseáveis | 1/301 | 1/301 (inalterado) |
+| Erros do `dart analyze` | 14.287 | **14.236** |
+| Avisos do `dart analyze` | 7.864 | 7.913 |
+| Panics no emissor | 0 | 0 |
+| Tokens `dynamic` emitidos | 0 | 0 |
+
+Idioma pré-`nullptr` (`NULL`/GNU `__null`, achado real em
+`adjustaccidxfunctor.cpp:25`'s `m_currentMeasure = NULL;`) — `libclang`
+nunca dava handling a `CXCursor_GNUNullExpr`, mascarado pelo bailout mais
+genérico do wrapper de conversão implícita externo. Fix lowera
+`GNUNullExpr` direto para `Expr::NullLiteral`. Eliminou a família inteira
+(~1.013 ocorrências, bem mais que os dois maiores contribuintes isolados
+sugeriam — estava espalhada por dezenas de tipos de record diferentes).
+Nota de processo registrada no arquivo de bailouts: a primeira reprodução
+mínima (sem `#include <cstddef>`) deu um resultado enganoso por recuperação
+de erro do compilador, corrigida ao comparar contra `-Xclang -ast-dump`
+real antes de aceitar qualquer conclusão.
+
+### Progresso acumulado da sessão (16 rodadas)
+
+14.477 → **9.275** bailouts totais (tipos 2.831 + expressões 6.007 +
+statements 437) — uma redução de 5.202 ocorrências (−35,9%) desde o início
+da sessão.
+
 ## Veredito
 
 O mecanismo central escala: as 298 unidades de compilação passam pela

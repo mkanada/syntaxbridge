@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../project/project_models.dart';
-import 'ide_theme.dart';
+import 'external_toggle_button.dart';
 
 class SourceFilesView extends StatelessWidget {
   const SourceFilesView({
@@ -9,20 +9,23 @@ class SourceFilesView extends StatelessWidget {
     required this.project,
     required this.onFileSelected,
     this.selectedPath,
-    this.onMarkFileExternal,
+    this.externalFiles = const <String>{},
+    this.onToggleFileExternal,
   });
 
   final CreatedProject project;
   final ValueChanged<SourceFile> onFileSelected;
   final String? selectedPath;
 
-  /// Marks every type/function declared in a file external in one action
-  /// (decision 3, `docs/plans/lista-de-externos.md`: expands to that file's
-  /// usrs *now*, a one-time snapshot — not an ongoing "this file is
-  /// external" state, so unlike [TypesView]/[FunctionsView]'s per-row
-  /// control this isn't a toggle with an on/off icon). `null` hides the
-  /// per-row action entirely.
-  final ValueChanged<SourceFile>? onMarkFileExternal;
+  /// Every file currently holding a persistent external mark (item 3,
+  /// `docs/prompts/2026-08-19-mudanca-interacao.md` — a reversal of decision
+  /// 3's cascade-snapshot behavior in `docs/plans/lista-de-externos.md`),
+  /// keyed by [SourceFile.path]. Drives each row's toggle icon state.
+  final Set<String> externalFiles;
+
+  /// Toggles a whole file's persistent external mark. `null` hides the
+  /// per-row control entirely.
+  final ValueChanged<SourceFile>? onToggleFileExternal;
 
   @override
   Widget build(BuildContext context) {
@@ -42,6 +45,7 @@ class SourceFilesView extends StatelessWidget {
             itemBuilder: (context, index) {
               final file = files[index];
               final relativePath = _projectRelativeFile(file.path);
+              final isExternal = externalFiles.contains(file.path);
 
               return ListTile(
                 contentPadding: EdgeInsets.zero,
@@ -52,15 +56,11 @@ class SourceFilesView extends StatelessWidget {
                       : Icons.article_outlined,
                 ),
                 title: Text(relativePath),
-                trailing: onMarkFileExternal == null
+                trailing: onToggleFileExternal == null
                     ? null
-                    : IconButton(
-                        iconSize: 16,
-                        visualDensity: VisualDensity.compact,
-                        tooltip: 'Marcar tudo neste arquivo como externo',
-                        color: IdePalette.muted,
-                        icon: const Icon(Icons.link),
-                        onPressed: () => onMarkFileExternal!(file),
+                    : ExternalToggleButton(
+                        isExternal: isExternal,
+                        onPressed: () => onToggleFileExternal!(file),
                       ),
                 onTap: () => onFileSelected(file),
               );
@@ -71,18 +71,31 @@ class SourceFilesView extends StatelessWidget {
     );
   }
 
+  /// Displays [file] relative to the C++ project itself: strips
+  /// `project.inputSourceDir` (where the uploaded archive was unpacked) and
+  /// the archive's own root folder, since neither is meaningful to the user.
+  /// A file sitting directly under `input-source/`, with no archive-root
+  /// folder above it, is left as-is past that prefix.
   String _projectRelativeFile(String file) {
-    final normalizedProjectDir = _stripTrailingSlash(project.projectDir);
-    if (normalizedProjectDir.isEmpty) {
+    final normalizedInputSourceDir = _stripTrailingSlash(
+      project.inputSourceDir,
+    );
+    if (normalizedInputSourceDir.isEmpty) {
       return file;
     }
 
-    final prefix = '$normalizedProjectDir/';
-    if (file.startsWith(prefix)) {
-      return file.substring(prefix.length);
+    final prefix = '$normalizedInputSourceDir/';
+    if (!file.startsWith(prefix)) {
+      return file;
     }
 
-    return file;
+    final rest = file.substring(prefix.length);
+    final archiveRootEnd = rest.indexOf('/');
+    if (archiveRootEnd == -1) {
+      return rest;
+    }
+
+    return rest.substring(archiveRootEnd + 1);
   }
 
   String _stripTrailingSlash(String path) {
