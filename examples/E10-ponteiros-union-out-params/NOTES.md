@@ -48,15 +48,23 @@ realmente precisava de correção.
   a resposta honesta ("talvez a resposta certa seja recusar"). Fica em
   aberto para quando um caso de uso real (não sintético) justificar o
   custo.
-- **Nenhuma tentativa de reconhecer o idioma de "out param"** (`void
-  f(int a, int b, int* resultado)` → `int f(int a, int b)` retornando o
-  valor por `resultado`, ou um record Dart de verdade para múltiplos
-  out params). Seria uma ponte genuína e possível — Dart tem records
-  nativos (`(int, int)`) desde a versão 3 — mas exigiria detectar o
-  padrão de uso (parâmetro só escrito, nunca lido) e reescrever
-  assinatura, retorno e call sites juntos; nenhum fixture força essa
-  complexidade ainda, e a resposta "recusar" já é honesta e correta para
-  o padrão de ponteiro cru puro que este fixture usa.
+- **Atualização (round 19 do loop de bailouts, `docs/prompts/2026-08-20-loop-bailout.md`):
+  o idioma de "out param" por ponteiro passou a ser reconhecido.** `int*
+  a` (e `int&`/`double&`/`bool&` na forma de referência, já suportada
+  desde E13) agora vira um parâmetro Dart comum do tipo do próprio
+  ponteiro (`int a`, não `int? a`) mais um slot no record de retorno
+  (`(int, int) trocar(int a, int b)`), com o call site desconstruindo o
+  record de volta nas variáveis do chamador (`(a, b) = trocar(a, b);`).
+  `trocar` neste fixture — cujo único propósito é justamente esse idioma
+  — deixou de ser um bailout honesto para virar Dart real, exercitando o
+  próprio golden deste degrau. Escopo continua restrito a ponteiro para
+  escalar puro (`int`/`double`/`bool`; um buffer nomeado como
+  `mz_uint8*`/`uint8_t*` continua `Bytes`, nunca reinterpretado como
+  out-param) e a um argumento de chamada com a forma exata `&lvalue`
+  (`nullptr` ou qualquer outra forma vira bailout explícito, nunca um
+  `ExprStmt` que descartaria o record de retorno silenciosamente). `union
+  ValorBruto` continua fora de escopo, sem mudança — a decisão de não
+  gerar `dart:ffi` real para `struct`/`union` acima permanece.
 - **`mapping::signature_options_for`** (o solver que já detecta ponteiro,
   inteiro de largura fixa, `float`, `setjmp`/`goto`/mutex por assinatura)
   **não é consultado pela geração aqui**, pela mesma razão do E08/E09: o

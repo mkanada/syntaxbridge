@@ -145,9 +145,20 @@ pub fn monomorphized_template_name(base_name: &str, cursor: clang_sys::CXCursor)
 
 /// The 0-based parameter positions, among `cursor`'s own declared
 /// parameters, of every non-`const` scalar (`Int`/`Double`/`Bool`)
-/// reference — C++'s "out parameter" idiom (`void f(int &out)`), never
-/// generalized past this (a reference to a `Record`/`Str`/`List` here is
-/// left alone; no fixture needs it). `cursor` may be a function/method
+/// reference or pointer — C++'s "out parameter" idiom, both its reference
+/// form (`void f(int &out)`) and its pointer form (`void f(int *out)`,
+/// the older/C-compatible spelling — confirmed the *dominant* real shape
+/// of a bare mutable scalar pointer *parameter* by grepping the actual
+/// Verovio source directly, round 19: `editortoolkit_neume.h`'s
+/// `ParseDragAction(..., int *x, int *y)`, `win_getopt.h`'s `int *idx`,
+/// `zip_file.hpp`'s `mz_uint32 *pIndex` — every real example found was a
+/// single scalar write-back, never an indexed buffer — the same
+/// "non-const scalar reference is an out-param, not aliased state" bar
+/// `is_non_const_scalar_out_param_type` already applied unconditionally
+/// to the reference form. Never generalized past a bare scalar (a
+/// reference/pointer to `Record`/`Str`/`List`/`Bytes` is left alone; those
+/// already have their own precise representations that a blind pointer
+/// buffer would misrepresent). `cursor` may be a function/method
 /// *declaration* (`clang_Cursor_getNumArguments`/`getArgument` work on a
 /// declaration exactly like on a call, per `lower_call_arguments`'s own
 /// doc comment) — used both by `apply_out_param_bridge`, from the
@@ -155,7 +166,7 @@ pub fn monomorphized_template_name(base_name: &str, cursor: clang_sys::CXCursor)
 /// from a *call*'s resolved callee — so a call site and its callee can
 /// never disagree about which parameters were bridged. Empty (the
 /// overwhelmingly common case) for anything else, including a `const`
-/// reference (E05's own by-reference `std::string`/`std::vector`
+/// reference/pointer (E05's own by-reference `std::string`/`std::vector`
 /// parameters, read-only, correctly untouched by this).
 unsafe fn out_param_indices(cursor: clang_sys::CXCursor) -> Vec<usize> {
     let count = unsafe { clang_sys::clang_Cursor_getNumArguments(cursor) };
@@ -166,24 +177,114 @@ unsafe fn out_param_indices(cursor: clang_sys::CXCursor) -> Vec<usize> {
         .filter(|&index| {
             let param_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, index) };
             let cx_type = unsafe { clang_sys::clang_getCursorType(param_cursor) };
-            unsafe { is_non_const_scalar_reference(cx_type) }
+            unsafe { is_non_const_scalar_out_param_type(cx_type) }
         })
         .map(|index| index as usize)
         .collect()
 }
 
-unsafe fn is_non_const_scalar_reference(cx_type: clang_sys::CXType) -> bool {
-    if cx_type.kind != clang_sys::CXType_LValueReference {
+unsafe fn is_non_const_scalar_out_param_type(cx_type: clang_sys::CXType) -> bool {
+    if cx_type.kind != clang_sys::CXType_LValueReference && cx_type.kind != clang_sys::CXType_Pointer
+    {
         return false;
     }
     let pointee = unsafe { clang_sys::clang_getPointeeType(cx_type) };
     if unsafe { clang_sys::clang_isConstQualifiedType(pointee) } != 0 {
         return false;
     }
+    // A pointer (never a reference — `mz_uint8&`/`char&` isn't a shape
+    // this corpus uses) whose pointee already has a *more specific*
+    // representation of its own — a named byte-buffer alias
+    // (`mz_uint8`/`uint8_t`, real trigger:
+    // `a_known_byte_buffer_pointer_lowers_to_a_nullable_uint8_list`'s own
+    // `mz_uint8* output`) or a text character type (`char`/`wchar_t`/...)
+    // — is that representation (`Bytes`/`Str` via `lower_type`'s own
+    // pointer branch), never a bare-scalar out-param: both alternatives
+    // lower `pointee` to `Type::Int` on its own (a byte/character *is* a
+    // small integer), which would otherwise make this indistinguishable
+    // from a genuine `int*`/`size_t*` out-param.
+    if cx_type.kind == clang_sys::CXType_Pointer {
+        let pointee_spelling = unsafe {
+            type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(pointee))
+        };
+        if is_known_byte_buffer_type(&pointee_spelling) || unsafe { is_text_character_type(pointee) }
+        {
+            return false;
+        }
+    }
     matches!(
         lower_type(pointee),
         ir::Type::Int | ir::Type::Double | ir::Type::Bool
     )
+}
+
+// Scoped registry of *pointer*-shaped out-param names currently standing
+// for their pointee's own type, while a function/method body that has one
+// is being lowered — round 19's pointer form of the out-param bridge.
+// Unlike the reference form (`int &out`, which C++ itself never lets the
+// body write through explicit `*`/`&` syntax — `out` already reads exactly
+// like an ordinary local), the pointer form (`int *out`) is written and
+// read through explicit `*out`/`&out` in the body, and `lower_unary_expr`'s
+// `Deref`/`AddrOf` handling normally keys entirely off `lower_type` on the
+// operand's own *declared* C++ type (`int *`, still `Type::Unsupported` —
+// `out_param_indices`'s parameter-type rewrite in `apply_out_param_bridge`
+// only touches the `ir::Param` list, built *before* body lowering, not the
+// raw clang type `lower_unary_expr` re-derives independently). Same
+// thread-local-stack shape as `ACTIVE_ITERATOR_LOOPS` (round 18) and the
+// same reasoning for why: `lower_stmt`/`lower_expr` have no context
+// parameter to carry this through, and each compilation unit lowers on its
+// own worker thread.
+thread_local! {
+    static ACTIVE_POINTER_OUT_PARAMS: RefCell<Vec<(String, ir::Type)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// The pointer-shaped (not reference-shaped — those need no interception,
+/// see the registry's own doc comment) out-params of `cursor`, as
+/// `(dart_name, pointee_type)` pairs ready to push onto
+/// `ACTIVE_POINTER_OUT_PARAMS` before lowering its body.
+unsafe fn pointer_out_param_bindings(cursor: clang_sys::CXCursor) -> Vec<(String, ir::Type)> {
+    unsafe { out_param_indices(cursor) }
+        .into_iter()
+        .filter_map(|index| {
+            let param_cursor =
+                unsafe { clang_sys::clang_Cursor_getArgument(cursor, index as c_uint) };
+            let cx_type = unsafe { clang_sys::clang_getCursorType(param_cursor) };
+            if cx_type.kind != clang_sys::CXType_Pointer {
+                return None;
+            }
+            let name = dart_safe_identifier(&unsafe {
+                type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(param_cursor))
+            });
+            let pointee_ty = lower_type(unsafe { clang_sys::clang_getPointeeType(cx_type) });
+            Some((name, pointee_ty))
+        })
+        .collect()
+}
+
+fn push_active_pointer_out_params(bindings: &[(String, ir::Type)]) {
+    ACTIVE_POINTER_OUT_PARAMS.with(|stack| {
+        stack.borrow_mut().extend(bindings.iter().cloned());
+    });
+}
+
+fn pop_active_pointer_out_params(count: usize) {
+    ACTIVE_POINTER_OUT_PARAMS.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        let new_len = stack.len().saturating_sub(count);
+        stack.truncate(new_len);
+    });
+}
+
+fn active_pointer_out_param_type(name: &str) -> Option<ir::Type> {
+    ACTIVE_POINTER_OUT_PARAMS.with(|stack| {
+        stack
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(active_name, _)| active_name == name)
+            .map(|(_, ty)| ty.clone())
+    })
 }
 
 /// Rewrites `return_type`/`body` in place to bridge C++'s "out parameter"
@@ -195,7 +296,7 @@ unsafe fn is_non_const_scalar_reference(cx_type: clang_sys::CXType) -> bool {
 /// from both `lower_function` and `lower_method` for exactly that reason.
 unsafe fn apply_out_param_bridge(
     cursor: clang_sys::CXCursor,
-    params: &[ir::Param],
+    params: &mut [ir::Param],
     return_type: &mut ir::Type,
     body: &mut Vec<ir::Stmt>,
     origin: &ir::Origin,
@@ -206,6 +307,26 @@ unsafe fn apply_out_param_bridge(
     let indices = unsafe { out_param_indices(cursor) };
     if indices.is_empty() {
         return;
+    }
+
+    // The reference form of an out-param already gets the right Dart
+    // parameter type for free: `lower_type`'s `CXType_LValueReference`
+    // branch unwraps straight to the pointee's own lowered type (a
+    // reference can't be null, so no `Nullable` wrapper). The pointer
+    // form doesn't: `lower_type`'s `CXType_Pointer` branch has no `Known`
+    // shape for a bare scalar pointee (only object/collection pointees
+    // do), so it fell through to `Type::Unsupported` before
+    // `out_param_indices` above ever got a say — this is the one place
+    // that already knows "this specific parameter is a recognized
+    // out-param", so it's the right place to correct it, by re-deriving
+    // the type directly from the pointee rather than trusting whatever
+    // `collect_params_with_clone_prelude` already put in `params[index]`.
+    for &index in &indices {
+        let param_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, index as c_uint) };
+        let cx_type = unsafe { clang_sys::clang_getCursorType(param_cursor) };
+        if cx_type.kind == clang_sys::CXType_Pointer {
+            params[index].ty = lower_type(unsafe { clang_sys::clang_getPointeeType(cx_type) });
+        }
     }
 
     replace_void_returns_with_tuple(body, &indices, params, origin);
@@ -363,15 +484,18 @@ pub fn lower_function(
     let origin = ir::Origin { file, line, column };
 
     let mut return_type = lower_type(unsafe { clang_sys::clang_getCursorResultType(cursor) });
-    let (params, clone_prelude) =
+    let (mut params, clone_prelude) =
         unsafe { collect_params_with_clone_prelude(cursor, &origin, project_root) };
     let body_cursor = unsafe { find_compound_stmt_child(cursor) };
+    let pointer_out_params = unsafe { pointer_out_param_bindings(cursor) };
+    push_active_pointer_out_params(&pointer_out_params);
     let mut body = match body_cursor {
         Some(compound) => unsafe { lower_compound_stmt(compound, project_root) },
         None => Vec::new(),
     };
+    pop_active_pointer_out_params(pointer_out_params.len());
     body.splice(0..0, clone_prelude);
-    unsafe { apply_out_param_bridge(cursor, &params, &mut return_type, &mut body, &origin) };
+    unsafe { apply_out_param_bridge(cursor, &mut params, &mut return_type, &mut body, &origin) };
 
     Some(ir::Function {
         name,
@@ -471,7 +595,7 @@ pub fn lower_method(
     let origin = ir::Origin { file, line, column };
 
     let mut return_type = lower_type(unsafe { clang_sys::clang_getCursorResultType(cursor) });
-    let (params, clone_prelude) =
+    let (mut params, clone_prelude) =
         unsafe { collect_params_with_clone_prelude(cursor, &origin, project_root) };
     // A pure virtual method (`virtual T f() = 0;`) has no body cursor at
     // all — `body: None` models that directly (E06's abstract-method case)
@@ -482,12 +606,17 @@ pub fn lower_method(
         None
     } else {
         let body_cursor = unsafe { find_compound_stmt_child(cursor) };
+        let pointer_out_params = unsafe { pointer_out_param_bindings(cursor) };
+        push_active_pointer_out_params(&pointer_out_params);
         let mut body = match body_cursor {
             Some(compound) => unsafe { lower_compound_stmt(compound, project_root) },
             None => Vec::new(),
         };
+        pop_active_pointer_out_params(pointer_out_params.len());
         body.splice(0..0, clone_prelude);
-        unsafe { apply_out_param_bridge(cursor, &params, &mut return_type, &mut body, &origin) };
+        unsafe {
+            apply_out_param_bridge(cursor, &mut params, &mut return_type, &mut body, &origin)
+        };
         Some(body)
     };
     let is_static = unsafe { clang_sys::clang_CXXMethod_isStatic(cursor) } != 0;
@@ -2840,19 +2969,64 @@ unsafe fn lower_stmt(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::St
         if unsafe { clang_sys::clang_Cursor_isNull(referenced) } == 0 {
             let out_indices = unsafe { call_out_param_arg_indices(referenced) };
             if !out_indices.is_empty() {
-                let targets: Vec<ir::Expr> = out_indices
+                let target_cursors: Option<Vec<clang_sys::CXCursor>> = out_indices
                     .iter()
-                    .map(|&index| {
-                        let arg_cursor =
-                            unsafe { clang_sys::clang_Cursor_getArgument(cursor, index as c_uint) };
-                        unsafe { lower_expr(arg_cursor, project_root) }
-                    })
+                    .map(|&index| unsafe { out_arg_target_cursor(referenced, cursor, index) })
                     .collect();
-                let value = unsafe { lower_expr(cursor, project_root) };
-                return ir::Stmt::TupleAssign {
-                    targets,
-                    value,
-                    origin,
+                return match target_cursors {
+                    Some(target_cursors) => {
+                        let targets: Vec<ir::Expr> = target_cursors
+                            .into_iter()
+                            .map(|target_cursor| unsafe {
+                                lower_expr(target_cursor, project_root)
+                            })
+                            .collect();
+                        let mut value = unsafe { lower_expr(cursor, project_root) };
+                        // The pointer form's raw C++ argument is `&a`, not a
+                        // Dart-representable value on its own — `lower_expr`
+                        // above just lowered it generically (an
+                        // `address-of`, `Unsupported` for a bare scalar
+                        // pointee). The bridged Dart *call*, though, takes
+                        // `a` itself as a plain input parameter (mirroring
+                        // exactly how the reference form already calls
+                        // `Reduce(numerador, denominador)` with no `&` at
+                        // all) — so each out-arg slot in the already-lowered
+                        // `Expr::Call`'s own argument list is overwritten
+                        // with the same target expression `targets` already
+                        // resolved, rather than trusting the generic
+                        // address-of lowering neither needs nor can produce
+                        // here.
+                        if let ir::Expr::Call { args, .. } = &mut value {
+                            for (&index, target) in out_indices.iter().zip(&targets) {
+                                if let Some(arg) = args.get_mut(index) {
+                                    *arg = target.clone();
+                                }
+                            }
+                        }
+                        ir::Stmt::TupleAssign {
+                            targets,
+                            value,
+                            origin,
+                        }
+                    }
+                    // A pointer-shaped out-arg that isn't a plain `&lvalue`
+                    // (`nullptr`, opting out of that output; a temporary;
+                    // any other shape) has no Dart target to assign into.
+                    // An honest statement-level bailout here, not a silent
+                    // fall-through to `is_known_expression_kind` below: that
+                    // path would lower this same cursor as a bare
+                    // `ExprStmt`, evaluating the call and *discarding* its
+                    // return value — which is exactly the out-param tuple
+                    // this call's callee was rewritten to return. Discarding
+                    // it would silently drop whatever the call was
+                    // called for, the "compiles and is wrong" failure this
+                    // module's own bailout discipline exists to prevent.
+                    None => ir::Stmt::Unsupported {
+                        reason: "call to an out-param-bridged function had an argument this \
+                                 module couldn't resolve back to an assignable target"
+                            .to_owned(),
+                        origin,
+                    },
                 };
             }
         }
@@ -3278,6 +3452,44 @@ unsafe fn call_out_param_arg_indices(referenced: clang_sys::CXCursor) -> Vec<usi
     unsafe { out_param_indices(referenced) }
 }
 
+/// The cursor a bridged out-arg (position `index` in `call_cursor`'s raw
+/// arguments) should be lowered as, to become one `Stmt::TupleAssign`
+/// target — `None` when it can't be resolved to a plain assignable lvalue.
+/// The reference form of an out-param binds implicitly at the call site
+/// (`Reduce(numerador, denominador)`, no `&`): the raw argument cursor is
+/// already the target. The pointer form needs `&numerador`/`&x` written
+/// explicitly in the source — the argument cursor is a `UnaryOperator`
+/// address-of wrapping the real target, which needs unwrapping first, and
+/// `None` (not a guess) for anything that isn't exactly that shape (a
+/// `nullptr` opt-out, a temporary, ...). `referenced`'s own declared
+/// parameter type at `index`, not the *lowered* `ir::Param` (unavailable
+/// here, and irrelevant: only the C++ reference-vs-pointer *shape* decides
+/// which unwrapping applies).
+unsafe fn out_arg_target_cursor(
+    referenced: clang_sys::CXCursor,
+    call_cursor: clang_sys::CXCursor,
+    index: usize,
+) -> Option<clang_sys::CXCursor> {
+    let arg_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, index as c_uint) };
+    let param_cursor = unsafe { clang_sys::clang_Cursor_getArgument(referenced, index as c_uint) };
+    let param_type = unsafe { clang_sys::clang_getCursorType(param_cursor) };
+    if param_type.kind != clang_sys::CXType_Pointer {
+        return Some(arg_cursor);
+    }
+    let unwrapped = unsafe { unwrap_transparent_value_cursor(arg_cursor) };
+    if unsafe { clang_sys::clang_getCursorKind(unwrapped) } != clang_sys::CXCursor_UnaryOperator
+        || unsafe { clang_sys::clang_getCursorUnaryOperatorKind(unwrapped) }
+            != clang_sys::CXUnaryOperator_AddrOf
+    {
+        return None;
+    }
+    let children = unsafe { collect_children(unwrapped) };
+    let [operand_cursor] = children.as_slice() else {
+        return None;
+    };
+    Some(*operand_cursor)
+}
+
 /// `int total = 0;` — a `DeclStmt` wrapping exactly one `VarDecl`. Multiple
 /// declarators in one statement (`int a = 0, b = 1;`) aren't in any E01–E03
 /// fixture; reported as `Unsupported` rather than guessing which one to
@@ -3667,6 +3879,20 @@ unsafe fn lower_assign_stmt(
     ) {
         return ir::Stmt::ExprAssign {
             target,
+            value,
+            origin,
+        };
+    }
+    // `*out = value` where `out` is a pointer-shaped out-param (round 19):
+    // `lhs_kind` here is `CXCursor_UnaryOperator` (a dereference), not
+    // `CXCursor_DeclRefExpr`, so the plain-variable branch above never
+    // fires — but `lower_unary_expr`'s own out-param check already
+    // resolved this exact `target` down to the same `Expr::Ref` shape that
+    // branch produces (the parameter *is* the pointee, per the bridge), so
+    // it gets the identical `Stmt::Assign` treatment here.
+    if let ir::Expr::Ref { name, .. } = target {
+        return ir::Stmt::Assign {
+            name,
             value,
             origin,
         };
@@ -4850,6 +5076,38 @@ unsafe fn lower_unary_expr(
     // as transparent as a parenthesized wrapper.
     if operator_kind == clang_sys::CXUnaryOperator_Plus {
         return unsafe { lower_expr(*operand_cursor, project_root) };
+    }
+
+    // `*out` where `out` is a pointer-shaped out-param (round 19,
+    // `pointer_out_param_bindings`/`ACTIVE_POINTER_OUT_PARAMS`): this
+    // bridge already treats the parameter itself as directly holding the
+    // pointee's value (its own `ir::Param.ty` is the pointee type, not
+    // `Nullable`/`Unsupported`), so `*out` needs no conversion at all —
+    // it *is* `out`. Checked before the general
+    // `CXUnaryOperator_Deref`/`AddrOf` handling below, which keys off
+    // `lower_type` on the operand's raw declared type (`int *`, still
+    // `Type::Unsupported` — that rewrite only ever touched the `ir::Param`
+    // list, not what this function independently re-derives from the
+    // cursor) and would otherwise report the same honest-but-now-wrong
+    // "dereference requires a representable nullable reference" bailout
+    // for a case this module already has a precise answer for.
+    let unwrapped_operand_cursor = unsafe { unwrap_transparent_value_cursor(*operand_cursor) };
+    if operator_kind == clang_sys::CXUnaryOperator_Deref
+        && unsafe { clang_sys::clang_getCursorKind(unwrapped_operand_cursor) }
+            == clang_sys::CXCursor_DeclRefExpr
+    {
+        let operand_name = dart_safe_identifier(&unsafe {
+            type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(
+                unwrapped_operand_cursor,
+            ))
+        });
+        if let Some(pointee_ty) = active_pointer_out_param_type(&operand_name) {
+            return ir::Expr::Ref {
+                name: operand_name,
+                ty: pointee_ty,
+                origin,
+            };
+        }
     }
 
     // A raw pointer is represented only when its pointee is already a Dart

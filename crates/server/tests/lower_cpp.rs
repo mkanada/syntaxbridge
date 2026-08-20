@@ -4094,6 +4094,86 @@ public:
     );
 }
 
+/// Round 19: the out-param bridge (E10/achado 5) only recognized C++'s
+/// *reference* out-param idiom (`void f(int &out)`); the older, equally
+/// common *pointer* spelling (`void f(int *out)`, real trigger:
+/// `editortoolkit_neume.h`'s `ParseDragAction(..., int *x, int *y)`,
+/// `win_getopt.h`'s `int *idx`) fell through to `Type::Unsupported`
+/// entirely, since `lower_type`'s pointer branch has no `Known` shape for
+/// a bare scalar pointee. `int *`/`size_t *`/etc. were consistently the
+/// single largest residual family in `unsupported_types` after the void*
+/// bridge (round 17) — grepping the real Verovio source confirmed every
+/// sampled real occurrence is a single-value write-back, never an indexed
+/// buffer, the same idiom the reference form already covers.
+#[test]
+fn a_pointer_out_param_bridges_to_a_dart_tuple_return() {
+    let source = lower_and_emit(
+        "lower-cpp-pointer-out-param",
+        r#"
+void GetPoint(int *x, int *y) {
+    *x = 10;
+    *y = 20;
+}
+
+int sum() {
+    int a = 0;
+    int b = 0;
+    GetPoint(&a, &b);
+    return a + b;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("(int, int) GetPoint(int x, int y)"),
+        "expected the pointer out-params to become a Dart tuple return, got:\n{source}"
+    );
+    assert!(
+        source.contains("(a, b) = GetPoint(a, b);"),
+        "expected the call site to pass the caller's own variables as input and destructure \
+         the tuple back into them, got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "pointer out-param bridge must not bail out, got:\n{source}"
+    );
+}
+
+/// A pointer out-arg that isn't a plain `&lvalue` (`nullptr`, opting out of
+/// that particular output — a real, valid C++ call a caller can make even
+/// though this bridge has no Dart target to write it into) must become an
+/// honest statement-level bailout, not a silently-wrong `ExprStmt` that
+/// evaluates the call and discards the very tuple the out-params were
+/// bridged into.
+#[test]
+fn a_pointer_out_param_call_with_a_null_argument_bails_out_honestly() {
+    let source = lower_and_emit(
+        "lower-cpp-pointer-out-param-null-arg",
+        r#"
+#include <cstddef>
+
+void GetPoint(int *x, int *y) {
+    if (x) *x = 10;
+    if (y) *y = 20;
+}
+
+void only_x(int *a) {
+    GetPoint(a, nullptr);
+}
+"#,
+    );
+
+    assert!(
+        source.contains("Unsupported"),
+        "expected an honest bailout for the nullptr out-arg, got:\n{source}"
+    );
+    assert!(
+        !source.contains("GetPoint(a, nullptr)") && !source.contains("GetPoint(a, null)"),
+        "the call must not survive as a bare (value-discarding) expression statement, \
+         got:\n{source}"
+    );
+}
+
 /// `void*`/`const void*` — the single largest type bailout in the
 /// 2026-08-20 Verovio diagnosis (896 + 253 occurrences), real shapes
 /// confirmed by grepping the extracted Verovio source directly

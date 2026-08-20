@@ -1,11 +1,8 @@
-void trocar(
-  SyntaxBridgeOpaque /* unsupported: int * */ a,
-  SyntaxBridgeOpaque /* unsupported: int * */ b,
-) {
-  // TODO(syntax-bridge): unsupported parameter type: int * (parameter `a`)
-  throw UnimplementedError(
-    '/home/mauricio/rust_projects/syntax-bridge/examples/E10-ponteiros-union-out-params/input/src/ponteiros.cpp:3: unsupported parameter type: int * (parameter `a`)',
-  );
+(int, int) trocar(int a, int b) {
+  int temp = a;
+  a = b;
+  b = temp;
+  return (a, b);
 }
 
 double lerComoFlutuante(
