@@ -881,6 +881,866 @@ fn field_and_method_access_through_a_nullable_pointer_gets_a_non_null_assertion(
     );
 }
 
+fn nota_ref_ty() -> Type {
+    Type::Nullable(Box::new(Type::Record {
+        usr: "c:@S@Nota".to_owned(),
+        name: "Nota".to_owned(),
+    }))
+}
+
+fn nullable_ref(name: &str, line: u32) -> Expr {
+    Expr::Ref {
+        name: name.to_owned(),
+        ty: nota_ref_ty(),
+        origin: origin(line),
+    }
+}
+
+fn altura_read(receiver: Expr, line: u32) -> Expr {
+    Expr::FieldAccess {
+        target: Box::new(receiver),
+        field: "altura".to_owned(),
+        ty: Type::Int,
+        origin: origin(line),
+    }
+}
+
+fn int_var_decl(name: &str, init: Expr, line: u32) -> Stmt {
+    Stmt::VarDecl {
+        name: name.to_owned(),
+        ty: Type::Int,
+        init: Some(init),
+        origin: origin(line),
+    }
+}
+
+/// Dart's flow-sensitive type promotion: once a local/parameter has been
+/// forced non-null with `!`, Dart's own analyzer treats every later read of
+/// that *same* local as already non-null and flags a repeated `!` as
+/// `unnecessary_non_null_assertion` — `receiver_bang` used to decide the `!`
+/// purely from the receiver's static type, with no notion of "already
+/// checked this flow", so it repeated the `!` on every dereference (real
+/// Verovio 6.2.0 diagnostic evidence: 6107 occurrences across 77 files, see
+/// `docs/prompts/2026-08-21-04-bang-redundante-e-promocao.md`).
+#[test]
+fn a_promoted_pointer_parameter_skips_the_redundant_non_null_assertion_on_later_reads() {
+    let processa = Function {
+        name: "Processa".to_owned(),
+        usr: "c:@F@Processa#*$@S@Nota#*$@S@Nota#".to_owned(),
+        params: vec![
+            Param {
+                name: "a".to_owned(),
+                ty: nota_ref_ty(),
+                default_value: None,
+            },
+            Param {
+                name: "b".to_owned(),
+                ty: nota_ref_ty(),
+                default_value: None,
+            },
+        ],
+        return_type: Type::Void,
+        body: vec![
+            int_var_decl("x1", altura_read(nullable_ref("a", 3), 3), 3),
+            int_var_decl("x2", altura_read(nullable_ref("a", 4), 4), 4),
+            int_var_decl("y1", altura_read(nullable_ref("b", 5), 5), 5),
+            int_var_decl("y2", altura_read(nullable_ref("b", 6), 6), 6),
+        ],
+        origin: origin(2),
+    };
+
+    let module = Module {
+        records: Vec::new(),
+        functions: vec![processa],
+        enums: Vec::new(),
+    };
+    let files = emit_module(&module);
+    let source = &files["lib/aritmetica.dart"];
+
+    let expected_body = "\
+  int x1 = a!.altura;
+  int x2 = a.altura;
+  int y1 = b!.altura;
+  int y2 = b.altura;
+";
+    assert!(
+        source.contains(expected_body),
+        "expected only the first read of each parameter to carry '!', got:\n{source}"
+    );
+}
+
+/// The safety half of the same rule: an assignment invalidates the
+/// promotion, since Dart's own analyzer can no longer prove the new value is
+/// non-null (`docs/prompts/2026-08-21-04-bang-redundante-e-promocao.md`'s
+/// own safety criterion — removing a `!` Dart would still require is a
+/// compile error, not a warning).
+#[test]
+fn reassigning_a_promoted_pointer_brings_the_non_null_assertion_back() {
+    let processa = Function {
+        name: "Processa".to_owned(),
+        usr: "c:@F@Processa#*$@S@Nota#".to_owned(),
+        params: vec![Param {
+            name: "a".to_owned(),
+            ty: nota_ref_ty(),
+            default_value: None,
+        }],
+        return_type: Type::Void,
+        body: vec![
+            int_var_decl("x1", altura_read(nullable_ref("a", 3), 3), 3),
+            Stmt::Assign {
+                name: "a".to_owned(),
+                value: Expr::NullLiteral { origin: origin(4) },
+                origin: origin(4),
+            },
+            int_var_decl("x2", altura_read(nullable_ref("a", 5), 5), 5),
+        ],
+        origin: origin(2),
+    };
+
+    let module = Module {
+        records: Vec::new(),
+        functions: vec![processa],
+        enums: Vec::new(),
+    };
+    let files = emit_module(&module);
+    let source = &files["lib/aritmetica.dart"];
+
+    let expected_body = "\
+  int x1 = a!.altura;
+  a = null;
+  int x2 = a!.altura;
+";
+    assert!(
+        source.contains(expected_body),
+        "expected the '!' to return after `a` is reassigned, got:\n{source}"
+    );
+}
+
+/// Dart never promotes a field access (`this._m_x`, `obj.field`) — unlike a
+/// local/parameter, another piece of code could reassign it between a check
+/// and a later use, so every field read keeps its own `!` regardless of how
+/// many times the same field is read in the same body.
+#[test]
+fn a_field_access_never_promotes_even_when_read_twice_in_the_same_body() {
+    use syntax_bridge_server::ir::{Constructor, Method};
+
+    let nota = Record {
+        name: "Nota".to_owned(),
+        usr: "c:@S@Nota".to_owned(),
+        namespace: String::new(),
+        fields: vec![Field {
+            name: "altura".to_owned(),
+            ty: Type::Int,
+        }],
+        static_fields: Vec::new(),
+        constructors: Vec::new(),
+        methods: Vec::new(),
+        base_class: None,
+        mixins: Vec::new(),
+        destructor: None,
+        origin: origin(2),
+    };
+
+    let this_atual = |line: u32| Expr::FieldAccess {
+        target: Box::new(Expr::This {
+            ty: Type::Void,
+            origin: origin(line),
+        }),
+        field: "_m_atual".to_owned(),
+        ty: nota_ref_ty(),
+        origin: origin(line),
+    };
+
+    let editor = Record {
+        name: "Editor".to_owned(),
+        usr: "c:@S@Editor".to_owned(),
+        namespace: String::new(),
+        fields: vec![Field {
+            name: "_m_atual".to_owned(),
+            ty: nota_ref_ty(),
+        }],
+        static_fields: Vec::new(),
+        constructors: vec![Constructor {
+            usr: "c:@S@Editor@F@Editor#".to_owned(),
+            constructor_index: 0,
+            params: Vec::new(),
+            body: Vec::new(),
+            origin: origin(4),
+        }],
+        methods: vec![Method {
+            name: "SomaAltura".to_owned(),
+            usr: "c:@S@Editor@F@SomaAltura#".to_owned(),
+            params: Vec::new(),
+            return_type: Type::Int,
+            body: Some(vec![
+                int_var_decl("x1", altura_read(this_atual(6), 6), 6),
+                Stmt::Return {
+                    value: Some(altura_read(this_atual(7), 7)),
+                    origin: origin(7),
+                },
+            ]),
+            is_static: false,
+            is_override: false,
+            origin: origin(6),
+        }],
+        base_class: None,
+        mixins: Vec::new(),
+        destructor: None,
+        origin: origin(3),
+    };
+
+    let module = Module {
+        records: vec![nota, editor],
+        functions: Vec::new(),
+        enums: Vec::new(),
+    };
+    let files = emit_module(&module);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert_eq!(
+        source.matches("_m_atual!.altura").count(),
+        2,
+        "expected both field reads to keep '!' since Dart never promotes a field, got:\n{source}"
+    );
+}
+
+/// A `x != null` conjunct earlier in the same `&&` chain promotes `x` for
+/// the rest of that chain *and* for the `if`'s `then` branch — real Verovio
+/// evidence: `.diagnosis/dart-package/lib/accid.dart:154`,
+/// `element!.IsClassId(…) && chord != null && chord!.HasAdjacentNotesInStaff(staff)`.
+#[test]
+fn a_null_check_conjunct_promotes_the_rest_of_the_and_chain_and_the_then_branch() {
+    let has_notes = |line: u32| Expr::Call {
+        target: Some(Box::new(nullable_ref("chord", line))),
+        callee_usr: "c:@S@Nota@F@HasNotes#".to_owned(),
+        callee_name: "HasNotes".to_owned(),
+        args: Vec::new(),
+        ty: Type::Bool,
+        origin: origin(line),
+    };
+    let other_thing = |line: u32| Expr::Call {
+        target: Some(Box::new(nullable_ref("chord", line))),
+        callee_usr: "c:@S@Nota@F@OtherThing#".to_owned(),
+        callee_name: "OtherThing".to_owned(),
+        args: Vec::new(),
+        ty: Type::Void,
+        origin: origin(line),
+    };
+
+    let condicao = Expr::Binary {
+        op: BinaryOp::And,
+        lhs: Box::new(Expr::Binary {
+            op: BinaryOp::Ne,
+            lhs: Box::new(nullable_ref("chord", 4)),
+            rhs: Box::new(Expr::NullLiteral { origin: origin(4) }),
+            ty: Type::Bool,
+            origin: origin(4),
+        }),
+        rhs: Box::new(has_notes(4)),
+        ty: Type::Bool,
+        origin: origin(4),
+    };
+
+    let processa = Function {
+        name: "Processa".to_owned(),
+        usr: "c:@F@Processa#".to_owned(),
+        params: Vec::new(),
+        return_type: Type::Void,
+        body: vec![
+            Stmt::VarDecl {
+                name: "chord".to_owned(),
+                ty: nota_ref_ty(),
+                init: Some(Expr::Call {
+                    target: None,
+                    callee_usr: "c:@F@GetFirstAncestor#".to_owned(),
+                    callee_name: "GetFirstAncestor".to_owned(),
+                    args: Vec::new(),
+                    ty: nota_ref_ty(),
+                    origin: origin(3),
+                }),
+                origin: origin(3),
+            },
+            Stmt::If {
+                condition: condicao,
+                then_branch: vec![Stmt::ExprStmt {
+                    expr: other_thing(5),
+                    origin: origin(5),
+                }],
+                else_branch: Vec::new(),
+                origin: origin(4),
+            },
+        ],
+        origin: origin(2),
+    };
+
+    let module = Module {
+        records: Vec::new(),
+        functions: vec![processa],
+        enums: Vec::new(),
+    };
+    let files = emit_module(&module);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert!(
+        source.contains("if (chord != null && chord.HasNotes())"),
+        "expected the second conjunct's '!' to be dropped once `chord != null` already proved it, got:\n{source}"
+    );
+    assert!(
+        source.contains("chord.OtherThing();"),
+        "expected the then-branch to inherit the condition's promotion, got:\n{source}"
+    );
+}
+
+/// A `&&`'s right operand only runs when the left operand is `true` — a bang
+/// inside it must not promote anything for code *after* the whole `&&`,
+/// since that code is also reached along the path where the left operand
+/// was `false` and the right operand never ran at all. Real Verovio
+/// regression: `if (!flag && !(pos!.Foo())) { continue; }` followed a few
+/// lines later by an unguarded `pos.Bar()` — the first emitter draft merged
+/// `pos`'s bang from inside the `&&`'s right operand back into the ambient
+/// promoted set regardless of whether that operand ever ran, producing
+/// `unchecked_use_of_nullable_value` (381 → 1080 occurrences over the real
+/// Verovio 6.2.0 corpus, `just verovio-diagnosis`).
+/// `&&` binds tighter than `||` in both C++ and Dart — printing a `||` node
+/// as a bare, unparenthesized child of an `&&` node silently changes which
+/// operand short-circuits which (`x && (a || b)` vs. the unparenthesized
+/// `x && a || b`, which Dart reads as `(x && a) || b`, a different boolean
+/// altogether). This is a real, pre-existing correctness bug independent of
+/// nullability — but it also breaks the promotion tracking's own soundness:
+/// `docs/prompts/2026-08-21-04-bang-redundante-e-promocao.md`'s own evidence
+/// trail — Verovio's `view_page.cpp`, `reh && ((reh->HasTstamp() &&
+/// reh->GetTstamp() == 0) || (reh->GetStart()->Is(BARLINE) && ...))` emitted
+/// with the `||` unparenthesized let a bang inside the left `&&` chain
+/// (legitimately promoting `reh` under the *real* tree, where the whole
+/// `||` is the right-hand side of the outer `&&`) leak into the `||`'s own
+/// right operand — correct under the real tree, but `dart analyze` parses
+/// the malformed text with the *other* grouping, where that promotion
+/// doesn't hold, and flags `unchecked_use_of_nullable_value`.
+#[test]
+fn an_or_nested_inside_an_and_is_parenthesized_so_dart_reads_the_same_tree_this_module_does() {
+    let has_tstamp = Expr::Call {
+        target: Some(Box::new(nullable_ref("reh", 4))),
+        callee_usr: "c:@S@Nota@F@HasTstamp#".to_owned(),
+        callee_name: "HasTstamp".to_owned(),
+        args: Vec::new(),
+        ty: Type::Bool,
+        origin: origin(4),
+    };
+    let get_start = Expr::Call {
+        target: Some(Box::new(nullable_ref("reh", 4))),
+        callee_usr: "c:@S@Nota@F@GetStart#".to_owned(),
+        callee_name: "GetStart".to_owned(),
+        args: Vec::new(),
+        ty: nota_ref_ty(),
+        origin: origin(4),
+    };
+    let is_class_id = Expr::Call {
+        target: Some(Box::new(get_start)),
+        callee_usr: "c:@S@Nota@F@IsClassId#".to_owned(),
+        callee_name: "IsClassId".to_owned(),
+        args: Vec::new(),
+        ty: Type::Bool,
+        origin: origin(4),
+    };
+
+    let a = Expr::Binary {
+        op: BinaryOp::And,
+        lhs: Box::new(has_tstamp),
+        rhs: Box::new(is_class_id.clone()),
+        ty: Type::Bool,
+        origin: origin(4),
+    };
+    // `reh` used as a bare truthy pointer check (`if (reh && ...)`), the
+    // C++ shape that actually triggered the real regression — it lowers to
+    // `Expr::Convert{ty: Bool}`, not `Expr::Binary{Ne}`, so it renders as
+    // `reh != null` without ever registering as a structural null check for
+    // `and_chain_null_check_names`.
+    let reh_truthy = Expr::Convert {
+        operand: Box::new(nullable_ref("reh", 4)),
+        ty: Type::Bool,
+        origin: origin(4),
+    };
+    let condicao = Expr::Binary {
+        op: BinaryOp::And,
+        lhs: Box::new(reh_truthy),
+        rhs: Box::new(Expr::Binary {
+            op: BinaryOp::Or,
+            lhs: Box::new(a),
+            rhs: Box::new(is_class_id),
+            ty: Type::Bool,
+            origin: origin(4),
+        }),
+        ty: Type::Bool,
+        origin: origin(4),
+    };
+    let processa = Function {
+        name: "Processa".to_owned(),
+        usr: "c:@F@Processa#".to_owned(),
+        params: Vec::new(),
+        return_type: Type::Bool,
+        body: vec![
+            Stmt::VarDecl {
+                name: "reh".to_owned(),
+                ty: nota_ref_ty(),
+                init: Some(Expr::Call {
+                    target: None,
+                    callee_usr: "c:@F@Find#".to_owned(),
+                    callee_name: "Find".to_owned(),
+                    args: Vec::new(),
+                    ty: nota_ref_ty(),
+                    origin: origin(3),
+                }),
+                origin: origin(3),
+            },
+            Stmt::Return {
+                value: Some(condicao),
+                origin: origin(4),
+            },
+        ],
+        origin: origin(2),
+    };
+    let module = Module {
+        records: Vec::new(),
+        functions: vec![processa],
+        enums: Vec::new(),
+    };
+    let files = emit_module(&module);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert!(
+        source.contains(
+            "return reh != null && (reh!.HasTstamp() && reh.GetStart()!.IsClassId() \
+             || reh.GetStart()!.IsClassId());"
+        ),
+        "expected the '||' to stay parenthesized inside the '&&' so Dart parses the \
+         same grouping this module's own promotion tracking reasoned about, got:\n{source}"
+    );
+}
+
+#[test]
+fn a_bang_inside_a_short_circuited_and_operand_does_not_leak_past_the_whole_condition() {
+    let foo = |line: u32| Expr::Call {
+        target: Some(Box::new(nullable_ref("pos", line))),
+        callee_usr: "c:@S@Nota@F@Foo#".to_owned(),
+        callee_name: "Foo".to_owned(),
+        args: Vec::new(),
+        ty: Type::Bool,
+        origin: origin(line),
+    };
+    let bar = |line: u32| Expr::Call {
+        target: Some(Box::new(nullable_ref("pos", line))),
+        callee_usr: "c:@S@Nota@F@Bar#".to_owned(),
+        callee_name: "Bar".to_owned(),
+        args: Vec::new(),
+        ty: Type::Void,
+        origin: origin(line),
+    };
+
+    let condicao = Expr::Binary {
+        op: BinaryOp::And,
+        lhs: Box::new(Expr::Ref {
+            name: "flag".to_owned(),
+            ty: Type::Bool,
+            origin: origin(4),
+        }),
+        rhs: Box::new(foo(4)),
+        ty: Type::Bool,
+        origin: origin(4),
+    };
+
+    let processa = Function {
+        name: "Processa".to_owned(),
+        usr: "c:@F@Processa#b#".to_owned(),
+        params: vec![
+            Param {
+                name: "flag".to_owned(),
+                ty: Type::Bool,
+                default_value: None,
+            },
+            Param {
+                name: "pos".to_owned(),
+                ty: nota_ref_ty(),
+                default_value: None,
+            },
+        ],
+        return_type: Type::Void,
+        body: vec![
+            Stmt::If {
+                condition: condicao,
+                then_branch: vec![Stmt::Return {
+                    value: None,
+                    origin: origin(4),
+                }],
+                else_branch: Vec::new(),
+                origin: origin(4),
+            },
+            Stmt::ExprStmt {
+                expr: bar(5),
+                origin: origin(5),
+            },
+        ],
+        origin: origin(2),
+    };
+
+    let module = Module {
+        records: Vec::new(),
+        functions: vec![processa],
+        enums: Vec::new(),
+    };
+    let files = emit_module(&module);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert!(
+        source.contains("pos!.Bar();"),
+        "expected `pos` to still need '!' after the if, since the '&&'s right \
+         operand (where `pos` was checked) might never have run, got:\n{source}"
+    );
+}
+
+/// A reassignment nested two `if` levels deep still invalidates a
+/// promotion the *outer* scope was relying on — real Verovio regression:
+/// `staff` promoted by an early `staff!.m_drawingStaffSize`, reassigned by
+/// `staff = slur!.CalculatePrincipalStaff(...)` two `if` levels deeper, then
+/// read again as a bare `staff.GetN()` right after that inner `if` —
+/// `emit_scoped_block`'s "nothing leaks back" design correctly dropped the
+/// inner scope's own copy of the promotion, but nothing invalidated the
+/// *outer* scope's copy, which had promoted `staff` before ever seeing the
+/// reassignment (`unchecked_use_of_nullable_value`, 381 → 434 over the real
+/// corpus even after the other two fixes in this file's history).
+#[test]
+fn a_reassignment_nested_two_if_levels_deep_still_invalidates_the_outer_promotion() {
+    let staff_ty = nota_ref_ty();
+    let call = |callee: &str, line: u32| Expr::Call {
+        target: None,
+        callee_usr: format!("c:@F@{callee}#"),
+        callee_name: callee.to_owned(),
+        args: Vec::new(),
+        ty: staff_ty.clone(),
+        origin: origin(line),
+    };
+    let bool_ref = |name: &str, line: u32| Expr::Ref {
+        name: name.to_owned(),
+        ty: Type::Bool,
+        origin: origin(line),
+    };
+
+    let processa = Function {
+        name: "Processa".to_owned(),
+        usr: "c:@F@Processa#bb#".to_owned(),
+        params: vec![
+            Param {
+                name: "cond1".to_owned(),
+                ty: Type::Bool,
+                default_value: None,
+            },
+            Param {
+                name: "cond2".to_owned(),
+                ty: Type::Bool,
+                default_value: None,
+            },
+        ],
+        return_type: Type::Void,
+        body: vec![
+            Stmt::VarDecl {
+                name: "staff".to_owned(),
+                ty: staff_ty.clone(),
+                init: Some(call("GetStaff", 3)),
+                origin: origin(3),
+            },
+            int_var_decl("x", altura_read(nullable_ref("staff", 4), 4), 4),
+            Stmt::If {
+                condition: bool_ref("cond1", 5),
+                then_branch: vec![
+                    Stmt::If {
+                        condition: bool_ref("cond2", 6),
+                        then_branch: vec![Stmt::Assign {
+                            name: "staff".to_owned(),
+                            value: call("OtherStaff", 7),
+                            origin: origin(7),
+                        }],
+                        else_branch: Vec::new(),
+                        origin: origin(6),
+                    },
+                    Stmt::ExprStmt {
+                        expr: altura_read(nullable_ref("staff", 8), 8),
+                        origin: origin(8),
+                    },
+                ],
+                else_branch: Vec::new(),
+                origin: origin(5),
+            },
+        ],
+        origin: origin(2),
+    };
+
+    let module = Module {
+        records: Vec::new(),
+        functions: vec![processa],
+        enums: Vec::new(),
+    };
+    let files = emit_module(&module);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert_eq!(
+        source.matches("staff!.altura").count(),
+        2,
+        "expected both the first promoting read and the read after the nested \
+         reassignment to keep '!', got:\n{source}"
+    );
+}
+
+/// A loop's back-edge means a name the body reassigns *anywhere* can't be
+/// trusted as promoted at the top of the body either, even textually
+/// *before* that reassignment — real Verovio regression:
+/// `HumdrumToken? token = endtoken; int tcount = token!.getPreviousTokenCount();`
+/// correctly promotes `token` before a `while` loop, but the loop body both
+/// reads `token` early and reassigns it later
+/// (`token = token.getPreviousToken(0);`) — `dart analyze` still flags that
+/// early read as needing its own `!` (`unchecked_use_of_nullable_value`,
+/// 381 → 421 over the real corpus even after every other fix in this file's
+/// history).
+#[test]
+fn a_loops_own_reassignment_strips_the_promotion_for_the_whole_body_not_just_after_it() {
+    let processa = Function {
+        name: "Processa".to_owned(),
+        usr: "c:@F@Processa#*$@S@Nota#".to_owned(),
+        params: vec![Param {
+            name: "token".to_owned(),
+            ty: nota_ref_ty(),
+            default_value: None,
+        }],
+        return_type: Type::Void,
+        body: vec![
+            int_var_decl("tcount", altura_read(nullable_ref("token", 3), 3), 3),
+            Stmt::While {
+                condition: Expr::Binary {
+                    op: BinaryOp::Gt,
+                    lhs: Box::new(Expr::Ref {
+                        name: "tcount".to_owned(),
+                        ty: Type::Int,
+                        origin: origin(4),
+                    }),
+                    rhs: Box::new(Expr::IntLiteral {
+                        value: 0,
+                        origin: origin(4),
+                    }),
+                    ty: Type::Bool,
+                    origin: origin(4),
+                },
+                body: vec![
+                    int_var_decl("early", altura_read(nullable_ref("token", 5), 5), 5),
+                    Stmt::Assign {
+                        name: "token".to_owned(),
+                        value: Expr::Call {
+                            target: None,
+                            callee_usr: "c:@F@NextToken#".to_owned(),
+                            callee_name: "NextToken".to_owned(),
+                            args: Vec::new(),
+                            ty: nota_ref_ty(),
+                            origin: origin(6),
+                        },
+                        origin: origin(6),
+                    },
+                ],
+                origin: origin(4),
+            },
+        ],
+        origin: origin(2),
+    };
+
+    let module = Module {
+        records: Vec::new(),
+        functions: vec![processa],
+        enums: Vec::new(),
+    };
+    let files = emit_module(&module);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert!(
+        source.contains("int early = token!.altura;"),
+        "expected the early read inside the loop body to keep '!', since the \
+         same body reassigns `token` further down and the loop's back-edge \
+         means that could just as well be the previous iteration's value, \
+         got:\n{source}"
+    );
+}
+
+/// A method call's receiver is evaluated — and dereferenced — before any of
+/// its arguments, same as Dart's own left-to-right evaluation of `receiver.
+/// method(args)`. A promotion an argument establishes must not reach back
+/// to decide the receiver's own `!`: real regression found by
+/// `just verovio-diagnosis` while implementing this promotion tracking
+/// (`unchecked_use_of_nullable_value` rose from 381 to 1080 because the
+/// first emitter draft rendered every call's `args_text` before its
+/// receiver's own `receiver_bang` decision, letting a bang inside an
+/// argument that happened to share the receiver's name silently swallow
+/// the receiver's own required `!`).
+#[test]
+fn a_calls_receiver_is_dereferenced_before_its_arguments_not_after() {
+    let processa = Function {
+        name: "Processa".to_owned(),
+        usr: "c:@F@Processa#".to_owned(),
+        params: Vec::new(),
+        return_type: Type::Void,
+        body: vec![
+            Stmt::VarDecl {
+                name: "chord".to_owned(),
+                ty: nota_ref_ty(),
+                init: Some(Expr::Call {
+                    target: None,
+                    callee_usr: "c:@F@GetFirstAncestor#".to_owned(),
+                    callee_name: "GetFirstAncestor".to_owned(),
+                    args: Vec::new(),
+                    ty: nota_ref_ty(),
+                    origin: origin(3),
+                }),
+                origin: origin(3),
+            },
+            Stmt::ExprStmt {
+                expr: Expr::Call {
+                    target: Some(Box::new(nullable_ref("chord", 4))),
+                    callee_usr: "c:@S@Nota@F@Foo#I#".to_owned(),
+                    callee_name: "Foo".to_owned(),
+                    args: vec![altura_read(nullable_ref("chord", 4), 4)],
+                    ty: Type::Void,
+                    origin: origin(4),
+                },
+                origin: origin(4),
+            },
+        ],
+        origin: origin(2),
+    };
+
+    let module = Module {
+        records: Vec::new(),
+        functions: vec![processa],
+        enums: Vec::new(),
+    };
+    let files = emit_module(&module);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert!(
+        source.contains("chord!.Foo(chord.altura);"),
+        "expected the receiver's own '!' (evaluated first) rather than a bang \
+         smuggled onto the argument that runs after it, got:\n{source}"
+    );
+}
+
+/// `if (x == null) return;` (or any other unconditional exit) promotes `x`
+/// for the rest of the enclosing block: falling past the `if` at all proves
+/// the condition was false.
+#[test]
+fn a_null_guard_that_returns_promotes_the_pointer_for_the_rest_of_the_function() {
+    let processa = Function {
+        name: "Processa".to_owned(),
+        usr: "c:@F@Processa#*$@S@Nota#".to_owned(),
+        params: vec![Param {
+            name: "a".to_owned(),
+            ty: nota_ref_ty(),
+            default_value: None,
+        }],
+        return_type: Type::Void,
+        body: vec![
+            Stmt::If {
+                condition: Expr::Binary {
+                    op: BinaryOp::Eq,
+                    lhs: Box::new(nullable_ref("a", 3)),
+                    rhs: Box::new(Expr::NullLiteral { origin: origin(3) }),
+                    ty: Type::Bool,
+                    origin: origin(3),
+                },
+                then_branch: vec![Stmt::Return {
+                    value: None,
+                    origin: origin(3),
+                }],
+                else_branch: Vec::new(),
+                origin: origin(3),
+            },
+            int_var_decl("x1", altura_read(nullable_ref("a", 4), 4), 4),
+        ],
+        origin: origin(2),
+    };
+
+    let module = Module {
+        records: Vec::new(),
+        functions: vec![processa],
+        enums: Vec::new(),
+    };
+    let files = emit_module(&module);
+    let source = &files["lib/aritmetica.dart"];
+
+    let expected_body = "\
+  if (a == null) {
+    return;
+  }
+  int x1 = a.altura;
+";
+    assert!(
+        source.contains(expected_body),
+        "expected the guard to promote `a` for the rest of the function, got:\n{source}"
+    );
+}
+
+/// `then_expr` and `else_expr` are mutually exclusive, exactly like an
+/// `if`'s two branches — a bang inside one must not promote the other, nor
+/// leak past the whole ternary to code that runs regardless of which side
+/// was taken.
+#[test]
+fn a_ternarys_two_branches_neither_promote_each_other_nor_leak_past_the_ternary() {
+    let processa = Function {
+        name: "Processa".to_owned(),
+        usr: "c:@F@Processa#*$@S@Nota#b#".to_owned(),
+        params: vec![
+            Param {
+                name: "a".to_owned(),
+                ty: nota_ref_ty(),
+                default_value: None,
+            },
+            Param {
+                name: "flag".to_owned(),
+                ty: Type::Bool,
+                default_value: None,
+            },
+        ],
+        return_type: Type::Int,
+        body: vec![Stmt::Return {
+            value: Some(Expr::Binary {
+                op: BinaryOp::Add,
+                lhs: Box::new(Expr::Conditional {
+                    condition: Box::new(Expr::Ref {
+                        name: "flag".to_owned(),
+                        ty: Type::Bool,
+                        origin: origin(3),
+                    }),
+                    then_expr: Box::new(altura_read(nullable_ref("a", 3), 3)),
+                    else_expr: Box::new(altura_read(nullable_ref("a", 3), 3)),
+                    ty: Type::Int,
+                    origin: origin(3),
+                }),
+                rhs: Box::new(altura_read(nullable_ref("a", 3), 3)),
+                ty: Type::Int,
+                origin: origin(3),
+            }),
+            origin: origin(3),
+        }],
+        origin: origin(2),
+    };
+
+    let module = Module {
+        records: Vec::new(),
+        functions: vec![processa],
+        enums: Vec::new(),
+    };
+    let files = emit_module(&module);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert!(
+        source.contains("return (flag ? a!.altura : a!.altura) + a!.altura;"),
+        "expected every one of the three mutually-exclusive-or-later reads of `a` \
+         to keep its own '!', got:\n{source}"
+    );
+}
+
 /// A field whose type has no sound zero literal used to be emitted as
 /// `Cor c = 0;` / `Ponto p = 0;` — not a poor default but invalid Dart, so
 /// the whole package stopped compiling. An enum field takes its first

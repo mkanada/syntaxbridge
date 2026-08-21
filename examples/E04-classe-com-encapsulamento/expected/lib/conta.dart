@@ -43,5 +43,5 @@ int testarContagemDeContas() {
   int meio = a.totalDeContas();
   ContaBancaria b = ContaBancaria(20);
   int depois = b.totalDeContas();
-  return meio - antes + depois - meio;
+  return meio - antes + (depois - meio);
 }

@@ -1307,7 +1307,16 @@ fn emit_mock_body(
                 ),
                 origin: origin.clone(),
             };
-            emit_stmt(&bailout, depth, used_expr_helper, used_utf8_encode)
+            // A fresh, throwaway `Promoted`: this whole call renders exactly
+            // one bailout statement, never a real function body with a flow
+            // of its own to track.
+            emit_stmt(
+                &bailout,
+                depth,
+                used_expr_helper,
+                used_utf8_encode,
+                &mut Promoted::new(),
+            )
         }
     }
 }
@@ -1611,6 +1620,11 @@ fn format_params(
                             .expect("filtered by is_some above"),
                         used_expr_helper,
                         used_utf8_encode,
+                        // A default-value expression stands alone — never a
+                        // dereference chained onto an earlier one in the
+                        // same parameter list — so it needs no shared
+                        // `Promoted` state with the rest of the signature.
+                        &mut Promoted::new(),
                     )
                 )
             })
@@ -1742,6 +1756,11 @@ fn emit_body(
         origin: origin.clone(),
     });
 
+    // Fresh per body: a function/method/constructor body is exactly the
+    // scope Dart's own flow-sensitive promotion resets at — no parameter
+    // starts promoted, and nothing from a caller's own body (there isn't
+    // one visible here) could apply.
+    let mut promoted = Promoted::new();
     match signature_bailout
         .as_ref()
         .or_else(|| first_unsupported_in_list(body))
@@ -1758,11 +1777,23 @@ fn emit_body(
         // `Stmt::Unsupported`, using the first one's reason/origin. Searched
         // recursively (nested inside `if`/`while`/`for` bodies too): a
         // conservative rule, not a scope analysis, but a simple one.
-        Some(unsupported) => emit_stmt(unsupported, depth, used_expr_helper, used_utf8_encode),
+        Some(unsupported) => emit_stmt(
+            unsupported,
+            depth,
+            used_expr_helper,
+            used_utf8_encode,
+            &mut promoted,
+        ),
         None => {
             let mut text = String::new();
             for stmt in body {
-                text.push_str(&emit_stmt(stmt, depth, used_expr_helper, used_utf8_encode));
+                text.push_str(&emit_stmt(
+                    stmt,
+                    depth,
+                    used_expr_helper,
+                    used_utf8_encode,
+                    &mut promoted,
+                ));
             }
             text
         }
@@ -2094,13 +2125,14 @@ fn emit_stmt(
     depth: usize,
     used_expr_helper: &mut bool,
     used_utf8_encode: &mut bool,
+    promoted: &mut Promoted,
 ) -> String {
     let pad = INDENT.repeat(depth);
     match stmt {
         Stmt::Return { value, .. } => match value {
             Some(expr) => format!(
                 "{pad}return {};\n",
-                emit_expr(expr, used_expr_helper, used_utf8_encode)
+                emit_expr(expr, used_expr_helper, used_utf8_encode, promoted)
             ),
             None => format!("{pad}return;\n"),
         },
@@ -2109,19 +2141,28 @@ fn emit_stmt(
         // `Ponto p;` would be. `late` defers that requirement to first use,
         // the closest match to C++ letting a local sit default-constructed
         // (or, for a POD's scalar fields, indeterminate) until assigned.
+        //
+        // A declaration always removes `name` from `promoted` first: even
+        // where a fixture reuses a name, the freshly declared local is a new
+        // binding with no promotion history of its own yet — the first
+        // dereference of it always needs its own `!`.
         Stmt::VarDecl { name, ty, init, .. } => match init {
-            Some(expr) => format!(
-                "{pad}{} {name} = {};\n",
-                emit_type(ty),
-                emit_expr(expr, used_expr_helper, used_utf8_encode)
-            ),
-            None => format!("{pad}late {} {name};\n", emit_type(ty)),
+            Some(expr) => {
+                let init_text = emit_expr(expr, used_expr_helper, used_utf8_encode, promoted);
+                promoted.remove(name);
+                format!("{pad}{} {name} = {init_text};\n", emit_type(ty))
+            }
+            None => {
+                promoted.remove(name);
+                format!("{pad}late {} {name};\n", emit_type(ty))
+            }
         },
         Stmt::Assign { name, value, .. } => {
-            format!(
-                "{pad}{name} = {};\n",
-                emit_expr(value, used_expr_helper, used_utf8_encode)
-            )
+            let value_text = emit_expr(value, used_expr_helper, used_utf8_encode, promoted);
+            // Reassignment invalidates any promotion `name` held — see
+            // `receiver_bang`'s own doc comment.
+            promoted.remove(name);
+            format!("{pad}{name} = {value_text};\n")
         }
         Stmt::FieldAssign {
             target,
@@ -2133,17 +2174,15 @@ fn emit_stmt(
             // same omission `emit_expr`'s `FieldAccess` arm applies for a
             // read (see its comment).
             Expr::This { .. } => {
-                format!(
-                    "{pad}{field} = {};\n",
-                    emit_expr(value, used_expr_helper, used_utf8_encode)
-                )
+                let value_text = emit_expr(value, used_expr_helper, used_utf8_encode, promoted);
+                format!("{pad}{field} = {value_text};\n")
             }
-            _ => format!(
-                "{pad}{}{}.{field} = {};\n",
-                emit_expr(target, used_expr_helper, used_utf8_encode),
-                receiver_bang(target),
-                emit_expr(value, used_expr_helper, used_utf8_encode)
-            ),
+            _ => {
+                let target_text = emit_expr(target, used_expr_helper, used_utf8_encode, promoted);
+                let bang = receiver_bang(target, promoted);
+                let value_text = emit_expr(value, used_expr_helper, used_utf8_encode, promoted);
+                format!("{pad}{target_text}{bang}.{field} = {value_text};\n")
+            }
         },
         Stmt::ExprAssign {
             target: Expr::MapIndexOrInsert {
@@ -2151,13 +2190,13 @@ fn emit_stmt(
             },
             value,
             ..
-        } => format!(
-            "{pad}{}{}[{}] = {};\n",
-            emit_expr(map, used_expr_helper, used_utf8_encode),
-            receiver_bang(map),
-            emit_expr(index, used_expr_helper, used_utf8_encode),
-            emit_expr(value, used_expr_helper, used_utf8_encode)
-        ),
+        } => {
+            let map_text = emit_expr(map, used_expr_helper, used_utf8_encode, promoted);
+            let bang = receiver_bang(map, promoted);
+            let index_text = emit_expr(index, used_expr_helper, used_utf8_encode, promoted);
+            let value_text = emit_expr(value, used_expr_helper, used_utf8_encode, promoted);
+            format!("{pad}{map_text}{bang}[{index_text}] = {value_text};\n")
+        }
         // Assigning *through* a `T*` out-param (`(*out) = value;`, C++'s
         // idiom for a mutable output parameter — Verovio's real
         // `ParseAddSylAction`/`ParseDragAction`/`ParseInsertAction`, among
@@ -2176,53 +2215,117 @@ fn emit_stmt(
             target: Expr::Convert { operand, .. },
             value,
             ..
-        } if operand.is_assignable_lvalue() => format!(
-            "{pad}{} = {};\n",
-            emit_expr(operand, used_expr_helper, used_utf8_encode),
-            emit_expr(value, used_expr_helper, used_utf8_encode)
-        ),
-        Stmt::ExprAssign { target, value, .. } => format!(
-            "{pad}{} = {};\n",
-            emit_expr(target, used_expr_helper, used_utf8_encode),
-            emit_expr(value, used_expr_helper, used_utf8_encode)
-        ),
+        } if operand.is_assignable_lvalue() => {
+            let target_text = emit_expr(operand, used_expr_helper, used_utf8_encode, promoted);
+            let value_text = emit_expr(value, used_expr_helper, used_utf8_encode, promoted);
+            if let Expr::Ref { name, .. } = operand.as_ref() {
+                promoted.remove(name);
+            }
+            format!("{pad}{target_text} = {value_text};\n")
+        }
+        Stmt::ExprAssign { target, value, .. } => {
+            let target_text = emit_expr(target, used_expr_helper, used_utf8_encode, promoted);
+            let value_text = emit_expr(value, used_expr_helper, used_utf8_encode, promoted);
+            if let Expr::Ref { name, .. } = target {
+                promoted.remove(name);
+            }
+            format!("{pad}{target_text} = {value_text};\n")
+        }
         Stmt::If {
             condition,
             then_branch,
             else_branch,
             ..
         } => {
-            let mut source = format!(
-                "{pad}if ({}) {{\n",
-                emit_expr(condition, used_expr_helper, used_utf8_encode)
-            );
-            for inner in then_branch {
-                source.push_str(&emit_stmt(
-                    inner,
-                    depth + 1,
-                    used_expr_helper,
-                    used_utf8_encode,
-                ));
+            // The condition always executes, in the enclosing flow — so it
+            // renders (and any bang usage inside it promotes) against the
+            // *ambient* `promoted`, not a scoped clone. `then_branch` and
+            // `else_branch` might not, so each gets its own clone, extended
+            // with whatever the condition itself proves for that branch,
+            // and discarded once the branch is emitted (`emit_scoped_block`)
+            // — except the one case handled below, after both branches:
+            // `if (x == null) return;` (or any other unconditional exit)
+            // proves `x` non-null for the rest of the enclosing block,
+            // *because* falling past the whole `if` at all means the
+            // condition was false.
+            let condition_text = emit_expr(condition, used_expr_helper, used_utf8_encode, promoted);
+            let mut source = format!("{pad}if ({condition_text}) {{\n");
+
+            let mut then_extra = Vec::new();
+            and_chain_null_check_names(condition, &mut then_extra);
+            let mut then_promoted = promoted.clone();
+            for name in then_extra {
+                then_promoted.insert(name.to_owned());
             }
+            source.push_str(&emit_scoped_block(
+                then_branch,
+                depth + 1,
+                used_expr_helper,
+                used_utf8_encode,
+                then_promoted,
+            ));
+
             if else_branch.is_empty() {
                 source.push_str(&format!("{pad}}}\n"));
             } else {
                 source.push_str(&format!("{pad}}} else {{\n"));
-                for inner in else_branch {
-                    source.push_str(&emit_stmt(
-                        inner,
-                        depth + 1,
-                        used_expr_helper,
-                        used_utf8_encode,
-                    ));
+                let mut else_promoted = promoted.clone();
+                if let Some(name) = ref_null_check_name(condition, BinaryOp::Eq) {
+                    else_promoted.insert(name.to_owned());
                 }
+                source.push_str(&emit_scoped_block(
+                    else_branch,
+                    depth + 1,
+                    used_expr_helper,
+                    used_utf8_encode,
+                    else_promoted,
+                ));
                 source.push_str(&format!("{pad}}}\n"));
+            }
+
+            // Anything either branch reassigns invalidates that name's
+            // promotion for the rest of the enclosing block, regardless of
+            // which branch actually ran — `collect_assigned_names`'s own
+            // doc comment has the real Verovio regression this guards
+            // against (an inner branch's reassignment silently surviving in
+            // an outer scope's stale promotion). Order matters: the guard
+            // case right after this re-establishes one specific name only
+            // once the sweep has cleared it, since that reasoning holds
+            // independent of what a *non-taken* `then_branch` might have
+            // reassigned.
+            let mut assigned = HashSet::new();
+            collect_assigned_names(then_branch, &mut assigned);
+            collect_assigned_names(else_branch, &mut assigned);
+            for name in &assigned {
+                promoted.remove(name);
+            }
+
+            if let Some(name) = ref_null_check_name(condition, BinaryOp::Eq)
+                && branch_always_exits(then_branch)
+            {
+                promoted.insert(name.to_owned());
             }
             source
         }
+        // A loop's own condition/increment run on every iteration, not just
+        // the first — including whichever iteration is the last one before
+        // falling out of the loop. Because of that back-edge, a promotion
+        // established on one iteration (whether from a literal `!` or a
+        // reassignment reachable earlier in the body) can't be trusted to
+        // still hold on the next: the whole loop, condition and increment
+        // included, renders against a single clone of `promoted` that's
+        // simply dropped once the loop is emitted, never merged back into
+        // the ambient set used after it. Some real reduction is left on the
+        // table by being this conservative — an acceptable residual, not a
+        // safety gap (see the plan doc's own criterion: never remove a `!`
+        // Dart would still require). `loop_scoped_promoted` additionally
+        // strips any name the body itself reassigns — needed even for the
+        // very first, textually-before-the-reassignment use inside the body
+        // (that function's own doc comment has the real regression).
         Stmt::DoWhile {
             body, condition, ..
         } => {
+            let mut scoped = loop_scoped_promoted(promoted, body);
             let mut source = format!("{pad}do {{\n");
             for inner in body {
                 source.push_str(&emit_stmt(
@@ -2230,12 +2333,12 @@ fn emit_stmt(
                     depth + 1,
                     used_expr_helper,
                     used_utf8_encode,
+                    &mut scoped,
                 ));
             }
-            source.push_str(&format!(
-                "{pad}}} while ({});\n",
-                emit_expr(condition, used_expr_helper, used_utf8_encode)
-            ));
+            let condition_text =
+                emit_expr(condition, used_expr_helper, used_utf8_encode, &mut scoped);
+            source.push_str(&format!("{pad}}} while ({condition_text});\n"));
             source
         }
         Stmt::ForEach {
@@ -2247,13 +2350,11 @@ fn emit_stmt(
             body,
             ..
         } => {
+            let iterable_text = emit_expr(iterable, used_expr_helper, used_utf8_encode, promoted);
             if *write_back {
                 const ITERABLE_NAME: &str = "_syntaxBridgeIterable";
                 const INDEX_NAME: &str = "_syntaxBridgeIndex";
-                let mut source = format!(
-                    "{pad}final {ITERABLE_NAME} = {};\n",
-                    emit_expr(iterable, used_expr_helper, used_utf8_encode)
-                );
+                let mut source = format!("{pad}final {ITERABLE_NAME} = {iterable_text};\n");
                 source.push_str(&format!(
                     "{pad}for (int {INDEX_NAME} = 0; {INDEX_NAME} < {ITERABLE_NAME}.length; ++{INDEX_NAME}) {{\n"
                 ));
@@ -2262,14 +2363,13 @@ fn emit_stmt(
                     emit_type(ty)
                 ));
                 source.push_str(&format!("{pad}{INDENT}try {{\n"));
-                for inner in body {
-                    source.push_str(&emit_stmt(
-                        inner,
-                        depth + 2,
-                        used_expr_helper,
-                        used_utf8_encode,
-                    ));
-                }
+                source.push_str(&emit_scoped_block(
+                    body,
+                    depth + 2,
+                    used_expr_helper,
+                    used_utf8_encode,
+                    loop_scoped_promoted(promoted, body),
+                ));
                 source.push_str(&format!("{pad}{INDENT}}} finally {{\n"));
                 source.push_str(&format!(
                     "{pad}{INDENT}{INDENT}{ITERABLE_NAME}[{INDEX_NAME}] = {name};\n"
@@ -2280,34 +2380,36 @@ fn emit_stmt(
             }
             let binding = if *is_final { "final " } else { "" };
             let mut source = format!(
-                "{pad}for ({binding}{} {name} in {}) {{\n",
-                emit_type(ty),
-                emit_expr(iterable, used_expr_helper, used_utf8_encode)
+                "{pad}for ({binding}{} {name} in {iterable_text}) {{\n",
+                emit_type(ty)
             );
-            for inner in body {
-                source.push_str(&emit_stmt(
-                    inner,
-                    depth + 1,
-                    used_expr_helper,
-                    used_utf8_encode,
-                ));
-            }
+            source.push_str(&emit_scoped_block(
+                body,
+                depth + 1,
+                used_expr_helper,
+                used_utf8_encode,
+                loop_scoped_promoted(promoted, body),
+            ));
             source.push_str(&format!("{pad}}}\n"));
             source
         }
         Stmt::While {
             condition, body, ..
         } => {
-            let mut source = format!(
-                "{pad}while ({}) {{\n",
-                emit_expr(condition, used_expr_helper, used_utf8_encode)
-            );
+            let mut scoped = loop_scoped_promoted(promoted, body);
+            let condition_text =
+                emit_expr(condition, used_expr_helper, used_utf8_encode, &mut scoped);
+            let mut source = format!("{pad}while ({condition_text}) {{\n");
+            if let Some(name) = ref_null_check_name(condition, BinaryOp::Ne) {
+                scoped.insert(name.to_owned());
+            }
             for inner in body {
                 source.push_str(&emit_stmt(
                     inner,
                     depth + 1,
                     used_expr_helper,
                     used_utf8_encode,
+                    &mut scoped,
                 ));
             }
             source.push_str(&format!("{pad}}}\n"));
@@ -2320,17 +2422,25 @@ fn emit_stmt(
             body,
             ..
         } => {
+            let mut scoped = loop_scoped_promoted(promoted, body);
+            if let Some(stmt) = increment.as_deref() {
+                let mut assigned = HashSet::new();
+                collect_assigned_names(std::slice::from_ref(stmt), &mut assigned);
+                for name in &assigned {
+                    scoped.remove(name);
+                }
+            }
             let init_text = init
                 .as_deref()
-                .map(|stmt| emit_for_clause(stmt, used_expr_helper, used_utf8_encode))
+                .map(|stmt| emit_for_clause(stmt, used_expr_helper, used_utf8_encode, &mut scoped))
                 .unwrap_or_default();
             let condition_text = condition
                 .as_ref()
-                .map(|expr| emit_expr(expr, used_expr_helper, used_utf8_encode))
+                .map(|expr| emit_expr(expr, used_expr_helper, used_utf8_encode, &mut scoped))
                 .unwrap_or_default();
             let increment_text = increment
                 .as_deref()
-                .map(|stmt| emit_for_clause(stmt, used_expr_helper, used_utf8_encode))
+                .map(|stmt| emit_for_clause(stmt, used_expr_helper, used_utf8_encode, &mut scoped))
                 .unwrap_or_default();
             let mut source =
                 format!("{pad}for ({init_text}; {condition_text}; {increment_text}) {{\n");
@@ -2340,6 +2450,7 @@ fn emit_stmt(
                     depth + 1,
                     used_expr_helper,
                     used_utf8_encode,
+                    &mut scoped,
                 ));
             }
             source.push_str(&format!("{pad}}}\n"));
@@ -2350,12 +2461,16 @@ fn emit_stmt(
         Stmt::ContinueLabel { label, .. } => format!("{pad}continue {label};\n"),
         Stmt::ExprStmt { expr, .. } => format!(
             "{pad}{};\n",
-            emit_expr(expr, used_expr_helper, used_utf8_encode)
+            emit_expr(expr, used_expr_helper, used_utf8_encode, promoted)
         ),
         Stmt::Throw { value, .. } => format!(
             "{pad}throw {};\n",
-            emit_expr(value, used_expr_helper, used_utf8_encode)
+            emit_expr(value, used_expr_helper, used_utf8_encode, promoted)
         ),
+        // `try_body` might throw before finishing (that's the whole reason
+        // it's a `try`), so anything it promotes can't be trusted in
+        // `catch_body` — each gets its own clone of `promoted`, dropped once
+        // rendered, same reasoning as an `if`'s branches.
         Stmt::TryCatch {
             try_body,
             catch_type,
@@ -2364,26 +2479,24 @@ fn emit_stmt(
             ..
         } => {
             let mut source = format!("{pad}try {{\n");
-            for inner in try_body {
-                source.push_str(&emit_stmt(
-                    inner,
-                    depth + 1,
-                    used_expr_helper,
-                    used_utf8_encode,
-                ));
-            }
+            source.push_str(&emit_scoped_block(
+                try_body,
+                depth + 1,
+                used_expr_helper,
+                used_utf8_encode,
+                promoted.clone(),
+            ));
             source.push_str(&format!(
                 "{pad}}} on {} catch ({catch_var}) {{\n",
                 emit_type(catch_type)
             ));
-            for inner in catch_body {
-                source.push_str(&emit_stmt(
-                    inner,
-                    depth + 1,
-                    used_expr_helper,
-                    used_utf8_encode,
-                ));
-            }
+            source.push_str(&emit_scoped_block(
+                catch_body,
+                depth + 1,
+                used_expr_helper,
+                used_utf8_encode,
+                promoted.clone(),
+            ));
             source.push_str(&format!("{pad}}}\n"));
             source
         }
@@ -2393,23 +2506,21 @@ fn emit_stmt(
             ..
         } => {
             let mut source = format!("{pad}try {{\n");
-            for inner in try_body {
-                source.push_str(&emit_stmt(
-                    inner,
-                    depth + 1,
-                    used_expr_helper,
-                    used_utf8_encode,
-                ));
-            }
+            source.push_str(&emit_scoped_block(
+                try_body,
+                depth + 1,
+                used_expr_helper,
+                used_utf8_encode,
+                promoted.clone(),
+            ));
             source.push_str(&format!("{pad}}} finally {{\n"));
-            for inner in finally_body {
-                source.push_str(&emit_stmt(
-                    inner,
-                    depth + 1,
-                    used_expr_helper,
-                    used_utf8_encode,
-                ));
-            }
+            source.push_str(&emit_scoped_block(
+                finally_body,
+                depth + 1,
+                used_expr_helper,
+                used_utf8_encode,
+                promoted.clone(),
+            ));
             source.push_str(&format!("{pad}}}\n"));
             source
         }
@@ -2430,25 +2541,27 @@ fn emit_stmt(
         // function — without needing a counter to keep every temporary
         // name unique.
         Stmt::TupleAssign { targets, value, .. } if tuple_assign_needs_temp_block(targets) => {
+            let value_text = emit_expr(value, used_expr_helper, used_utf8_encode, promoted);
             let mut source = format!("{pad}{{\n");
             source.push_str(&format!(
-                "{pad}{INDENT}final {TUPLE_ASSIGN_TEMP} = {};\n",
-                emit_expr(value, used_expr_helper, used_utf8_encode)
+                "{pad}{INDENT}final {TUPLE_ASSIGN_TEMP} = {value_text};\n"
             ));
             for (index, target) in targets.iter().enumerate() {
                 if is_tuple_assign_discard(target) {
                     continue;
                 }
+                let target_text = emit_expr(target, used_expr_helper, used_utf8_encode, promoted);
                 source.push_str(&format!(
-                    "{pad}{INDENT}{} = {TUPLE_ASSIGN_TEMP}.${};\n",
-                    emit_expr(target, used_expr_helper, used_utf8_encode),
+                    "{pad}{INDENT}{target_text} = {TUPLE_ASSIGN_TEMP}.${};\n",
                     index + 1
                 ));
             }
             source.push_str(&format!("{pad}}}\n"));
+            invalidate_ref_targets(targets, promoted);
             source
         }
         Stmt::TupleAssign { targets, value, .. } => {
+            let value_text = emit_expr(value, used_expr_helper, used_utf8_encode, promoted);
             // A single-element Dart record pattern needs a trailing comma
             // (`(a,) = expr;`) — see `emit_type`'s own `Type::Tuple` arm for
             // why: without it, `(a)` parses as a parenthesized expression,
@@ -2456,19 +2569,18 @@ fn emit_stmt(
             let targets_text = if targets.len() == 1 {
                 format!(
                     "{},",
-                    emit_expr(&targets[0], used_expr_helper, used_utf8_encode)
+                    emit_expr(&targets[0], used_expr_helper, used_utf8_encode, promoted)
                 )
             } else {
                 targets
                     .iter()
-                    .map(|target| emit_expr(target, used_expr_helper, used_utf8_encode))
+                    .map(|target| emit_expr(target, used_expr_helper, used_utf8_encode, promoted))
                     .collect::<Vec<_>>()
                     .join(", ")
             };
-            format!(
-                "{pad}({targets_text}) = {};\n",
-                emit_expr(value, used_expr_helper, used_utf8_encode)
-            )
+            let source = format!("{pad}({targets_text}) = {value_text};\n");
+            invalidate_ref_targets(targets, promoted);
+            source
         }
         // `lower::cpp::lower_switch_stmt` already guarantees every case's
         // `body` ends in a jump (`break`/`continue`/`continue <label>;`/
@@ -2483,40 +2595,40 @@ fn emit_stmt(
             default,
             ..
         } => {
-            let mut source = format!(
-                "{pad}switch ({}) {{\n",
-                emit_expr(scrutinee, used_expr_helper, used_utf8_encode)
-            );
+            let scrutinee_text = emit_expr(scrutinee, used_expr_helper, used_utf8_encode, promoted);
+            let mut source = format!("{pad}switch ({scrutinee_text}) {{\n");
             let case_pad = INDENT.repeat(depth + 1);
             for case in cases {
                 if let Some(label) = &case.label {
                     source.push_str(&format!("{case_pad}{label}:\n"));
                 }
                 for value in &case.values {
-                    source.push_str(&format!(
-                        "{case_pad}case {}:\n",
-                        emit_expr(value, used_expr_helper, used_utf8_encode)
-                    ));
+                    let value_text = emit_expr(value, used_expr_helper, used_utf8_encode, promoted);
+                    source.push_str(&format!("{case_pad}case {value_text}:\n"));
                 }
-                for inner in &case.body {
-                    source.push_str(&emit_stmt(
-                        inner,
-                        depth + 2,
-                        used_expr_helper,
-                        used_utf8_encode,
-                    ));
-                }
+                // A case that stacks labels shares a body with the case(s)
+                // it falls through from (`SwitchCase::label`'s own doc
+                // comment) — but each case still gets its own clone of
+                // `promoted`, the same conservative-and-safe treatment every
+                // other maybe-skipped block gets (`Stmt::TryCatch`'s doc
+                // comment).
+                source.push_str(&emit_scoped_block(
+                    &case.body,
+                    depth + 2,
+                    used_expr_helper,
+                    used_utf8_encode,
+                    promoted.clone(),
+                ));
             }
             if let Some(default) = default {
                 source.push_str(&format!("{case_pad}default:\n"));
-                for inner in default {
-                    source.push_str(&emit_stmt(
-                        inner,
-                        depth + 2,
-                        used_expr_helper,
-                        used_utf8_encode,
-                    ));
-                }
+                source.push_str(&emit_scoped_block(
+                    default,
+                    depth + 2,
+                    used_expr_helper,
+                    used_utf8_encode,
+                    promoted.clone(),
+                ));
             }
             source.push_str(&format!("{pad}}}\n"));
             source
@@ -2538,6 +2650,7 @@ fn emit_for_clause(
     stmt: &Stmt,
     used_expr_helper: &mut bool,
     used_utf8_encode: &mut bool,
+    promoted: &mut Promoted,
 ) -> String {
     match stmt {
         Stmt::VarDecl {
@@ -2545,22 +2658,24 @@ fn emit_for_clause(
             ty,
             init: Some(expr),
             ..
-        } => format!(
-            "{} {name} = {}",
-            emit_type(ty),
-            emit_expr(expr, used_expr_helper, used_utf8_encode)
-        ),
+        } => {
+            let init_text = emit_expr(expr, used_expr_helper, used_utf8_encode, promoted);
+            promoted.remove(name);
+            format!("{} {name} = {init_text}", emit_type(ty))
+        }
         Stmt::VarDecl {
             name,
             ty,
             init: None,
             ..
-        } => format!("late {} {name}", emit_type(ty)),
+        } => {
+            promoted.remove(name);
+            format!("late {} {name}", emit_type(ty))
+        }
         Stmt::Assign { name, value, .. } => {
-            format!(
-                "{name} = {}",
-                emit_expr(value, used_expr_helper, used_utf8_encode)
-            )
+            let value_text = emit_expr(value, used_expr_helper, used_utf8_encode, promoted);
+            promoted.remove(name);
+            format!("{name} = {value_text}")
         }
         Stmt::ExprAssign {
             target: Expr::MapIndexOrInsert {
@@ -2568,30 +2683,38 @@ fn emit_for_clause(
             },
             value,
             ..
-        } => format!(
-            "{}{}[{}] = {}",
-            emit_expr(map, used_expr_helper, used_utf8_encode),
-            receiver_bang(map),
-            emit_expr(index, used_expr_helper, used_utf8_encode),
-            emit_expr(value, used_expr_helper, used_utf8_encode)
-        ),
+        } => {
+            let map_text = emit_expr(map, used_expr_helper, used_utf8_encode, promoted);
+            let bang = receiver_bang(map, promoted);
+            let index_text = emit_expr(index, used_expr_helper, used_utf8_encode, promoted);
+            let value_text = emit_expr(value, used_expr_helper, used_utf8_encode, promoted);
+            format!("{map_text}{bang}[{index_text}] = {value_text}")
+        }
         // Same out-param dereference-assignment case `emit_stmt`'s
         // `Stmt::ExprAssign` handles — see its doc comment.
         Stmt::ExprAssign {
             target: Expr::Convert { operand, .. },
             value,
             ..
-        } if operand.is_assignable_lvalue() => format!(
-            "{} = {}",
-            emit_expr(operand, used_expr_helper, used_utf8_encode),
-            emit_expr(value, used_expr_helper, used_utf8_encode)
-        ),
-        Stmt::ExprAssign { target, value, .. } => format!(
-            "{} = {}",
-            emit_expr(target, used_expr_helper, used_utf8_encode),
-            emit_expr(value, used_expr_helper, used_utf8_encode)
-        ),
-        Stmt::ExprStmt { expr, .. } => emit_expr(expr, used_expr_helper, used_utf8_encode),
+        } if operand.is_assignable_lvalue() => {
+            let target_text = emit_expr(operand, used_expr_helper, used_utf8_encode, promoted);
+            let value_text = emit_expr(value, used_expr_helper, used_utf8_encode, promoted);
+            if let Expr::Ref { name, .. } = operand.as_ref() {
+                promoted.remove(name);
+            }
+            format!("{target_text} = {value_text}")
+        }
+        Stmt::ExprAssign { target, value, .. } => {
+            let target_text = emit_expr(target, used_expr_helper, used_utf8_encode, promoted);
+            let value_text = emit_expr(value, used_expr_helper, used_utf8_encode, promoted);
+            if let Expr::Ref { name, .. } = target {
+                promoted.remove(name);
+            }
+            format!("{target_text} = {value_text}")
+        }
+        Stmt::ExprStmt { expr, .. } => {
+            emit_expr(expr, used_expr_helper, used_utf8_encode, promoted)
+        }
         other => {
             *used_expr_helper = true;
             format!(
@@ -2681,6 +2804,19 @@ fn is_tuple_assign_discard(target: &Expr) -> bool {
     matches!(target, Expr::Ref { name, .. } if name == "_")
 }
 
+/// Invalidates the promotion of every bare-local `targets` entry — see
+/// `receiver_bang`'s own doc comment on why reassignment always does.
+/// `Stmt::TupleAssign`'s targets aren't necessarily locals (a `FieldAccess`/
+/// `Index` target is never tracked in `promoted` to begin with, so removing
+/// it here is a no-op), so this only has an effect on the `Expr::Ref` ones.
+fn invalidate_ref_targets(targets: &[Expr], promoted: &mut Promoted) {
+    for target in targets {
+        if let Expr::Ref { name, .. } = target {
+            promoted.remove(name);
+        }
+    }
+}
+
 /// Whether `Stmt::TupleAssign`'s ordinary record-pattern syntax
 /// (`(targets...) = value;`) is unusable for this `targets` list — true
 /// when any target is reached through a nullable receiver
@@ -2697,16 +2833,303 @@ fn tuple_assign_needs_temp_block(targets: &[Expr]) -> bool {
         }
         | Expr::Index {
             target: receiver, ..
-        } => !receiver_bang(receiver).is_empty(),
+        } => !receiver_bang_by_type(receiver).is_empty(),
         _ => false,
     })
 }
 
-fn receiver_bang(receiver: &Expr) -> &'static str {
+/// Names of local variables/parameters Dart's flow-sensitive type promotion
+/// currently treats as non-null at the emission point reached so far — see
+/// `receiver_bang`'s own doc comment for the conservative subset of Dart's
+/// real promotion rules this tracks. Threaded the same way as
+/// `used_expr_helper`/`used_utf8_encode`: sequentially, mutably, through
+/// every statement and expression in a single straight-line scope. A nested,
+/// possibly-not-taken scope (an `if` branch, a loop body, a `try`/`catch`
+/// arm, a `switch` case) always gets a *clone*, extended if the scope's own
+/// entry condition proves anything, and that clone is simply dropped once
+/// the scope is done — nothing learned inside leaks back out, except the
+/// one narrow case `Stmt::If`'s own handling merges back explicitly (an
+/// unconditional-exit null guard, `if (x == null) return;`).
+type Promoted = HashSet<String>;
+
+/// Whether `receiver` needs a trailing `!` to read through, using only its
+/// static type — ignores Dart's flow-sensitive promotion entirely. Used by
+/// `tuple_assign_needs_temp_block`, which decides an emission *shape* before
+/// the real receiver is emitted, so it has no `Promoted` state of its own to
+/// consult or update. Conservatively assuming a statically-nullable receiver
+/// always needs the temp-block shape — even where the real emission later
+/// finds the `!` unnecessary — is safe on its own terms: it can only produce
+/// more verbose Dart than strictly needed, never wrong Dart.
+fn receiver_bang_by_type(receiver: &Expr) -> &'static str {
     if matches!(expr_ty(receiver), Some(Type::Nullable(_))) {
         "!"
     } else {
         ""
+    }
+}
+
+/// Whether `receiver` needs a trailing `!` to read through, given both its
+/// static type and Dart's flow-sensitive type promotion. A `T*`-derived
+/// receiver is always `Type::Nullable(T)`, and the static type alone can't
+/// tell whether the C++ source ever checked for null — asserting with `!` is
+/// always *correct* there (see this function's module-level doc comment on
+/// why C++ never required that check), but repeating it after Dart's own
+/// analyzer has already proved the receiver non-null earns
+/// `unnecessary_non_null_assertion` (real Verovio 6.2.0 evidence: 6107
+/// occurrences across 77 files — `docs/prompts/2026-08-21-04-bang-redundante-e-promocao.md`).
+/// Only `Expr::Ref` — a bare local or parameter — is ever tracked in
+/// `promoted`: Dart never promotes a field access (`this._m_x`, `obj.field`)
+/// or a call result, since other code could reassign a field between the
+/// check and the use, so every other receiver shape keeps consulting only
+/// the static type via `receiver_bang_by_type`.
+fn receiver_bang(receiver: &Expr, promoted: &mut Promoted) -> &'static str {
+    if let Expr::Ref { name, ty, .. } = receiver {
+        if matches!(ty, Type::Nullable(_)) {
+            return if promoted.insert(name.clone()) {
+                "!"
+            } else {
+                ""
+            };
+        }
+        return "";
+    }
+    receiver_bang_by_type(receiver)
+}
+
+/// If `expr` is `x != null`/`null != x` (when `op` is `BinaryOp::Ne`) or
+/// `x == null`/`null == x` (when `op` is `BinaryOp::Eq`) for some
+/// local/parameter `x`, its name — the shape Dart's flow analysis treats as
+/// a promotion witness. Doesn't look inside `&&`/`||` itself; see
+/// `and_chain_null_check_names` for that.
+fn ref_null_check_name(expr: &Expr, op: BinaryOp) -> Option<&str> {
+    let Expr::Binary {
+        op: found_op,
+        lhs,
+        rhs,
+        ..
+    } = expr
+    else {
+        return None;
+    };
+    if *found_op != op {
+        return None;
+    }
+    match (lhs.as_ref(), rhs.as_ref()) {
+        (Expr::Ref { name, .. }, Expr::NullLiteral { .. }) => Some(name.as_str()),
+        (Expr::NullLiteral { .. }, Expr::Ref { name, .. }) => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+/// Every name proven non-null by `expr` being `true`, when `expr` is a
+/// (possibly nested) `&&` chain — the conservative subset of Dart's
+/// promotion this module tracks for `&&`: each `x != null` conjunct, at any
+/// position in the chain, promotes `x` for every conjunct to its right
+/// (`emit_and_rhs`) and for the branch the whole chain guards (`Stmt::If`'s
+/// `then_branch`). A non-`&&`, non-null-check conjunct (a plain call, say)
+/// contributes nothing but doesn't stop the walk — nor does `expr` not being
+/// an `&&` chain at all, so a bare `if (x != null)` is handled by the same
+/// call.
+fn and_chain_null_check_names<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
+    if let Expr::Binary {
+        op: BinaryOp::And,
+        lhs,
+        rhs,
+        ..
+    } = expr
+    {
+        and_chain_null_check_names(lhs, out);
+        and_chain_null_check_names(rhs, out);
+        return;
+    }
+    if let Some(name) = ref_null_check_name(expr, BinaryOp::Ne) {
+        out.push(name);
+    }
+}
+
+/// Whether every path through `stmts` (as far as this module's conservative
+/// analysis goes: just its last statement) leaves the enclosing block
+/// through a jump rather than falling off the end — the shape
+/// `Stmt::If`'s handling needs to know a `x == null` guard's `then_branch`
+/// unconditionally exits before it can promote `x` for the rest of the
+/// enclosing block (`if (x == null) return;`, real Verovio 6.2.0 evidence in
+/// `docs/prompts/2026-08-21-04-bang-redundante-e-promocao.md`).
+fn branch_always_exits(stmts: &[Stmt]) -> bool {
+    matches!(
+        stmts.last(),
+        Some(
+            Stmt::Return { .. }
+                | Stmt::Throw { .. }
+                | Stmt::Break { .. }
+                | Stmt::Continue { .. }
+                | Stmt::ContinueLabel { .. }
+        )
+    )
+}
+
+/// Emits `stmts` as a nested scope that might not run (an `if` branch, a
+/// loop body, a `try`/`catch` arm, a `switch` case): `promoted` is *owned*,
+/// not borrowed, specifically so nothing this scope learns — a bang usage,
+/// a reassignment — can leak back into the caller's own `Promoted` once this
+/// function returns and the local copy is dropped. The caller clones (and,
+/// for `Stmt::If`'s branches, extends) its own `Promoted` to build the value
+/// passed in.
+fn emit_scoped_block(
+    stmts: &[Stmt],
+    depth: usize,
+    used_expr_helper: &mut bool,
+    used_utf8_encode: &mut bool,
+    mut promoted: Promoted,
+) -> String {
+    let mut source = String::new();
+    for stmt in stmts {
+        source.push_str(&emit_stmt(
+            stmt,
+            depth,
+            used_expr_helper,
+            used_utf8_encode,
+            &mut promoted,
+        ));
+    }
+    source
+}
+
+/// `expr`'s name, if it's the bare-`Ref` shape an assignment target
+/// invalidates a promotion for — see `receiver_bang`'s own doc comment on
+/// why reassignment always does. Shared between `emit_stmt`'s own
+/// invalidation (a same-level `Stmt::Assign`/`Stmt::ExprAssign`) and
+/// `collect_assigned_names` below (an assignment nested inside a maybe-
+/// skipped block).
+fn assign_target_name(target: &Expr) -> Option<&str> {
+    match target {
+        Expr::Ref { name, .. } => Some(name),
+        _ => None,
+    }
+}
+
+/// A fresh clone of `promoted` for rendering a loop's condition/increment/
+/// body, with any name `body` itself reassigns already stripped out — even
+/// for a use textually *before* that reassignment. A loop's own back-edge
+/// means the top of the body has two incoming paths: straight from before
+/// the loop (where a name might be legitimately promoted) and looping back
+/// from the bottom of the previous iteration (where that same name might
+/// already have been reassigned to something not proven non-null). Dart's
+/// own analyzer resolves that by never trusting a promotion for a name the
+/// loop body assigns anywhere, for the whole body, not just from the
+/// assignment onward — real Verovio 6.2.0 regression:
+/// `docs/prompts/2026-08-21-04-bang-redundante-e-promocao.md`'s own evidence
+/// trail — `HumdrumToken? token = endtoken; int tcount =
+/// token!.getPreviousTokenCount();` correctly promotes `token` before a
+/// `while` loop, but the loop body both uses `token` early (inside a nested
+/// `for`) and reassigns it later (`token = token.getPreviousToken(0);`) —
+/// `dart analyze` still flags that *early* use as needing its own `!`, even
+/// on what textually looks like the first, not-yet-reassigned use.
+fn loop_scoped_promoted(promoted: &Promoted, body: &[Stmt]) -> Promoted {
+    let mut assigned = HashSet::new();
+    collect_assigned_names(body, &mut assigned);
+    let mut scoped = promoted.clone();
+    for name in &assigned {
+        scoped.remove(name);
+    }
+    scoped
+}
+
+/// Every local/parameter name `stmts` assigns to, anywhere inside it —
+/// recursing into every nested block (`if`, loop, `try`, `switch`), not
+/// just this list's own top level. `Stmt::If`'s handling uses this on both
+/// of its branches to invalidate, in the *ambient* `Promoted` used for code
+/// after the whole `if`, any name either branch might have reassigned: real
+/// Verovio 6.2.0 regression (`docs/prompts/2026-08-21-04-bang-redundante-e-promocao.md`)
+/// — `staff` promoted by an early `staff!.m_drawingStaffSize`, then
+/// reassigned by `staff = slur!.CalculatePrincipalStaff(...)` two `if`
+/// levels deeper, then read again as a bare `staff.GetN()` right after —
+/// `emit_scoped_block`'s own "nothing leaks back" design correctly drops
+/// that inner scope's *own* copy of the promotion, but nothing was
+/// invalidating the *outer* scope's copy, which had promoted `staff` before
+/// ever seeing the reassignment. A conservative over-approximation (an
+/// assignment on a path that isn't actually reachable here) only costs an
+/// unnecessary `!`, never an unsafely dropped one.
+fn collect_assigned_names(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Assign { name, .. } => {
+                out.insert(name.clone());
+            }
+            Stmt::ExprAssign { target, .. } => {
+                let name = assign_target_name(target).or_else(|| match target {
+                    Expr::Convert { operand, .. } => assign_target_name(operand),
+                    _ => None,
+                });
+                if let Some(name) = name {
+                    out.insert(name.to_owned());
+                }
+            }
+            Stmt::TupleAssign { targets, .. } => {
+                for target in targets {
+                    if let Some(name) = assign_target_name(target) {
+                        out.insert(name.to_owned());
+                    }
+                }
+            }
+            Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                collect_assigned_names(then_branch, out);
+                collect_assigned_names(else_branch, out);
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::ForEach { body, .. } => {
+                collect_assigned_names(body, out);
+            }
+            Stmt::For {
+                init,
+                increment,
+                body,
+                ..
+            } => {
+                if let Some(stmt) = init.as_deref() {
+                    collect_assigned_names(std::slice::from_ref(stmt), out);
+                }
+                if let Some(stmt) = increment.as_deref() {
+                    collect_assigned_names(std::slice::from_ref(stmt), out);
+                }
+                collect_assigned_names(body, out);
+            }
+            Stmt::TryCatch {
+                try_body,
+                catch_body,
+                ..
+            } => {
+                collect_assigned_names(try_body, out);
+                collect_assigned_names(catch_body, out);
+            }
+            Stmt::TryFinally {
+                try_body,
+                finally_body,
+                ..
+            } => {
+                collect_assigned_names(try_body, out);
+                collect_assigned_names(finally_body, out);
+            }
+            Stmt::Switch { cases, default, .. } => {
+                for case in cases {
+                    collect_assigned_names(&case.body, out);
+                }
+                if let Some(default) = default {
+                    collect_assigned_names(default, out);
+                }
+            }
+            Stmt::Return { .. }
+            | Stmt::VarDecl { .. }
+            | Stmt::FieldAssign { .. }
+            | Stmt::Break { .. }
+            | Stmt::Continue { .. }
+            | Stmt::ContinueLabel { .. }
+            | Stmt::ExprStmt { .. }
+            | Stmt::Throw { .. }
+            | Stmt::Unsupported { .. } => {}
+        }
     }
 }
 
@@ -2727,8 +3150,9 @@ fn emit_convert_operand(
     operand: &Expr,
     used_expr_helper: &mut bool,
     used_utf8_encode: &mut bool,
+    promoted: &mut Promoted,
 ) -> String {
-    let text = emit_expr(operand, used_expr_helper, used_utf8_encode);
+    let text = emit_expr(operand, used_expr_helper, used_utf8_encode, promoted);
     if matches!(
         operand,
         Expr::Unary {
@@ -2742,7 +3166,52 @@ fn emit_convert_operand(
     }
 }
 
-fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bool) -> String {
+/// Emits a short-circuit operator's (`&&`/`||`) right operand against a
+/// *clone* of `promoted`, discarded once `rhs` is rendered — never the
+/// caller's own `promoted` in place. Two separate reasons this has to be a
+/// throwaway clone, not a widen-in-place:
+///
+/// - `rhs` might not run at all: `&&` skips it once `lhs` is `false`, `||`
+///   skips it once `lhs` is `true`. A bang inside `rhs` only proves anything
+///   in the world where `rhs` actually executed — real Verovio regression
+///   (`docs/prompts/2026-08-21-04-bang-redundante-e-promocao.md`'s own
+///   evidence trail): `if (!a && !(positioner!.GetObject()!.…)) { continue; }`
+///   followed by an unguarded `positioner.GetDrawingPlace()` a few lines
+///   later — the whole `&&` is reached, but its right operand, where
+///   `positioner!` sits, only runs when `!a` is `true`; a first emitter
+///   draft merged that operand's own bang usage back into the ambient set
+///   regardless, so `positioner` looked promoted even along the path where
+///   `rhs` never ran, producing `unchecked_use_of_nullable_value`.
+/// - what *is* provably true from `lhs` alone (`and_chain_null_check_names`,
+///   `&&` only) is exactly what `Stmt::If`'s own handling of `then_branch`
+///   already seeds separately from the condition's structure — that's the
+///   one legitimate way a `&&`'s left operand promotes anything beyond its
+///   own right operand, and it doesn't need this function's help.
+fn emit_short_circuit_rhs(
+    lhs: &Expr,
+    rhs: &Expr,
+    op: BinaryOp,
+    used_expr_helper: &mut bool,
+    used_utf8_encode: &mut bool,
+    promoted: &Promoted,
+) -> String {
+    let mut scoped = promoted.clone();
+    if op == BinaryOp::And {
+        let mut extra = Vec::new();
+        and_chain_null_check_names(lhs, &mut extra);
+        for name in extra {
+            scoped.insert(name.to_owned());
+        }
+    }
+    emit_expr(rhs, used_expr_helper, used_utf8_encode, &mut scoped)
+}
+
+fn emit_expr(
+    expr: &Expr,
+    used_expr_helper: &mut bool,
+    used_utf8_encode: &mut bool,
+    promoted: &mut Promoted,
+) -> String {
     match expr {
         Expr::IntLiteral { value, .. } => value.to_string(),
         Expr::DoubleLiteral { value, .. } => value.to_string(),
@@ -2753,34 +3222,69 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
         Expr::Binary {
             op, lhs, rhs, ty, ..
         } => {
-            let lhs_text = emit_expr(lhs, used_expr_helper, used_utf8_encode);
-            let rhs_text = emit_expr(rhs, used_expr_helper, used_utf8_encode);
-            let lhs_text = if matches!(lhs.as_ref(), Expr::Conditional { .. }) {
+            let lhs_text = emit_expr(lhs, used_expr_helper, used_utf8_encode, promoted);
+            let rhs_text = if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                emit_short_circuit_rhs(lhs, rhs, *op, used_expr_helper, used_utf8_encode, promoted)
+            } else {
+                emit_expr(rhs, used_expr_helper, used_utf8_encode, promoted)
+            };
+            // A lower- (or, on the right, equal-) precedence child printed
+            // bare would silently reassociate — see `binary_child_needs_parens`'s
+            // own doc comment for why this is a real correctness bug on its
+            // own, not just a nullability concern.
+            let lhs_text = if binary_child_needs_parens(*op, lhs, false) {
                 format!("({lhs_text})")
             } else {
                 lhs_text
             };
-            let rhs_text = if matches!(rhs.as_ref(), Expr::Conditional { .. }) {
+            let rhs_text = if binary_child_needs_parens(*op, rhs, true) {
                 format!("({rhs_text})")
             } else {
                 rhs_text
             };
             format!("{lhs_text} {} {rhs_text}", emit_binary_op(*op, ty))
         }
+        // `then_expr`/`else_expr` are mutually exclusive, exactly like
+        // `Stmt::If`'s two branches (see that arm's own doc comment) — each
+        // renders against its own clone of `promoted`, extended with
+        // whatever `condition` proves for that side, and neither clone is
+        // merged back: a bang inside `then_expr` must not promote a name
+        // for `else_expr`'s evaluation, nor for whatever follows the whole
+        // ternary.
         Expr::Conditional {
             condition,
             then_expr,
             else_expr,
             ..
-        } => format!(
-            "{} ? {} : {}",
-            emit_expr(condition, used_expr_helper, used_utf8_encode),
-            emit_expr(then_expr, used_expr_helper, used_utf8_encode),
-            emit_expr(else_expr, used_expr_helper, used_utf8_encode)
-        ),
+        } => {
+            let condition_text = emit_expr(condition, used_expr_helper, used_utf8_encode, promoted);
+            let mut then_extra = Vec::new();
+            and_chain_null_check_names(condition, &mut then_extra);
+            let mut then_promoted = promoted.clone();
+            for name in then_extra {
+                then_promoted.insert(name.to_owned());
+            }
+            let then_text = emit_expr(
+                then_expr,
+                used_expr_helper,
+                used_utf8_encode,
+                &mut then_promoted,
+            );
+            let mut else_promoted = promoted.clone();
+            if let Some(name) = ref_null_check_name(condition, BinaryOp::Eq) {
+                else_promoted.insert(name.to_owned());
+            }
+            let else_text = emit_expr(
+                else_expr,
+                used_expr_helper,
+                used_utf8_encode,
+                &mut else_promoted,
+            );
+            format!("{condition_text} ? {then_text} : {else_text}")
+        }
         Expr::Unary { op, operand, .. } => {
             let op_text = emit_unary_op(*op);
-            let operand_text = emit_expr(operand, used_expr_helper, used_utf8_encode);
+            let operand_text = emit_expr(operand, used_expr_helper, used_utf8_encode, promoted);
             if matches!(op, UnaryOp::PostIncrement | UnaryOp::PostDecrement) {
                 return format!("{operand_text}{op_text}");
             }
@@ -2803,7 +3307,7 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
         Expr::Convert { operand, ty, .. } => match ty {
             Type::Double => format!(
                 "{}.toDouble()",
-                emit_convert_operand(operand, used_expr_helper, used_utf8_encode)
+                emit_convert_operand(operand, used_expr_helper, used_utf8_encode, promoted)
             ),
             // `bool` → `int` (C++ implicitly reads a `bool` as `1`/`0`
             // wherever an integer is expected), `enum` → `int` (the
@@ -2815,19 +3319,19 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
             // `ty: Type::Int`.
             Type::Int if matches!(expr_ty(operand), Some(Type::Bool)) => format!(
                 "{} ? 1 : 0",
-                emit_expr(operand, used_expr_helper, used_utf8_encode)
+                emit_expr(operand, used_expr_helper, used_utf8_encode, promoted)
             ),
             Type::Int if matches!(expr_ty(operand), Some(Type::Enum { .. })) => format!(
                 "{}.value",
-                emit_convert_operand(operand, used_expr_helper, used_utf8_encode)
+                emit_convert_operand(operand, used_expr_helper, used_utf8_encode, promoted)
             ),
             Type::Int => format!(
                 "{}.toInt()",
-                emit_convert_operand(operand, used_expr_helper, used_utf8_encode)
+                emit_convert_operand(operand, used_expr_helper, used_utf8_encode, promoted)
             ),
             Type::Bool => format!(
                 "{} != {}",
-                emit_expr(operand, used_expr_helper, used_utf8_encode),
+                emit_expr(operand, used_expr_helper, used_utf8_encode, promoted),
                 if matches!(expr_ty(operand), Some(Type::Nullable(_))) {
                     "null"
                 } else {
@@ -2839,13 +3343,13 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
             // widening implicitly. A dereference goes the other way and
             // needs the explicit assertion that mirrors C++'s own unchecked
             // pointer access.
-            Type::Nullable(_) => emit_expr(operand, used_expr_helper, used_utf8_encode),
+            Type::Nullable(_) => emit_expr(operand, used_expr_helper, used_utf8_encode, promoted),
             _ if matches!(operand.as_ref(), Expr::This { .. }) => {
-                emit_expr(operand, used_expr_helper, used_utf8_encode)
+                emit_expr(operand, used_expr_helper, used_utf8_encode, promoted)
             }
             _ if matches!(expr_ty(operand), Some(Type::Nullable(_))) => format!(
                 "{}!",
-                emit_convert_operand(operand, used_expr_helper, used_utf8_encode)
+                emit_convert_operand(operand, used_expr_helper, used_utf8_encode, promoted)
             ),
             _ => unreachable!(
                 "only represented scalar and nullable-reference conversions construct \
@@ -2872,39 +3376,49 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
             if callee_name.starts_with("utf8.") {
                 *used_utf8_encode = true;
             }
+            // The receiver (when there is one) is evaluated — and, for
+            // promotion purposes, dereferenced — before any argument, same
+            // as Dart's own left-to-right evaluation of `receiver.method
+            // (args)`. Computing `args_text` first would let a bang inside
+            // an argument promote a name the receiver itself still needs
+            // its own `!` for at this point, since Dart's analyzer hasn't
+            // reached that argument yet when it checks the receiver —
+            // producing `unchecked_use_of_nullable_value` in exactly the
+            // real Verovio corpus's most common expression shape (real
+            // regression caught by `just verovio-diagnosis` while
+            // implementing `receiver_bang`'s promotion tracking).
+            let receiver_prefix = match target.as_deref() {
+                None | Some(Expr::This { .. }) => String::new(),
+                Some(receiver) => {
+                    let receiver_text =
+                        emit_expr(receiver, used_expr_helper, used_utf8_encode, promoted);
+                    let bang = receiver_bang(receiver, promoted);
+                    format!("{receiver_text}{bang}.")
+                }
+            };
             let args_text = args
                 .iter()
-                .map(|arg| emit_expr(arg, used_expr_helper, used_utf8_encode))
+                .map(|arg| emit_expr(arg, used_expr_helper, used_utf8_encode, promoted))
                 .collect::<Vec<_>>()
                 .join(", ");
-            // `None` (a free function) and `Some(This)` (a method called on
-            // an implicit receiver, from inside another method) both emit
-            // with no receiver at all — Dart, like C++, never requires
-            // `this.` to reach a class's own members. Only a call on some
-            // other, explicit object prints its receiver.
-            match target.as_deref() {
-                None | Some(Expr::This { .. }) => format!("{callee_name}({args_text})"),
-                Some(receiver) => format!(
-                    "{}{}.{callee_name}({args_text})",
-                    emit_expr(receiver, used_expr_helper, used_utf8_encode),
-                    receiver_bang(receiver)
-                ),
-            }
+            format!("{receiver_prefix}{callee_name}({args_text})")
         }
         Expr::FieldAccess { target, field, .. } => match target.as_ref() {
             Expr::This { .. } => field.clone(),
-            _ => format!(
-                "{}{}.{field}",
-                emit_expr(target, used_expr_helper, used_utf8_encode),
-                receiver_bang(target)
-            ),
+            _ => {
+                let target_text = emit_expr(target, used_expr_helper, used_utf8_encode, promoted);
+                let bang = receiver_bang(target, promoted);
+                format!("{target_text}{bang}.{field}")
+            }
         },
         Expr::RecordConstruct {
             type_name, fields, ..
         } => {
             let args_text = fields
                 .iter()
-                .map(|(_name, value)| emit_expr(value, used_expr_helper, used_utf8_encode))
+                .map(|(_name, value)| {
+                    emit_expr(value, used_expr_helper, used_utf8_encode, promoted)
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("{type_name}({args_text})")
@@ -2917,7 +3431,7 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
         } => {
             let args_text = args
                 .iter()
-                .map(|arg| emit_expr(arg, used_expr_helper, used_utf8_encode))
+                .map(|arg| emit_expr(arg, used_expr_helper, used_utf8_encode, promoted))
                 .collect::<Vec<_>>()
                 .join(", ");
             let dart_name = dart_constructor_name(type_name, *constructor_index);
@@ -2931,45 +3445,56 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
         // *does* produce a bare `This` fails loudly in `dart analyze`
         // (`this` outside a method) rather than panicking the emitter.
         Expr::This { .. } => "this".to_owned(),
-        Expr::Index { target, index, .. } => format!(
-            "{}{}[{}]",
-            emit_expr(target, used_expr_helper, used_utf8_encode),
-            receiver_bang(target),
-            emit_expr(index, used_expr_helper, used_utf8_encode)
-        ),
+        Expr::Index { target, index, .. } => {
+            let target_text = emit_expr(target, used_expr_helper, used_utf8_encode, promoted);
+            let bang = receiver_bang(target, promoted);
+            let index_text = emit_expr(index, used_expr_helper, used_utf8_encode, promoted);
+            format!("{target_text}{bang}[{index_text}]")
+        }
         Expr::MapIndexOrInsert {
             target,
             index,
             default_value,
             ..
-        } => format!(
-            "{}{}.putIfAbsent({}, () => {})",
-            emit_expr(target, used_expr_helper, used_utf8_encode),
-            receiver_bang(target),
-            emit_expr(index, used_expr_helper, used_utf8_encode),
-            emit_expr(default_value, used_expr_helper, used_utf8_encode)
-        ),
+        } => {
+            let target_text = emit_expr(target, used_expr_helper, used_utf8_encode, promoted);
+            let bang = receiver_bang(target, promoted);
+            let index_text = emit_expr(index, used_expr_helper, used_utf8_encode, promoted);
+            // `default_value` renders inside a `() => ...` closure literal
+            // (below) — it may run zero times (an existing key) or later
+            // than this point, never inline with the rest of this
+            // expression, so anything it promotes must not leak into
+            // `promoted` past this call, same reasoning as a loop body or
+            // an `if` branch.
+            let default_text = emit_expr(
+                default_value,
+                used_expr_helper,
+                used_utf8_encode,
+                &mut promoted.clone(),
+            );
+            format!("{target_text}{bang}.putIfAbsent({index_text}, () => {default_text})")
+        }
         Expr::StringByteLength { target, .. } => {
             *used_utf8_encode = true;
             format!(
                 "utf8.encode({}).length",
-                emit_expr(target, used_expr_helper, used_utf8_encode)
+                emit_expr(target, used_expr_helper, used_utf8_encode, promoted)
             )
         }
         Expr::StringByteIndexOf { target, needle, .. } => {
             *used_utf8_encode = true;
             format!(
                 "utf8.encode({}).indexOf(utf8.encode({}))",
-                emit_expr(target, used_expr_helper, used_utf8_encode),
-                emit_expr(needle, used_expr_helper, used_utf8_encode)
+                emit_expr(target, used_expr_helper, used_utf8_encode, promoted),
+                emit_expr(needle, used_expr_helper, used_utf8_encode, promoted)
             )
         }
         Expr::StringByteAt { target, index, .. } => {
             *used_utf8_encode = true;
             format!(
                 "utf8.encode({})[{}]",
-                emit_expr(target, used_expr_helper, used_utf8_encode),
-                emit_expr(index, used_expr_helper, used_utf8_encode)
+                emit_expr(target, used_expr_helper, used_utf8_encode, promoted),
+                emit_expr(index, used_expr_helper, used_utf8_encode, promoted)
             )
         }
         // A single-element Dart record needs a trailing comma
@@ -2977,7 +3502,7 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
         Expr::Tuple { values, .. } if values.len() == 1 => {
             format!(
                 "({},)",
-                emit_expr(&values[0], used_expr_helper, used_utf8_encode)
+                emit_expr(&values[0], used_expr_helper, used_utf8_encode, promoted)
             )
         }
         Expr::ListLiteral { items, ty, .. } => format!(
@@ -2988,7 +3513,7 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
             }),
             items
                 .iter()
-                .map(|item| emit_expr(item, used_expr_helper, used_utf8_encode))
+                .map(|item| emit_expr(item, used_expr_helper, used_utf8_encode, promoted))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -3003,11 +3528,12 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
                 emit_type(value_ty),
                 entries
                     .iter()
-                    .map(|(key, value)| format!(
-                        "{}: {}",
-                        emit_expr(key, used_expr_helper, used_utf8_encode),
-                        emit_expr(value, used_expr_helper, used_utf8_encode)
-                    ))
+                    .map(|(key, value)| {
+                        let key_text = emit_expr(key, used_expr_helper, used_utf8_encode, promoted);
+                        let value_text =
+                            emit_expr(value, used_expr_helper, used_utf8_encode, promoted);
+                        format!("{key_text}: {value_text}")
+                    })
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -3018,22 +3544,28 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
             ..
         } => format!(
             "{} is {}",
-            emit_expr(operand, used_expr_helper, used_utf8_encode),
+            emit_expr(operand, used_expr_helper, used_utf8_encode, promoted),
             emit_type(target_type)
         ),
         // Always parenthesized: Dart's `=` has the same low precedence
         // C++'s does, so an unparenthesized `x = y != null` would parse as
         // `x = (y != null)`, not the intended `(x = y) != null`.
-        Expr::Assign { target, value, .. } => format!(
-            "({} = {})",
-            emit_expr(target, used_expr_helper, used_utf8_encode),
-            emit_expr(value, used_expr_helper, used_utf8_encode)
-        ),
+        Expr::Assign { target, value, .. } => {
+            let target_text = emit_expr(target, used_expr_helper, used_utf8_encode, promoted);
+            let value_text = emit_expr(value, used_expr_helper, used_utf8_encode, promoted);
+            // Reassignment invalidates any promotion the target held — Dart
+            // can no longer prove the new value is non-null, so a later
+            // dereference needs its own `!` again.
+            if let Expr::Ref { name, .. } = target.as_ref() {
+                promoted.remove(name);
+            }
+            format!("({target_text} = {value_text})")
+        }
         Expr::Tuple { values, .. } => format!(
             "({})",
             values
                 .iter()
-                .map(|value| emit_expr(value, used_expr_helper, used_utf8_encode))
+                .map(|value| emit_expr(value, used_expr_helper, used_utf8_encode, promoted))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -3086,6 +3618,57 @@ fn emit_binary_op(op: BinaryOp, ty: &Type) -> &'static str {
         BinaryOp::BitAnd => "&",
         BinaryOp::BitXor => "^",
         BinaryOp::BitOr => "|",
+    }
+}
+
+/// Dart's own binary-operator precedence (higher binds tighter) — the
+/// subset this module ever constructs. Needed to decide when a nested
+/// `Expr::Binary` must be parenthesized to print with the same grouping the
+/// IR tree actually has: printing a lower-precedence child bare next to a
+/// higher-precedence parent silently reassociates it (`x && a || b` parses
+/// as `(x && a) || b`, not the intended `x && (a || b)`) — a real,
+/// nullability-independent correctness bug that also breaks the promotion
+/// tracking's own soundness once one operand promotes a name (see the
+/// `Expr::Binary` arm's own doc comment and
+/// `docs/prompts/2026-08-21-04-bang-redundante-e-promocao.md`'s evidence
+/// trail for the real Verovio regression this caused).
+fn binary_precedence(op: BinaryOp) -> u8 {
+    match op {
+        BinaryOp::Or => 1,
+        BinaryOp::And => 2,
+        BinaryOp::BitOr => 3,
+        BinaryOp::BitXor => 4,
+        BinaryOp::BitAnd => 5,
+        BinaryOp::Eq | BinaryOp::Ne => 6,
+        BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => 7,
+        BinaryOp::ShiftLeft | BinaryOp::ShiftRight => 8,
+        BinaryOp::Add | BinaryOp::Sub => 9,
+        BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => 10,
+    }
+}
+
+/// Whether `child`, printed as the left or right operand of a `Binary` node
+/// with operator `outer_op`, needs parentheses to keep the same grouping the
+/// IR tree actually has. A ternary always does (lower precedence than any
+/// binary operator). A nested `Binary` needs them whenever it binds looser
+/// than `outer_op` — or, on the right side, whenever it binds *equally
+/// tight*: every one of these operators is left-associative in both Dart
+/// and C++, so a same-precedence child can only be on the right if the
+/// source had explicit parentheses putting it there, which the printed text
+/// must therefore preserve (`a - (b - c)` is not `a - b - c`).
+fn binary_child_needs_parens(outer_op: BinaryOp, child: &Expr, child_is_rhs: bool) -> bool {
+    match child {
+        Expr::Conditional { .. } => true,
+        Expr::Binary { op: child_op, .. } => {
+            let outer = binary_precedence(outer_op);
+            let inner = binary_precedence(*child_op);
+            if child_is_rhs {
+                inner <= outer
+            } else {
+                inner < outer
+            }
+        }
+        _ => false,
     }
 }
 
