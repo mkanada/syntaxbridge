@@ -4174,6 +4174,102 @@ void only_x(int *a) {
     );
 }
 
+/// Round 20: a `bool`-returning out-param function (the *dominant* real
+/// shape — real trigger `editortoolkit_neume.h`'s `bool
+/// ParseDragAction(jsonxx::Object param, std::string *elementId, int *x,
+/// int *y)`, whose real body is `if (!param.has<...>("x")) return false;
+/// (*x) = param.get<...>("x"); ...`, an early `return false;` *before* any
+/// out-param write, and a parenthesized deref-assign — both reproduced
+/// here faithfully, not simplified away), called inside an `if` condition
+/// — the real corpus's own call site (`editortoolkit_neume.cpp:92`).
+#[test]
+fn a_bool_returning_out_param_call_used_in_an_if_condition_bridges_correctly() {
+    let source = lower_and_emit(
+        "lower-cpp-bool-out-param-if-condition",
+        r#"
+bool GetPoint(bool available, int *x, int *y) {
+    if (!available) return false;
+    (*x) = 10;
+    (*y) = 20;
+    return true;
+}
+
+int use_it(bool available) {
+    int a = 0;
+    int b = 0;
+    if (GetPoint(available, &a, &b)) {
+        return a + b;
+    }
+    return -1;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("(bool, int, int) GetPoint(bool available, int x, int y)"),
+        "expected the bool return plus pointer out-params to become a Dart tuple, got:\n{source}"
+    );
+    assert!(
+        source.contains("return (false, x, y);"),
+        "expected the early return's implicit out-param values to fill the tuple's other \
+         slots, got:\n{source}"
+    );
+    assert!(
+        source.contains("return (true, x, y);"),
+        "expected the original bool return value to be part of the tuple, got:\n{source}"
+    );
+    assert!(
+        source.contains("_syntaxBridgeIfCallTemp = GetPoint(available, a, b);")
+            && source.contains("a = _syntaxBridgeIfCallTemp.$2;")
+            && source.contains("b = _syntaxBridgeIfCallTemp.$3;")
+            && source.contains("if (_syntaxBridgeIfCallTemp.$1) {"),
+        "expected the if-condition call to destructure into a temp before testing the bool \
+         slot, got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "bool-returning out-param call in an if condition must not bail out, got:\n{source}"
+    );
+}
+
+/// The negated form, `if (!chamada(...))` — equally common in the real
+/// corpus's own guard-clause style (`if (!param.has<...>("x")) return
+/// false;`, the exact shape `ParseDragAction`'s own body uses, just with
+/// the out-param call itself as the negated condition instead).
+#[test]
+fn a_negated_bool_returning_out_param_call_in_an_if_condition_bridges_correctly() {
+    let source = lower_and_emit(
+        "lower-cpp-negated-bool-out-param-if-condition",
+        r#"
+bool GetPoint(int *x, int *y) {
+    (*x) = 10;
+    (*y) = 20;
+    return true;
+}
+
+int use_it() {
+    int a = 0;
+    int b = 0;
+    if (!GetPoint(&a, &b)) {
+        return -1;
+    }
+    return a + b;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("if (!(_syntaxBridgeIfCallTemp.$1)) {"),
+        "expected the negated condition to test the negation of the tuple's bool slot, \
+         got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "negated bool-returning out-param call in an if condition must not bail out, \
+         got:\n{source}"
+    );
+}
+
 /// `std::stringstream`/`std::ostringstream` accumulation (round 19, real
 /// trigger `options.cpp`'s `OptionArray::GetStr`): `ss << a << b;` used as
 /// its own statement, across several separate insertions (including inside

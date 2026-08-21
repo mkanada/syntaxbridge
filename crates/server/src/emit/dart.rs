@@ -2438,6 +2438,9 @@ fn emit_stmt(
                 emit_expr(value, used_expr_helper, used_utf8_encode)
             ));
             for (index, target) in targets.iter().enumerate() {
+                if is_tuple_assign_discard(target) {
+                    continue;
+                }
                 source.push_str(&format!(
                     "{pad}{INDENT}{} = {TUPLE_ASSIGN_TEMP}.${};\n",
                     emit_expr(target, used_expr_helper, used_utf8_encode),
@@ -2661,6 +2664,24 @@ fn expr_ty(expr: &Expr) -> Option<&Type> {
 /// same-named local outside it, or with another bridged call's own block
 /// elsewhere in the same function.
 const TUPLE_ASSIGN_TEMP: &str = "_syntaxBridgeTupleAssign";
+
+/// A `Stmt::TupleAssign` target that discards its own slot — round 20's
+/// non-`void` out-param bridge (`lower::cpp::apply_out_param_bridge`):
+/// when the original C++ return value itself is discarded at a call site
+/// (`ParseDragAction(...);`, a bare statement ignoring the `bool` — legal
+/// C++), the tuple's own leading slot has nothing to assign into. `_` in
+/// Dart's *pattern*-destructuring position (`(_, x, y) = call();`) is a
+/// real wildcard needing no declaration — but the temp-block fallback
+/// below assigns each target with an *ordinary* statement
+/// (`target = temp.$N;`), where a bare `_` would be an assignment to an
+/// undeclared identifier, a real Dart error, not a wildcard. `lower::cpp`
+/// marks a discard as `Expr::Ref { name: "_", .. }` (`Ref` rendering is
+/// exactly its own name, so the pattern form needs nothing special); the
+/// block form below checks for this marker explicitly and skips the line
+/// entirely instead of assigning to it.
+fn is_tuple_assign_discard(target: &Expr) -> bool {
+    matches!(target, Expr::Ref { name, .. } if name == "_")
+}
 
 /// Whether `Stmt::TupleAssign`'s ordinary record-pattern syntax
 /// (`(targets...) = value;`) is unusable for this `targets` list — true

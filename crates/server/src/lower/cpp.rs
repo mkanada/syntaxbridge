@@ -301,12 +301,42 @@ unsafe fn apply_out_param_bridge(
     body: &mut Vec<ir::Stmt>,
     origin: &ir::Origin,
 ) {
-    if *return_type != ir::Type::Void {
-        return;
-    }
     let indices = unsafe { out_param_indices(cursor) };
     if indices.is_empty() {
         return;
+    }
+    // A real out-param function very often isn't `void` — a `bool`/status
+    // return alongside the out-params is the *dominant* shape in the real
+    // Verovio corpus (round 19/20, real trigger: `editortoolkit_neume.h`'s
+    // `bool ParseDragAction(..., int *x, int *y)`), not an edge case the
+    // original `void`-only scope correctly deferred. Bridging a non-`void`
+    // function is scoped to the *pointer* form of out-param specifically
+    // (`unsafe { is_pointer_out_param(cursor, index) }` below), never the
+    // reference form: a reference out-param's call-site argument is a bare
+    // name (`Reduce(numerador, denominador)`, no `&`) that lowers cleanly
+    // through the *ordinary* expression path in any context this module
+    // doesn't specifically recognize as a bridged call (an `if` condition,
+    // a nested boolean expression, ...) — which would silently assume the
+    // callee still returns its original scalar type instead of the new
+    // tuple, a real type mismatch this module has no way to catch from a
+    // single function's own lowering. A *pointer* out-arg has no such
+    // risk: `&x` for a bare scalar always lowers to an honest
+    // `Unsupported` in any context other than the ones this module
+    // specifically unwraps it in (`lower_unary_expr`'s `AddrOf` case has
+    // no `Known` shape for a scalar pointee) — so an unrecognized call
+    // site to a non-`void` pointer-bridged function fails safely (an
+    // honest bailout on its own arguments), never a clean-looking call to
+    // the wrong Dart signature.
+    let had_void_return = *return_type == ir::Type::Void;
+    if !had_void_return {
+        let all_pointer_form = indices.iter().all(|&index| {
+            let param_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, index as c_uint) };
+            unsafe { clang_sys::clang_getCursorType(param_cursor) }.kind
+                == clang_sys::CXType_Pointer
+        });
+        if !all_pointer_form {
+            return;
+        }
     }
 
     // The reference form of an out-param already gets the right Dart
@@ -329,21 +359,31 @@ unsafe fn apply_out_param_bridge(
         }
     }
 
-    replace_void_returns_with_tuple(body, &indices, params, origin);
-    body.push(ir::Stmt::Return {
-        value: Some(ir::Expr::Tuple {
-            values: out_param_tuple_values(&indices, params, origin),
+    replace_returns_with_out_param_tuple(body, &indices, params, origin);
+    // A bare `return;`/fall-through only needs synthesizing for a `void`
+    // function — every path of a well-formed non-`void` C++ function
+    // already has an explicit `return value;` (falling off the end
+    // without one is undefined behavior a real compiler would already
+    // reject/warn on), which `replace_returns_with_out_param_tuple` above
+    // already rewrote in place; adding another one here would return a
+    // tuple missing its own first (original-return-value) slot.
+    if had_void_return {
+        body.push(ir::Stmt::Return {
+            value: Some(ir::Expr::Tuple {
+                values: out_param_tuple_values(&indices, params, origin),
+                origin: origin.clone(),
+            }),
             origin: origin.clone(),
-        }),
-        origin: origin.clone(),
-    });
+        });
+    }
 
-    *return_type = ir::Type::Tuple(
-        indices
-            .iter()
-            .map(|&index| params[index].ty.clone())
-            .collect(),
-    );
+    let mut tuple_types: Vec<ir::Type> = if had_void_return {
+        Vec::new()
+    } else {
+        vec![return_type.clone()]
+    };
+    tuple_types.extend(indices.iter().map(|&index| params[index].ty.clone()));
+    *return_type = ir::Type::Tuple(tuple_types);
 }
 
 fn out_param_tuple_values(
@@ -361,36 +401,40 @@ fn out_param_tuple_values(
         .collect()
 }
 
-/// A bare `return;` inside a bridged `void` function/method also needs to
-/// return the out-param tuple — a fall-through past the last statement
-/// isn't the only way such a function can end. Walks every nested
-/// `if`/`while`/`for`/`try` block; every other statement shape is left
-/// alone (a `return` with a real C++ value can't appear in a function this
-/// module already confirmed returns `void`).
-fn replace_void_returns_with_tuple(
+/// Every `return`, in a bridged function/method, needs its value (if any)
+/// folded into the out-param tuple, in addition to the out-param values
+/// themselves — a bare `return;` (the `void` case: the out-param values
+/// alone become the tuple) or `return value;` (the non-`void` case, real
+/// trigger `editortoolkit_neume.h`'s `bool ParseDragAction(...)`: `value`
+/// becomes the tuple's own first slot, out-param values following it, the
+/// same order `apply_out_param_bridge` builds the return *type* tuple in).
+/// Walks every nested `if`/`while`/`for`/`try` block; every other
+/// statement shape is left alone.
+fn replace_returns_with_out_param_tuple(
     stmts: &mut [ir::Stmt],
     indices: &[usize],
     params: &[ir::Param],
     origin: &ir::Origin,
 ) {
     for stmt in stmts {
-        replace_void_return_with_tuple(stmt, indices, params, origin);
+        replace_return_with_out_param_tuple(stmt, indices, params, origin);
     }
 }
 
-fn replace_void_return_with_tuple(
+fn replace_return_with_out_param_tuple(
     stmt: &mut ir::Stmt,
     indices: &[usize],
     params: &[ir::Param],
     origin: &ir::Origin,
 ) {
     match stmt {
-        ir::Stmt::Return {
-            value: value @ None,
-            ..
-        } => {
+        ir::Stmt::Return { value, .. } => {
+            let mut tuple_values = out_param_tuple_values(indices, params, origin);
+            if let Some(original_value) = value.take() {
+                tuple_values.insert(0, original_value);
+            }
             *value = Some(ir::Expr::Tuple {
-                values: out_param_tuple_values(indices, params, origin),
+                values: tuple_values,
                 origin: origin.clone(),
             });
         }
@@ -399,14 +443,14 @@ fn replace_void_return_with_tuple(
             else_branch,
             ..
         } => {
-            replace_void_returns_with_tuple(then_branch, indices, params, origin);
-            replace_void_returns_with_tuple(else_branch, indices, params, origin);
+            replace_returns_with_out_param_tuple(then_branch, indices, params, origin);
+            replace_returns_with_out_param_tuple(else_branch, indices, params, origin);
         }
         ir::Stmt::While { body, .. } => {
-            replace_void_returns_with_tuple(body, indices, params, origin)
+            replace_returns_with_out_param_tuple(body, indices, params, origin)
         }
         ir::Stmt::DoWhile { body, .. } => {
-            replace_void_returns_with_tuple(body, indices, params, origin)
+            replace_returns_with_out_param_tuple(body, indices, params, origin)
         }
         ir::Stmt::For {
             init,
@@ -415,42 +459,41 @@ fn replace_void_return_with_tuple(
             ..
         } => {
             if let Some(init) = init {
-                replace_void_return_with_tuple(init, indices, params, origin);
+                replace_return_with_out_param_tuple(init, indices, params, origin);
             }
             if let Some(increment) = increment {
-                replace_void_return_with_tuple(increment, indices, params, origin);
+                replace_return_with_out_param_tuple(increment, indices, params, origin);
             }
-            replace_void_returns_with_tuple(body, indices, params, origin);
+            replace_returns_with_out_param_tuple(body, indices, params, origin);
         }
         ir::Stmt::ForEach { body, .. } => {
-            replace_void_returns_with_tuple(body, indices, params, origin)
+            replace_returns_with_out_param_tuple(body, indices, params, origin)
         }
         ir::Stmt::TryCatch {
             try_body,
             catch_body,
             ..
         } => {
-            replace_void_returns_with_tuple(try_body, indices, params, origin);
-            replace_void_returns_with_tuple(catch_body, indices, params, origin);
+            replace_returns_with_out_param_tuple(try_body, indices, params, origin);
+            replace_returns_with_out_param_tuple(catch_body, indices, params, origin);
         }
         ir::Stmt::TryFinally {
             try_body,
             finally_body,
             ..
         } => {
-            replace_void_returns_with_tuple(try_body, indices, params, origin);
-            replace_void_returns_with_tuple(finally_body, indices, params, origin);
+            replace_returns_with_out_param_tuple(try_body, indices, params, origin);
+            replace_returns_with_out_param_tuple(finally_body, indices, params, origin);
         }
         ir::Stmt::Switch { cases, default, .. } => {
             for case in cases {
-                replace_void_returns_with_tuple(&mut case.body, indices, params, origin);
+                replace_returns_with_out_param_tuple(&mut case.body, indices, params, origin);
             }
             if let Some(default) = default {
-                replace_void_returns_with_tuple(default, indices, params, origin);
+                replace_returns_with_out_param_tuple(default, indices, params, origin);
             }
         }
-        ir::Stmt::Return { .. }
-        | ir::Stmt::VarDecl { .. }
+        ir::Stmt::VarDecl { .. }
         | ir::Stmt::Assign { .. }
         | ir::Stmt::FieldAssign { .. }
         | ir::Stmt::ExprAssign { .. }
@@ -2507,7 +2550,194 @@ unsafe fn lower_stmt_into(cursor: clang_sys::CXCursor, project_root: &Path) -> V
             return statements;
         }
     }
+    if kind == clang_sys::CXCursor_IfStmt {
+        let origin = stmt_origin(cursor, project_root);
+        if let Some(statements) =
+            unsafe { lower_if_with_out_param_call(cursor, project_root, &origin) }
+        {
+            return statements;
+        }
+    }
     vec![unsafe { lower_stmt(cursor, project_root) }]
+}
+
+/// `if (chamada(...))`/`if (!chamada(...))` where `chamada` resolves to a
+/// non-`void` out-param-bridged function (round 20 — real trigger
+/// `editortoolkit_neume.cpp:92`'s `if (this->ParseDragAction(json.get<
+/// jsonxx::Object>("param"), &elementId, &x, &y))`). The bridged callee
+/// now returns `(bool, ...)`, not `bool` — using it directly as an `if`
+/// condition, the way this idiom's *value* is actually consumed, needs a
+/// temporary holding the whole tuple, one assignment per out-param target,
+/// and the `if` itself testing only the tuple's own first slot. This is
+/// exactly why `Stmt::TupleAssign`'s own bare-statement form (used by a
+/// *discarded*-return call, `lower_stmt`'s `CXCursor_CallExpr` branch)
+/// isn't reused here: this call's return value *is* consumed, just not by
+/// assignment. Returns `None` (never a guess) for anything not exactly
+/// this shape — the call is still `lower_stmt`'s ordinary `IfStmt` path
+/// otherwise, and its condition still lowers through the *generic*
+/// expression path, whose own `&x`-is-`Unsupported` rule for a bare scalar
+/// pointer (`is_non_const_scalar_out_param_type`'s own doc comment) is what
+/// keeps every *other*, unrecognized use of a non-`void` bridged call
+/// (nested in a larger boolean expression, a `while` condition, assigned
+/// to a variable, ...) an honest bailout instead of a silent type mismatch
+/// against the callee's real (tuple) Dart signature.
+unsafe fn lower_if_with_out_param_call(
+    cursor: clang_sys::CXCursor,
+    project_root: &Path,
+    origin: &ir::Origin,
+) -> Option<Vec<ir::Stmt>> {
+    let children = unsafe { collect_children(cursor) };
+    let (condition_cursor, then_cursor, else_cursor) = match children.as_slice() {
+        [condition_cursor, then_cursor] => (*condition_cursor, *then_cursor, None),
+        [condition_cursor, then_cursor, else_cursor] => {
+            (*condition_cursor, *then_cursor, Some(*else_cursor))
+        }
+        _ => return None,
+    };
+
+    let condition_cursor = unsafe { unwrap_transparent_value_cursor(condition_cursor) };
+    // `CXUnaryOperator_Not` (9) is bitwise `~`; logical `!` is
+    // `CXUnaryOperator_LNot` (10) — confirmed directly against clang-sys's
+    // own constants after this comparison silently never matched with the
+    // wrong one.
+    let is_negated = unsafe { clang_sys::clang_getCursorKind(condition_cursor) }
+        == clang_sys::CXCursor_UnaryOperator
+        && unsafe { clang_sys::clang_getCursorUnaryOperatorKind(condition_cursor) }
+            == clang_sys::CXUnaryOperator_LNot;
+    let call_cursor = if is_negated {
+        let not_children = unsafe { collect_children(condition_cursor) };
+        let [operand_cursor] = not_children.as_slice() else {
+            return None;
+        };
+        unsafe { unwrap_transparent_value_cursor(*operand_cursor) }
+    } else {
+        condition_cursor
+    };
+    if unsafe { clang_sys::clang_getCursorKind(call_cursor) } != clang_sys::CXCursor_CallExpr {
+        return None;
+    }
+    let referenced = unsafe { clang_sys::clang_getCursorReferenced(call_cursor) };
+    if unsafe { clang_sys::clang_Cursor_isNull(referenced) } != 0 {
+        return None;
+    }
+    let out_indices = unsafe { call_out_param_arg_indices(referenced) };
+    if out_indices.is_empty() {
+        return None;
+    }
+    let leading_ty = unsafe { out_param_bridge_leading_return_type(referenced, &out_indices) }?;
+    if !matches!(leading_ty, ir::Type::Bool | ir::Type::Int) {
+        // A status type this bridge doesn't yet know how to turn into a
+        // Dart boolean condition (no fixture forces one) — bail rather
+        // than guess.
+        return None;
+    }
+
+    let target_cursors: Option<Vec<clang_sys::CXCursor>> = out_indices
+        .iter()
+        .map(|&index| unsafe { out_arg_target_cursor(referenced, call_cursor, index) })
+        .collect();
+    let target_cursors = target_cursors?;
+    let out_param_targets: Vec<ir::Expr> = target_cursors
+        .into_iter()
+        .map(|target_cursor| unsafe { lower_expr(target_cursor, project_root) })
+        .collect();
+
+    let mut call_value = unsafe { lower_expr(call_cursor, project_root) };
+    if let ir::Expr::Call { args, .. } = &mut call_value {
+        for (&index, target) in out_indices.iter().zip(&out_param_targets) {
+            if let Some(arg) = args.get_mut(index) {
+                *arg = target.clone();
+            }
+        }
+    }
+
+    // Recomputed straight from `referenced`'s own parameter cursors, the
+    // same way `apply_out_param_bridge` derives each out-param's pointee
+    // type for its own tuple — not read back off `out_param_targets`,
+    // whose lowered `Expr`s don't uniformly expose their own static type
+    // through one accessor this module has.
+    let out_param_types: Vec<ir::Type> = out_indices
+        .iter()
+        .map(|&index| {
+            let param_cursor =
+                unsafe { clang_sys::clang_Cursor_getArgument(referenced, index as c_uint) };
+            lower_type(unsafe {
+                clang_sys::clang_getPointeeType(clang_sys::clang_getCursorType(param_cursor))
+            })
+        })
+        .collect();
+    let temp_ty = ir::Type::Tuple(
+        std::iter::once(leading_ty.clone())
+            .chain(out_param_types.iter().cloned())
+            .collect(),
+    );
+    let temp_name = "_syntaxBridgeIfCallTemp".to_owned();
+    let mut statements = vec![ir::Stmt::VarDecl {
+        name: temp_name.clone(),
+        ty: temp_ty.clone(),
+        init: Some(call_value),
+        origin: origin.clone(),
+    }];
+    for (index, (target, ty)) in out_param_targets
+        .into_iter()
+        .zip(out_param_types)
+        .enumerate()
+    {
+        statements.push(ir::Stmt::ExprAssign {
+            target,
+            value: ir::Expr::FieldAccess {
+                target: Box::new(ir::Expr::Ref {
+                    name: temp_name.clone(),
+                    ty: temp_ty.clone(),
+                    origin: origin.clone(),
+                }),
+                field: format!("${}", index + 2),
+                ty,
+                origin: origin.clone(),
+            },
+            origin: origin.clone(),
+        });
+    }
+
+    let temp_first_field = ir::Expr::FieldAccess {
+        target: Box::new(ir::Expr::Ref {
+            name: temp_name,
+            ty: temp_ty,
+            origin: origin.clone(),
+        }),
+        field: "$1".to_owned(),
+        ty: leading_ty.clone(),
+        origin: origin.clone(),
+    };
+    let condition = match leading_ty {
+        ir::Type::Int => ir::Expr::Convert {
+            operand: Box::new(temp_first_field),
+            ty: ir::Type::Bool,
+            origin: origin.clone(),
+        },
+        _ => temp_first_field,
+    };
+    let condition = if is_negated {
+        ir::Expr::Unary {
+            op: ir::UnaryOp::Not,
+            operand: Box::new(condition),
+            ty: ir::Type::Bool,
+            origin: origin.clone(),
+        }
+    } else {
+        condition
+    };
+
+    statements.push(ir::Stmt::If {
+        condition,
+        then_branch: unsafe { lower_branch(then_cursor, project_root) },
+        else_branch: match else_cursor {
+            Some(else_cursor) => unsafe { lower_branch(else_cursor, project_root) },
+            None => Vec::new(),
+        },
+        origin: origin.clone(),
+    });
+    Some(statements)
 }
 
 /// Lowers an `if`/`while`/`for` branch that may or may not be a braced
@@ -3002,7 +3232,7 @@ unsafe fn lower_stmt(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::St
                     .collect();
                 return match target_cursors {
                     Some(target_cursors) => {
-                        let targets: Vec<ir::Expr> = target_cursors
+                        let out_param_targets: Vec<ir::Expr> = target_cursors
                             .into_iter()
                             .map(|target_cursor| unsafe {
                                 lower_expr(target_cursor, project_root)
@@ -3019,16 +3249,39 @@ unsafe fn lower_stmt(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::St
                         // `Reduce(numerador, denominador)` with no `&` at
                         // all) — so each out-arg slot in the already-lowered
                         // `Expr::Call`'s own argument list is overwritten
-                        // with the same target expression `targets` already
-                        // resolved, rather than trusting the generic
+                        // with the same target expression `out_param_targets`
+                        // already resolved, rather than trusting the generic
                         // address-of lowering neither needs nor can produce
                         // here.
                         if let ir::Expr::Call { args, .. } = &mut value {
-                            for (&index, target) in out_indices.iter().zip(&targets) {
+                            for (&index, target) in out_indices.iter().zip(&out_param_targets) {
                                 if let Some(arg) = args.get_mut(index) {
                                     *arg = target.clone();
                                 }
                             }
+                        }
+                        // A non-`void` bridged callee's tuple has the
+                        // original return value as its own leading slot
+                        // (round 20) — a bare-statement call
+                        // (`ParseDragAction(...);`) discards it exactly
+                        // the way C++ itself allows discarding any
+                        // return value, so the destructuring target for
+                        // that slot is a wildcard, not a real assignment.
+                        // Prepended only *after* the arg-patching above,
+                        // which indexes by out-param position and would
+                        // misalign against this extra leading slot.
+                        let mut targets = out_param_targets;
+                        if let Some(leading_ty) =
+                            unsafe { out_param_bridge_leading_return_type(referenced, &out_indices) }
+                        {
+                            targets.insert(
+                                0,
+                                ir::Expr::Ref {
+                                    name: "_".to_owned(),
+                                    ty: leading_ty,
+                                    origin: origin.clone(),
+                                },
+                            );
                         }
                         ir::Stmt::TupleAssign {
                             targets,
@@ -3477,6 +3730,30 @@ unsafe fn call_out_param_arg_indices(referenced: clang_sys::CXCursor) -> Vec<usi
         return Vec::new();
     }
     unsafe { out_param_indices(referenced) }
+}
+
+/// Whether `referenced` (a callee already confirmed out-param-bridged —
+/// `indices` non-empty) was bridged as *non*-`void` (round 20) — and if so,
+/// the original return type that becomes the out-param tuple's own
+/// leading slot. Mirrors `apply_out_param_bridge`'s own eligibility check
+/// exactly (non-`void` *and* every out-param is the pointer form) so a
+/// call site and its callee's definition can never disagree about whether
+/// the leading slot exists — the same "never disagree" discipline
+/// `out_param_indices`'s own doc comment already establishes for the
+/// indices themselves.
+unsafe fn out_param_bridge_leading_return_type(
+    referenced: clang_sys::CXCursor,
+    indices: &[usize],
+) -> Option<ir::Type> {
+    let return_type = lower_type(unsafe { clang_sys::clang_getCursorResultType(referenced) });
+    if return_type == ir::Type::Void {
+        return None;
+    }
+    let all_pointer_form = indices.iter().all(|&index| {
+        let param_cursor = unsafe { clang_sys::clang_Cursor_getArgument(referenced, index as c_uint) };
+        unsafe { clang_sys::clang_getCursorType(param_cursor) }.kind == clang_sys::CXType_Pointer
+    });
+    all_pointer_form.then_some(return_type)
 }
 
 /// The cursor a bridged out-arg (position `index` in `call_cursor`'s raw
