@@ -2691,6 +2691,38 @@ fn receiver_bang(receiver: &Expr) -> &'static str {
     }
 }
 
+/// Renders `operand` for an `Expr::Convert` branch that chains a postfix
+/// suffix directly onto it (`.toInt()`, `.toDouble()`, `.value`, `!`) —
+/// parenthesized when `operand` is itself a postfix `++`/`--` (real bug
+/// found in the Verovio corpus, round 19: `*pSrc++` — C's dereference-
+/// then-advance idiom — lowers to `Expr::Convert{ operand:
+/// Unary{PostIncrement, pSrc}, ty: Int }`, which this function used to
+/// render bare as `pSrc++.toInt()`, invalid Dart — `dart format` itself
+/// rejects it, "Expected to find ';'." — since a suffix can't chain
+/// directly onto a postfix increment/decrement the way it can onto any
+/// other primary expression). A prefix `++x`/`--x` has no such ambiguity
+/// (its own suffix is exactly one token that never invites another chained
+/// straight after in the shapes this module constructs), so only the
+/// postfix operators need the parens.
+fn emit_convert_operand(
+    operand: &Expr,
+    used_expr_helper: &mut bool,
+    used_utf8_encode: &mut bool,
+) -> String {
+    let text = emit_expr(operand, used_expr_helper, used_utf8_encode);
+    if matches!(
+        operand,
+        Expr::Unary {
+            op: UnaryOp::PostIncrement | UnaryOp::PostDecrement,
+            ..
+        }
+    ) {
+        format!("({text})")
+    } else {
+        text
+    }
+}
+
 fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bool) -> String {
     match expr {
         Expr::IntLiteral { value, .. } => value.to_string(),
@@ -2752,7 +2784,7 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
         Expr::Convert { operand, ty, .. } => match ty {
             Type::Double => format!(
                 "{}.toDouble()",
-                emit_expr(operand, used_expr_helper, used_utf8_encode)
+                emit_convert_operand(operand, used_expr_helper, used_utf8_encode)
             ),
             // `bool` → `int` (C++ implicitly reads a `bool` as `1`/`0`
             // wherever an integer is expected), `enum` → `int` (the
@@ -2768,11 +2800,11 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
             ),
             Type::Int if matches!(expr_ty(operand), Some(Type::Enum { .. })) => format!(
                 "{}.value",
-                emit_expr(operand, used_expr_helper, used_utf8_encode)
+                emit_convert_operand(operand, used_expr_helper, used_utf8_encode)
             ),
             Type::Int => format!(
                 "{}.toInt()",
-                emit_expr(operand, used_expr_helper, used_utf8_encode)
+                emit_convert_operand(operand, used_expr_helper, used_utf8_encode)
             ),
             Type::Bool => format!(
                 "{} != {}",
@@ -2794,7 +2826,7 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
             }
             _ if matches!(expr_ty(operand), Some(Type::Nullable(_))) => format!(
                 "{}!",
-                emit_expr(operand, used_expr_helper, used_utf8_encode)
+                emit_convert_operand(operand, used_expr_helper, used_utf8_encode)
             ),
             _ => unreachable!(
                 "only represented scalar and nullable-reference conversions construct \

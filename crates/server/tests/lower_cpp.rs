@@ -4251,6 +4251,33 @@ std::string describe(int count) {
     );
 }
 
+/// A real invalid-Dart bug found in the Verovio corpus itself (round 19,
+/// `zip_file.hpp`'s `tdefl_compress_normal`, confirmed via `dart format`
+/// against the real emitted package: "Expected to find ';'."): `*pSrc++`
+/// (C's dereference-then-advance idiom, `pSrc` a known byte-buffer
+/// pointer) lowers `Expr::Convert{ operand: Unary{PostIncrement, pSrc},
+/// ty: Int }`, which used to render bare as `pSrc++.toInt()` — a postfix
+/// `++` can't have a suffix chained directly onto it in Dart.
+#[test]
+fn a_postfix_increment_converted_to_int_is_parenthesized() {
+    let source = lower_and_emit(
+        "lower-cpp-postfix-increment-convert",
+        r#"
+#include <cstdint>
+
+int read_and_advance(const uint8_t* pSrc) {
+    int c = *pSrc++;
+    return c;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("(pSrc++).toInt()"),
+        "a postfix increment converted with .toInt() must be parenthesized, got:\n{source}"
+    );
+}
+
 /// `void*`/`const void*` — the single largest type bailout in the
 /// 2026-08-20 Verovio diagnosis (896 + 253 occurrences), real shapes
 /// confirmed by grepping the extracted Verovio source directly
