@@ -1748,6 +1748,128 @@ void copy(Counter& destination, const Counter& source) {
     );
 }
 
+/// Tarefa 08 (F5), Caso 1: `operator=` implicit, right-hand side a freshly
+/// constructed temporary — the real Verovio 6.2.0 trigger
+/// (`alignfunctor.dart:67`'s `assignFrom(_m_time, Fraction(0));`, always
+/// inside a member function assigning to one of its own fields). Overload
+/// resolution picks the implicit *move* assignment for an rvalue right-hand
+/// side, never the copy overload `lower_defaulted_record_assignment_stmt`
+/// already handled — nothing else references the temporary, so a plain Dart
+/// assignment is a sound translation, and the declaration-less `assignFrom`
+/// bridge must not appear at all.
+#[test]
+fn implicit_assignment_from_a_freshly_constructed_temporary_is_a_plain_assignment() {
+    let source = lower_and_emit(
+        "lower-cpp-assign-from-temporary",
+        r#"
+struct Ponto {
+    int x;
+    int y;
+
+    Ponto(int x, int y) : x(x), y(y) {}
+};
+
+struct Holder {
+    Ponto m_point;
+
+    Holder() : m_point(0, 0) {
+        m_point = Ponto(1, 2);
+    }
+};
+"#,
+    );
+
+    assert!(
+        source.contains("m_point = Ponto(1, 2);"),
+        "assignment from a temporary must stay a plain Dart assignment, got:\n{source}"
+    );
+    assert!(
+        !source.contains("assignFrom"),
+        "a temporary right-hand side must never route through the assignFrom bridge, got:\n{source}"
+    );
+}
+
+/// Tarefa 08 (F5), Caso 2: `operator=` explicit, called on the receiver's own
+/// field through implicit `this` — the exact receiver shape
+/// `lower_method_call` used to misread as a normal `obj.method()` call
+/// (`collect_children`'s first child is a `MemberRefExpr` in this shape too,
+/// indistinguishable by kind alone from `field.assignFrom(...)`'s real
+/// receiver), producing the same free two-argument `assignFrom(field, value)`
+/// the implicit case did. The declaration must exist on `Contador` and the
+/// call site must reach it as a real method call on the field.
+#[test]
+fn explicit_assignment_operator_reached_through_a_field_receiver_becomes_a_named_method_call() {
+    let source = lower_and_emit(
+        "lower-cpp-assign-explicit-field-receiver",
+        r#"
+struct Contador {
+    int valor;
+
+    Contador& operator=(const Contador& other) {
+        valor = other.valor;
+        return *this;
+    }
+};
+
+struct Caixa {
+    Contador m_contador;
+
+    void reset(const Contador& origem) {
+        m_contador = origem;
+    }
+};
+"#,
+    );
+
+    assert!(
+        source.contains("Contador assignFrom(Contador other)"),
+        "the explicit assignment operator must still be declared as a named method, got:\n{source}"
+    );
+    assert!(
+        source.contains("m_contador.assignFrom(origem);"),
+        "the call site must reach the field through a real method call, not a free two-argument \
+         call, got:\n{source}"
+    );
+    assert!(
+        !source.contains("assignFrom(m_contador,"),
+        "the field receiver must never be misread as the assignFrom call's first argument, \
+         got:\n{source}"
+    );
+}
+
+/// Tarefa 08 (F5), the dangerous case the prompt itself calls out: `operator=`
+/// implicit, right-hand side a *live* object (`Ponto a, b; a = b;`). Overload
+/// resolution picks the implicit copy assignment here — already handled by
+/// `lower_defaulted_record_assignment_stmt`'s field-by-field
+/// `RecordConstruct` — but this pins the exact shape the prompt warns a fix
+/// must never regress into: whatever is emitted, it cannot be a call to an
+/// `assignFrom` that doesn't exist anywhere in the package.
+#[test]
+fn implicit_assignment_from_a_live_object_never_calls_a_nonexistent_assign_from() {
+    let source = lower_and_emit(
+        "lower-cpp-assign-from-live-object",
+        r#"
+struct Ponto {
+    int x;
+    int y;
+};
+
+void sincroniza(Ponto& a, const Ponto& b) {
+    a = b;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("assignFrom"),
+        "a live-object right-hand side must never route through the assignFrom bridge, got:\n{source}"
+    );
+    assert!(
+        source.contains("a = Ponto(b.x, b.y);"),
+        "a live-object copy assignment must construct a distinct Dart value, got:\n{source}"
+    );
+}
+
 /// C++ loop control maps directly to Dart. A range-for's collection traversal
 /// must remain typed while `continue` and `break` keep their control-flow
 /// meaning.

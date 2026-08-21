@@ -4029,6 +4029,20 @@ unsafe fn assignment_operator_call_cursor(
 /// helper: `List` assignment aliases storage whereas `std::vector` assignment
 /// copies elements, so it needs its own `List.of` adapter instead of a silent
 /// direct assignment.
+///
+/// Handles *both* implicitly-defaulted special members C++ generates for a
+/// class with value semantics: copy assignment (`clang_CXXMethod_
+/// isCopyAssignmentOperator`) and move assignment (`clang_CXXMethod_
+/// isMoveAssignmentOperator`) — never a user-written body for either (that's
+/// `lower_method_call`'s `assignFrom` bridge, F5's Caso 2), only the
+/// compiler-synthesized member-for-member copy. Overload resolution already
+/// did the hard part for us: it only ever selects the move overload for an
+/// rvalue right-hand side (F5's Caso 1's "temporário recém-construído"), so
+/// which overload `referenced` names *is* the signal for whether Dart's
+/// aliasing assignment is sound here — confirmed empirically (not assumed):
+/// `p = Ponto(1, 2);` and `this->m_point = Ponto(1, 2);` both resolve to the
+/// implicit `Ponto &operator=(Ponto&&)`, never the copy overload, even though
+/// neither source line ever writes "move".
 unsafe fn lower_defaulted_record_assignment_stmt(
     cursor: clang_sys::CXCursor,
     project_root: &Path,
@@ -4037,10 +4051,14 @@ unsafe fn lower_defaulted_record_assignment_stmt(
     let referenced = unsafe { clang_sys::clang_getCursorReferenced(cursor) };
     if unsafe { clang_sys::clang_Cursor_isNull(referenced) } != 0
         || unsafe { clang_sys::clang_getCursorKind(referenced) } != clang_sys::CXCursor_CXXMethod
-        || unsafe { clang_sys::clang_CXXMethod_isCopyAssignmentOperator(referenced) } == 0
         || unsafe { clang_sys::clang_CXXMethod_isDefaulted(referenced) } == 0
         || unsafe { clang_sys::clang_Cursor_getNumArguments(cursor) } != 2
     {
+        return None;
+    }
+    let is_copy = unsafe { clang_sys::clang_CXXMethod_isCopyAssignmentOperator(referenced) } != 0;
+    let is_move = unsafe { clang_sys::clang_CXXMethod_isMoveAssignmentOperator(referenced) } != 0;
+    if !(is_copy || is_move) {
         return None;
     }
 
@@ -4069,6 +4087,31 @@ unsafe fn lower_defaulted_record_assignment_stmt(
     if let Some(reason) = unassignable_target_reason(&target) {
         return Some(ir::Stmt::Unsupported {
             reason,
+            origin: origin.clone(),
+        });
+    }
+    // Move assignment only fires for an rvalue right-hand side, but an
+    // rvalue isn't automatically an *unaliased* one: `a = std::move(b);`
+    // resolves to the same move overload a genuine temporary does, yet `b`
+    // stays a live, named object a reader can still reach afterward — C++
+    // leaves it in a valid, independent (if unspecified) state, which a
+    // plain Dart `a = b;` would violate by aliasing the two forever after.
+    // `unwrap_transparent_value_cursor` peels the `MaterializeTemporaryExpr`/
+    // `ImplicitCastExpr` sugar every rvalue argument is wrapped in (both
+    // `libclang`'s `CXCursor_UnexposedExpr` catch-all); what's left is either
+    // a `DeclRefExpr`/`MemberRefExpr` naming the live object being moved
+    // from, or a real construction/call with no name behind it at all — the
+    // exact "temporário recém-construído" the task's Caso 1 describes.
+    let source_root_kind =
+        unsafe { clang_sys::clang_getCursorKind(unwrap_transparent_value_cursor(source_cursor)) };
+    let source_is_provably_fresh = !matches!(
+        source_root_kind,
+        clang_sys::CXCursor_DeclRefExpr | clang_sys::CXCursor_MemberRefExpr
+    );
+    if is_move && source_is_provably_fresh {
+        return Some(ir::Stmt::ExprAssign {
+            target,
+            value: unsafe { lower_expr(source_cursor, project_root) },
             origin: origin.clone(),
         });
     }
@@ -8832,23 +8875,40 @@ unsafe fn lower_method_call(
     project_root: &Path,
     origin: ir::Origin,
 ) -> ir::Expr {
-    let receiver_children = unsafe { collect_children(call_cursor) };
-    let Some(first_child) = receiver_children.first() else {
-        return ir::Expr::UnsupportedTyped {
-            reason: "method call had no receiver expression".to_owned(),
-            ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
-            origin,
-        };
-    };
+    // `this->m_point = Ponto(1, 2);` (F5/tarefa 08) breaks the assumption
+    // this function's own doc comment above states as fact: a `CXXOperatorCallExpr`
+    // does *not* always spell its receiver as an `UnexposedExpr`-wrapped
+    // argument, distinct in kind from `MemberRefExpr`. When the receiver
+    // itself is a field accessed through implicit `this`, `collect_children`
+    // reports that `MemberRefExpr` directly as `call_cursor`'s first child —
+    // confirmed empirically (not assumed) by instrumenting this exact call
+    // with the real Verovio-shaped fixture below: `first_child`'s kind was
+    // `102` (`CXCursor_MemberRefExpr`) for `m_point = Ponto(1, 2)` inside a
+    // constructor, identical to the kind a genuine `obj.method()` receiver
+    // reports. The old kind-only check therefore misread the assignment's
+    // *first argument* as a method-call *receiver*, producing a free
+    // two-argument `assignFrom(m_point, Ponto(1, 2))` instead of
+    // `m_point.assignFrom(Ponto(1, 2))` — the real corpus's exact `assignFrom`
+    // shape (`docs/plans/dart-analyze-verovio-6.2.0.md`'s F5).
+    //
+    // The operator's own name resolves the ambiguity `first_child`'s kind
+    // alone can't: `referenced`'s spelling starting with "operator" already
+    // means (per this function's own comment on `a == b`) the receiver is
+    // always `clang_Cursor_getArgument(call_cursor, 0)`, regardless of what
+    // shape that argument's expression happens to have. `operator()`
+    // (functor calls) shares this shape too. A user-defined conversion
+    // operator is the one exception whose raw spelling also starts with
+    // "operator" (`"operator std::string"`) yet is invoked with genuine
+    // `obj.method()` call syntax, receiver truly folded into a
+    // `MemberRefExpr` — excluded by its own distinct cursor kind, checked
+    // directly rather than inferred from the spelling.
+    let raw_callee_name =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced)) };
+    let is_operator_syntax_call = unsafe { clang_sys::clang_getCursorKind(referenced) }
+        != clang_sys::CXCursor_ConversionFunction
+        && raw_callee_name.starts_with("operator");
 
-    let (target, arg_skip) = if unsafe { clang_sys::clang_getCursorKind(*first_child) }
-        == clang_sys::CXCursor_MemberRefExpr
-    {
-        (
-            unsafe { member_ref_receiver(*first_child, project_root, &origin) },
-            0,
-        )
-    } else {
+    let (target, arg_skip) = if is_operator_syntax_call {
         let arg_count = unsafe { clang_sys::clang_Cursor_getNumArguments(call_cursor) };
         if arg_count < 1 {
             return ir::Expr::UnsupportedTyped {
@@ -8859,6 +8919,34 @@ unsafe fn lower_method_call(
         }
         let receiver_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
         (unsafe { lower_expr(receiver_cursor, project_root) }, 1)
+    } else {
+        let receiver_children = unsafe { collect_children(call_cursor) };
+        let Some(first_child) = receiver_children.first() else {
+            return ir::Expr::UnsupportedTyped {
+                reason: "method call had no receiver expression".to_owned(),
+                ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
+                origin,
+            };
+        };
+        if unsafe { clang_sys::clang_getCursorKind(*first_child) }
+            == clang_sys::CXCursor_MemberRefExpr
+        {
+            (
+                unsafe { member_ref_receiver(*first_child, project_root, &origin) },
+                0,
+            )
+        } else {
+            let arg_count = unsafe { clang_sys::clang_Cursor_getNumArguments(call_cursor) };
+            if arg_count < 1 {
+                return ir::Expr::UnsupportedTyped {
+                    reason: "operator call had no receiver argument".to_owned(),
+                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
+                    origin,
+                };
+            }
+            let receiver_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
+            (unsafe { lower_expr(receiver_cursor, project_root) }, 1)
+        }
     };
 
     let callee_usr =
@@ -8870,8 +8958,6 @@ unsafe fn lower_method_call(
             origin,
         };
     }
-    let callee_name =
-        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced)) };
     // A functor call (`pred(a, b)`) reaches this same operator-syntax
     // branch as `a == b` (E13) does — `emit::dart`'s own bridge for the
     // *declaration* of `operator()` renames it to Dart's `call` method
@@ -8889,7 +8975,7 @@ unsafe fn lower_method_call(
     // identifier) spelling is kept as a fallback rather than panicking, in
     // the defensive case some other future call path reaches this function
     // directly with a target type this module still doesn't name.
-    let callee_name = if callee_name == "operator()" {
+    let callee_name = if raw_callee_name == "operator()" {
         "call".to_owned()
     } else if unsafe { clang_sys::clang_getCursorKind(referenced) }
         == clang_sys::CXCursor_ConversionFunction
@@ -8897,9 +8983,9 @@ unsafe fn lower_method_call(
         let target_type = lower_type(unsafe { clang_sys::clang_getCursorResultType(referenced) });
         conversion_operator_dart_method_name(&target_type)
             .map(str::to_owned)
-            .unwrap_or(callee_name)
+            .unwrap_or(raw_callee_name)
     } else {
-        callee_name
+        raw_callee_name
     };
     if callee_name.starts_with("operator") {
         let args =
