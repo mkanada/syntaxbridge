@@ -267,15 +267,32 @@ pub fn extract_function_catalog_cancellable(
             .min(total);
         let chunk_size = total.div_ceil(worker_count);
 
+        // A worker's default thread stack (2 MiB unless `RUST_MIN_STACK`
+        // overrides it) is smaller than the main thread's own (`ulimit -s`,
+        // commonly 8 MiB) — normally invisible, but `libclang`'s own
+        // recursive-descent parsing of a real, deeply-nested translation
+        // unit already sits close to that smaller budget for at least one
+        // real Verovio 6.2.0 file (`calcdotsfunctor.cpp`, confirmed via
+        // `just verovio-diagnosis` segfaulting deep inside `parseTranslationUnit`
+        // on a worker thread, with no Rust panic/backtrace at all — a native
+        // stack overflow, not a Rust-level bug — the moment `lower::cpp`
+        // grew large enough per call frame to tip an already-marginal
+        // worker over the edge). 64 MiB matches the generous budget the
+        // main thread already effectively has and then some.
+        const WORKER_STACK_SIZE: usize = 64 * 1024 * 1024;
+
         std::thread::scope(|scope| {
             compilation_units
                 .chunks(chunk_size)
                 .enumerate()
                 .map(|(worker_index, chunk)| {
                     let project_root = &project_root;
-                    scope.spawn(move || {
-                        parse_chunk(worker_index, chunk, project_root, progress, cancellation)
-                    })
+                    std::thread::Builder::new()
+                        .stack_size(WORKER_STACK_SIZE)
+                        .spawn_scoped(scope, move || {
+                            parse_chunk(worker_index, chunk, project_root, progress, cancellation)
+                        })
+                        .expect("spawn function catalog worker thread")
                 })
                 .collect::<Vec<_>>()
                 .into_iter()
@@ -443,6 +460,12 @@ pub(crate) fn finish_function_catalog(partials: Vec<FunctionCatalogPartial>) -> 
     // names, and before RAII/enum-rejection, neither of which cares about
     // `base_class`/`mixins` shape.
     apply_mixin_forms(&mut ir_functions, &mut ir_records);
+
+    // F12/tarefa 09 (`docs/prompts/2026-08-21-09-chamada-a-base-qualificada.md`):
+    // has to run after `apply_mixin_forms`, once every record's
+    // `mixins`/`base_class` are in their final, Dart-emitted shape — see the
+    // function's own doc comment for why.
+    resolve_qualified_base_calls(&mut ir_records);
 
     // Has to run after the loop above, when `ir_enums` is finally complete:
     // only then is "no declaration for this usr" a settled fact rather than
@@ -1558,6 +1581,145 @@ fn apply_mixin_forms(ir_functions: &mut [ir::Function], ir_records: &mut Vec<ir:
         }
         if let Some(destructor) = &mut record.destructor {
             simplify_provably_true_is_checks_in_stmts(destructor, ancestors);
+        }
+    }
+}
+
+/// F12/tarefa 09 (`docs/prompts/2026-08-21-09-chamada-a-base-qualificada.md`):
+/// confirms every `Expr::Call.base_qualifier` `lower::cpp` recorded for a
+/// qualified base call (`Base::method()` from inside an override) against
+/// the record's *final* mixin membership — only settled once `apply_mixin_forms`
+/// has already run and `record.mixins`/`record.base_class` won't change
+/// again, which is why this runs right after it rather than during
+/// `lower::cpp` itself (that only ever sees one translation unit, never the
+/// whole `Module` a mixin's own membership can depend on).
+///
+/// Reuses `emit::dart::expand_mixin_chain` — the exact order
+/// `emit::dart::emit_record` prints a `with` clause in, and the order Dart's
+/// own mixin linearization resolves `super` through — so this can never
+/// disagree with what `super.` actually reaches at runtime. Walking that
+/// list from the end picks the *last* applied mixin that declares the
+/// member, same as Dart; falling through to the plain `extends` chain
+/// (`base_class`, recursively) covers the ordinary single-inheritance case,
+/// where a record has no mixins at all.
+///
+/// A call whose named base isn't the one this reaches is downgraded to an
+/// honest `Expr::UnsupportedTyped` bailout instead of letting `emit::dart`
+/// print a `super.` that would silently call some *other* method — the
+/// exact failure mode (`super.Reset()` resolving to the wrong mixin) that's
+/// worse than the infinite-recursion bug this whole family exists to fix.
+fn resolve_qualified_base_calls(ir_records: &mut [ir::Record]) {
+    struct RecordShape {
+        expanded_mixins: Vec<ir::BaseClass>,
+        base_class: Option<ir::BaseClass>,
+        method_names: HashSet<String>,
+    }
+
+    let shapes: HashMap<String, RecordShape> = {
+        let records_by_usr: HashMap<&str, &ir::Record> = ir_records
+            .iter()
+            .map(|record| (record.usr.as_str(), record))
+            .collect();
+        ir_records
+            .iter()
+            .map(|record| {
+                let expanded_mixins =
+                    crate::emit::dart::expand_mixin_chain(&record.mixins, &records_by_usr)
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                let method_names = record
+                    .methods
+                    .iter()
+                    .map(|method| method.name.clone())
+                    .collect();
+                (
+                    record.usr.clone(),
+                    RecordShape {
+                        expanded_mixins,
+                        base_class: record.base_class.clone(),
+                        method_names,
+                    },
+                )
+            })
+            .collect()
+    };
+
+    // The base Dart's own `super.callee_name` would actually reach from
+    // `record_usr`, if any — last-applied mixin declaring it first, then the
+    // plain `extends` chain, recursively. Mirrors Dart's real resolution
+    // order exactly (see this function's own doc comment).
+    fn super_target<'a>(
+        record_usr: &str,
+        callee_name: &str,
+        shapes: &'a HashMap<String, RecordShape>,
+    ) -> Option<&'a ir::BaseClass> {
+        let shape = shapes.get(record_usr)?;
+        for base in shape.expanded_mixins.iter().rev() {
+            if shapes
+                .get(base.usr.as_str())
+                .is_some_and(|base_shape| base_shape.method_names.contains(callee_name))
+            {
+                return Some(base);
+            }
+        }
+        let mut current = shape.base_class.as_ref();
+        while let Some(base) = current {
+            let Some(base_shape) = shapes.get(base.usr.as_str()) else {
+                break;
+            };
+            if base_shape.method_names.contains(callee_name) {
+                return Some(base);
+            }
+            current = base_shape.base_class.as_ref();
+        }
+        None
+    }
+
+    for record in ir_records.iter_mut() {
+        let record_usr = record.usr.clone();
+        let mut resolve = |expr: &mut ir::Expr| {
+            let ir::Expr::Call {
+                base_qualifier: Some(named_base),
+                callee_name,
+                ty,
+                origin,
+                ..
+            } = expr
+            else {
+                return;
+            };
+            let resolves = super_target(&record_usr, callee_name, &shapes)
+                .is_some_and(|winner| winner.usr == named_base.usr);
+            if !resolves {
+                *expr = ir::Expr::UnsupportedTyped {
+                    reason: format!(
+                        "qualified base call {}::{callee_name} does not resolve through \
+                         Dart's `super` in this record's mixin linearization",
+                        named_base.name
+                    ),
+                    ty: ty.clone(),
+                    origin: origin.clone(),
+                };
+            }
+        };
+
+        let mut visitor = IrRefVisitor {
+            on_type: &mut |_ty: &mut ir::Type| {},
+            on_record_construct:
+                &mut |_usr: &str, _name: &mut String, _index: Option<&mut usize>| {},
+            on_expr: &mut resolve,
+        };
+        for constructor in &mut record.constructors {
+            visitor.visit_stmts(&mut constructor.body);
+        }
+        for method in &mut record.methods {
+            if let Some(body) = &mut method.body {
+                visitor.visit_stmts(body);
+            }
+        }
+        if let Some(destructor) = &mut record.destructor {
+            visitor.visit_stmts(destructor);
         }
     }
 }

@@ -277,6 +277,34 @@ fn pop_active_pointer_out_params(count: usize) {
     });
 }
 
+// The `usr` of the record whose method/constructor/destructor body is
+// currently being lowered (F12/tarefa 09) — same thread-local-stack shape and
+// same reasoning as `ACTIVE_POINTER_OUT_PARAMS` just above: `lower_expr` has
+// no context parameter to carry this through, and `lower_method_call` needs
+// it to tell a genuinely self-qualified call (`Foo::f()` written inside
+// `Foo::f()` itself — still recursive in Dart exactly as it is in C++, left
+// alone) apart from a qualified call to a *different*, ancestor record
+// (`Base::f()` from inside a derived override — the shape that recurses
+// forever if lowered the same way, `docs/prompts/
+// 2026-08-21-09-chamada-a-base-qualificada.md`'s whole reason to exist).
+thread_local! {
+    static ACTIVE_METHOD_OWNER_USRS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+fn push_active_method_owner_usr(usr: String) {
+    ACTIVE_METHOD_OWNER_USRS.with(|stack| stack.borrow_mut().push(usr));
+}
+
+fn pop_active_method_owner_usr() {
+    ACTIVE_METHOD_OWNER_USRS.with(|stack| {
+        stack.borrow_mut().pop();
+    });
+}
+
+fn active_method_owner_usr() -> Option<String> {
+    ACTIVE_METHOD_OWNER_USRS.with(|stack| stack.borrow().last().cloned())
+}
+
 fn active_pointer_out_param_type(name: &str) -> Option<ir::Type> {
     ACTIVE_POINTER_OUT_PARAMS.with(|stack| {
         stack
@@ -719,10 +747,15 @@ pub fn lower_method(
         let body_cursor = unsafe { find_compound_stmt_child(cursor) };
         let pointer_out_params = unsafe { pointer_out_param_bindings(cursor) };
         push_active_pointer_out_params(&pointer_out_params);
+        let owner = unsafe { clang_sys::clang_getCursorSemanticParent(cursor) };
+        let owner_usr =
+            unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(owner)) };
+        push_active_method_owner_usr(owner_usr);
         let mut body = match body_cursor {
             Some(compound) => unsafe { lower_compound_stmt(compound, project_root) },
             None => Vec::new(),
         };
+        pop_active_method_owner_usr();
         pop_active_pointer_out_params(pointer_out_params.len());
         body.splice(0..0, clone_prelude);
         unsafe {
@@ -769,7 +802,13 @@ pub fn lower_destructor(cursor: clang_sys::CXCursor, project_root: &Path) -> Opt
         return None;
     }
     let body_cursor = unsafe { find_compound_stmt_child(cursor) }?;
-    Some(unsafe { lower_compound_stmt(body_cursor, project_root) })
+    let owner = unsafe { clang_sys::clang_getCursorSemanticParent(cursor) };
+    let owner_usr =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(owner)) };
+    push_active_method_owner_usr(owner_usr);
+    let body = unsafe { lower_compound_stmt(body_cursor, project_root) };
+    pop_active_method_owner_usr();
+    Some(body)
 }
 
 pub fn lower_constructor(
@@ -793,10 +832,14 @@ pub fn lower_constructor(
     let (params, clone_prelude) =
         unsafe { collect_params_with_clone_prelude(cursor, &origin, project_root) };
     let body_cursor = unsafe { find_compound_stmt_child(cursor) };
+    let owner_usr =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(owner)) };
+    push_active_method_owner_usr(owner_usr);
     let mut body = match body_cursor {
         Some(compound) => unsafe { lower_compound_stmt(compound, project_root) },
         None => Vec::new(),
     };
+    pop_active_method_owner_usr();
     body.splice(0..0, clone_prelude);
 
     Some(ir::Constructor {
@@ -1386,6 +1429,38 @@ unsafe fn member_ref_receiver(
             origin: origin.clone(),
         },
     }
+}
+
+/// The base named by a qualified member reference (`Base::foo()`,
+/// `this->Base::foo()`), if any — the disambiguating `TypeRef` sibling
+/// `member_ref_receiver` (just above) already filters out of the receiver
+/// walk. `None` for an ordinary unqualified/virtual access (`foo()`,
+/// `obj.foo()`), whose `MemberRefExpr` has no such sibling at all — this is
+/// exactly how `lower_method_call` (F12/tarefa 09) tells a qualified base
+/// call apart from ordinary virtual dispatch, the distinction
+/// `EditorialElement::Reset();` vs `ResetSource();` loses today
+/// (`docs/prompts/2026-08-21-09-chamada-a-base-qualificada.md`).
+unsafe fn member_ref_qualifier_base(
+    member_ref_cursor: clang_sys::CXCursor,
+) -> Option<ir::BaseClass> {
+    let type_ref = unsafe { collect_children(member_ref_cursor) }
+        .into_iter()
+        .find(|child| {
+            let kind = unsafe { clang_sys::clang_getCursorKind(*child) };
+            kind == clang_sys::CXCursor_TypeRef
+        })?;
+    let referenced = unsafe { clang_sys::clang_getCursorReferenced(type_ref) };
+    if unsafe { clang_sys::clang_Cursor_isNull(referenced) } != 0 {
+        return None;
+    }
+    let usr =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(referenced)) };
+    if usr.is_empty() {
+        return None;
+    }
+    let name =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced)) };
+    Some(ir::BaseClass { usr, name })
 }
 
 /// Whether `cursor`'s own spelling location resolves to no real file at
@@ -2938,6 +3013,7 @@ unsafe fn lower_string_byte_assign_stmt(
             name: bytes_name,
             ty: ir::Type::List(Box::new(ir::Type::Int)),
             init: Some(ir::Expr::Call {
+                base_qualifier: None,
                 target: None,
                 callee_usr: String::new(),
                 callee_name: "utf8.encode".to_owned(),
@@ -2960,6 +3036,7 @@ unsafe fn lower_string_byte_assign_stmt(
         ir::Stmt::ExprAssign {
             target: *string_target,
             value: ir::Expr::Call {
+                base_qualifier: None,
                 target: None,
                 callee_usr: String::new(),
                 callee_name: "utf8.decode".to_owned(),
@@ -3841,6 +3918,7 @@ unsafe fn lower_stdlib_mutating_string_stmt(
             op: ir::BinaryOp::Add,
             lhs: Box::new(target.clone()),
             rhs: Box::new(ir::Expr::Call {
+                base_qualifier: None,
                 target: None,
                 callee_usr: String::new(),
                 callee_name: "String.fromCharCode".to_owned(),
@@ -3960,10 +4038,12 @@ unsafe fn lower_stdlib_mutating_sequence_stmt(
         }],
         else_branch: vec![ir::Stmt::ExprStmt {
             expr: ir::Expr::Call {
+                base_qualifier: None,
                 target: Some(Box::new(target)),
                 callee_usr: String::new(),
                 callee_name: "addAll".to_owned(),
                 args: vec![ir::Expr::Call {
+                    base_qualifier: None,
                     target: None,
                     callee_usr: String::new(),
                     callee_name: "List.filled".to_owned(),
@@ -4151,6 +4231,7 @@ fn clone_value_expr(value: ir::Expr, ty: &ir::Type, origin: &ir::Origin) -> ir::
     };
     match callee_name {
         Some(callee_name) => ir::Expr::Call {
+            base_qualifier: None,
             target: None,
             callee_usr: String::new(),
             callee_name: callee_name.to_owned(),
@@ -4208,6 +4289,7 @@ unsafe fn lower_stdlib_assignment_stmt(
         },
         ("optional", "operator=") => value,
         ("vector" | "list" | "deque", "operator=") => ir::Expr::Call {
+            base_qualifier: None,
             target: None,
             callee_usr: String::new(),
             callee_name: "List.of".to_owned(),
@@ -4621,6 +4703,7 @@ fn default_scalar_value(ty: &ir::Type, origin: &ir::Origin) -> ir::Expr {
             origin: origin.clone(),
         },
         ir::Type::List(_) => ir::Expr::Call {
+            base_qualifier: None,
             target: None,
             callee_usr: String::new(),
             callee_name: "List.empty".to_owned(),
@@ -4629,6 +4712,7 @@ fn default_scalar_value(ty: &ir::Type, origin: &ir::Origin) -> ir::Expr {
             origin: origin.clone(),
         },
         ir::Type::Set(_) => ir::Expr::Call {
+            base_qualifier: None,
             target: None,
             callee_usr: String::new(),
             callee_name: "Set.empty".to_owned(),
@@ -4637,6 +4721,7 @@ fn default_scalar_value(ty: &ir::Type, origin: &ir::Origin) -> ir::Expr {
             origin: origin.clone(),
         },
         ir::Type::Map(_, _) => ir::Expr::Call {
+            base_qualifier: None,
             target: None,
             callee_usr: String::new(),
             callee_name: "Map".to_owned(),
@@ -4645,6 +4730,7 @@ fn default_scalar_value(ty: &ir::Type, origin: &ir::Origin) -> ir::Expr {
             origin: origin.clone(),
         },
         ir::Type::Bytes => ir::Expr::Call {
+            base_qualifier: None,
             target: None,
             callee_usr: String::new(),
             callee_name: "Uint8List".to_owned(),
@@ -5234,6 +5320,7 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
                 // `Uint8List.fromList` already applied to copy-construction
                 // in `clone_value_expr` just above.
                 ir::Expr::Call {
+                    base_qualifier: None,
                     target: None,
                     callee_usr: String::new(),
                     callee_name: "Uint8List.fromList".to_owned(),
@@ -6448,6 +6535,7 @@ unsafe fn lower_call_expr(
             let first = unsafe { lower_expr(first_cursor, project_root) };
             let second = unsafe { lower_expr(second_cursor, project_root) };
             return ir::Expr::Call {
+                base_qualifier: None,
                 target: None,
                 callee_usr: unsafe {
                     type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(referenced))
@@ -6677,6 +6765,7 @@ unsafe fn lower_call_expr(
         };
         let ty = lower_type(unsafe { clang_sys::clang_getCursorType(cursor) });
         return ir::Expr::Call {
+            base_qualifier: None,
             target: None,
             callee_usr,
             callee_name: dart_operator_bridge_name(&callee_name, args.len()).to_owned(),
@@ -6716,6 +6805,7 @@ unsafe fn lower_call_expr(
 
     let ty = lower_type(unsafe { clang_sys::clang_getCursorType(cursor) });
     ir::Expr::Call {
+        base_qualifier: None,
         target: None,
         callee_usr,
         callee_name,
@@ -6783,6 +6873,7 @@ unsafe fn lower_callable_value_call(
     };
 
     ir::Expr::Call {
+        base_qualifier: None,
         target,
         callee_usr: String::new(),
         callee_name: unsafe { dart_member_name(referenced) },
@@ -7043,6 +7134,7 @@ unsafe fn lower_ostream_insertion_chain(
         match lower_type(unsafe { clang_sys::clang_getCursorType(value_cursor) }) {
             ir::Type::Str => value,
             ir::Type::Int | ir::Type::Double => ir::Expr::Call {
+                base_qualifier: None,
                 target: Some(Box::new(value)),
                 callee_usr: String::new(),
                 callee_name: "toString".to_owned(),
@@ -7161,6 +7253,7 @@ unsafe fn lower_stringstream_insertion_chain(
         match lower_type(unsafe { clang_sys::clang_getCursorType(value_cursor) }) {
             ir::Type::Str => value,
             ir::Type::Int | ir::Type::Double => ir::Expr::Call {
+                base_qualifier: None,
                 target: Some(Box::new(value)),
                 callee_usr: String::new(),
                 callee_name: "toString".to_owned(),
@@ -7354,6 +7447,7 @@ unsafe fn lower_stdlib_method_call(
             // `std::endl` asks for.
             return Some(match stream {
                 KnownOstream::Cout => ir::Expr::Call {
+                    base_qualifier: None,
                     target: None,
                     callee_usr: String::new(),
                     callee_name: "print".to_owned(),
@@ -7362,6 +7456,7 @@ unsafe fn lower_stdlib_method_call(
                     origin: origin.clone(),
                 },
                 KnownOstream::Cerr => ir::Expr::Call {
+                    base_qualifier: None,
                     target: Some(Box::new(ir::Expr::Ref {
                         name: "stderr".to_owned(),
                         ty: ir::Type::Void,
@@ -7447,6 +7542,7 @@ unsafe fn lower_stdlib_method_call(
                 });
             }
             Some(ir::Expr::Call {
+                base_qualifier: None,
                 target: Some(Box::new(target)),
                 callee_usr: String::new(),
                 callee_name: "containsKey".to_owned(),
@@ -7468,6 +7564,7 @@ unsafe fn lower_stdlib_method_call(
                 });
             }
             Some(ir::Expr::Call {
+                base_qualifier: None,
                 target: Some(Box::new(target)),
                 callee_usr: String::new(),
                 callee_name: "contains".to_owned(),
@@ -7495,6 +7592,7 @@ unsafe fn lower_stdlib_method_call(
             };
             Some(ir::Expr::Conditional {
                 condition: Box::new(ir::Expr::Call {
+                    base_qualifier: None,
                     target: Some(Box::new(target)),
                     callee_usr: String::new(),
                     callee_name: contains_name.to_owned(),
@@ -7548,6 +7646,7 @@ unsafe fn lower_stdlib_method_call(
                 [other] => (target, other.clone()),
                 [pos, count, other] => (
                     ir::Expr::Call {
+                        base_qualifier: None,
                         target: Some(Box::new(target)),
                         callee_usr: String::new(),
                         callee_name: "substring".to_owned(),
@@ -7578,6 +7677,7 @@ unsafe fn lower_stdlib_method_call(
                 }
             };
             Some(ir::Expr::Call {
+                base_qualifier: None,
                 target: Some(Box::new(compare_target)),
                 callee_usr: String::new(),
                 callee_name: "compareTo".to_owned(),
@@ -7612,6 +7712,7 @@ unsafe fn lower_stdlib_method_call(
                 }
             };
             Some(ir::Expr::Call {
+                base_qualifier: None,
                 target: Some(Box::new(target)),
                 callee_usr: String::new(),
                 callee_name: "substring".to_owned(),
@@ -7652,6 +7753,7 @@ unsafe fn lower_stdlib_method_call(
                 });
             }
             Some(ir::Expr::Call {
+                base_qualifier: None,
                 target: Some(Box::new(target)),
                 callee_usr: String::new(),
                 callee_name: "add".to_owned(),
@@ -7673,6 +7775,7 @@ unsafe fn lower_stdlib_method_call(
                 });
             }
             Some(ir::Expr::Call {
+                base_qualifier: None,
                 target: Some(Box::new(target)),
                 callee_usr: String::new(),
                 callee_name: "clear".to_owned(),
@@ -7796,6 +7899,7 @@ unsafe fn lower_stdlib_method_call(
                 });
             }
             Some(ir::Expr::Call {
+                base_qualifier: None,
                 target: Some(Box::new(target)),
                 callee_usr: String::new(),
                 callee_name: "add".to_owned(),
@@ -7817,6 +7921,7 @@ unsafe fn lower_stdlib_method_call(
                 });
             }
             Some(ir::Expr::Call {
+                base_qualifier: None,
                 target: Some(Box::new(target)),
                 callee_usr: String::new(),
                 callee_name: "removeLast".to_owned(),
@@ -8222,6 +8327,7 @@ unsafe fn lower_find_contains_idiom(
 
     let value = unsafe { lower_expr(value_cursor, project_root) };
     let contains = ir::Expr::Call {
+        base_qualifier: None,
         target: Some(Box::new(begin_receiver)),
         callee_usr: String::new(),
         callee_name: "contains".to_owned(),
@@ -8643,6 +8749,7 @@ unsafe fn lower_stdlib_free_function_call(
             // to, that method always returns `int`, so the result is typed
             // directly rather than through the alien C++ type expression.
             Some(ir::Expr::Call {
+                base_qualifier: None,
                 target: Some(Box::new(target)),
                 callee_usr,
                 callee_name: "gcd".to_owned(),
@@ -8670,6 +8777,7 @@ unsafe fn lower_stdlib_free_function_call(
             let rhs = unsafe { lower_expr(rhs_cursor, project_root) };
             let ty = lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) });
             Some(ir::Expr::Call {
+                base_qualifier: None,
                 target: None,
                 callee_usr,
                 callee_name: format!("math.{callee_name}"),
@@ -8689,6 +8797,7 @@ unsafe fn lower_stdlib_free_function_call(
             let target = unsafe { lower_expr(arg_cursor, project_root) };
             let ty = lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) });
             Some(ir::Expr::Call {
+                base_qualifier: None,
                 target: Some(Box::new(target)),
                 callee_usr,
                 callee_name: "abs".to_owned(),
@@ -8706,6 +8815,7 @@ unsafe fn lower_stdlib_free_function_call(
             let arg_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
             let target = unsafe { lower_expr(arg_cursor, project_root) };
             Some(ir::Expr::Call {
+                base_qualifier: None,
                 target: Some(Box::new(target)),
                 callee_usr,
                 callee_name: "toString".to_owned(),
@@ -8733,6 +8843,7 @@ unsafe fn lower_stdlib_free_function_call(
                 return Some(unsupported());
             };
             Some(ir::Expr::Call {
+                base_qualifier: None,
                 target: None,
                 callee_usr,
                 // Must read the same literal name as
@@ -8908,7 +9019,7 @@ unsafe fn lower_method_call(
         != clang_sys::CXCursor_ConversionFunction
         && raw_callee_name.starts_with("operator");
 
-    let (target, arg_skip) = if is_operator_syntax_call {
+    let (target, arg_skip, base_qualifier) = if is_operator_syntax_call {
         let arg_count = unsafe { clang_sys::clang_Cursor_getNumArguments(call_cursor) };
         if arg_count < 1 {
             return ir::Expr::UnsupportedTyped {
@@ -8918,7 +9029,11 @@ unsafe fn lower_method_call(
             };
         }
         let receiver_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
-        (unsafe { lower_expr(receiver_cursor, project_root) }, 1)
+        (
+            unsafe { lower_expr(receiver_cursor, project_root) },
+            1,
+            None,
+        )
     } else {
         let receiver_children = unsafe { collect_children(call_cursor) };
         let Some(first_child) = receiver_children.first() else {
@@ -8931,10 +9046,27 @@ unsafe fn lower_method_call(
         if unsafe { clang_sys::clang_getCursorKind(*first_child) }
             == clang_sys::CXCursor_MemberRefExpr
         {
-            (
-                unsafe { member_ref_receiver(*first_child, project_root, &origin) },
-                0,
-            )
+            // `Base::foo()`/`this->Base::foo()` (F12/tarefa 09) — only a
+            // qualified call on an *implicit* `this` receiver has a Dart
+            // `super.` equivalent at all; `obj.Base::foo()` on an explicit,
+            // different object has none (Dart has no way to pick a specific
+            // ancestor implementation through an arbitrary reference), so
+            // this stays disqualified even though `member_ref_qualifier_base`
+            // still reports the same `TypeRef`. A qualifier naming *this
+            // very record* (a non-virtual self-qualified call, still
+            // genuinely recursive the same way in Dart as in C++) is left
+            // alone exactly like an unqualified call; only a qualifier
+            // naming a *different* record, on the implicit receiver, is a
+            // real base-qualified call, whose dispatch `super.`/a bailout
+            // has to capture — see `Expr::Call::base_qualifier`'s own doc
+            // comment.
+            let receiver = unsafe { member_ref_receiver(*first_child, project_root, &origin) };
+            let qualifier = unsafe { member_ref_qualifier_base(*first_child) };
+            let base_qualifier = qualifier.filter(|base| {
+                matches!(receiver, ir::Expr::This { .. })
+                    && active_method_owner_usr().as_deref() != Some(base.usr.as_str())
+            });
+            (receiver, 0, base_qualifier)
         } else {
             let arg_count = unsafe { clang_sys::clang_Cursor_getNumArguments(call_cursor) };
             if arg_count < 1 {
@@ -8945,7 +9077,11 @@ unsafe fn lower_method_call(
                 };
             }
             let receiver_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
-            (unsafe { lower_expr(receiver_cursor, project_root) }, 1)
+            (
+                unsafe { lower_expr(receiver_cursor, project_root) },
+                1,
+                None,
+            )
         }
     };
 
@@ -9001,6 +9137,7 @@ unsafe fn lower_method_call(
             };
         let ty = lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) });
         return ir::Expr::Call {
+            base_qualifier,
             target: Some(Box::new(target)),
             callee_usr,
             callee_name: dart_operator_bridge_name(&callee_name, args.len()).to_owned(),
@@ -9034,6 +9171,7 @@ unsafe fn lower_method_call(
     let ty = lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) });
 
     ir::Expr::Call {
+        base_qualifier,
         target: Some(Box::new(target)),
         callee_usr,
         callee_name,
@@ -9096,6 +9234,7 @@ unsafe fn lower_static_method_call(
     let ty = lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) });
 
     ir::Expr::Call {
+        base_qualifier: None,
         target: Some(Box::new(ir::Expr::Ref {
             name: owner_name.clone(),
             ty: ir::Type::Record {

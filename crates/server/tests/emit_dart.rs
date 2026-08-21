@@ -1225,6 +1225,7 @@ fn a_field_access_never_promotes_even_when_read_twice_in_the_same_body() {
 #[test]
 fn a_null_check_conjunct_promotes_the_rest_of_the_and_chain_and_the_then_branch() {
     let has_notes = |line: u32| Expr::Call {
+        base_qualifier: None,
         target: Some(Box::new(nullable_ref("chord", line))),
         callee_usr: "c:@S@Nota@F@HasNotes#".to_owned(),
         callee_name: "HasNotes".to_owned(),
@@ -1233,6 +1234,7 @@ fn a_null_check_conjunct_promotes_the_rest_of_the_and_chain_and_the_then_branch(
         origin: origin(line),
     };
     let other_thing = |line: u32| Expr::Call {
+        base_qualifier: None,
         target: Some(Box::new(nullable_ref("chord", line))),
         callee_usr: "c:@S@Nota@F@OtherThing#".to_owned(),
         callee_name: "OtherThing".to_owned(),
@@ -1265,6 +1267,7 @@ fn a_null_check_conjunct_promotes_the_rest_of_the_and_chain_and_the_then_branch(
                 name: "chord".to_owned(),
                 ty: nota_ref_ty(),
                 init: Some(Expr::Call {
+                    base_qualifier: None,
                     target: None,
                     callee_usr: "c:@F@GetFirstAncestor#".to_owned(),
                     callee_name: "GetFirstAncestor".to_owned(),
@@ -1333,6 +1336,7 @@ fn a_null_check_conjunct_promotes_the_rest_of_the_and_chain_and_the_then_branch(
 #[test]
 fn an_or_nested_inside_an_and_is_parenthesized_so_dart_reads_the_same_tree_this_module_does() {
     let has_tstamp = Expr::Call {
+        base_qualifier: None,
         target: Some(Box::new(nullable_ref("reh", 4))),
         callee_usr: "c:@S@Nota@F@HasTstamp#".to_owned(),
         callee_name: "HasTstamp".to_owned(),
@@ -1341,6 +1345,7 @@ fn an_or_nested_inside_an_and_is_parenthesized_so_dart_reads_the_same_tree_this_
         origin: origin(4),
     };
     let get_start = Expr::Call {
+        base_qualifier: None,
         target: Some(Box::new(nullable_ref("reh", 4))),
         callee_usr: "c:@S@Nota@F@GetStart#".to_owned(),
         callee_name: "GetStart".to_owned(),
@@ -1349,6 +1354,7 @@ fn an_or_nested_inside_an_and_is_parenthesized_so_dart_reads_the_same_tree_this_
         origin: origin(4),
     };
     let is_class_id = Expr::Call {
+        base_qualifier: None,
         target: Some(Box::new(get_start)),
         callee_usr: "c:@S@Nota@F@IsClassId#".to_owned(),
         callee_name: "IsClassId".to_owned(),
@@ -1397,6 +1403,7 @@ fn an_or_nested_inside_an_and_is_parenthesized_so_dart_reads_the_same_tree_this_
                 name: "reh".to_owned(),
                 ty: nota_ref_ty(),
                 init: Some(Expr::Call {
+                    base_qualifier: None,
                     target: None,
                     callee_usr: "c:@F@Find#".to_owned(),
                     callee_name: "Find".to_owned(),
@@ -1434,6 +1441,7 @@ fn an_or_nested_inside_an_and_is_parenthesized_so_dart_reads_the_same_tree_this_
 #[test]
 fn a_bang_inside_a_short_circuited_and_operand_does_not_leak_past_the_whole_condition() {
     let foo = |line: u32| Expr::Call {
+        base_qualifier: None,
         target: Some(Box::new(nullable_ref("pos", line))),
         callee_usr: "c:@S@Nota@F@Foo#".to_owned(),
         callee_name: "Foo".to_owned(),
@@ -1442,6 +1450,7 @@ fn a_bang_inside_a_short_circuited_and_operand_does_not_leak_past_the_whole_cond
         origin: origin(line),
     };
     let bar = |line: u32| Expr::Call {
+        base_qualifier: None,
         target: Some(Box::new(nullable_ref("pos", line))),
         callee_usr: "c:@S@Nota@F@Bar#".to_owned(),
         callee_name: "Bar".to_owned(),
@@ -1525,6 +1534,7 @@ fn a_bang_inside_a_short_circuited_and_operand_does_not_leak_past_the_whole_cond
 fn a_reassignment_nested_two_if_levels_deep_still_invalidates_the_outer_promotion() {
     let staff_ty = nota_ref_ty();
     let call = |callee: &str, line: u32| Expr::Call {
+        base_qualifier: None,
         target: None,
         callee_usr: format!("c:@F@{callee}#"),
         callee_name: callee.to_owned(),
@@ -1646,6 +1656,7 @@ fn a_loops_own_reassignment_strips_the_promotion_for_the_whole_body_not_just_aft
                     Stmt::Assign {
                         name: "token".to_owned(),
                         value: Expr::Call {
+                            base_qualifier: None,
                             target: None,
                             callee_usr: "c:@F@NextToken#".to_owned(),
                             callee_name: "NextToken".to_owned(),
@@ -1701,6 +1712,7 @@ fn a_calls_receiver_is_dereferenced_before_its_arguments_not_after() {
                 name: "chord".to_owned(),
                 ty: nota_ref_ty(),
                 init: Some(Expr::Call {
+                    base_qualifier: None,
                     target: None,
                     callee_usr: "c:@F@GetFirstAncestor#".to_owned(),
                     callee_name: "GetFirstAncestor".to_owned(),
@@ -1712,6 +1724,7 @@ fn a_calls_receiver_is_dereferenced_before_its_arguments_not_after() {
             },
             Stmt::ExprStmt {
                 expr: Expr::Call {
+                    base_qualifier: None,
                     target: Some(Box::new(nullable_ref("chord", 4))),
                     callee_usr: "c:@S@Nota@F@Foo#I#".to_owned(),
                     callee_name: "Foo".to_owned(),

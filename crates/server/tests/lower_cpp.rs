@@ -3010,6 +3010,124 @@ public:
     );
 }
 
+/// F12/tarefa 09 (`docs/prompts/2026-08-21-09-chamada-a-base-qualificada.md`):
+/// `B::f()` calling `A::f();` (the base implementation, by qualified name)
+/// used to lower with the qualifier discarded — the emitted Dart called
+/// `f()` bare, which resolves to `B`'s own override, infinite recursion.
+/// Single inheritance is the simple case: `B extends A` directly, no mixin
+/// linearization to disambiguate, so the qualified call always has exactly
+/// one place `super.f()` can resolve to.
+#[test]
+fn a_qualified_base_call_in_single_inheritance_emits_super_not_a_self_recursive_call() {
+    let source = lower_and_emit(
+        "lower-cpp-qualified-base-call-single-inheritance",
+        r#"
+class A {
+public:
+    virtual void f() {}
+};
+
+class B : public A {
+public:
+    void f() override {
+        A::f();
+    }
+};
+"#,
+    );
+
+    assert!(
+        source.contains("super.f()"),
+        "expected the qualified base call to emit `super.f()`, got:\n{source}"
+    );
+    assert!(
+        !source.contains("void f() {\n    f();"),
+        "the qualified base call must not lower to a bare self-recursive call, got:\n{source}"
+    );
+}
+
+/// F12/tarefa 09's dangerous case: multiple inheritance flattens into a
+/// mixin list (`with M1, M2`), and Dart's own `super` resolves to the *last*
+/// mixin in that list that declares the member — here `M2`, since both
+/// declare `reset`. The C++ source names `M1` explicitly, which is *not*
+/// the one Dart's `super.reset()` would actually reach — emitting `super.
+/// reset()` anyway would silently call `M2`'s implementation instead of
+/// `M1`'s, which is worse than the original recursion bug (it looks like it
+/// works). The correct output is an honest bailout, never a guessed
+/// `super.`.
+#[test]
+fn a_qualified_base_call_that_mismatches_dart_mixin_linearization_bails_out() {
+    let source = lower_and_emit(
+        "lower-cpp-qualified-base-call-linearization-mismatch",
+        r#"
+class M1 {
+public:
+    virtual void reset() {}
+};
+
+class M2 {
+public:
+    virtual void reset() {}
+};
+
+class D : public M1, public M2 {
+public:
+    void reset() override {
+        M1::reset();
+    }
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("super.reset()"),
+        "expected an honest bailout, not a `super.reset()` that would silently \
+         resolve to the wrong mixin, got:\n{source}"
+    );
+    assert!(
+        !source.contains("void reset() {\n    reset();"),
+        "the mismatched qualified base call must not fall back to a bare \
+         self-recursive call either, got:\n{source}"
+    );
+    assert!(
+        source.contains("does not resolve"),
+        "expected the mismatch to surface as an explicit bailout reason, got:\n{source}"
+    );
+}
+
+/// F12/tarefa 09's non-regression case: an ordinary virtual call (no C++
+/// qualifier at all, whether spelled bare or through `this->`) must keep
+/// emitting a plain, unqualified call — never `super.`, which would change
+/// its dispatch (skip the most-derived override at every real virtual call
+/// site, not just the qualified ones this family targets).
+#[test]
+fn an_unqualified_virtual_call_from_an_override_still_emits_a_bare_call() {
+    let source = lower_and_emit(
+        "lower-cpp-unqualified-virtual-call-non-regression",
+        r#"
+class A {
+public:
+    virtual void f() {}
+    virtual void g() { f(); }
+};
+
+class B : public A {
+public:
+    void f() override { this->g(); }
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("super."),
+        "an unqualified/virtual call must never emit `super.`, got:\n{source}"
+    );
+    assert!(
+        source.contains("g()"),
+        "expected the unqualified call to still lower, got:\n{source}"
+    );
+}
+
 /// `std::vector<int> v = {1, 2, 3};` — a brace initializer for a
 /// `vector`/`array`/`deque`, invoking their `initializer_list` constructor.
 /// `lower::cpp` had no `Expr` shape for a brace-enclosed initializer list at

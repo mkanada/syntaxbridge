@@ -342,8 +342,28 @@ pub enum Expr {
     /// method (`emit::dart` omits the receiver for that case, same as it
     /// omits `this.` for a bare field access); `Some(other)` for a method
     /// called on an explicit object (`obj.method(args)`).
+    ///
+    /// `base_qualifier` is `Some(base)` for a C++ call that names its target
+    /// with an explicit base qualifier from inside an override
+    /// (`Base::method()`, F12/tarefa 09) — `target` is still `Expr::This` in
+    /// that case (the receiver is unchanged), but the *dispatch* isn't: C++
+    /// bypasses the vtable entirely, which `lower::cpp` alone can't safely
+    /// mimic by just printing `method(args)` (that resolves to the current
+    /// override itself in Dart, infinite recursion — the real bug this field
+    /// exists to fix) or by always printing `super.method(args)` (Dart's
+    /// mixin linearization picks the *last* applied mixin that declares the
+    /// member, which only sometimes agrees with the base C++ actually named).
+    /// `lower::cpp` can't decide which case applies — that needs the whole
+    /// `Module`'s mixin membership, not available until every translation
+    /// unit is merged — so it always records the named base honestly here,
+    /// and `function_catalog::resolve_qualified_base_calls` (which runs once
+    /// the full picture exists) either confirms it (kept as-is, `emit::dart`
+    /// prints `super.method(args)`) or downgrades the whole call to an
+    /// honest `Expr::UnsupportedTyped` bailout when the base named here isn't
+    /// the one Dart's `super` would actually reach.
     Call {
         target: Option<Box<Expr>>,
+        base_qualifier: Option<BaseClass>,
         callee_usr: String,
         callee_name: String,
         args: Vec<Expr>,

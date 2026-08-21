@@ -283,7 +283,7 @@ pub(crate) fn mixin_usrs(records: &[Record]) -> HashSet<&str> {
 /// each expanded dependency to the file it has to `import`, the same
 /// expansion `emit_record`'s own `with` clause already relies on to know
 /// what it needs printed by name.
-fn expand_mixin_chain<'a>(
+pub(crate) fn expand_mixin_chain<'a>(
     bases: &'a [crate::ir::BaseClass],
     records_by_usr: &HashMap<&str, &'a Record>,
 ) -> Vec<&'a crate::ir::BaseClass> {
@@ -3389,6 +3389,7 @@ fn emit_expr(
         },
         Expr::Call {
             target,
+            base_qualifier,
             callee_name,
             args,
             ..
@@ -3417,13 +3418,24 @@ fn emit_expr(
             // real Verovio corpus's most common expression shape (real
             // regression caught by `just verovio-diagnosis` while
             // implementing `receiver_bang`'s promotion tracking).
-            let receiver_prefix = match target.as_deref() {
-                None | Some(Expr::This { .. }) => String::new(),
-                Some(receiver) => {
-                    let receiver_text =
-                        emit_expr(receiver, used_expr_helper, used_utf8_encode, promoted);
-                    let bang = receiver_bang(receiver, promoted);
-                    format!("{receiver_text}{bang}.")
+            // `base_qualifier` (F12/tarefa 09) is set only once
+            // `function_catalog::resolve_qualified_base_calls` has already
+            // confirmed the base named in C++ is exactly the one Dart's own
+            // mixin linearization reaches through `super` for this member —
+            // any call that didn't confirm was already downgraded to an
+            // `Expr::UnsupportedTyped` bailout before emission ever sees it,
+            // so reaching here with `Some` always means `super.` is correct.
+            let receiver_prefix = if base_qualifier.is_some() {
+                "super.".to_owned()
+            } else {
+                match target.as_deref() {
+                    None | Some(Expr::This { .. }) => String::new(),
+                    Some(receiver) => {
+                        let receiver_text =
+                            emit_expr(receiver, used_expr_helper, used_utf8_encode, promoted);
+                        let bang = receiver_bang(receiver, promoted);
+                        format!("{receiver_text}{bang}.")
+                    }
                 }
             };
             let args_text = args
