@@ -4276,12 +4276,11 @@ unsafe fn default_field_value(
     origin: &ir::Origin,
     depth: usize,
 ) -> ir::Expr {
-    if matches!(ty, ir::Type::Record { .. }) {
-        if let Some(value) =
+    if matches!(ty, ir::Type::Record { .. })
+        && let Some(value) =
             unsafe { default_record_construct_at_depth(ty, cx_type, origin, depth) }
-        {
-            return value;
-        }
+    {
+        return value;
     }
     if let ir::Type::Enum { name, .. } = ty {
         let declaration = unsafe { clang_sys::clang_getTypeDeclaration(cx_type) };

@@ -3296,17 +3296,24 @@ fn emit_expr(
             if matches!(op, UnaryOp::PostIncrement | UnaryOp::PostDecrement) {
                 return format!("{operand_text}{op_text}");
             }
-            // A nested unary minus (Verovio's `-VRV_UNSET`, a macro expanding
-            // to `(-2147483647)`) would otherwise print as `--2147483647` —
-            // two adjacent `-` characters with nothing between them merge
-            // into Dart's prefix-decrement token, which can't apply to a
-            // literal (`dart format`: "Missing selector", confirmed
-            // empirically). Parenthesizing whenever the operand's own text
-            // starts with the same character keeps the two tokens apart
-            // regardless of how deep the nesting goes.
-            if *op == UnaryOp::Not {
-                format!("{op_text}({operand_text})")
-            } else if operand_text.starts_with(op_text) {
+            // Two different reasons collapse to the same "wrap it in
+            // parens" output here. `Not`'s operand can be an arbitrary
+            // lower-precedence expression (`return !(node != null);`) —
+            // `!` binds tighter than Dart's own `!=`/`&&`/`||`/ternary, so
+            // an unparenthesized `!node != null` would parse as `(!node)
+            // != null`, a different truth value entirely; always
+            // parenthesizing sidesteps having to reason about every
+            // operand shape's precedence individually. A nested unary
+            // minus (Verovio's `-VRV_UNSET`, a macro expanding to
+            // `(-2147483647)`) needs the same wrapping for an unrelated,
+            // purely lexical reason: printed bare it would read
+            // `--2147483647` — two adjacent `-` characters with nothing
+            // between them merge into Dart's prefix-decrement token, which
+            // can't apply to a literal (`dart format`: "Missing selector",
+            // confirmed empirically). Checking whether the operand's own
+            // text starts with the same character catches that regardless
+            // of how deep the nesting goes.
+            if *op == UnaryOp::Not || operand_text.starts_with(op_text) {
                 format!("{op_text}({operand_text})")
             } else {
                 format!("{op_text}{operand_text}")

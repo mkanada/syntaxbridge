@@ -154,8 +154,13 @@ fn generate_job_id() -> String {
     format!("job-{}", NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed))
 }
 
+/// The id-to-handle map a [`JobRegistry`] guards behind its `Mutex` —
+/// named so the field below states its own shape instead of nesting four
+/// generic layers inline.
+type JobMap<T, E> = HashMap<String, Arc<Job<T, E>>>;
+
 pub struct JobRegistry<T, E> {
-    jobs: Arc<Mutex<HashMap<String, Arc<Job<T, E>>>>>,
+    jobs: Arc<Mutex<JobMap<T, E>>>,
 }
 
 // Written by hand instead of `#[derive(Clone)]`: the derive would require
