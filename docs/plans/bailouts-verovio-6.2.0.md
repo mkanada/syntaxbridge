@@ -1245,6 +1245,119 @@ próximo passo natural antes de mais uma rodada dedicada a este idiom.
 zerar — tratadas como trabalho genuíno, mas parcial, não como as "20
 causas zeradas" que o processo do loop pede idealmente.
 
+### Atualização de 2026-08-20 (19ª rodada) — forma de ponteiro do idiom out-param, acumulador de `stringstream`, e uma regressão real corrigida antes de registrar
+
+Executado pelo loop autônomo, continuação da sessão. Baseline: tipos
+1.695/240, expressões 5.575/354, statements 391/16 — total 7.661 (idêntico
+ao fim da 18ª rodada, sem divergência).
+
+**Feature 1: forma de ponteiro do idiom out-param (`void f(int *out)`).** A
+ponte já existente (`apply_out_param_bridge`, desde E13) só reconhecia a
+forma de referência (`int &out`). A forma de ponteiro, mais antiga/
+compatível com C, caía inteira em `Type::Unsupported` e era consistentemente
+a maior família residual em `unsupported_types` depois da ponte de `void*`
+(17ª rodada) — `int *`, `size_t *`, `mz_uint64 *`, `uint32_t *`, `uint16_t
+*`, `mz_uint32 *`, `time_t *`, `mz_uint16 *`, `mz_ulong *`, cada um sua
+própria linha. `grep` direto na fonte real confirmou toda ocorrência
+amostrada como escrita de valor único genuína (`editortoolkit_neume.h`'s
+`ParseDragAction(..., int *x, int *y)`, `win_getopt.h`'s `int *idx`,
+`zip_file.hpp`'s `mz_uint32 *pIndex`), nunca um buffer indexado.
+`is_non_const_scalar_out_param_type` (renomeada de
+`is_non_const_scalar_reference`) agora também aceita ponteiro para
+`Int`/`Double`/`Bool` não-`const`, excluindo pointees que já têm
+representação mais específica (`mz_uint8`/`uint8_t` → `Bytes`, caractere de
+texto → `Str` — pego por uma regressão real em
+`a_known_byte_buffer_pointer_lowers_to_a_nullable_uint8_list` antes de
+aceitar). Um novo registro `thread_local`
+(`ACTIVE_POINTER_OUT_PARAMS`, mesmo formato do `ACTIVE_ITERATOR_LOOPS` da
+18ª rodada) liga o nome do parâmetro ao tipo do pointee enquanto o corpo da
+função/método é lowered, para que `*out` dentro do corpo resolva para o
+próprio parâmetro em vez do tipo de ponteiro nunca-representável. No call
+site, `out_arg_target_cursor` desembrulha `&lvalue` para o alvo real, e os
+argumentos correspondentes na própria chamada são reescritos para os mesmos
+alvos (o chamador passa suas variáveis como entrada também, espelhando
+exatamente como a forma de referência já chama `Reduce(numerador,
+denominador)` sem `&`). Um argumento de ponteiro que não é um `&lvalue`
+simples (`nullptr` optando por fora, um temporário) vira um
+`Stmt::Unsupported` honesto — nomeado e novo, não uma regressão — em vez de
+descartar silenciosamente a tupla de retorno como um `ExprStmt` comum. O
+próprio golden do E10 (`ponteiros-union-out-params`) exercitava exatamente
+esse idiom e foi re-abençoado contra o Dart real (`NOTES.md` atualizado).
+
+**Feature 2: acumulador `std::stringstream`/`std::ostringstream`.**
+Candidato investigado na 13ª rodada e adiado por depender de "atribuição
+como expressão", que a 14ª rodada já tinha implementado sem essa conexão
+ter sido percebida então. Achado real, `options.cpp`'s
+`OptionArray::GetStr`: `ss << "\"" << value << "\"";` dentro de um laço,
+depois `return ss.str();`. `std::stringstream`/`ostringstream` agora
+lowera direto para `Type::Str` (toda operação que esta ponte suporta —
+inserção `<<` como statement, `.str()` — reduz a concatenação/identidade de
+string). `ss << a << b;` usado como statement vira `ss = ss + a.toString()
++ b.toString();`, reusando o mesmo passeio de cadeia esquerda-associativa e
+conversão de peça Str/Int/Double que a ponte de `std::cout`/`std::cerr` já
+tinha, duplicado em `lower_stringstream_insertion_chain` (a base do
+recursivo e o que se faz com o resultado diferem o suficiente para não
+compensar compartilhar uma função só). `ss.str()` é identidade. Achado de
+AST real via `-ast-dump`: o receptor de `operator<<` chega através de um
+`ImplicitCastExpr <DerivedToBase>` (`basic_iostream` → `basic_ostream`),
+diferente de `std::cout`/`std::cerr` (objetos globais já do tipo
+`basic_ostream`, sem cast).
+
+**Bug real pré-existente encontrado e corrigido no caminho.**
+`std::string s;` (ou agora `std::stringstream ss;`) sem inicializador
+escrito lowerava para `String s = basic_string();` — chamada a uma função
+Dart que nunca é gerada, Dart inválido. `is_default_construct_with_no_args`
+não filtra esse caso: seu `!has_real_body` não consegue distinguir "nada a
+fazer" de "desconhecido" para o construtor nunca-instanciado de um tipo de
+biblioteca. Corrigido com `is_default_construct_of_a_known_adapter_type`,
+que não precisa inspecionar corpo nenhum — `default_scalar_value` já tem o
+valor zero real de C++ para esses adaptadores (`''` para string) — e um
+teste de regressão dedicado (`std::string` puro, não só stringstream).
+
+**Regressão real encontrada pela própria medição desta rodada, corrigida
+antes de registrar.** `unparseable_files_count` foi de 1/301 para 2/301 —
+`zip_file.dart` ficou inválido. Causa raiz, confirmada com `dart format`
+direto: `zip_file.hpp`'s `tdefl_compress_normal` tem `*pSrc++` (idiom C de
+"lê e avança" sobre um ponteiro de buffer já conhecido), que lowera para
+`Expr::Convert{ operand: Unary{PostIncrement, pSrc}, ty: Int }` —
+`emit::dart` renderizava isso como `pSrc++.toInt()`, Dart inválido (`dart
+format`: "Expected to find ';'.") porque um sufixo não pode encadear direto
+num pós-incremento. Bug pré-existente, só exposto (não introduzido) por
+correções anteriores alcançarem mais fundo nesta função específica —
+mas a regra de regressão do próprio loop exige corrigir antes de aceitar o
+resultado desta rodada. `emit_convert_operand` (novo helper) parenteiza o
+operando especificamente quando é um pós-incremento/decremento, usado em
+toda ramificação de `Expr::Convert` que encadeia um sufixo direto.
+
+**Medição final (depois da correção da regressão):** tipos 1.695/240 →
+**1.595/236** (−100 ocorrências, −4 causas: `mz_uint16 *`,
+`basic_stringstream`, `basic_ostringstream` zeradas de verdade, mais uma
+quarta não auditada individualmente); expressões 5.575/354 →
+**5.285/351** (−290, −3 causas); statements 391/16 → **348/17** (−43
+ocorrências, **+1 causa nova** — `"call to an out-param-bridged function
+had an argument..."`, o próprio bailout nomeado e honesto desta rodada
+para o caso `nullptr`, mesmo padrão já aceito nas rodadas 9/14, não uma
+regressão); total 7.661 → **7.228** (−433, −5,7%); **1/301 arquivos
+inválidos** (mesmo `pugixml.dart` de sempre, sem mudança líquida depois da
+correção); `dart analyze` 16.258 → 15.632 erros (−626), 8.986 avisos (sem
+mudança líquida). Conferido: zero tokens `dynamic`, zero panics.
+
+**Residual não totalmente explicado, registrado para a próxima rodada:**
+`int *`/`size_t *`/`mz_uint64 *`/`uint32_t *`/`uint16_t *`/`mz_uint32 *`/
+`time_t *`/`mz_ulong *` (as causas-alvo principais da feature 1) reduziram
+muito menos do que o volume de parâmetros pareceria sugerir (`int *`:
+63→59, `size_t *`: inalterado em 51, `mz_uint64 *`/`uint32_t *`/
+`uint16_t *`/`mz_uint32 *`/`mz_ulong *`: inalterados). A mesma família de
+suspeita já registrada para `vector::end`/`list::end` na 18ª rodada
+provavelmente se aplica aqui: a maioria das ocorrências reais desses
+spellings provavelmente não é parâmetro de função (`out_param_indices` só
+olha para parâmetros) — pode ser campo de struct, variável local, ou
+ponteiro aritmético genuíno — não auditado ainda. `unsupported std::
+basic_stringstream::str call` também não zerou (61→3): o resíduo de 3
+provavelmente é a sobrecarga de 1 argumento (`ss.str(newValue)`,
+deliberadamente fora de escopo) ou um receptor não reconhecido pelo mesmo
+`stringstream_variable_name`, não auditado individualmente ainda.
+
 ## 1. Tipos sem mapeamento — snapshot-base de 4.384 ocorrências
 
 ### Progresso executado
