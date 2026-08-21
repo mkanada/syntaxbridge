@@ -4374,6 +4374,65 @@ int read_and_advance(const uint8_t* pSrc) {
     );
 }
 
+/// Round 21: a byte-indexed *write* into a `std::string`
+/// (`keyString[i] = tolower(keyString[i]);`, real trigger — grepped
+/// directly, `ioabc.cpp:624` and `json/jsonxx.cc:637`'s `input[size - 2] =
+/// ' ';`). Dart's `String` is immutable — there is no in-place indexed
+/// assignment — so this reassigns the whole variable: encode to UTF-8
+/// bytes (the same byte model `Expr::StringByteAt`'s *read* side already
+/// uses), write the one byte, decode back.
+#[test]
+fn a_string_byte_index_write_reassigns_the_whole_string() {
+    let source = lower_and_emit(
+        "lower-cpp-string-byte-index-write",
+        r#"
+#include <string>
+
+void lowercase_first(std::string& s) {
+    s[0] = 'a';
+}
+"#,
+    );
+
+    assert!(
+        source.contains("List<int> _syntaxBridgeStringBytes = utf8.encode(s);")
+            && source.contains("_syntaxBridgeStringBytes[0] = ")
+            && source.contains("s = utf8.decode(_syntaxBridgeStringBytes);"),
+        "expected the string byte write to encode/mutate/decode, got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "string byte-index write must not bail out, got:\n{source}"
+    );
+}
+
+/// The same rewrite, but the target is a `std::string` *field* reached
+/// through a plain (non-nullable) receiver — `keyString[i] = ...;` where
+/// `keyString` might itself be a field, not always a bare local.
+#[test]
+fn a_string_byte_index_write_through_a_field_target_reassigns_the_field() {
+    let source = lower_and_emit(
+        "lower-cpp-string-byte-index-write-field",
+        r#"
+#include <string>
+
+struct Holder {
+    std::string keyString;
+    void LowerFirst() { keyString[0] = 'a'; }
+};
+"#,
+    );
+
+    assert!(
+        source.contains("keyString = utf8.decode(_syntaxBridgeStringBytes);"),
+        "expected the field target to be reassigned after the byte write, got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "string byte-index write through a field must not bail out, got:\n{source}"
+    );
+}
+
 /// `void*`/`const void*` — the single largest type bailout in the
 /// 2026-08-20 Verovio diagnosis (896 + 253 occurrences), real shapes
 /// confirmed by grepping the extracted Verovio source directly

@@ -2558,7 +2558,103 @@ unsafe fn lower_stmt_into(cursor: clang_sys::CXCursor, project_root: &Path) -> V
             return statements;
         }
     }
+    if kind == clang_sys::CXCursor_BinaryOperator
+        && unsafe { clang_sys::clang_getCursorBinaryOperatorKind(cursor) }
+            == clang_sys::CXBinaryOperator_Assign
+    {
+        let origin = stmt_origin(cursor, project_root);
+        if let Some(statements) =
+            unsafe { lower_string_byte_assign_stmt(cursor, project_root, &origin) }
+        {
+            return statements;
+        }
+    }
     vec![unsafe { lower_stmt(cursor, project_root) }]
+}
+
+/// `target[index] = value;` where `target[index]` reads as a byte-indexed
+/// `std::string` access (round 21, real trigger — grepped directly,
+/// `ioabc.cpp`'s `keyString[i] = tolower(keyString[i]);`,
+/// `json/jsonxx.cc`'s `input[size - 2] = ' ';`). Dart's `String` has no
+/// in-place indexed assignment (it's immutable) — the whole target
+/// variable/field is reassigned instead, from a byte buffer round-tripped
+/// through the same UTF-8 encoding `Expr::StringByteAt`'s *read* side
+/// already uses (`utf8.encode`/`.indexOf` — this bridge's own byte model
+/// for a string, not UTF-16 code units): encode to bytes, write the one
+/// byte, decode back. Three statements from what was one C++ statement —
+/// exactly why this lives in `lower_stmt_into` (already returns
+/// `Vec<Stmt>` for `DeclStmt`/`CompoundStmt`/the out-param `if` pattern),
+/// not `lower_stmt` itself. `None` (falling through to the ordinary
+/// `lower_assign_stmt`, unchanged) for any assignment whose lowered LHS
+/// isn't exactly `Expr::StringByteAt`, or whose own target isn't a simple
+/// assignable lvalue (`is_assignable_lvalue`) — the same conservative
+/// bar every other rewrite in this module holds itself to.
+unsafe fn lower_string_byte_assign_stmt(
+    cursor: clang_sys::CXCursor,
+    project_root: &Path,
+    origin: &ir::Origin,
+) -> Option<Vec<ir::Stmt>> {
+    let children = unsafe { collect_children(cursor) };
+    let [lhs_cursor, rhs_cursor] = children.as_slice() else {
+        return None;
+    };
+    let lhs = unsafe { lower_expr(*lhs_cursor, project_root) };
+    let ir::Expr::StringByteAt {
+        target: string_target,
+        index,
+        ..
+    } = lhs
+    else {
+        return None;
+    };
+    if !string_target.is_assignable_lvalue() {
+        return None;
+    }
+    let value = unsafe { lower_expr(*rhs_cursor, project_root) };
+
+    let bytes_name = "_syntaxBridgeStringBytes".to_owned();
+    let bytes_ref = ir::Expr::Ref {
+        name: bytes_name.clone(),
+        ty: ir::Type::List(Box::new(ir::Type::Int)),
+        origin: origin.clone(),
+    };
+    Some(vec![
+        ir::Stmt::VarDecl {
+            name: bytes_name,
+            ty: ir::Type::List(Box::new(ir::Type::Int)),
+            init: Some(ir::Expr::Call {
+                target: None,
+                callee_usr: String::new(),
+                callee_name: "utf8.encode".to_owned(),
+                args: vec![(*string_target).clone()],
+                ty: ir::Type::List(Box::new(ir::Type::Int)),
+                origin: origin.clone(),
+            }),
+            origin: origin.clone(),
+        },
+        ir::Stmt::ExprAssign {
+            target: ir::Expr::Index {
+                target: Box::new(bytes_ref.clone()),
+                index,
+                ty: ir::Type::Int,
+                origin: origin.clone(),
+            },
+            value,
+            origin: origin.clone(),
+        },
+        ir::Stmt::ExprAssign {
+            target: *string_target,
+            value: ir::Expr::Call {
+                target: None,
+                callee_usr: String::new(),
+                callee_name: "utf8.decode".to_owned(),
+                args: vec![bytes_ref],
+                ty: ir::Type::Str,
+                origin: origin.clone(),
+            },
+            origin: origin.clone(),
+        },
+    ])
 }
 
 /// `if (chamada(...))`/`if (!chamada(...))` where `chamada` resolves to a

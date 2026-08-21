@@ -2861,6 +2861,19 @@ fn emit_expr(expr: &Expr, used_expr_helper: &mut bool, used_utf8_encode: &mut bo
             args,
             ..
         } => {
+            // `Expr::Call{target: None, callee_name: "utf8.encode"/"utf8.
+            // decode", ..}` (round 21's string byte-index write —
+            // `lower_string_byte_assign_stmt`) is the one place this
+            // generic renderer emits a raw `dart:convert` reference
+            // outside the dedicated `Expr::StringByteAt`/
+            // `StringByteLength`/`find` renderers, which each already set
+            // this flag directly at their own call sites — this call has
+            // no such dedicated renderer, so it has to set it here
+            // instead, or the `import 'dart:convert';` this call needs
+            // would silently never get added.
+            if callee_name.starts_with("utf8.") {
+                *used_utf8_encode = true;
+            }
             let args_text = args
                 .iter()
                 .map(|arg| emit_expr(arg, used_expr_helper, used_utf8_encode))
