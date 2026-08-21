@@ -385,8 +385,9 @@ fn an_unsupported_expression_calls_a_typed_helper_without_dynamic() {
         "helper function should preserve an explicit static type, got:\n{source}"
     );
     assert!(
-        source.contains("final class SyntaxBridgeOpaque {"),
-        "unsupported types need a named bridge declaration, got:\n{source}"
+        files["lib/syntax_bridge_support.dart"].contains("final class SyntaxBridgeOpaque {"),
+        "unsupported types need a named bridge declaration in the shared support file, got:\n{}",
+        files["lib/syntax_bridge_support.dart"]
     );
     assert!(
         !source.contains("dynamic"),
@@ -537,8 +538,13 @@ fn a_function_with_an_unsupported_parameter_type_throws_instead_of_running_its_b
         "an unsupported source type needs the named opaque bridge, got:\n{source}"
     );
     assert!(
-        source.contains("final class SyntaxBridgeOpaque {") && !source.contains("dynamic"),
+        !source.contains("dynamic"),
         "the generated signature must not fall back to dynamic, got:\n{source}"
+    );
+    assert!(
+        files["lib/syntax_bridge_support.dart"].contains("final class SyntaxBridgeOpaque {"),
+        "the opaque bridge must be declared in the shared support file, got:\n{}",
+        files["lib/syntax_bridge_support.dart"]
     );
 }
 
@@ -630,6 +636,114 @@ fn a_record_with_an_unsupported_field_type_has_a_throwing_constructor() {
     assert!(
         source.contains("long double"),
         "expected the unsupported spelling in the message, got:\n{source}"
+    );
+}
+
+/// (a) — `docs/prompts/2026-08-21-06-bailout-tipado-e-opaque-compartilhado.md`:
+/// two records that each declare their own bailout to the opaque bridge from
+/// *different* source files, with an override relationship between them —
+/// the exact shape that produced Verovio's `invalid_override` diagnostics,
+/// because each file used to get its own `final class SyntaxBridgeOpaque {}`
+/// and Dart treated them as unrelated types. There must be exactly one
+/// declaration, in the shared support file, and both files must import it.
+#[test]
+fn syntax_bridge_opaque_is_declared_once_in_the_shared_support_file() {
+    let base_origin = Origin {
+        file: "/project/input-source/src/devicecontext.cpp".to_owned(),
+        line: 10,
+        column: 1,
+    };
+    let derived_origin = Origin {
+        file: "/project/input-source/src/bboxdevicecontext.cpp".to_owned(),
+        line: 20,
+        column: 1,
+    };
+
+    let draw_spline_params = || {
+        vec![Param {
+            name: "coords".to_owned(),
+            ty: Type::Unsupported("ArrayOfPoints".to_owned()),
+            default_value: None,
+        }]
+    };
+
+    let base_record = Record {
+        name: "DeviceContext".to_owned(),
+        usr: "c:@S@DeviceContext".to_owned(),
+        namespace: String::new(),
+        fields: Vec::new(),
+        static_fields: Vec::new(),
+        constructors: Vec::new(),
+        methods: vec![Method {
+            name: "DrawSpline".to_owned(),
+            usr: "c:@S@DeviceContext@F@DrawSpline#ArrayOfPoints#".to_owned(),
+            params: draw_spline_params(),
+            return_type: Type::Void,
+            body: None,
+            is_static: false,
+            is_override: false,
+            origin: base_origin.clone(),
+        }],
+        base_class: None,
+        mixins: Vec::new(),
+        destructor: None,
+        origin: base_origin,
+    };
+
+    let derived_record = Record {
+        name: "BBoxDeviceContext".to_owned(),
+        usr: "c:@S@BBoxDeviceContext".to_owned(),
+        namespace: String::new(),
+        fields: Vec::new(),
+        static_fields: Vec::new(),
+        constructors: Vec::new(),
+        methods: vec![Method {
+            name: "DrawSpline".to_owned(),
+            usr: "c:@S@BBoxDeviceContext@F@DrawSpline#ArrayOfPoints#".to_owned(),
+            params: draw_spline_params(),
+            return_type: Type::Void,
+            body: None,
+            is_static: false,
+            is_override: true,
+            origin: derived_origin.clone(),
+        }],
+        base_class: Some(base(&base_record.usr, &base_record.name)),
+        mixins: Vec::new(),
+        destructor: None,
+        origin: derived_origin,
+    };
+
+    let module = Module {
+        records: vec![base_record, derived_record],
+        functions: Vec::new(),
+        enums: Vec::new(),
+    };
+
+    let files = emit_module(&module);
+    let base_source = &files["lib/devicecontext.dart"];
+    let derived_source = &files["lib/bboxdevicecontext.dart"];
+    let support_source = &files["lib/syntax_bridge_support.dart"];
+
+    assert!(
+        !base_source.contains("class SyntaxBridgeOpaque"),
+        "the opaque bridge must not be redeclared in the base's own file, got:\n{base_source}"
+    );
+    assert!(
+        !derived_source.contains("class SyntaxBridgeOpaque"),
+        "the opaque bridge must not be redeclared in the derived file, got:\n{derived_source}"
+    );
+    assert_eq!(
+        support_source.matches("class SyntaxBridgeOpaque").count(),
+        1,
+        "expected exactly one shared declaration, got:\n{support_source}"
+    );
+    assert!(
+        base_source.contains("import 'syntax_bridge_support.dart';"),
+        "the base file must import the shared support file, got:\n{base_source}"
+    );
+    assert!(
+        derived_source.contains("import 'syntax_bridge_support.dart';"),
+        "the derived file must import the shared support file, got:\n{derived_source}"
     );
 }
 

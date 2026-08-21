@@ -1,3 +1,5 @@
+import 'syntax_bridge_support.dart';
+
 (int, int) trocar(int a, int b) {
   int temp = a;
   a = b;
@@ -16,8 +18,4 @@ double lerComoFlutuante(
 
 int somarSemPonteiro(int a, int b) {
   return a + b;
-}
-
-final class SyntaxBridgeOpaque {
-  const SyntaxBridgeOpaque();
 }

@@ -1931,7 +1931,8 @@ int sum_values(const std::list<Item>& items) {
     );
 
     assert!(
-        source.contains("for (final Item it in items)") && source.contains("total = total + it.value;"),
+        source.contains("for (final Item it in items)")
+            && source.contains("total = total + it.value;"),
         "expected arrow member access through the loop iterator to read the element's field, \
          got:\n{source}"
     );
@@ -2254,6 +2255,44 @@ void reset_and_append(std::string& text) {
         !source.contains("unsupported std::basic_string::clear call")
             && !source.contains("unsupported std::basic_string::append call"),
         "supported mutating string calls must not remain bailouts, got:\n{source}"
+    );
+}
+
+/// (c) — `docs/prompts/2026-08-21-06-bailout-tipado-e-opaque-compartilhado.md`:
+/// real corpus trigger (`iomei.dart`/`jsonxx.dart`/`humlib.dart` in the
+/// Verovio 6.2.0 diagnosis) — chaining a one-argument `append` (which
+/// reassigns its receiver) onto a receiver that itself failed to lower
+/// (here, a two-argument `append(s, n)` overload this bridge doesn't
+/// support) used to build `Stmt::ExprAssign` with the *bailout itself* as
+/// the assignment target: `_syntaxBridgeUnsupported<...>(...) = ... ;`.
+/// That's not just semantically wrong, it's not valid Dart syntax at
+/// all — Dart reads the callable-looking left side as an attempted
+/// destructuring pattern and rejects it with unrelated pattern errors
+/// (`not_a_type`, `positional_field_in_object_pattern`,
+/// `refutable_pattern_in_irrefutable_context`, all confirmed on the same
+/// line in the real diagnosis). The whole statement must escalate to an
+/// honest `Stmt::Unsupported` instead.
+#[test]
+fn an_append_chained_onto_an_unrepresentable_receiver_bails_out_the_whole_statement_not_just_the_target()
+ {
+    let source = lower_and_emit(
+        "lower-cpp-append-chained-onto-unsupported-receiver",
+        r#"
+#include <string>
+
+void build(std::string& text, const char* extra, int extra_len, char terminator) {
+    text.append(extra, extra_len).push_back(terminator);
+}
+"#,
+    );
+
+    assert!(
+        !source.contains(") = _syntaxBridgeUnsupported"),
+        "a bailout must never reach an assignment target position, got:\n{source}"
+    );
+    assert!(
+        source.contains("throw UnimplementedError("),
+        "expected the whole statement to bail out honestly instead, got:\n{source}"
     );
 }
 
@@ -3420,6 +3459,49 @@ public:
     );
 }
 
+/// (b) — `docs/prompts/2026-08-21-06-bailout-tipado-e-opaque-compartilhado.md`:
+/// the `dynamic_cast` bailout just above still has a known static type — the
+/// cast's own nullable target record, `OptionBool?` — even though its
+/// operand is unrepresentable. It must carry that type instead of the
+/// generic opaque bridge, the same real corpus family (~126 occurrences of
+/// "dynamic_cast operand is not a simple reference" in the Verovio 6.2.0
+/// diagnosis) that produced `unchecked_use_of_nullable_value`/
+/// `argument_type_not_assignable` whenever the bailout's declared context
+/// (a variable, a field, a return type) expected the real record type.
+#[test]
+fn a_dynamic_cast_bailout_on_a_call_operand_still_carries_its_target_type() {
+    let source = lower_and_emit(
+        "lower-cpp-dynamic-cast-typed-bailout",
+        r#"
+class Base {
+public:
+    virtual ~Base() {}
+    Base* Self() { return this; }
+};
+class OptionBool : public Base {
+public:
+    bool m_value = false;
+};
+class Derived : public Base {
+public:
+    OptionBool* from_call() {
+        return dynamic_cast<OptionBool*>(Self());
+    }
+};
+"#,
+    );
+
+    assert!(
+        source.contains("_syntaxBridgeUnsupported<OptionBool?>("),
+        "expected the bailout to carry the dynamic_cast's own nullable target \
+         type instead of the generic opaque bridge, got:\n{source}"
+    );
+    assert!(
+        !source.contains("_syntaxBridgeUnsupported<SyntaxBridgeOpaque>("),
+        "a statically known bailout type must not fall back to the opaque bridge, got:\n{source}"
+    );
+}
+
 /// `return new Abbr(*this);` — Verovio's own `Clone()` idiom
 /// (`include/vrv/abbr.h`'s `Object *Clone() const override { return new
 /// Abbr(*this); }`, confirmed as the real trigger by grepping the source
@@ -3589,7 +3671,8 @@ struct Holder {
 
     assert!(
         !source.contains("panicked")
-            && source.contains("assignment target's dereference operand is not a simple"),
+            && source
+                .contains("assignment target is not representable as a Dart assignment target"),
         "expected an honest bailout, not a panic, got:\n{source}"
     );
 }
@@ -4496,8 +4579,7 @@ std::string join(const std::vector<std::string>& values) {
         "expected the stringstream to start as an empty Dart String, got:\n{source}"
     );
     assert!(
-        source.contains("ss = ss + ', ';")
-            && source.contains("ss = ss + '\"' + value + '\"';"),
+        source.contains("ss = ss + ', ';") && source.contains("ss = ss + '\"' + value + '\"';"),
         "expected each insertion chain to reassign ss by concatenation, got:\n{source}"
     );
     assert!(
@@ -5242,5 +5324,50 @@ struct Holder {
     assert!(
         !source.contains("Unsupported") && !source.contains("dynamic"),
         "unique_ptr get/operator-> must not bail out, got:\n{source}"
+    );
+}
+
+/// Regression: `.begin()`/`.end()` (and any other call whose own static
+/// type is an unrecognized, system-header-only implementation type — here
+/// libstdc++'s `__gnu_cxx::__normal_iterator`) used outside the narrow
+/// idioms this bridge lowers specially still hits `lower_stdlib_method_call`'s
+/// generic fallback, which types the bailout from the call's own
+/// `lower_type`. `lower_type`'s `CXType_Record`/`CXType_Unexposed` branch
+/// used to fall through to `Type::Record { usr, name }` for *any* named,
+/// non-anonymous declaration with a real USR — including one from a system
+/// header that this project never declares a Dart class for. The typed
+/// bailout then printed that bare name as a generic type argument
+/// (`_syntaxBridgeUnsupported<__normal_iterator>(...)`), which doesn't
+/// parse: `__normal_iterator` names no Dart type. A record type is only
+/// ever real here when it's declared in the project's own source, never a
+/// system header.
+#[test]
+fn a_bailout_typed_from_an_unrecognized_system_header_type_never_prints_a_bare_undeclared_name() {
+    let source = lower_and_emit(
+        "lower-cpp-iterator-typed-bailout",
+        r#"
+#include <vector>
+
+struct Coord {
+    int m_x;
+};
+
+struct Thing {
+    std::vector<Coord> m_refs;
+    int f() {
+        return m_refs.begin()->m_x;
+    }
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("<__normal_iterator>"),
+        "a system-header-only type must never print as a bare, undeclared Dart type \
+         argument (appearing inside a bailout's own message string is fine), got:\n{source}"
+    );
+    assert!(
+        source.contains("throw UnimplementedError("),
+        "expected an honest bailout instead, got:\n{source}"
     );
 }

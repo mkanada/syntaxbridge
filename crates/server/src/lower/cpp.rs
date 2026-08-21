@@ -184,7 +184,8 @@ unsafe fn out_param_indices(cursor: clang_sys::CXCursor) -> Vec<usize> {
 }
 
 unsafe fn is_non_const_scalar_out_param_type(cx_type: clang_sys::CXType) -> bool {
-    if cx_type.kind != clang_sys::CXType_LValueReference && cx_type.kind != clang_sys::CXType_Pointer
+    if cx_type.kind != clang_sys::CXType_LValueReference
+        && cx_type.kind != clang_sys::CXType_Pointer
     {
         return false;
     }
@@ -204,10 +205,10 @@ unsafe fn is_non_const_scalar_out_param_type(cx_type: clang_sys::CXType) -> bool
     // small integer), which would otherwise make this indistinguishable
     // from a genuine `int*`/`size_t*` out-param.
     if cx_type.kind == clang_sys::CXType_Pointer {
-        let pointee_spelling = unsafe {
-            type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(pointee))
-        };
-        if is_known_byte_buffer_type(&pointee_spelling) || unsafe { is_text_character_type(pointee) }
+        let pointee_spelling =
+            unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(pointee)) };
+        if is_known_byte_buffer_type(&pointee_spelling)
+            || unsafe { is_text_character_type(pointee) }
         {
             return false;
         }
@@ -330,7 +331,8 @@ unsafe fn apply_out_param_bridge(
     let had_void_return = *return_type == ir::Type::Void;
     if !had_void_return {
         let all_pointer_form = indices.iter().all(|&index| {
-            let param_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, index as c_uint) };
+            let param_cursor =
+                unsafe { clang_sys::clang_Cursor_getArgument(cursor, index as c_uint) };
             unsafe { clang_sys::clang_getCursorType(param_cursor) }.kind
                 == clang_sys::CXType_Pointer
         });
@@ -1094,8 +1096,9 @@ unsafe fn record_derives_from(record_decl: clang_sys::CXCursor, ancestor_usr: &s
         .any(|base_specifier| {
             let base_type = unsafe { clang_sys::clang_getCursorType(base_specifier) };
             let base_decl = unsafe { clang_sys::clang_getTypeDeclaration(base_type) };
-            let base_usr =
-                unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(base_decl)) };
+            let base_usr = unsafe {
+                type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(base_decl))
+            };
             base_usr == ancestor_usr || unsafe { record_derives_from(base_decl, ancestor_usr) }
         })
 }
@@ -1818,6 +1821,31 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
                         return lower_type(canonical);
                     }
                 }
+                let spelling = unsafe {
+                    type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(cx_type))
+                };
+                ir::Type::Unsupported(spelling)
+            } else if unsafe {
+                clang_sys::clang_Location_isInSystemHeader(clang_sys::clang_getCursorLocation(decl))
+            } != 0
+            {
+                // A named, non-anonymous declaration with a real usr isn't
+                // automatically one of *this project's* records — libstdc++
+                // internals the stdlib-adapter match above doesn't name
+                // (`__gnu_cxx::__normal_iterator`, the real type `.begin()`/
+                // `.end()` return outside the narrow idioms this bridge
+                // lowers specially) have both too, and reaching here with
+                // one built `Type::Record { usr, name }` naming a class this
+                // project never declares — confirmed the hard way: a typed
+                // bailout then printed it as a bare, undeclared Dart type
+                // argument (`_syntaxBridgeUnsupported<__normal_iterator>`),
+                // which doesn't parse at all (`dart analyze`'s
+                // `non_type_as_type_argument`/`undefined_class`), the exact
+                // "silêncio é proibido" failure mode `Type::Record`'s own
+                // fallback exists to avoid one guard up (the union check).
+                // A project record is always declared in the project's own
+                // source, never a system header, so this can't misfire on a
+                // real one.
                 let spelling = unsafe {
                     type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(cx_type))
                 };
@@ -2833,6 +2861,20 @@ unsafe fn lower_if_with_out_param_call(
         .into_iter()
         .map(|target_cursor| unsafe { lower_expr(target_cursor, project_root) })
         .collect();
+    // An out-param target that itself failed to lower to a plain
+    // assignable lvalue can't be placed on the left of the `Stmt::ExprAssign`
+    // this function builds below (`unassignable_target_reason`'s own doc
+    // comment). Bailing out to `None` here — rather than trying to build a
+    // half-formed `Stmt::Unsupported` mid-construction — falls back to this
+    // condition's ordinary (non-out-param-bridged) `IfStmt` lowering, whose
+    // own generic expression path already produces an honest bailout for
+    // exactly this failure, per this function's own doc comment.
+    if out_param_targets
+        .iter()
+        .any(|target| unassignable_target_reason(target).is_some())
+    {
+        return None;
+    }
 
     let mut call_value = unsafe { lower_expr(call_cursor, project_root) };
     if let ir::Expr::Call { args, .. } = &mut call_value {
@@ -3426,10 +3468,22 @@ unsafe fn lower_stmt(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::St
                     Some(target_cursors) => {
                         let out_param_targets: Vec<ir::Expr> = target_cursors
                             .into_iter()
-                            .map(|target_cursor| unsafe {
-                                lower_expr(target_cursor, project_root)
-                            })
+                            .map(|target_cursor| unsafe { lower_expr(target_cursor, project_root) })
                             .collect();
+                        // Same reasoning as `lower_if_with_out_param_call`'s
+                        // own check: an out-param target that didn't lower
+                        // to a plain assignable lvalue can't sit in
+                        // `Stmt::TupleAssign`'s destructuring-pattern
+                        // position below (Dart doesn't parse a bailout
+                        // helper call there at all, let alone assign to
+                        // it) — the whole statement has to become an
+                        // honest bailout instead.
+                        if let Some(reason) = out_param_targets
+                            .iter()
+                            .find_map(unassignable_target_reason)
+                        {
+                            return ir::Stmt::Unsupported { reason, origin };
+                        }
                         let mut value = unsafe { lower_expr(cursor, project_root) };
                         // The pointer form's raw C++ argument is `&a`, not a
                         // Dart-representable value on its own — `lower_expr`
@@ -3463,9 +3517,9 @@ unsafe fn lower_stmt(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::St
                         // which indexes by out-param position and would
                         // misalign against this extra leading slot.
                         let mut targets = out_param_targets;
-                        if let Some(leading_ty) =
-                            unsafe { out_param_bridge_leading_return_type(referenced, &out_indices) }
-                        {
+                        if let Some(leading_ty) = unsafe {
+                            out_param_bridge_leading_return_type(referenced, &out_indices)
+                        } {
                             targets.insert(
                                 0,
                                 ir::Expr::Ref {
@@ -3608,6 +3662,12 @@ unsafe fn lower_stdlib_mutating_string_stmt(
         },
         _ => return None,
     };
+    if let Some(reason) = unassignable_target_reason(&target) {
+        return Some(ir::Stmt::Unsupported {
+            reason,
+            origin: origin.clone(),
+        });
+    }
     Some(ir::Stmt::ExprAssign {
         target,
         value,
@@ -3807,17 +3867,17 @@ unsafe fn lower_defaulted_record_assignment_stmt(
     // assignment used as an expression) instead of a bailout, but
     // `Expr::Assign` is a valid Dart *value*, never a valid Dart assignment
     // *target* (`(x = y) = z;` doesn't compile) — `emit::dart`'s own
-    // `Stmt::ExprAssign` unwrap only fires for the three shapes Dart
-    // actually accepts there (`Expr::is_assignable_lvalue`), so anything
-    // else has to stay an honest bailout here rather than reach emission
-    // and produce invalid Dart.
-    if let ir::Expr::Convert { operand, .. } = &target
-        && !operand.is_assignable_lvalue()
-    {
+    // `Stmt::ExprAssign` unwrap only fires for the shapes Dart actually
+    // accepts there (`unassignable_target_reason`), so anything else has to
+    // stay an honest bailout here rather than reach emission and produce
+    // invalid Dart. Also catches `target` itself already being an
+    // `Expr::Unsupported`/`UnsupportedTyped` bailout (e.g. the dereference's
+    // own operand failed to lower at all) — that shape isn't wrapped in
+    // `Convert`, so the narrower check this replaced only ever saw it once
+    // it *was* wrapped.
+    if let Some(reason) = unassignable_target_reason(&target) {
         return Some(ir::Stmt::Unsupported {
-            reason: "assignment target's dereference operand is not a simple local variable \
-                     or a field"
-                .to_owned(),
+            reason,
             origin: origin.clone(),
         });
     }
@@ -3923,6 +3983,12 @@ unsafe fn lower_stdlib_assignment_stmt(
         },
         _ => return None,
     };
+    if let Some(reason) = unassignable_target_reason(&target) {
+        return Some(ir::Stmt::Unsupported {
+            reason,
+            origin: origin.clone(),
+        });
+    }
     Some(ir::Stmt::ExprAssign {
         target,
         value,
@@ -3969,7 +4035,8 @@ unsafe fn out_param_bridge_leading_return_type(
         return None;
     }
     let all_pointer_form = indices.iter().all(|&index| {
-        let param_cursor = unsafe { clang_sys::clang_Cursor_getArgument(referenced, index as c_uint) };
+        let param_cursor =
+            unsafe { clang_sys::clang_Cursor_getArgument(referenced, index as c_uint) };
         unsafe { clang_sys::clang_getCursorType(param_cursor) }.kind == clang_sys::CXType_Pointer
     });
     all_pointer_form.then_some(return_type)
@@ -4195,11 +4262,12 @@ unsafe fn lower_one_var_decl(
             .then(|| default_scalar_value(&ty, &origin))
         }),
         [only_child] => Some(unsafe { lower_expr(*only_child, project_root) }),
-        _ => Some(ir::Expr::Unsupported {
+        _ => Some(ir::Expr::UnsupportedTyped {
             reason: format!(
                 "VarDecl had {} initializer-shaped children, expected at most 1",
                 init_candidates.len()
             ),
+            ty: ty.clone(),
             origin: origin.clone(),
         }),
     };
@@ -4362,8 +4430,9 @@ fn default_scalar_value(ty: &ir::Type, origin: &ir::Origin) -> ir::Expr {
         | ir::Type::Callback { .. }
         | ir::Type::Tuple(_)
         | ir::Type::Void
-        | ir::Type::Unsupported(_) => ir::Expr::Unsupported {
+        | ir::Type::Unsupported(_) => ir::Expr::UnsupportedTyped {
             reason: "no default value available for this field's type yet".to_owned(),
+            ty: ty.clone(),
             origin: origin.clone(),
         },
     }
@@ -4529,6 +4598,46 @@ unsafe fn lower_compound_assign_stmt(
         reason: "compound assignment target is not a simple local variable or a field".to_owned(),
         origin,
     }
+}
+
+/// Whether `target` is representable as a Dart assignment target: one of
+/// `Expr::is_assignable_lvalue`'s own shapes, or (the bridged
+/// pointer-dereference shape `lower_unary_expr`'s address-of/dereference
+/// handling produces) a `Convert` wrapping one. Anything else — most often
+/// a nested `Expr::Unsupported`/`UnsupportedTyped` bailout surfacing where
+/// the target itself failed to lower, e.g. `stdlib_method_receiver`
+/// returning the bailout it got from `lower_expr` unchanged — is not just
+/// semantically wrong but syntactically invalid Dart when placed on the
+/// left of `=`: `SomeCall<T>(...) = value;` doesn't parse as a plain
+/// assignment. Dart's grammar reads a callable-looking LHS as an attempted
+/// destructuring pattern instead, and rejects it with unrelated-looking
+/// pattern errors (confirmed on the real Verovio 6.2.0 corpus —
+/// `not_a_type`/`positional_field_in_object_pattern`/
+/// `refutable_pattern_in_irrefutable_context` all firing on the same line).
+/// Returns the bailout's own reason when `target` already carries one, so
+/// the statement-level `Stmt::Unsupported` this escalates to stays as
+/// specific as the value-level bailout it replaces.
+fn unassignable_target_reason(target: &ir::Expr) -> Option<String> {
+    // `Expr::is_assignable_lvalue`'s own whitelist doesn't include
+    // `MapIndexOrInsert` — a `std::map`/`unordered_map` index write is
+    // still a legitimate assignment target `emit::dart` renders specially
+    // (`target[index] = value;`, never through the generic lvalue path),
+    // the same second shape `lower_assign_stmt`'s own pre-existing
+    // `Index`/`MapIndexOrInsert` check already recognizes.
+    if target.is_assignable_lvalue() || matches!(target, ir::Expr::MapIndexOrInsert { .. }) {
+        return None;
+    }
+    if let ir::Expr::Convert { operand, .. } = target
+        && operand.is_assignable_lvalue()
+    {
+        return None;
+    }
+    Some(match target {
+        ir::Expr::Unsupported { reason, .. } | ir::Expr::UnsupportedTyped { reason, .. } => {
+            reason.clone()
+        }
+        _ => "assignment target is not representable as a Dart assignment target".to_owned(),
+    })
 }
 
 /// A compound assignment reads and writes its target. Dart's expanded
@@ -4818,10 +4927,8 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
                 // the C++ compiler's own acceptance of the source is exactly
                 // as sound.
                 inner
-            } else if let (
-                ir::Type::Nullable(child_record),
-                ir::Type::Nullable(outer_record),
-            ) = (&child_ty, &outer_ty)
+            } else if let (ir::Type::Nullable(child_record), ir::Type::Nullable(outer_record)) =
+                (&child_ty, &outer_ty)
                 && let (
                     ir::Type::Record { usr: child_usr, .. },
                     ir::Type::Record { usr: outer_usr, .. },
@@ -4910,12 +5017,13 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
                 }
             };
         }
-        return ir::Expr::Unsupported {
+        return ir::Expr::UnsupportedTyped {
             reason: format!(
                 "wrapper cursor kind {kind} had {} children after filtering type \
                  references, expected exactly one",
                 children.len()
             ),
+            ty: lower_type(unsafe { clang_sys::clang_getCursorType(cursor) }),
             origin,
         };
     }
@@ -4983,8 +5091,9 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
     if kind == clang_sys::CXCursor_StringLiteral {
         return match unsafe { string_literal_text(cursor) } {
             Some(value) => ir::Expr::StringLiteral { value, origin },
-            None => ir::Expr::Unsupported {
+            None => ir::Expr::UnsupportedTyped {
                 reason: "could not evaluate string literal".to_owned(),
+                ty: ir::Type::Str,
                 origin,
             },
         };
@@ -4993,8 +5102,9 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
     if kind == clang_sys::CXCursor_CharacterLiteral {
         return match unsafe { evaluate_int_eval_result(cursor) } {
             Some(value) => ir::Expr::IntLiteral { value, origin },
-            None => ir::Expr::Unsupported {
+            None => ir::Expr::UnsupportedTyped {
                 reason: "could not evaluate character literal".to_owned(),
+                ty: ir::Type::Int,
                 origin,
             },
         };
@@ -5003,8 +5113,9 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
     if kind == clang_sys::CXCursor_IntegerLiteral {
         return match unsafe { evaluate_int_eval_result(cursor) } {
             Some(value) => ir::Expr::IntLiteral { value, origin },
-            None => ir::Expr::Unsupported {
+            None => ir::Expr::UnsupportedTyped {
                 reason: "could not evaluate integer literal".to_owned(),
+                ty: ir::Type::Int,
                 origin,
             },
         };
@@ -5047,8 +5158,9 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
     if kind == clang_sys::CXCursor_FloatingLiteral {
         return match unsafe { evaluate_float_eval_result(cursor) } {
             Some(value) => ir::Expr::DoubleLiteral { value, origin },
-            None => ir::Expr::Unsupported {
+            None => ir::Expr::UnsupportedTyped {
                 reason: "could not evaluate floating-point literal".to_owned(),
+                ty: ir::Type::Double,
                 origin,
             },
         };
@@ -5060,8 +5172,9 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
                 value: value != 0,
                 origin,
             },
-            None => ir::Expr::Unsupported {
+            None => ir::Expr::UnsupportedTyped {
                 reason: "could not evaluate bool literal".to_owned(),
+                ty: ir::Type::Bool,
                 origin,
             },
         };
@@ -5179,11 +5292,12 @@ unsafe fn lower_dynamic_cast_expr(
         })
         .collect();
     let [operand_cursor] = children.as_slice() else {
-        return ir::Expr::Unsupported {
+        return ir::Expr::UnsupportedTyped {
             reason: format!(
                 "dynamic_cast had {} children after filtering type references, expected exactly 1",
                 children.len()
             ),
+            ty: lower_type(unsafe { clang_sys::clang_getCursorType(cursor) }),
             origin,
         };
     };
@@ -5192,28 +5306,31 @@ unsafe fn lower_dynamic_cast_expr(
         unsafe { clang_sys::clang_getCursorKind(operand_value_cursor) },
         clang_sys::CXCursor_DeclRefExpr | clang_sys::CXCursor_CXXThisExpr
     ) {
-        return ir::Expr::Unsupported {
+        return ir::Expr::UnsupportedTyped {
             reason: "dynamic_cast operand is not a simple reference — re-evaluating a call \
                      or field access twice risks duplicating a side effect"
                 .to_owned(),
+            ty: lower_type(unsafe { clang_sys::clang_getCursorType(cursor) }),
             origin,
         };
     }
 
     let target_type = lower_type(unsafe { clang_sys::clang_getCursorType(cursor) });
     let ir::Type::Nullable(target_record) = &target_type else {
-        return ir::Expr::Unsupported {
+        return ir::Expr::UnsupportedTyped {
             reason: format!(
                 "dynamic_cast target type does not resolve to a nullable record: {target_type:?}"
             ),
+            ty: target_type.clone(),
             origin,
         };
     };
     if !matches!(target_record.as_ref(), ir::Type::Record { .. }) {
-        return ir::Expr::Unsupported {
+        return ir::Expr::UnsupportedTyped {
             reason: format!(
                 "dynamic_cast target type does not resolve to a representable record: {target_type:?}"
             ),
+            ty: target_type.clone(),
             origin,
         };
     }
@@ -5372,11 +5489,12 @@ unsafe fn lower_array_subscript_expr(
 ) -> ir::Expr {
     let children = unsafe { collect_children(cursor) };
     let [target_cursor, index_cursor] = children.as_slice() else {
-        return ir::Expr::Unsupported {
+        return ir::Expr::UnsupportedTyped {
             reason: format!(
                 "array subscript cursor had {} children, expected 2",
                 children.len()
             ),
+            ty: lower_type(unsafe { clang_sys::clang_getCursorType(cursor) }),
             origin,
         };
     };
@@ -5456,8 +5574,9 @@ unsafe fn lower_array_subscript_expr(
         }
     );
     if !is_indexable {
-        return ir::Expr::Unsupported {
+        return ir::Expr::UnsupportedTyped {
             reason: "array subscript receiver is not a lowered Dart collection".to_owned(),
+            ty: lower_type(unsafe { clang_sys::clang_getCursorType(cursor) }),
             origin,
         };
     }
@@ -5553,11 +5672,12 @@ unsafe fn lower_binary_expr(
     if operator_kind == clang_sys::CXBinaryOperator_Assign {
         let children = unsafe { collect_children(cursor) };
         let [lhs_cursor, rhs_cursor] = children.as_slice() else {
-            return ir::Expr::Unsupported {
+            return ir::Expr::UnsupportedTyped {
                 reason: format!(
                     "assignment expression cursor had {} children, expected 2",
                     children.len()
                 ),
+                ty: lower_type(unsafe { clang_sys::clang_getCursorType(cursor) }),
                 origin,
             };
         };
@@ -5586,11 +5706,13 @@ unsafe fn lower_binary_expr(
         } else {
             None
         };
+        let ty = lower_type(unsafe { clang_sys::clang_getCursorType(cursor) });
         let Some(target) = target else {
-            return ir::Expr::Unsupported {
+            return ir::Expr::UnsupportedTyped {
                 reason: "assignment-as-expression target is not a simple local variable \
                          or a field"
                     .to_owned(),
+                ty,
                 origin,
             };
         };
@@ -5607,12 +5729,12 @@ unsafe fn lower_binary_expr(
         if let ir::Expr::Unsupported { reason, .. } | ir::Expr::UnsupportedTyped { reason, .. } =
             &value
         {
-            return ir::Expr::Unsupported {
+            return ir::Expr::UnsupportedTyped {
                 reason: reason.clone(),
+                ty,
                 origin,
             };
         }
-        let ty = lower_type(unsafe { clang_sys::clang_getCursorType(cursor) });
         return ir::Expr::Assign {
             target: Box::new(target),
             value: Box::new(value),
@@ -5622,19 +5744,21 @@ unsafe fn lower_binary_expr(
     }
 
     let Some(op) = lower_binary_op(operator_kind) else {
-        return ir::Expr::Unsupported {
+        return ir::Expr::UnsupportedTyped {
             reason: format!("unsupported binary operator kind {operator_kind}"),
+            ty: lower_type(unsafe { clang_sys::clang_getCursorType(cursor) }),
             origin,
         };
     };
 
     let children = unsafe { collect_children(cursor) };
     let [lhs_cursor, rhs_cursor] = children.as_slice() else {
-        return ir::Expr::Unsupported {
+        return ir::Expr::UnsupportedTyped {
             reason: format!(
                 "binary operator cursor had {} children, expected 2",
                 children.len()
             ),
+            ty: lower_type(unsafe { clang_sys::clang_getCursorType(cursor) }),
             origin,
         };
     };
@@ -5659,11 +5783,12 @@ unsafe fn lower_unary_expr(
     let operator_kind = unsafe { clang_sys::clang_getCursorUnaryOperatorKind(cursor) };
     let children = unsafe { collect_children(cursor) };
     let [operand_cursor] = children.as_slice() else {
-        return ir::Expr::Unsupported {
+        return ir::Expr::UnsupportedTyped {
             reason: format!(
                 "unary operator cursor had {} children, expected 1",
                 children.len()
             ),
+            ty: lower_type(unsafe { clang_sys::clang_getCursorType(cursor) }),
             origin,
         };
     };
@@ -5768,8 +5893,9 @@ unsafe fn lower_unary_expr(
     }
 
     let Some(op) = lower_unary_op(operator_kind) else {
-        return ir::Expr::Unsupported {
+        return ir::Expr::UnsupportedTyped {
             reason: format!("unsupported unary operator kind {operator_kind}"),
+            ty: lower_type(unsafe { clang_sys::clang_getCursorType(cursor) }),
             origin,
         };
     };
@@ -5917,8 +6043,9 @@ unsafe fn lower_call_expr(
 ) -> ir::Expr {
     let referenced = unsafe { clang_sys::clang_getCursorReferenced(cursor) };
     if unsafe { clang_sys::clang_Cursor_isNull(referenced) } != 0 {
-        return ir::Expr::Unsupported {
+        return ir::Expr::UnsupportedTyped {
             reason: "call target could not be resolved".to_owned(),
+            ty: lower_type(unsafe { clang_sys::clang_getCursorType(cursor) }),
             origin,
         };
     }
@@ -6120,8 +6247,9 @@ unsafe fn lower_call_expr(
         if conversion_operator_dart_method_name(&target_type).is_some() {
             return unsafe { lower_method_call(cursor, referenced, project_root, origin) };
         }
-        return ir::Expr::Unsupported {
+        return ir::Expr::UnsupportedTyped {
             reason: format!("unsupported conversion operator target: {target_type:?}"),
+            ty: lower_type(unsafe { clang_sys::clang_getCursorType(cursor) }),
             origin,
         };
     }
@@ -6156,11 +6284,12 @@ unsafe fn lower_call_expr(
     }
 
     if referenced_kind != clang_sys::CXCursor_FunctionDecl {
-        return ir::Expr::Unsupported {
+        return ir::Expr::UnsupportedTyped {
             reason: format!(
                 "unsupported call target cursor kind {referenced_kind} \
                  (only free functions, methods and constructors are lowered as calls so far)"
             ),
+            ty: lower_type(unsafe { clang_sys::clang_getCursorType(cursor) }),
             origin,
         };
     }
@@ -6168,8 +6297,9 @@ unsafe fn lower_call_expr(
     let callee_usr =
         unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(referenced)) };
     if callee_usr.is_empty() {
-        return ir::Expr::Unsupported {
+        return ir::Expr::UnsupportedTyped {
             reason: "resolved call target has no stable identity".to_owned(),
+            ty: lower_type(unsafe { clang_sys::clang_getCursorType(cursor) }),
             origin,
         };
     }
@@ -6256,8 +6386,9 @@ unsafe fn lower_call_expr(
         let args = match unsafe { lower_call_arguments(cursor, project_root) } {
             Some(args) => args,
             None => {
-                return ir::Expr::Unsupported {
+                return ir::Expr::UnsupportedTyped {
                     reason: "could not enumerate free operator arguments".to_owned(),
+                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(cursor) }),
                     origin,
                 };
             }
@@ -6283,8 +6414,9 @@ unsafe fn lower_call_expr(
     // which `dart format` rejects outright, so this must bail out here
     // rather than build a `Call` no emitter step downstream could catch.
     if !is_plain_dart_identifier(&callee_name) {
-        return ir::Expr::Unsupported {
+        return ir::Expr::UnsupportedTyped {
             reason: format!("unsupported free operator overload: {callee_name}"),
+            ty: lower_type(unsafe { clang_sys::clang_getCursorType(cursor) }),
             origin,
         };
     }
@@ -6292,8 +6424,9 @@ unsafe fn lower_call_expr(
     let args = match unsafe { lower_call_arguments(cursor, project_root) } {
         Some(args) => args,
         None => {
-            return ir::Expr::Unsupported {
+            return ir::Expr::UnsupportedTyped {
                 reason: "could not enumerate call arguments".to_owned(),
+                ty: lower_type(unsafe { clang_sys::clang_getCursorType(cursor) }),
                 origin,
             };
         }
@@ -6327,8 +6460,9 @@ unsafe fn lower_callable_value_call(
     let args = match unsafe { lower_call_arguments(call_cursor, project_root) } {
         Some(args) => args,
         None => {
-            return ir::Expr::Unsupported {
+            return ir::Expr::UnsupportedTyped {
                 reason: "could not enumerate callback call arguments".to_owned(),
+                ty: return_type,
                 origin,
             };
         }
@@ -6355,8 +6489,9 @@ unsafe fn lower_callable_value_call(
                 }))
             }
             _ => {
-                return ir::Expr::Unsupported {
+                return ir::Expr::UnsupportedTyped {
                     reason: "callback field call had no member-reference receiver".to_owned(),
+                    ty: return_type,
                     origin,
                 };
             }
@@ -6675,9 +6810,8 @@ unsafe fn stringstream_variable_name(cursor: clang_sys::CXCursor) -> Option<Stri
     // reports as "not a template specialization" — so this needs the
     // canonical type first, or every real `std::stringstream` variable
     // would silently never match.
-    let declared_type = unsafe {
-        clang_sys::clang_getCanonicalType(clang_sys::clang_getCursorType(referenced))
-    };
+    let declared_type =
+        unsafe { clang_sys::clang_getCanonicalType(clang_sys::clang_getCursorType(referenced)) };
     match unsafe { stdlib_template_name_of_type(declared_type) }.as_deref() {
         Some("basic_stringstream") | Some("basic_ostringstream") => {}
         _ => return None,
@@ -6825,11 +6959,12 @@ unsafe fn lower_stdlib_method_call(
     if callee_name == "operator[]" {
         let children = unsafe { collect_children(call_cursor) };
         let [receiver_cursor, _operator_ref_cursor, index_cursor] = children.as_slice() else {
-            return Some(ir::Expr::Unsupported {
+            return Some(ir::Expr::UnsupportedTyped {
                 reason: format!(
                     "std::{template_name}::operator[] call had {} children, expected 3",
                     children.len()
                 ),
+                ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                 origin: origin.clone(),
             });
         };
@@ -6848,17 +6983,19 @@ unsafe fn lower_stdlib_method_call(
                 ir::Expr::Ref { ty, .. } | ir::Expr::FieldAccess { ty, .. } => match ty {
                     ir::Type::Map(_, value_type) => (**value_type).clone(),
                     _ => {
-                        return Some(ir::Expr::Unsupported {
+                        return Some(ir::Expr::UnsupportedTyped {
                             reason: "std::map::operator[] receiver did not lower to a Dart Map"
                                 .to_owned(),
+                            ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                             origin: origin.clone(),
                         });
                     }
                 },
                 _ => {
-                    return Some(ir::Expr::Unsupported {
+                    return Some(ir::Expr::UnsupportedTyped {
                         reason: "std::map::operator[] receiver has no recoverable map type"
                             .to_owned(),
+                        ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                         origin: origin.clone(),
                     });
                 }
@@ -6872,8 +7009,9 @@ unsafe fn lower_stdlib_method_call(
             });
         }
         if !matches!(template_name.as_str(), "vector" | "deque") {
-            return Some(ir::Expr::Unsupported {
+            return Some(ir::Expr::UnsupportedTyped {
                 reason: format!("unsupported std::{template_name}::operator[] call"),
+                ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                 origin: origin.clone(),
             });
         }
@@ -6966,8 +7104,9 @@ unsafe fn lower_stdlib_method_call(
     let target = match unsafe { stdlib_method_receiver(call_cursor, project_root, origin) } {
         Ok(target) => target,
         Err(reason) => {
-            return Some(ir::Expr::Unsupported {
+            return Some(ir::Expr::UnsupportedTyped {
                 reason,
+                ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                 origin: origin.clone(),
             });
         }
@@ -7016,11 +7155,12 @@ unsafe fn lower_stdlib_method_call(
         ("map", "contains") => {
             let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
             if args.len() != 1 {
-                return Some(ir::Expr::Unsupported {
+                return Some(ir::Expr::UnsupportedTyped {
                     reason: format!(
                         "std::map::contains had {} arguments, expected exactly 1",
                         args.len()
                     ),
+                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                     origin: origin.clone(),
                 });
             }
@@ -7036,11 +7176,12 @@ unsafe fn lower_stdlib_method_call(
         ("set", "contains") => {
             let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
             if args.len() != 1 {
-                return Some(ir::Expr::Unsupported {
+                return Some(ir::Expr::UnsupportedTyped {
                     reason: format!(
                         "std::set::contains had {} arguments, expected exactly 1",
                         args.len()
                     ),
+                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                     origin: origin.clone(),
                 });
             }
@@ -7056,11 +7197,12 @@ unsafe fn lower_stdlib_method_call(
         ("map", "count") | ("set", "count") => {
             let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
             if args.len() != 1 {
-                return Some(ir::Expr::Unsupported {
+                return Some(ir::Expr::UnsupportedTyped {
                     reason: format!(
                         "std::{template_name}::count had {} arguments, expected exactly 1",
                         args.len()
                     ),
+                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                     origin: origin.clone(),
                 });
             }
@@ -7094,11 +7236,12 @@ unsafe fn lower_stdlib_method_call(
         ("basic_string", "find") => {
             let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
             let [needle] = args.as_slice() else {
-                return Some(ir::Expr::Unsupported {
+                return Some(ir::Expr::UnsupportedTyped {
                     reason: format!(
                         "std::basic_string::find had {} arguments, expected exactly 1",
                         args.len()
                     ),
+                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                     origin: origin.clone(),
                 });
             };
@@ -7142,11 +7285,12 @@ unsafe fn lower_stdlib_method_call(
                     other.clone(),
                 ),
                 _ => {
-                    return Some(ir::Expr::Unsupported {
+                    return Some(ir::Expr::UnsupportedTyped {
                         reason: format!(
                             "std::basic_string::compare had {} arguments, expected 1 or 3",
                             args.len()
                         ),
+                        ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                         origin: origin.clone(),
                     });
                 }
@@ -7175,11 +7319,12 @@ unsafe fn lower_stdlib_method_call(
                     },
                 ],
                 _ => {
-                    return Some(ir::Expr::Unsupported {
+                    return Some(ir::Expr::UnsupportedTyped {
                         reason: format!(
                             "std::basic_string::substr had {} arguments, expected 1 or 2",
                             args.len()
                         ),
+                        ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                         origin: origin.clone(),
                     });
                 }
@@ -7196,11 +7341,12 @@ unsafe fn lower_stdlib_method_call(
         ("basic_string", "at") => {
             let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
             let [index] = args.as_slice() else {
-                return Some(ir::Expr::Unsupported {
+                return Some(ir::Expr::UnsupportedTyped {
                     reason: format!(
                         "std::basic_string::at had {} arguments, expected exactly 1",
                         args.len()
                     ),
+                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                     origin: origin.clone(),
                 });
             };
@@ -7214,11 +7360,12 @@ unsafe fn lower_stdlib_method_call(
         ("vector" | "list" | "deque", "push_back") => {
             let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
             if args.len() != 1 {
-                return Some(ir::Expr::Unsupported {
+                return Some(ir::Expr::UnsupportedTyped {
                     reason: format!(
                         "std::{template_name}::push_back had {} arguments, expected exactly 1",
                         args.len()
                     ),
+                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                     origin: origin.clone(),
                 });
             }
@@ -7234,11 +7381,12 @@ unsafe fn lower_stdlib_method_call(
         ("vector" | "list" | "deque", "clear") => {
             let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
             if !args.is_empty() {
-                return Some(ir::Expr::Unsupported {
+                return Some(ir::Expr::UnsupportedTyped {
                     reason: format!(
                         "std::{template_name}::clear had {} arguments, expected none",
                         args.len()
                     ),
+                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                     origin: origin.clone(),
                 });
             }
@@ -7254,11 +7402,12 @@ unsafe fn lower_stdlib_method_call(
         ("vector" | "deque", "at") => {
             let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
             let [index] = args.as_slice() else {
-                return Some(ir::Expr::Unsupported {
+                return Some(ir::Expr::UnsupportedTyped {
                     reason: format!(
                         "std::{template_name}::at had {} arguments, expected exactly 1",
                         args.len()
                     ),
+                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                     origin: origin.clone(),
                 });
             };
@@ -7272,11 +7421,12 @@ unsafe fn lower_stdlib_method_call(
         ("vector" | "list" | "deque", "front") | ("vector" | "list" | "deque", "back") => {
             let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
             if !args.is_empty() {
-                return Some(ir::Expr::Unsupported {
+                return Some(ir::Expr::UnsupportedTyped {
                     reason: format!(
                         "std::{template_name}::{callee_name} had {} arguments, expected none",
                         args.len()
                     ),
+                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                     origin: origin.clone(),
                 });
             }
@@ -7321,11 +7471,12 @@ unsafe fn lower_stdlib_method_call(
         ("stack", "top") => {
             let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
             if !args.is_empty() {
-                return Some(ir::Expr::Unsupported {
+                return Some(ir::Expr::UnsupportedTyped {
                     reason: format!(
                         "std::stack::top had {} arguments, expected none",
                         args.len()
                     ),
+                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                     origin: origin.clone(),
                 });
             }
@@ -7353,11 +7504,12 @@ unsafe fn lower_stdlib_method_call(
         ("stack", "push") => {
             let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
             if args.len() != 1 {
-                return Some(ir::Expr::Unsupported {
+                return Some(ir::Expr::UnsupportedTyped {
                     reason: format!(
                         "std::stack::push had {} arguments, expected exactly 1",
                         args.len()
                     ),
+                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                     origin: origin.clone(),
                 });
             }
@@ -7373,11 +7525,12 @@ unsafe fn lower_stdlib_method_call(
         ("stack", "pop") => {
             let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
             if !args.is_empty() {
-                return Some(ir::Expr::Unsupported {
+                return Some(ir::Expr::UnsupportedTyped {
                     reason: format!(
                         "std::stack::pop had {} arguments, expected none",
                         args.len()
                     ),
+                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                     origin: origin.clone(),
                 });
             }
@@ -7401,11 +7554,12 @@ unsafe fn lower_stdlib_method_call(
         ("map" | "unordered_map", "at") => {
             let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
             let [key] = args.as_slice() else {
-                return Some(ir::Expr::Unsupported {
+                return Some(ir::Expr::UnsupportedTyped {
                     reason: format!(
                         "std::{template_name}::at had {} arguments, expected exactly 1",
                         args.len()
                     ),
+                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                     origin: origin.clone(),
                 });
             };
@@ -7413,19 +7567,21 @@ unsafe fn lower_stdlib_method_call(
                 ir::Expr::Ref { ty, .. } | ir::Expr::FieldAccess { ty, .. } => match ty {
                     ir::Type::Map(_, value_type) => (**value_type).clone(),
                     _ => {
-                        return Some(ir::Expr::Unsupported {
+                        return Some(ir::Expr::UnsupportedTyped {
                             reason: format!(
                                 "std::{template_name}::at receiver did not lower to a Dart Map"
                             ),
+                            ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                             origin: origin.clone(),
                         });
                     }
                 },
                 _ => {
-                    return Some(ir::Expr::Unsupported {
+                    return Some(ir::Expr::UnsupportedTyped {
                         reason: format!(
                             "std::{template_name}::at receiver has no recoverable map type"
                         ),
+                        ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                         origin: origin.clone(),
                     });
                 }
@@ -7512,33 +7668,34 @@ unsafe fn lower_stdlib_method_call(
             let receiver_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
             let receiver_referenced =
                 unsafe { clang_sys::clang_getCursorReferenced(receiver_cursor) };
-            let receiver_name = if unsafe { clang_sys::clang_Cursor_isNull(receiver_referenced) }
-                == 0
+            let receiver_name =
+                if unsafe { clang_sys::clang_Cursor_isNull(receiver_referenced) } == 0 {
+                    Some(dart_safe_identifier(&unsafe {
+                        type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(
+                            receiver_referenced,
+                        ))
+                    }))
+                } else {
+                    None
+                };
+            match receiver_name
+                .and_then(|name| active_iterator_loop_element_type(&name).map(|ty| (name, ty)))
             {
-                Some(dart_safe_identifier(&unsafe {
-                    type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(
-                        receiver_referenced,
-                    ))
-                }))
-            } else {
-                None
-            };
-            match receiver_name.and_then(|name| {
-                active_iterator_loop_element_type(&name).map(|ty| (name, ty))
-            }) {
                 Some((name, elem_ty)) => Some(ir::Expr::Ref {
                     name,
                     ty: elem_ty,
                     origin: origin.clone(),
                 }),
-                None => Some(ir::Expr::Unsupported {
+                None => Some(ir::Expr::UnsupportedTyped {
                     reason: format!("unsupported std::{template_name}::{callee_name} call"),
+                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                     origin: origin.clone(),
                 }),
             }
         }
-        _ => Some(ir::Expr::Unsupported {
+        _ => Some(ir::Expr::UnsupportedTyped {
             reason: format!("unsupported std::{template_name}::{callee_name} call"),
+            ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
             origin: origin.clone(),
         }),
     }
@@ -7884,8 +8041,7 @@ unsafe fn lower_iterator_for_loop(
     origin: &ir::Origin,
 ) -> Option<ir::Stmt> {
     let children = unsafe { collect_children(cursor) };
-    let [init_cursor, condition_cursor, increment_cursor, body_cursor] = children.as_slice()
-    else {
+    let [init_cursor, condition_cursor, increment_cursor, body_cursor] = children.as_slice() else {
         return None;
     };
     // The condition's `CXXOperatorCallExpr` sits inside an `ExprWithCleanups`
@@ -7910,24 +8066,22 @@ unsafe fn lower_iterator_for_loop(
     let it_name = dart_safe_identifier(&unsafe {
         type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(*it_decl_cursor))
     });
-    let it_init_candidates: Vec<clang_sys::CXCursor> =
-        unsafe { collect_children(*it_decl_cursor) }
-            .into_iter()
-            .filter(|child| {
-                !matches!(
-                    unsafe { clang_sys::clang_getCursorKind(*child) },
-                    clang_sys::CXCursor_TypeRef
-                        | clang_sys::CXCursor_NamespaceRef
-                        | clang_sys::CXCursor_TemplateRef
-                )
-            })
-            .collect();
+    let it_init_candidates: Vec<clang_sys::CXCursor> = unsafe { collect_children(*it_decl_cursor) }
+        .into_iter()
+        .filter(|child| {
+            !matches!(
+                unsafe { clang_sys::clang_getCursorKind(*child) },
+                clang_sys::CXCursor_TypeRef
+                    | clang_sys::CXCursor_NamespaceRef
+                    | clang_sys::CXCursor_TemplateRef
+            )
+        })
+        .collect();
     let [it_init_cursor] = it_init_candidates.as_slice() else {
         return None;
     };
-    let begin_receiver = unsafe {
-        container_begin_or_end_receiver(*it_init_cursor, true, project_root, origin)
-    }?;
+    let begin_receiver =
+        unsafe { container_begin_or_end_receiver(*it_init_cursor, true, project_root, origin) }?;
     let elem_ty = match &begin_receiver {
         ir::Expr::Ref { ty, .. } | ir::Expr::FieldAccess { ty, .. } => match ty {
             ir::Type::List(elem) | ir::Type::Set(elem) => (**elem).clone(),
@@ -7961,20 +8115,20 @@ unsafe fn lower_iterator_for_loop(
     // correctly leaves it alone — so it needs its own explicit branch here,
     // structurally equivalent to `lower_find_contains_idiom`'s own
     // `is_negated` handling for the exact same rewritten-`!=`-as-`==` shape.
-    let (condition_operator_cursor, expected_name) = if unsafe {
-        clang_sys::clang_getCursorKind(*condition_cursor)
-    } == clang_sys::CXCursor_UnaryOperator
-        && unsafe { clang_sys::clang_getCursorUnaryOperatorKind(*condition_cursor) }
-            == clang_sys::CXUnaryOperator_LNot
-    {
-        let not_children = unsafe { collect_children(*condition_cursor) };
-        let [operand_cursor] = not_children.as_slice() else {
-            return None;
+    let (condition_operator_cursor, expected_name) =
+        if unsafe { clang_sys::clang_getCursorKind(*condition_cursor) }
+            == clang_sys::CXCursor_UnaryOperator
+            && unsafe { clang_sys::clang_getCursorUnaryOperatorKind(*condition_cursor) }
+                == clang_sys::CXUnaryOperator_LNot
+        {
+            let not_children = unsafe { collect_children(*condition_cursor) };
+            let [operand_cursor] = not_children.as_slice() else {
+                return None;
+            };
+            (*operand_cursor, "operator==")
+        } else {
+            (*condition_cursor, "operator!=")
         };
-        (*operand_cursor, "operator==")
-    } else {
-        (*condition_cursor, "operator!=")
-    };
     if unsafe { clang_sys::clang_getCursorKind(condition_operator_cursor) }
         != clang_sys::CXCursor_CallExpr
     {
@@ -8045,9 +8199,8 @@ unsafe fn lower_iterator_for_loop(
     let increment_referenced_receiver =
         unsafe { clang_sys::clang_getCursorReferenced(increment_receiver) };
     if unsafe { clang_sys::clang_Cursor_isNull(increment_referenced_receiver) } != 0
-        || unsafe {
-            clang_sys::clang_equalCursors(increment_referenced_receiver, *it_decl_cursor)
-        } == 0
+        || unsafe { clang_sys::clang_equalCursors(increment_referenced_receiver, *it_decl_cursor) }
+            == 0
     {
         return None;
     }
@@ -8109,7 +8262,16 @@ unsafe fn lower_stdlib_free_function_call(
     let rhs_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 1) };
     let target = unsafe { lower_expr(lhs_cursor, project_root) };
     let arg = unsafe { lower_expr(rhs_cursor, project_root) };
-    let ty = lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) });
+    // Not `lower_type(clang_getCursorType(call_cursor))`: `std::gcd`'s real
+    // C++ return type is `std::common_type_t<M, N>`, a library-internal
+    // alias `lower_type` can't resolve to anything meaningful (confirmed the
+    // hard way — E13's own `Fraction::Reduce` regressed to a whole-body
+    // bailout once `lower_type` stopped mis-resolving an unrecognized
+    // system-header type as a bogus `Type::Record`). This bridge already
+    // asserts the semantic fact that Dart's `int.gcd()` is the exact match
+    // (this doc comment's own opening line) — for the two-`int`-argument
+    // shape it's gated to, that method always returns `int`, so the result
+    // is typed directly rather than through the alien C++ type expression.
     Some(ir::Expr::Call {
         target: Some(Box::new(target)),
         callee_usr: unsafe {
@@ -8117,7 +8279,7 @@ unsafe fn lower_stdlib_free_function_call(
         },
         callee_name: "gcd".to_owned(),
         args: vec![arg],
-        ty,
+        ty: ir::Type::Int,
         origin: origin.clone(),
     })
 }
@@ -8252,8 +8414,9 @@ unsafe fn lower_method_call(
 ) -> ir::Expr {
     let receiver_children = unsafe { collect_children(call_cursor) };
     let Some(first_child) = receiver_children.first() else {
-        return ir::Expr::Unsupported {
+        return ir::Expr::UnsupportedTyped {
             reason: "method call had no receiver expression".to_owned(),
+            ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
             origin,
         };
     };
@@ -8268,8 +8431,9 @@ unsafe fn lower_method_call(
     } else {
         let arg_count = unsafe { clang_sys::clang_Cursor_getNumArguments(call_cursor) };
         if arg_count < 1 {
-            return ir::Expr::Unsupported {
+            return ir::Expr::UnsupportedTyped {
                 reason: "operator call had no receiver argument".to_owned(),
+                ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                 origin,
             };
         }
@@ -8280,8 +8444,9 @@ unsafe fn lower_method_call(
     let callee_usr =
         unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(referenced)) };
     if callee_usr.is_empty() {
-        return ir::Expr::Unsupported {
+        return ir::Expr::UnsupportedTyped {
             reason: "resolved method call target has no stable identity".to_owned(),
+            ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
             origin,
         };
     }
@@ -8321,8 +8486,9 @@ unsafe fn lower_method_call(
             match unsafe { lower_call_arguments_skipping(call_cursor, arg_skip, project_root) } {
                 Some(args) => args,
                 None => {
-                    return ir::Expr::Unsupported {
+                    return ir::Expr::UnsupportedTyped {
                         reason: "could not enumerate named operator bridge arguments".to_owned(),
+                        ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                         origin,
                     };
                 }
@@ -8343,16 +8509,18 @@ unsafe fn lower_method_call(
     // print as a call target — same guard as the free-function fallback
     // above, and for the same reason.
     if !is_plain_dart_identifier(&callee_name) {
-        return ir::Expr::Unsupported {
+        return ir::Expr::UnsupportedTyped {
             reason: format!("unsupported operator method call: {callee_name}"),
+            ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
             origin,
         };
     }
     let args = match unsafe { lower_call_arguments_skipping(call_cursor, arg_skip, project_root) } {
         Some(args) => args,
         None => {
-            return ir::Expr::Unsupported {
+            return ir::Expr::UnsupportedTyped {
                 reason: "could not enumerate method call arguments".to_owned(),
+                ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                 origin,
             };
         }
@@ -8391,8 +8559,9 @@ unsafe fn lower_static_method_call(
     let owner_name =
         unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(owner)) };
     if owner_usr.is_empty() || owner_name.is_empty() {
-        return ir::Expr::Unsupported {
+        return ir::Expr::UnsupportedTyped {
             reason: "static method's owning class has no stable identity".to_owned(),
+            ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
             origin,
         };
     }
@@ -8400,8 +8569,9 @@ unsafe fn lower_static_method_call(
     let callee_usr =
         unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(referenced)) };
     if callee_usr.is_empty() {
-        return ir::Expr::Unsupported {
+        return ir::Expr::UnsupportedTyped {
             reason: "resolved static method call target has no stable identity".to_owned(),
+            ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
             origin,
         };
     }
@@ -8410,8 +8580,9 @@ unsafe fn lower_static_method_call(
     let args = match unsafe { lower_call_arguments(call_cursor, project_root) } {
         Some(args) => args,
         None => {
-            return ir::Expr::Unsupported {
+            return ir::Expr::UnsupportedTyped {
                 reason: "could not enumerate static method call arguments".to_owned(),
+                ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
                 origin,
             };
         }
@@ -8453,8 +8624,9 @@ unsafe fn lower_constructor_call(
     let type_name =
         unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(owner)) };
     if type_usr.is_empty() || type_name.is_empty() {
-        return ir::Expr::Unsupported {
+        return ir::Expr::UnsupportedTyped {
             reason: "constructor's owning class has no stable identity".to_owned(),
+            ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
             origin,
         };
     }
@@ -8463,8 +8635,12 @@ unsafe fn lower_constructor_call(
     let args = match unsafe { lower_call_arguments(call_cursor, project_root) } {
         Some(args) => args,
         None => {
-            return ir::Expr::Unsupported {
+            return ir::Expr::UnsupportedTyped {
                 reason: "could not enumerate constructor call arguments".to_owned(),
+                ty: ir::Type::Record {
+                    usr: type_usr,
+                    name: type_name,
+                },
                 origin,
             };
         }

@@ -185,13 +185,22 @@ pub fn emit_module_with_externals(
             )
         })
         .collect();
+    let needs_opaque_support = files
+        .values()
+        .any(|source| source.contains(OPAQUE_TYPE_NAME));
     let needs_pair_support = files.values().any(|source| source.contains(PAIR_TYPE_NAME));
     let needs_native_handle_support = files
         .values()
         .any(|source| source.contains(NATIVE_HANDLE_TYPE_NAME));
-    if needs_pair_support || needs_native_handle_support {
+    if needs_opaque_support || needs_pair_support || needs_native_handle_support {
         let mut support = String::new();
+        if needs_opaque_support {
+            support.push_str(&emit_opaque_type());
+        }
         if needs_pair_support {
+            if !support.is_empty() {
+                support.push('\n');
+            }
             support.push_str(&emit_pair_support());
         }
         if needs_native_handle_support {
@@ -436,13 +445,6 @@ fn emit_file(
         }
         source.push_str(&emit_unsupported_helper());
     }
-    if source.contains(OPAQUE_TYPE_NAME) {
-        if !source.is_empty() {
-            source.push('\n');
-        }
-        source.push_str(&emit_opaque_type());
-    }
-
     let mut referenced_usrs: HashSet<&str> = HashSet::new();
     for record in records {
         collect_referenced_usrs_in_record(record, records_by_usr, &mut referenced_usrs);
@@ -471,7 +473,10 @@ fn emit_file(
     if source.contains("stderr.") {
         import_lines.push("import 'dart:io';".to_owned());
     }
-    if source.contains(PAIR_TYPE_NAME) || source.contains(NATIVE_HANDLE_TYPE_NAME) {
+    if source.contains(OPAQUE_TYPE_NAME)
+        || source.contains(PAIR_TYPE_NAME)
+        || source.contains(NATIVE_HANDLE_TYPE_NAME)
+    {
         import_lines.push(format!("import '{SUPPORT_FILE_NAME}';"));
     }
     for other_stem in &needed_imports {
