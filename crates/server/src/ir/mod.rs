@@ -738,11 +738,12 @@ pub struct Function {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Field {
-    /// Already the *Dart* name — a private/protected C++ member (E04's
-    /// visibility requirement) gets its leading `_` baked in here, at the
-    /// same place every reference to the field resolves its name from
+    /// Already the *Dart* name — a `private` C++ member (E04's visibility
+    /// requirement) gets its leading `_` baked in here, at the same place
+    /// every reference to the field resolves its name from
     /// (`lower::cpp::dart_member_name`), so a field's declaration and every
-    /// access of it can never disagree on whether it's private.
+    /// access of it can never disagree on whether it's private. `protected`
+    /// is *not* treated as private — see `dart_member_name`'s doc comment.
     pub name: String,
     pub ty: Type,
 }

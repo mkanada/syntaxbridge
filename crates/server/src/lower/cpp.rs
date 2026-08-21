@@ -1116,25 +1116,45 @@ unsafe fn record_static_fields_of(cursor: clang_sys::CXCursor) -> Vec<ir::Field>
 /// The Dart-side name for a field/static-field cursor (or the cursor a
 /// `MemberRefExpr` resolves to, via `clang_getCursorReferenced` — the same
 /// call site the field's own declaration and every reference to it both
-/// route through, so they can never disagree): a private/protected C++
-/// member (E04's visibility requirement — Dart only distinguishes
-/// library-private, so `protected` collapses into the same leading-`_`
-/// treatment as `private`) gets a leading `_`, trimming one trailing `_` off
-/// the C++ name first so a conventionally-named `saldo_` becomes `_saldo`,
-/// not `_saldo_`. A `public` (or unspecified-in-a-`struct`, which defaults
-/// to public) member is untouched.
+/// route through, so they can never disagree): a `private` C++ member gets
+/// a leading `_`, trimming one trailing `_` off the C++ name first so a
+/// conventionally-named `saldo_` becomes `_saldo`, not `_saldo_`.
+///
+/// `protected` does *not* get the same treatment (tarefa 03,
+/// `docs/prompts/2026-08-21-03-*.md`, família F2 — decisão de produto
+/// confirmada pelo usuário: opção A). `protected` in C++ means "visible to
+/// subclasses", but Dart's `_` means library-private, and `emit::dart`
+/// gives every record its own file/library — so prefixing `_` on a
+/// `protected` member hides it from exactly the subclasses C++ granted
+/// access to (`Undefined name` in every subclass file, `unused_field` in
+/// the declaring one). Collapsing `protected` into `private` was
+/// `dart_member_name`'s original approach, matching Dart's own two-level
+/// model, but that model has no library-scoped-but-subclass-visible tier to
+/// map `protected` onto, so it's treated as public instead: a `public` (or
+/// unspecified-in-a-`struct`, which defaults to public) member is
+/// untouched *except* for a leading `_` already in its C++ spelling
+/// (`pugixml.hpp`'s `protected xml_node_struct* _root;` — some C++
+/// codebases use a leading underscore as their own "internal" convention,
+/// independent of the access specifier). Dart's privacy rule reads the
+/// literal identifier text, not the access specifier, so passing that
+/// spelling through unchanged reproduces the exact bug this function exists
+/// to avoid: `_root` still can't be read from any file but the declaring
+/// one. Stripped here rather than left to `dart_safe_identifier` since it's
+/// a privacy concern (this function's whole reason to exist), not a
+/// reserved-word one; guarded against an all-underscore name (`_`, `__`)
+/// stripping to empty, which no real C++ member spelling is.
 unsafe fn dart_member_name(cursor: clang_sys::CXCursor) -> String {
     let cpp_name =
         unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(cursor)) };
     let access = unsafe { clang_sys::clang_getCXXAccessSpecifier(cursor) };
-    let is_private = matches!(
-        access,
-        clang_sys::CX_CXXPrivate | clang_sys::CX_CXXProtected
-    );
-    if is_private {
+    if access == clang_sys::CX_CXXPrivate {
         format!("_{}", cpp_name.trim_end_matches('_'))
     } else {
-        dart_safe_identifier(&cpp_name)
+        let public_name = match cpp_name.trim_start_matches('_') {
+            "" => cpp_name.as_str(),
+            stripped => stripped,
+        };
+        dart_safe_identifier(public_name)
     }
 }
 

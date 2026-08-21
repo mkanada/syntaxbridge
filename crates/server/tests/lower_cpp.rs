@@ -2423,6 +2423,101 @@ public:
     );
 }
 
+/// Tarefa 03 (`docs/prompts/2026-08-21-03-*.md`, família F2): `protected` in
+/// C++ means "visible to subclasses", but Dart's `_` means library-private,
+/// and `emit::dart::emit_file` puts every record in its own file/library —
+/// so a `protected` field prefixed with `_` becomes invisible to the very
+/// subclasses C++ granted access to. A subclass reading its base's
+/// `protected` field must see the same name the base declared it with, with
+/// no leading `_`.
+#[test]
+fn a_protected_fields_name_is_visible_without_a_privacy_underscore_to_a_subclass() {
+    let source = lower_and_emit(
+        "lower-cpp-protected-field-visible-to-subclass",
+        r#"
+class Base {
+protected:
+    int m_value;
+};
+class Derived : public Base {
+public:
+    int read() { return m_value; }
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("_m_value"),
+        "a protected field must not gain a library-privacy underscore, got:\n{source}"
+    );
+    assert!(
+        source.contains("m_value"),
+        "expected the protected field to survive lowering under its C++ name, got:\n{source}"
+    );
+}
+
+/// A sibling bug to the one above, same root cause: `pugixml.hpp`'s
+/// `xml_node::_root` is `protected` — the previous test's fix already
+/// applies — but its *C++ spelling itself* starts with `_` (a leading-
+/// underscore-for-"internal" convention some C++ codebases use regardless
+/// of access specifier). Dart's privacy rule looks at the literal
+/// identifier text, not at any access-specifier side channel, so a bare
+/// pass-through of that spelling still reads as library-private and is
+/// still invisible to a subclass in another file — the exact symptom the
+/// test above fixed, wearing a different hat. Verified against the real
+/// diagnosis run (1049 identical `undefined_getter` occurrences before and
+/// after the access-specifier fix alone).
+#[test]
+fn a_protected_fields_leading_underscore_is_stripped_so_it_does_not_trip_darts_own_privacy_convention()
+ {
+    let source = lower_and_emit(
+        "lower-cpp-protected-leading-underscore-field",
+        r#"
+class Base {
+protected:
+    int _root;
+};
+class Derived : public Base {
+public:
+    int read() { return _root; }
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("_root"),
+        "a protected member whose C++ spelling already starts with `_` must not keep it, got:\n{source}"
+    );
+    assert!(
+        source.contains("int root;") && source.contains("return root;"),
+        "expected the leading underscore stripped consistently at declaration and reference, got:\n{source}"
+    );
+}
+
+/// The companion to the two tests above: `private` (unlike `protected`) really is
+/// invisible outside the declaring class in C++ too, so it must keep the
+/// leading `_` — the fix for `protected` must not become "drop the
+/// underscore from everything".
+#[test]
+fn a_private_field_still_gets_a_privacy_underscore() {
+    let source = lower_and_emit(
+        "lower-cpp-private-field-keeps-underscore",
+        r#"
+class C {
+public:
+    int read() { return m_value; }
+private:
+    int m_value;
+};
+"#,
+    );
+
+    assert!(
+        source.contains("_m_value"),
+        "expected a private field to keep its privacy underscore, got:\n{source}"
+    );
+}
+
 /// A bare `;` (`CXCursor_NullStmt`) — a stray empty statement, C++'s idiom
 /// for "nothing happens here" (a loop with all its work in the clauses, or
 /// simply a redundant semicolon) — has no Dart form worth bailing out on: it
@@ -4575,15 +4670,18 @@ struct Holder {
         "got:\n{source}"
     );
     assert!(
-        source.contains("SyntaxBridgeNativeHandle? _impl;"),
-        "expected the field to keep a precise, named nullable type, got:\n{source}"
+        source.contains("SyntaxBridgeNativeHandle? impl;"),
+        "expected the field to keep a precise, named nullable type — and, since this public field's \
+         C++ spelling starts with `_`, that leading underscore stripped (tarefa 03's leading-\
+         underscore fix: a non-private member's bare name must not accidentally trip Dart's own \
+         privacy convention), got:\n{source}"
     );
     assert!(
         source.contains("int SetDrawingGrpObject(SyntaxBridgeNativeHandle? drawingGrpObject)"),
         "expected the parameter to keep the same named type, got:\n{source}"
     );
     assert!(
-        source.contains("_impl = drawingGrpObject;") && source.contains("_impl == null"),
+        source.contains("impl = drawingGrpObject;") && source.contains("impl == null"),
         "expected assignment and null-comparison to keep working without any adapter, got:\n{source}"
     );
 }
