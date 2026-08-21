@@ -280,6 +280,25 @@ pub enum Expr {
         target_type: Type,
         origin: Origin,
     },
+    /// Dart's checked `operand as T` cast — produced by a C++
+    /// `static_cast`/C-style cast that narrows a pointer down a class
+    /// hierarchy (`Base*` → `Derived*`, F7 —
+    /// `docs/prompts/2026-08-21-05-downcast-de-hierarquia-preservado.md`).
+    /// Unlike `Is`'s ternary (built only for the *checked* `dynamic_cast`),
+    /// `static_cast` is unchecked in C++ itself: an incorrect cast is
+    /// undefined behavior, not a null result, so translating it to `is T ?
+    /// x : null` would silently turn a real program bug into a quiet
+    /// `null` — exactly the "silêncio é proibido" failure `AGENTS.md`
+    /// forbids. `as T?` throws a `TypeError` instead, the honest
+    /// equivalent. `ty` is always the cast's target `Type::Nullable(Record)`.
+    /// Needs no simple-operand guard the way `Is`/`dynamic_cast` does:
+    /// `as` evaluates `operand` exactly once, so it covers call/field-access
+    /// operands `dynamic_cast`'s ternary form has to bail out on.
+    As {
+        operand: Box<Expr>,
+        ty: Type,
+        origin: Origin,
+    },
     /// C++ assignment used as an *expression*, not a whole statement
     /// (`while ((x = foo()) != nullptr)`, or the same shape reached
     /// indirectly when an intervening `libclang` wrapper cursor — e.g. a
@@ -465,6 +484,7 @@ impl Expr {
             | Self::ListLiteral { origin, .. }
             | Self::MapLiteral { origin, .. }
             | Self::Is { origin, .. }
+            | Self::As { origin, .. }
             | Self::Assign { origin, .. }
             | Self::Convert { origin, .. }
             | Self::Call { origin, .. }

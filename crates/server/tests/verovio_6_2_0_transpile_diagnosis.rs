@@ -682,6 +682,10 @@ fn collect_expression_bailouts(expression: &Expr, inventory: &mut BailoutInvento
             collect_type_bailouts(target_type, inventory);
             collect_expression_bailouts(operand, inventory);
         }
+        Expr::As { operand, ty, .. } => {
+            collect_type_bailouts(ty, inventory);
+            collect_expression_bailouts(operand, inventory);
+        }
         Expr::Assign {
             target, value, ty, ..
         } => {

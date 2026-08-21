@@ -1363,6 +1363,10 @@ impl IrRefVisitor<'_> {
                 self.visit_type(target_type);
                 self.visit_expr(operand);
             }
+            ir::Expr::As { operand, ty, .. } => {
+                self.visit_type(ty);
+                self.visit_expr(operand);
+            }
             ir::Expr::Assign {
                 target, value, ty, ..
             } => {
@@ -2120,6 +2124,7 @@ fn expr_references_name(expr: &ir::Expr, name: &str) -> bool {
             expr_references_name(key, name) || expr_references_name(value, name)
         }),
         ir::Expr::Is { operand, .. } => expr_references_name(operand, name),
+        ir::Expr::As { operand, .. } => expr_references_name(operand, name),
         ir::Expr::Assign { target, value, .. } => {
             expr_references_name(target, name) || expr_references_name(value, name)
         }
@@ -2337,6 +2342,7 @@ fn replace_this_with_ref_in_expr(expr: &mut ir::Expr, var_name: &str) {
             }
         }
         ir::Expr::Is { operand, .. } => replace_this_with_ref_in_expr(operand, var_name),
+        ir::Expr::As { operand, .. } => replace_this_with_ref_in_expr(operand, var_name),
         ir::Expr::Assign { target, value, .. } => {
             replace_this_with_ref_in_expr(target, var_name);
             replace_this_with_ref_in_expr(value, var_name);
@@ -2574,6 +2580,7 @@ fn rename_calls_in_expr(expr: &mut ir::Expr, renames: &HashMap<String, String>) 
             }
         }
         ir::Expr::Is { operand, .. } => rename_calls_in_expr(operand, renames),
+        ir::Expr::As { operand, .. } => rename_calls_in_expr(operand, renames),
         ir::Expr::Assign { target, value, .. } => {
             rename_calls_in_expr(target, renames);
             rename_calls_in_expr(value, renames);

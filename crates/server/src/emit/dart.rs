@@ -859,6 +859,10 @@ fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str
             collect_referenced_usrs_in_type(target_type, out);
             collect_referenced_usrs_in_expr(operand, out);
         }
+        Expr::As { operand, ty, .. } => {
+            collect_referenced_usrs_in_type(ty, out);
+            collect_referenced_usrs_in_expr(operand, out);
+        }
         Expr::Assign {
             target, value, ty, ..
         } => {
@@ -2001,6 +2005,9 @@ fn expr_unsupported_type_spelling(expr: &Expr) -> Option<&str> {
             target_type,
             ..
         } => unsupported_spelling(target_type).or_else(|| expr_unsupported_type_spelling(operand)),
+        Expr::As { operand, ty, .. } => {
+            unsupported_spelling(ty).or_else(|| expr_unsupported_type_spelling(operand))
+        }
         Expr::Assign {
             target, value, ty, ..
         } => unsupported_spelling(ty)
@@ -2746,6 +2753,7 @@ fn expr_ty(expr: &Expr) -> Option<&Type> {
         | Expr::MapLiteral { ty, .. }
         | Expr::Assign { ty, .. }
         | Expr::Convert { ty, .. }
+        | Expr::As { ty, .. }
         | Expr::Call { ty, .. }
         | Expr::FieldAccess { ty, .. }
         | Expr::This { ty, .. }
@@ -3546,6 +3554,22 @@ fn emit_expr(
             "{} is {}",
             emit_expr(operand, used_expr_helper, used_utf8_encode, promoted),
             emit_type(target_type)
+        ),
+        // Always parenthesized, the same reasoning as `Expr::Assign` just
+        // below: `as`'s own type operand can itself end in `?`, and this
+        // result is exactly the shape `receiver_bang` targets (the cast
+        // narrows a pointer, so it's overwhelmingly used as a receiver
+        // right after) — an unparenthesized `x as T?!.field` doesn't parse
+        // as "force-unwrap the cast, then access `.field`" the way `(x as
+        // T?)!.field` does; Dart reads the bare form as a syntax error
+        // (confirmed empirically: it broke `dart format` on 14 real
+        // Verovio files before this was parenthesized). Every other
+        // embedding context (a call argument, a binary operand, ...)
+        // accepts the extra parens just as safely.
+        Expr::As { operand, ty, .. } => format!(
+            "({} as {})",
+            emit_expr(operand, used_expr_helper, used_utf8_encode, promoted),
+            emit_type(ty)
         ),
         // Always parenthesized: Dart's `=` has the same low precedence
         // C++'s does, so an unparenthesized `x = y != null` would parse as

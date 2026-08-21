@@ -1062,6 +1062,44 @@ unsafe fn base_classes_of(cursor: clang_sys::CXCursor) -> Vec<ir::BaseClass> {
         .collect()
 }
 
+/// Whether the record declared at `record_decl` transitively derives from
+/// `ancestor_usr` — used to tell a pointer upcast (safe, transparent) from
+/// a downcast (needs a checked Dart `as T?`) when lowering an explicit
+/// `static_cast`/C-style cast between two different `Type::Record`s (F7,
+/// `docs/prompts/2026-08-21-05-downcast-de-hierarquia-preservado.md`).
+/// Walks `CXXBaseSpecifier` cursors directly, the same way
+/// `base_classes_of` does for a record's *declared* bases, rather than
+/// consulting a `Module`/type catalog: none exists yet at this point in
+/// lowering (`lower_expr` runs during a single libclang cursor visitation,
+/// well before `function_catalog::extract_function_catalog` assembles the
+/// `Module` its callers use). `clang_getTypeDeclaration` alone can return a
+/// forward-declaration cursor with no base-specifier children, so this
+/// follows it to `clang_getCursorDefinition` wherever one is available —
+/// at every recursion level, since a base's own declaration cursor can be
+/// a forward declaration just as easily as the starting one.
+unsafe fn record_derives_from(record_decl: clang_sys::CXCursor, ancestor_usr: &str) -> bool {
+    let definition = unsafe { clang_sys::clang_getCursorDefinition(record_decl) };
+    let record_cursor = if unsafe { clang_sys::clang_Cursor_isNull(definition) } != 0 {
+        record_decl
+    } else {
+        definition
+    };
+
+    unsafe { collect_children(record_cursor) }
+        .into_iter()
+        .filter(|child| {
+            (unsafe { clang_sys::clang_getCursorKind(*child) })
+                == clang_sys::CXCursor_CXXBaseSpecifier
+        })
+        .any(|base_specifier| {
+            let base_type = unsafe { clang_sys::clang_getCursorType(base_specifier) };
+            let base_decl = unsafe { clang_sys::clang_getTypeDeclaration(base_type) };
+            let base_usr =
+                unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(base_decl)) };
+            base_usr == ancestor_usr || unsafe { record_derives_from(base_decl, ancestor_usr) }
+        })
+}
+
 /// Whether `cursor` (a `CXXMethod` definition) overrides a base class's
 /// virtual method — `clang_getOverriddenCursors`, not name-matching against
 /// the base's own member list, so an unrelated method that happens to share
@@ -4781,14 +4819,68 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
                 // the C++ compiler's own acceptance of the source is exactly
                 // as sound.
                 inner
-            } else if matches!(child_ty, ir::Type::Nullable(ref inner) if matches!(inner.as_ref(), ir::Type::Record { .. }))
-                && matches!(outer_ty, ir::Type::Nullable(ref inner) if matches!(inner.as_ref(), ir::Type::Record { .. }))
+            } else if let (
+                ir::Type::Nullable(child_record),
+                ir::Type::Nullable(outer_record),
+            ) = (&child_ty, &outer_ty)
+                && let (
+                    ir::Type::Record { usr: child_usr, .. },
+                    ir::Type::Record { usr: outer_usr, .. },
+                ) = (child_record.as_ref(), outer_record.as_ref())
             {
                 // The nullable counterpart of the record upcast above. A
                 // `Derived*` becomes `Derived?` and a `Base*` becomes
-                // `Base?`; Dart preserves the same subtype relation, so the
-                // compiler-accepted C++ conversion needs no generated cast.
-                inner
+                // `Base?`; Dart preserves the same subtype relation, so a
+                // compiler-accepted *implicit* C++ conversion (only ever
+                // inserted for a derived-to-base widening) needs no
+                // generated cast.
+                //
+                // An *explicit* `static_cast`/C-style cast reaching this
+                // same shape (`kind` one of the two, rather than the
+                // implicit-conversion `UnexposedExpr`) isn't guaranteed to
+                // be that same safe widening — F7
+                // (`docs/prompts/2026-08-21-05-downcast-de-hierarquia-preservado.md`):
+                // Verovio's `vrv_cast<Doc *>(object)` (`vrv_cast` is
+                // `#define vrv_cast static_cast`,
+                // `include/vrv/vrvdef.h:65`) narrows `Object*` down to
+                // `Doc*`, and unwrapping it the same way as the implicit
+                // case silently drops the cast, leaving the operand typed
+                // as its own base — confirmed as the real corpus trigger
+                // for ~1523 `dart analyze` diagnostics
+                // (`argument_type_not_assignable`/`invalid_assignment`/
+                // `return_of_invalid_type`) in the Verovio 6.2.0 diagnosis.
+                // `record_derives_from` walks the *child*'s own base
+                // specifiers (transitively, straight from libclang cursors
+                // — no `Module`/catalog exists yet at this point in
+                // lowering) to tell a genuine upcast, still transparent,
+                // from a downcast or unrelated cast, which needs a real
+                // Dart cast to survive.
+                if child_usr == outer_usr {
+                    inner
+                } else if matches!(
+                    kind,
+                    clang_sys::CXCursor_CXXStaticCastExpr | clang_sys::CXCursor_CStyleCastExpr
+                ) && !unsafe {
+                    let child_pointer_ty = clang_sys::clang_getCursorType(child_cursor);
+                    let child_pointee_ty = clang_sys::clang_getPointeeType(child_pointer_ty);
+                    let child_decl = clang_sys::clang_getTypeDeclaration(child_pointee_ty);
+                    record_derives_from(child_decl, outer_usr)
+                } {
+                    // A narrowing (or unrelated) explicit cast: C++'s own
+                    // `static_cast` is unchecked here (undefined behavior on
+                    // a real mismatch, not a null result), so the honest
+                    // translation is Dart's checked `as T?` — it throws a
+                    // `TypeError` if the source wasn't really a `T`, rather
+                    // than silently turning a program bug into `null` the
+                    // way `dynamic_cast`'s ternary form would.
+                    ir::Expr::As {
+                        operand: Box::new(inner),
+                        ty: outer_ty.clone(),
+                        origin,
+                    }
+                } else {
+                    inner
+                }
             } else if child_ty == ir::Type::List(Box::new(ir::Type::Int))
                 && (outer_ty == ir::Type::Bytes
                     || outer_ty == ir::Type::Nullable(Box::new(ir::Type::Bytes)))

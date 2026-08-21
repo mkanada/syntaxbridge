@@ -1653,6 +1653,67 @@ Base* as_base(Derived* value) {
     );
 }
 
+/// F7 (`docs/prompts/2026-08-21-05-downcast-de-hierarquia-preservado.md`):
+/// `static_cast`/C-style cast down a class hierarchy (`Base*` → `Derived*`)
+/// must not be unwrapped as if it were sugar — `is_transparent_wrapper`
+/// already treats `CXXStaticCastExpr`/`CStyleCastExpr` as pure sugar for the
+/// numeric-conversion case, but the same unwrap silently dropped a real
+/// pointer downcast, passing the operand along still typed as its base. A
+/// downcast is emitted as Dart's checked `as T?`, which throws a
+/// `TypeError` at runtime if the source wasn't really a `T` — the honest
+/// translation of C++'s own unchecked (undefined-behavior-on-mismatch)
+/// `static_cast`, never a silent `null`.
+#[test]
+fn static_cast_downcast_preserves_the_narrower_type() {
+    let source = lower_and_emit(
+        "lower-cpp-static-cast-downcast",
+        r#"
+struct Base {};
+struct Derivada : Base {};
+
+void f(Derivada* d) {}
+
+void g(Base* b) {
+    f(static_cast<Derivada*>(b));
+}
+"#,
+    );
+
+    assert!(
+        source.contains("f((b as Derivada?))"),
+        "expected the downcast to survive as a checked Dart cast, got:\n{source}"
+    );
+}
+
+/// The same F7 downcast as above, but immediately dereferenced through the
+/// cast result (`vrv_cast<Doc *>(object)->GetSomething()`-shaped —
+/// `iomei.cpp`'s real trigger reaches a field, not just a call argument).
+/// `emit::dart`'s `receiver_bang` appends `!` straight after whatever text
+/// `emit_expr` renders for the receiver, with no parens of its own —
+/// unparenthesized, `x as T?!.field` isn't valid Dart (`!` binds to the
+/// cast's own `T?` type, not to the cast expression as a whole), confirmed
+/// by `dart format` failing on 14 real Verovio files before `Expr::As`
+/// started parenthesizing its own output.
+#[test]
+fn static_cast_downcast_used_as_a_field_receiver_stays_parseable() {
+    let source = lower_and_emit(
+        "lower-cpp-static-cast-downcast-receiver",
+        r#"
+struct Base {};
+struct Derivada : Base { int valor; };
+
+int g(Base* b) {
+    return static_cast<Derivada*>(b)->valor;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("(b as Derivada?)!.valor"),
+        "expected the parenthesized cast to survive the receiver's `!`, got:\n{source}"
+    );
+}
+
 /// A user-defined C++ assignment operator may carry invariants beyond a
 /// field-for-field copy. Dart has no overloadable assignment, so preserve its
 /// body in a named instance method and route `destination = source` through
