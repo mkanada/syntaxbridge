@@ -4433,6 +4433,79 @@ struct Holder {
     );
 }
 
+/// A real invalid-Dart bug found in the Verovio corpus itself (round 22,
+/// `humlib.h`'s `class HumdrumToken : public std::string, public
+/// HumHash`, confirmed against the real emitted package:
+/// `class HumdrumToken with string, HumHash {`, referencing an undeclared
+/// Dart class `string` — a `dart analyze` `undefined_class`).
+/// `base_classes_of` included *any* base with a resolvable usr/name,
+/// including one that maps to a library adapter (`Type::Str` for
+/// `std::string`) this bridge never backs with a real declared Dart
+/// class. Scoped to exactly `Type::Record`/`Type::Enum` bases now — the
+/// only shapes this bridge ever emits a class declaration for.
+#[test]
+fn a_base_class_that_is_a_library_adapter_is_never_emitted_as_a_dart_mixin_or_extends() {
+    let source = lower_and_emit(
+        "lower-cpp-string-base-class",
+        r#"
+#include <string>
+
+class Hashable {
+public:
+    int Hash() { return 0; }
+};
+
+class Comparable {
+public:
+    int Compare() { return 0; }
+};
+
+class Token : public std::string, public Hashable, public Comparable {
+public:
+    int m_x = 0;
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("with string") && !source.contains("extends string"),
+        "must never reference an undeclared Dart class \"string\" as a base/mixin, \
+         got:\n{source}"
+    );
+    assert!(
+        source.contains("class Token with Hashable, Comparable"),
+        "the genuine project base classes must still be kept as mixins, got:\n{source}"
+    );
+}
+
+/// The single-base form (E06's "extends", not E09's multi-base mixin
+/// list) needs the same exclusion: a class inheriting *only* from a
+/// library adapter must declare no base at all, not `extends string`.
+#[test]
+fn a_single_library_adapter_base_is_never_emitted_as_a_dart_extends_clause() {
+    let source = lower_and_emit(
+        "lower-cpp-string-only-base-class",
+        r#"
+#include <string>
+
+class Token : public std::string {
+public:
+    int m_x = 0;
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("extends string") && !source.contains("with string"),
+        "must never reference an undeclared Dart class \"string\" as a base, got:\n{source}"
+    );
+    assert!(
+        source.contains("class Token {"),
+        "a class whose only base is a library adapter must declare no Dart base at all, \
+         got:\n{source}"
+    );
+}
+
 /// `void*`/`const void*` — the single largest type bailout in the
 /// 2026-08-20 Verovio diagnosis (896 + 253 occurrences), real shapes
 /// confirmed by grepping the extracted Verovio source directly

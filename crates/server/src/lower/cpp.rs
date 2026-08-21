@@ -1024,9 +1024,39 @@ unsafe fn base_classes_of(cursor: clang_sys::CXCursor) -> Vec<ir::BaseClass> {
                 type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(decl))
             };
             if usr.is_empty() || name.is_empty() {
-                None
-            } else {
-                Some(ir::BaseClass { usr, name })
+                return None;
+            }
+            // A base that isn't itself a `Type::Record` — `class
+            // HumdrumToken : public std::string, public HumHash` (real,
+            // `humlib.h`) is the corpus trigger: `std::string` resolves to
+            // `Type::Str` here, a library adapter this bridge represents
+            // as a Dart `String`, never as a real declared class. Left
+            // unfiltered, `emit::dart` printed it as a base/mixin name
+            // anyway — `class HumdrumToken with string, HumHash` —
+            // referencing an undeclared Dart class `string`, a real
+            // `dart analyze` `undefined_class` error, not just a
+            // stylistic wart. `Type::Record`/`Type::Enum` are the only
+            // shapes this bridge ever backs with a real Dart class
+            // declaration; anything else this same base type would
+            // otherwise map to (`Str`/`List`/`Bytes`/`Unsupported`/...)
+            // is excluded the same way. This does *not* pretend the
+            // inheritance never happened — `HumdrumToken`'s own use as a
+            // `Str` (assignment, comparison, `.find`/`.substr`, ...) stays
+            // its own honest bailout (`unsupported implicit conversion
+            // from Record{HumdrumToken} to Str`), since fully modeling a
+            // string-backed base needs the base's own constructor
+            // arguments — a C++ member-initializer-list entry
+            // (`: std::string(s)`), which `clang_visitChildren` never
+            // exposes as a cursor at all (`CXCursor_CXXCtorInitializer`
+            // doesn't exist in `libclang`'s public C API — confirmed
+            // directly against `clang-sys`'s own generated bindings, not
+            // assumed) — a real, separate blocker this filter doesn't
+            // attempt to work around.
+            match lower_type(base_type) {
+                ir::Type::Record { .. } | ir::Type::Enum { .. } => {
+                    Some(ir::BaseClass { usr, name })
+                }
+                _ => None,
             }
         })
         .collect()
