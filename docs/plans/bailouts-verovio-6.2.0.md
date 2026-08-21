@@ -1342,19 +1342,55 @@ inválidos** (mesmo `pugixml.dart` de sempre, sem mudança líquida depois da
 correção); `dart analyze` 16.258 → 15.632 erros (−626), 8.986 avisos (sem
 mudança líquida). Conferido: zero tokens `dynamic`, zero panics.
 
-**Residual não totalmente explicado, registrado para a próxima rodada:**
-`int *`/`size_t *`/`mz_uint64 *`/`uint32_t *`/`uint16_t *`/`mz_uint32 *`/
-`time_t *`/`mz_ulong *` (as causas-alvo principais da feature 1) reduziram
-muito menos do que o volume de parâmetros pareceria sugerir (`int *`:
-63→59, `size_t *`: inalterado em 51, `mz_uint64 *`/`uint32_t *`/
-`uint16_t *`/`mz_uint32 *`/`mz_ulong *`: inalterados). A mesma família de
-suspeita já registrada para `vector::end`/`list::end` na 18ª rodada
-provavelmente se aplica aqui: a maioria das ocorrências reais desses
-spellings provavelmente não é parâmetro de função (`out_param_indices` só
-olha para parâmetros) — pode ser campo de struct, variável local, ou
-ponteiro aritmético genuíno — não auditado ainda. `unsupported std::
-basic_stringstream::str call` também não zerou (61→3): o resíduo de 3
-provavelmente é a sobrecarga de 1 argumento (`ss.str(newValue)`,
+**Residual explicado depois da medição — causa raiz real encontrada, correção
+adiada por segurança.** `int *`/`size_t *`/`mz_uint64 *`/`uint32_t *`/
+`uint16_t *`/`mz_uint32 *`/`time_t *`/`mz_ulong *` reduziram muito menos do
+que o volume de parâmetros sugeria. Investigado diretamente no pacote
+emitido: `editortoolkit_neume.h`'s `bool ParseDragAction(jsonxx::Object
+param, std::string *elementId, int *x, int *y)` — exatamente o exemplo real
+citado na feature 1 — continua `Unsupported` porque **retorna `bool`, não
+`void`**, e `apply_out_param_bridge` só bridgeava função `void`. Essa
+restrição não era uma decisão de escopo deliberada, era estreita demais: o
+padrão dominante real de out-param em C++ é *status de sucesso + valores de
+saída juntos* (`bool`/código de erro + parâmetros), não a forma pura `void`
+E13 forçou.
+
+Uma tentativa de remover a restrição `void` foi implementada e depois
+**revertida antes de commitar**, por um risco real encontrado durante a
+própria implementação, não hipotético: o call site real de
+`ParseDragAction` é `if (this->ParseDragAction(...)) { ... }`
+(`editortoolkit_neume.cpp:92`) — o valor de retorno *é* usado, dentro da
+condição de um `if`, não descartado como statement solto. A ponte de call
+site já existente (`Stmt::TupleAssign`) só reconhece uma chamada usada como
+*statement solto* (`kind == CXCursor_CallExpr` em `lower_stmt`) — uma
+chamada dentro de uma condição de `if` nunca passa por ali, cai no
+`lower_expr` genérico, que deriva o tipo do retorno a partir do tipo C++
+declarado original (`bool`) — sem saber que a função foi reescrita para
+retornar uma tupla. Bridgear a definição sem também tratar esse call site
+teria produzido exatamente a falha "compila e está errado" que o AGENTS.md
+proíbe: `if (algumaFuncao(...))` chamando uma função Dart que na verdade
+retorna `(bool, String?, int, int)`, não `bool` — um `if` sobre um valor do
+tipo errado.
+
+**Próxima rodada, com o desenho já esboçado:** reconhecer o padrão inteiro
+`if (chamada(...))`/`if (!chamada(...))` quando `chamada` resolve para uma
+função bridged por out-param, como uma forma de statement (na família dos
+outros reconhecedores de statement inteiro desta sessão — laço de
+iterador, acumulador de stringstream): reescrever para uma variável
+temporária guardando a tupla completa, atribuições individuais para cada
+alvo de out-param, e o `if` original testando só o primeiro elemento da
+tupla (o valor de retorno real). Precisa decidir como emitir múltiplos
+statements a partir de um `Stmt::Return`-adjacent (a ponte de "receptor
+anulável" do E10/achado 5 já faz algo parecido — bloco escopado com
+temporária — vale conferir se o mesmo mecanismo de emissão dá pra
+reaproveitar antes de desenhar um novo). Até lá, a extensão para retorno
+não-`void` fica documentada aqui, não implementada — a versão só-`void`
+(já commitada) continua correta e sem esse risco, porque nunca reescreve o
+tipo de retorno de uma função cujos call sites este módulo não pode
+verificar univocamente.
+
+`unsupported std::basic_stringstream::str call` também não zerou (61→3): o
+resíduo de 3 provavelmente é a sobrecarga de 1 argumento (`ss.str(newValue)`,
 deliberadamente fora de escopo) ou um receptor não reconhecido pelo mesmo
 `stringstream_variable_name`, não auditado individualmente ainda.
 
