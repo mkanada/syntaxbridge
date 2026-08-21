@@ -335,8 +335,14 @@ pub(crate) fn finish_function_catalog(partials: Vec<FunctionCatalogPartial>) -> 
     let mut ir_function_index: HashMap<String, usize> = HashMap::new();
     let mut ir_function_is_prototype: HashMap<String, bool> = HashMap::new();
     let mut ir_functions = Vec::new();
-    let mut ir_record_seen = HashSet::new();
-    let mut ir_records = Vec::new();
+    // Index (not just membership) — same rationale as `ir_function_index`
+    // above, but for whole records: two different workers can each hold a
+    // different (both partial) lowering of the same class `usr` (one only
+    // saw the header, the other also saw the `.cpp` with an out-of-line
+    // member), and both must be *unioned* into the surviving entry rather
+    // than the second one being discarded outright. See `merge_ir_record`.
+    let mut ir_record_index: HashMap<String, usize> = HashMap::new();
+    let mut ir_records: Vec<ir::Record> = Vec::new();
     let mut ir_enum_seen = HashSet::new();
     let mut ir_enums = Vec::new();
 
@@ -390,8 +396,12 @@ pub(crate) fn finish_function_catalog(partials: Vec<FunctionCatalogPartial>) -> 
         }
 
         for record in partial_ir_records {
-            if ir_record_seen.insert(record.usr.clone()) {
-                ir_records.push(record);
+            match ir_record_index.get(&record.usr) {
+                None => {
+                    ir_record_index.insert(record.usr.clone(), ir_records.len());
+                    ir_records.push(record);
+                }
+                Some(&index) => merge_ir_record(&mut ir_records[index], record),
             }
         }
 
@@ -439,6 +449,124 @@ pub(crate) fn finish_function_catalog(partials: Vec<FunctionCatalogPartial>) -> 
         ir_functions,
         ir_records,
         ir_enums,
+    }
+}
+
+/// Unions `incoming` into `existing` — both partial lowerings of the same
+/// class `usr`, contributed by different `finish_function_catalog` workers
+/// (`docs/prompts/2026-08-21-01-uniao-de-registros-no-merge.md`). A worker
+/// that only parsed a translation unit including the class's header lowers
+/// the class with none (or only some) of its out-of-line members; a worker
+/// that also parsed the `.cpp` defining them lowers those members too. The
+/// old "first partial with this `usr` wins" merge kept whichever copy
+/// happened to be encountered first in `partials`' order — almost always
+/// the header-only one, since a shared header is included by far more
+/// translation units than the single `.cpp` that defines its members
+/// out-of-line — silently discarding the richer copy.
+///
+/// `fields`/`static_fields`/`base_class`/`mixins`/`namespace` come from the
+/// class *definition* itself (`lower::cpp::lower_record`), lowered
+/// identically by every worker that visits it at all, so they're expected
+/// to already agree; a mismatch is logged rather than silently resolved one
+/// way, since it signals a real problem (e.g. divergent macro expansion
+/// across translation units) this merge has no business papering over.
+fn merge_ir_record(existing: &mut ir::Record, incoming: ir::Record) {
+    if existing.namespace != incoming.namespace
+        || existing.fields != incoming.fields
+        || existing.static_fields != incoming.static_fields
+        || existing.base_class != incoming.base_class
+        || existing.mixins != incoming.mixins
+    {
+        log_function_catalog(format_args!(
+            "finish_function_catalog: record {} was lowered differently by two \
+             compilation units (namespace/fields/static_fields/base_class/mixins \
+             disagree) — kept the first partial's definition, discarded the other's",
+            existing.usr
+        ));
+    }
+
+    merge_methods(&mut existing.methods, incoming.methods);
+    merge_constructors(&mut existing.constructors, incoming.constructors);
+
+    match (&existing.destructor, incoming.destructor) {
+        (None, Some(body)) => existing.destructor = Some(body),
+        (Some(existing_body), Some(incoming_body)) if *existing_body != incoming_body => {
+            log_function_catalog(format_args!(
+                "finish_function_catalog: record {}'s destructor body disagrees \
+                 between compilation units — kept the first partial's body",
+                existing.usr
+            ));
+        }
+        _ => {}
+    }
+}
+
+/// Merges `incoming` methods into `existing`, deduplicating by `usr`
+/// (`ir::Method::usr`, the join key back to `FunctionDeclaration`). A method
+/// is only ever added to a record's `methods` when the visiting worker saw
+/// either its definition or its pure-virtual (`= 0`) declaration — never a
+/// bodyless prototype — so `body: None` here means "genuinely pure virtual
+/// in this worker's view", not "missing". When the two workers disagree on
+/// that (one has a body, the other doesn't), the one with a body wins: it
+/// saw the out-of-line definition the other worker's translation units never
+/// included.
+fn merge_methods(existing: &mut Vec<ir::Method>, incoming: Vec<ir::Method>) {
+    let mut index_by_usr: HashMap<String, usize> = existing
+        .iter()
+        .enumerate()
+        .map(|(index, method)| (method.usr.clone(), index))
+        .collect();
+
+    for method in incoming {
+        match index_by_usr.get(&method.usr) {
+            None => {
+                index_by_usr.insert(method.usr.clone(), existing.len());
+                existing.push(method);
+            }
+            Some(&index) => {
+                if existing[index].body.is_none() && method.body.is_some() {
+                    existing[index] = method;
+                } else if existing[index].body.is_some()
+                    && method.body.is_some()
+                    && existing[index].body != method.body
+                {
+                    log_function_catalog(format_args!(
+                        "finish_function_catalog: method {} has a different body \
+                         in two compilation units — kept the first partial's body",
+                        method.usr
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Merges `incoming` constructors into `existing`, deduplicating by `usr`.
+/// Unlike a method, a `Constructor` is only ever pushed when
+/// `lower::cpp::lower_constructor` found a real, user-written body
+/// (`Constructor`'s own doc comment), so there's no bodyless placeholder to
+/// prefer away from — a `usr` present in only one partial is simply
+/// appended, and a `usr` present in both is expected to carry the same body.
+fn merge_constructors(existing: &mut Vec<ir::Constructor>, incoming: Vec<ir::Constructor>) {
+    let mut seen: HashSet<String> = existing
+        .iter()
+        .map(|constructor| constructor.usr.clone())
+        .collect();
+
+    for constructor in incoming {
+        if seen.insert(constructor.usr.clone()) {
+            existing.push(constructor);
+        } else if let Some(existing_constructor) = existing
+            .iter()
+            .find(|candidate| candidate.usr == constructor.usr)
+            && existing_constructor.body != constructor.body
+        {
+            log_function_catalog(format_args!(
+                "finish_function_catalog: constructor {} has a different body \
+                 in two compilation units — kept the first partial's body",
+                constructor.usr
+            ));
+        }
     }
 }
 
@@ -3106,4 +3234,174 @@ unsafe fn parameter_list(cursor: clang_sys::CXCursor) -> String {
     }
 
     parts.join(", ")
+}
+
+#[cfg(test)]
+mod merge_tests {
+    //! Tarefa 01 (`docs/prompts/2026-08-21-01-uniao-de-registros-no-merge.md`):
+    //! `finish_function_catalog` used to keep only the first worker partial
+    //! that mentioned a given record `usr`, discarding every out-of-line
+    //! member a *different* worker's partial had lowered for that same
+    //! class. These build `FunctionCatalogPartial` tuples by hand (see that
+    //! prompt's "Método" section for why: deterministic, independent of how
+    //! many workers the machine happens to have).
+    use super::*;
+
+    fn origin(line: u32) -> ir::Origin {
+        ir::Origin {
+            file: "include/foo.h".to_owned(),
+            line,
+            column: 1,
+        }
+    }
+
+    fn empty_partial() -> FunctionCatalogPartial {
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
+    }
+
+    fn record_with(mutate: impl FnOnce(&mut ir::Record)) -> ir::Record {
+        let mut record = ir::Record {
+            name: "Foo".to_owned(),
+            usr: "c:@S@Foo".to_owned(),
+            namespace: String::new(),
+            fields: Vec::new(),
+            static_fields: Vec::new(),
+            constructors: Vec::new(),
+            methods: Vec::new(),
+            base_class: None,
+            mixins: Vec::new(),
+            destructor: None,
+            origin: origin(1),
+        };
+        mutate(&mut record);
+        record
+    }
+
+    /// The exact scenario `finish_function_catalog`'s doc comment/prompt
+    /// describes: one worker only ever parses a translation unit that
+    /// includes `foo.h` (so it lowers `Foo`'s definition with a
+    /// declaration-only `Bar`), another worker parses `foo.cpp`, which
+    /// defines `Bar` out-of-line — a second, richer copy of the same
+    /// record `usr`. The union must keep `Bar`'s body, not discard it
+    /// because the header-only partial happened to be merged first.
+    #[test]
+    fn merges_out_of_line_method_from_a_different_worker_partial() {
+        let header_only_record = record_with(|_| {});
+
+        let method_usr = "c:@S@Foo@F@Bar#";
+        let with_out_of_line_method = record_with(|record| {
+            record.methods.push(ir::Method {
+                name: "Bar".to_owned(),
+                usr: method_usr.to_owned(),
+                params: Vec::new(),
+                return_type: ir::Type::Void,
+                body: Some(Vec::new()),
+                is_static: false,
+                is_override: false,
+                origin: origin(2),
+            });
+        });
+
+        let mut header_only_partial = empty_partial();
+        header_only_partial.4.push(header_only_record);
+
+        let mut definition_partial = empty_partial();
+        definition_partial.4.push(with_out_of_line_method);
+
+        let catalog = finish_function_catalog(vec![header_only_partial, definition_partial]);
+
+        assert_eq!(catalog.ir_records.len(), 1);
+        let merged = &catalog.ir_records[0];
+        assert_eq!(merged.methods.len(), 1, "out-of-line method was dropped by the merge");
+        assert_eq!(merged.methods[0].usr, method_usr);
+        assert!(merged.methods[0].body.is_some());
+    }
+
+    /// Same shape, but the header-only partial arrives *second* — the old
+    /// "first partial with this usr wins" rule would keep the rich copy in
+    /// this ordering by accident. The union must not depend on which
+    /// partial happens to come first.
+    #[test]
+    fn merge_is_order_independent() {
+        let header_only_record = record_with(|_| {});
+        let method_usr = "c:@S@Foo@F@Bar#";
+        let with_out_of_line_method = record_with(|record| {
+            record.methods.push(ir::Method {
+                name: "Bar".to_owned(),
+                usr: method_usr.to_owned(),
+                params: Vec::new(),
+                return_type: ir::Type::Void,
+                body: Some(Vec::new()),
+                is_static: false,
+                is_override: false,
+                origin: origin(2),
+            });
+        });
+
+        let mut definition_partial = empty_partial();
+        definition_partial.4.push(with_out_of_line_method);
+
+        let mut header_only_partial = empty_partial();
+        header_only_partial.4.push(header_only_record);
+
+        let catalog = finish_function_catalog(vec![definition_partial, header_only_partial]);
+
+        assert_eq!(catalog.ir_records.len(), 1);
+        let merged = &catalog.ir_records[0];
+        assert_eq!(merged.methods.len(), 1);
+        assert!(merged.methods[0].body.is_some());
+    }
+
+    /// A constructor lowered out-of-line in one partial must survive the
+    /// merge the same way a method does — same causa raiz, different
+    /// `Record` field.
+    #[test]
+    fn merges_out_of_line_constructor_from_a_different_worker_partial() {
+        let header_only_record = record_with(|_| {});
+        let constructor_usr = "c:@S@Foo@F@Foo#";
+        let with_constructor = record_with(|record| {
+            record.constructors.push(ir::Constructor {
+                usr: constructor_usr.to_owned(),
+                constructor_index: 0,
+                params: Vec::new(),
+                body: Vec::new(),
+                origin: origin(3),
+            });
+        });
+
+        let mut header_only_partial = empty_partial();
+        header_only_partial.4.push(header_only_record);
+        let mut definition_partial = empty_partial();
+        definition_partial.4.push(with_constructor);
+
+        let catalog = finish_function_catalog(vec![header_only_partial, definition_partial]);
+
+        assert_eq!(catalog.ir_records.len(), 1);
+        assert_eq!(catalog.ir_records[0].constructors.len(), 1);
+        assert_eq!(catalog.ir_records[0].constructors[0].usr, constructor_usr);
+    }
+
+    /// Same causa raiz for the destructor: a header-only partial sees no
+    /// destructor body at all (`None`), the `.cpp` partial that defines it
+    /// does — the union must keep the real teardown logic, not the `None`.
+    #[test]
+    fn merges_destructor_body_from_a_different_worker_partial() {
+        let header_only_record = record_with(|_| {});
+        let with_destructor = record_with(|record| {
+            record.destructor = Some(vec![ir::Stmt::Unsupported {
+                reason: "placeholder".to_owned(),
+                origin: origin(4),
+            }]);
+        });
+
+        let mut header_only_partial = empty_partial();
+        header_only_partial.4.push(header_only_record);
+        let mut definition_partial = empty_partial();
+        definition_partial.4.push(with_destructor);
+
+        let catalog = finish_function_catalog(vec![header_only_partial, definition_partial]);
+
+        assert_eq!(catalog.ir_records.len(), 1);
+        assert!(catalog.ir_records[0].destructor.is_some());
+    }
 }

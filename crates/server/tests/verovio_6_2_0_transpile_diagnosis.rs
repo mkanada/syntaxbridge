@@ -99,11 +99,16 @@ fn transpiling_the_real_verovio_6_2_0_project_reports_coverage() {
     // `dynamic` hides a missing source-to-target mapping from both users and
     // the Dart analyzer. Keep the real-project diagnostic as the broad
     // regression gate: every generated token must now be a concrete Dart
-    // type or a named bridge such as `SyntaxBridgeOpaque`.
+    // type or a named bridge such as `SyntaxBridgeOpaque`. String literals
+    // are stripped first — a transpiled C++ string can legally contain the
+    // plain English word "dynamic" (Verovio's `options.cpp` does, in a
+    // `SetInfo(...)` help string), which isn't the Dart type this gate
+    // exists to catch.
     let dynamic_files: Vec<&str> = files
         .iter()
         .filter_map(|(path, contents)| {
-            contains_dart_token(contents, "dynamic").then_some(path.as_str())
+            contains_dart_token(&strip_dart_string_literals(contents), "dynamic")
+                .then_some(path.as_str())
         })
         .collect();
     assert!(
@@ -340,6 +345,38 @@ fn contains_dart_token(source: &str, sought: &str) -> bool {
         .any(|token| token == sought)
 }
 
+/// Blanks out the contents of every Dart string literal in `source`, so
+/// `contains_dart_token` only ever sees real code tokens. Needed because a
+/// transpiled C++ string literal can legally contain the plain English word
+/// "dynamic" (Verovio's `options.cpp` has one: `SetInfo("Dynam dist", "...
+/// for dynamic marks")`) — without this, that quoted prose would trip the
+/// same `dynamic`-type regression gate a real `dynamic` token should. Only
+/// needs to understand `emit::dart::dart_string_literal`'s own output shape
+/// (single-quoted, `\`-escaped, never triple-quoted or raw) since this test
+/// only ever scans text this project's own emitter produced.
+fn strip_dart_string_literals(source: &str) -> String {
+    let mut result = String::with_capacity(source.len());
+    let mut chars = source.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\'' && ch != '"' {
+            result.push(ch);
+            continue;
+        }
+        let quote = ch;
+        result.push(' ');
+        while let Some(next) = chars.next() {
+            if next == '\\' {
+                chars.next();
+                continue;
+            }
+            if next == quote {
+                break;
+            }
+        }
+    }
+    result
+}
+
 #[test]
 fn dynamic_regression_check_ignores_a_safe_identifier_suffix() {
     assert!(contains_dart_token(
@@ -347,6 +384,20 @@ fn dynamic_regression_check_ignores_a_safe_identifier_suffix() {
         "dynamic"
     ));
     assert!(!contains_dart_token("int dynamic_ = 0;", "dynamic"));
+}
+
+#[test]
+fn dynamic_regression_check_ignores_the_word_inside_a_string_literal() {
+    let source = "m.setInfo('Dynam dist', 'The default distance for dynamic marks');";
+    assert!(contains_dart_token(source, "dynamic"));
+    assert!(!contains_dart_token(
+        &strip_dart_string_literals(source),
+        "dynamic"
+    ));
+    assert!(contains_dart_token(
+        &strip_dart_string_literals("dynamic value2;"),
+        "dynamic"
+    ));
 }
 
 #[test]
