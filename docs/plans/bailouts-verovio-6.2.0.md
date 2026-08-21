@@ -1394,6 +1394,87 @@ resíduo de 3 provavelmente é a sobrecarga de 1 argumento (`ss.str(newValue)`,
 deliberadamente fora de escopo) ou um receptor não reconhecido pelo mesmo
 `stringstream_variable_name`, não auditado individualmente ainda.
 
+### Atualização de 2026-08-20 (20ª rodada) — retorno não-`void` do idiom out-param, escopado com segurança
+
+Executado pelo loop autônomo, continuação da sessão. Baseline: tipos
+1.595/236, expressões 5.285/351, statements 348/17 — total 7.228 (idêntico
+ao fim da 19ª rodada).
+
+**Feature: bridge de out-param estendido para retorno não-`void`, mas só na
+forma de ponteiro.** A causa raiz real do resíduo da 19ª rodada era
+`apply_out_param_bridge` só bridgear função `void` — o padrão dominante
+real é `bool`/status junto com os out-params (`editortoolkit_neume.h`'s
+`bool ParseDragAction(..., int *x, int *y)`, cujo corpo real é `if
+(!param.has<...>("x")) return false; (*x) = param.get<...>("x");` — um
+guard de retorno antecipado antes de qualquer escrita, e um deref-assign
+parentetizado — e cujo call site real, `editortoolkit_neume.cpp:92`, é
+`if (this->ParseDragAction(...)) { ... }`, usando o valor de retorno, não
+descartando).
+
+Escopado deliberadamente à **forma de ponteiro apenas**, nunca à forma de
+referência: um argumento de referência é um nome nu no call site
+(`Reduce(numerador, denominador)`, sem `&`), que lowera limpo pelo caminho
+de expressão comum em qualquer contexto que este módulo não reconheça
+especificamente — assumindo silenciosamente que o callee ainda retorna seu
+tipo escalar original em vez da nova tupla, sem nenhuma rede de segurança.
+Um argumento de ponteiro não tem esse risco: `&x` para um escalar puro
+sempre lowera para um `Unsupported` honesto fora das formas específicas que
+este módulo já desembrulha — então um call site não reconhecido para uma
+função não-`void` bridgeada por ponteiro falha com segurança (bailout
+honesto nos próprios argumentos), nunca compila contra a assinatura
+errada. Uma primeira tentativa sem o tratamento de `if`-condição foi
+implementada e **revertida antes de commitar**, depois de rastrear esse
+risco concretamente (`git checkout -- crates/server/src/lower/cpp.rs`,
+sem custo desperdiçado real já que a reimplementação reaproveitou o mesmo
+desenho).
+
+**Duas mudanças de call site, cobrindo os dois padrões reais:**
+
+1. **Chamada solta, retorno descartado** (`Stmt::TupleAssign` já existente):
+   o slot inicial (valor de retorno original) recebe `Expr::Ref{name: "_"}`
+   como alvo — o wildcard real de padrão de record do Dart —, com o
+   fallback de bloco-temporário de `emit::dart` (para quando outro alvo
+   precisa de `!` de receptor anulável) pulando esse slot inteiramente em
+   vez de gerar uma atribuição a um `_` não declarado.
+2. **`if (chamada(...))`/`if (!chamada(...))`** (o padrão real dominante):
+   `lower_if_with_out_param_call` reconhece o `IfStmt` inteiro e reescreve
+   para uma variável temporária guardando a tupla completa, um
+   `Stmt::ExprAssign` por alvo de out-param, e o `if` original testando só
+   o primeiro slot da tupla. Nenhuma variante de `Stmt` nova: reaproveita
+   `VarDecl`/`ExprAssign`/`If` já existentes, mais `Expr::FieldAccess` com
+   um nome de campo sintético `"$N"` (a própria sintaxe de campo posicional
+   de record do Dart) — viável porque `lower_stmt_into` já devolve
+   `Vec<Stmt>` (usado por `DeclStmt`/`CompoundStmt`), não `Stmt` único.
+
+**Bug real encontrado por um teste falhando, não hipótese**: `if
+(!chamada(...))` (negado) silenciosamente nunca casava — `CXUnaryOperator_
+Not` é `~` bit a bit; `!` lógico é `CXUnaryOperator_LNot`. Corrigido depois
+de conferir contra as próprias constantes do `clang-sys`.
+
+**Medição:** tipos 1.595/236 → **1.526/234** (−69 ocorrências, −2 causas —
+nenhuma das causas-alvo principais zerou de vez, mas todas reduziram:
+`int *` 59→44, `size_t *` 51→37, `mz_uint64 *` 59→53, `uint32_t *` 32→31,
+`uint16_t *` 30→29, `mz_uint32 *` 20→8, `time_t *` 12→9, `mz_ulong *`
+8→3); expressões 5.285/351 → **5.272/351** (−13, mesmas causas);
+statements inalterado (348/17); total 7.228 → **7.146** (−82, −1,1%);
+**1/301 arquivos inválidos** (mesmo `pugixml.dart`, sem regressão); `dart
+analyze` 15.632 → 15.752 erros (+120, mesmo padrão de exposição de
+cobertura já registrado várias vezes), 8.986 → 9.053 avisos. Conferido:
+zero tokens `dynamic`, zero panics.
+
+**Por que nenhuma causa zerou — residual esperado, dentro do escopo
+deliberado desta rodada, não um bug**: o escopo de segurança (só
+ponteiro, só `bool`/`int` de retorno, só as duas formas de call site
+reconhecidas) deixa de fora, por design: função com retorno não-`void`
+misturando forma de ponteiro e referência no mesmo out-param; call sites
+que usam o retorno de formas mais complexas (`if (chamada() && outraCoisa)`,
+atribuído a uma variável, dentro de um `while`); e — como já suspeitado nas
+rodadas 18/19 — ocorrências desses spellings que não são parâmetro de
+função nenhum (campo, variável local, ponteiro aritmético genuíno). Cada
+uma dessas é uma extensão de escopo genuína, não um bug a corrigir — a
+próxima rodada pode medir qual delas domina o resíduo antes de decidir se
+vale a pena estender mais.
+
 ## 1. Tipos sem mapeamento — snapshot-base de 4.384 ocorrências
 
 ### Progresso executado
