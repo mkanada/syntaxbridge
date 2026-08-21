@@ -473,6 +473,16 @@ fn emit_file(
     if source.contains("stderr.") {
         import_lines.push("import 'dart:io';".to_owned());
     }
+    // `math.max`/`math.min` (F6/tarefa 07's `std::max`/`std::min` bridge,
+    // `lower::cpp::lower_stdlib_free_function_call`) — the one construct in
+    // this file that needs a *namespaced* import, since `dart:math`'s own
+    // top-level `max`/`min` would otherwise collide with the many project
+    // functions and record methods already named `max`/`min` in the real
+    // Verovio corpus (grepped directly, e.g. `vrv::Point`'s own `Max`
+    // family) — confirmed as a real ambiguity risk, not hypothetical.
+    if source.contains("math.max(") || source.contains("math.min(") {
+        import_lines.push("import 'dart:math' as math;".to_owned());
+    }
     if source.contains(OPAQUE_TYPE_NAME)
         || source.contains(PAIR_TYPE_NAME)
         || source.contains(NATIVE_HANDLE_TYPE_NAME)

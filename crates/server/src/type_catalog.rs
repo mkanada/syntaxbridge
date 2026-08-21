@@ -1044,6 +1044,50 @@ pub(crate) fn cursor_site(
     Some((canonical_file_path.display().to_string(), line, column))
 }
 
+/// `cursor_site`'s counterpart for a cursor that *is* a system-header
+/// declaration — F6/tarefa 07, Metade B: cataloging a libc/POSIX free
+/// function (`memset`, `fclose`, ...) the moment `function_catalog::
+/// record_call` sees it called needs this cursor's own real file/line/
+/// column (for the catalog entry `externals.rs`'s path-regex rules can
+/// still match, and for the UI's externals list to show something
+/// meaningful), which `cursor_site` can never give it: that function
+/// unconditionally excludes every system-header location, by design, so
+/// the ordinary top-level declaration walk never floods the catalog with
+/// every libc/toolchain prototype reachable through an `#include`. `None`
+/// for anything that *isn't* a system-header location — this is
+/// deliberately the mirror image of `cursor_site`, not a general-purpose
+/// replacement for it.
+pub(crate) fn system_header_cursor_site(cursor: clang_sys::CXCursor) -> Option<(String, u32, u32)> {
+    let location = unsafe { clang_sys::clang_getCursorLocation(cursor) };
+    if unsafe { clang_sys::clang_Location_isInSystemHeader(location) } == 0 {
+        return None;
+    }
+
+    let mut file = std::ptr::null_mut();
+    let mut line: c_uint = 0;
+    let mut column: c_uint = 0;
+    unsafe {
+        clang_sys::clang_getSpellingLocation(
+            location,
+            &mut file,
+            &mut line,
+            &mut column,
+            std::ptr::null_mut(),
+        );
+    }
+
+    if file.is_null() {
+        return None;
+    }
+
+    let file_name = unsafe { cxstring_to_string(clang_sys::clang_getFileName(file)) };
+    if file_name.is_empty() {
+        return None;
+    }
+
+    Some((file_name, line, column))
+}
+
 /// Walks `cursor`'s semantic parents, collecting the spelling of every
 /// enclosing `namespace` (innermost last), and joins them with `::`.
 ///

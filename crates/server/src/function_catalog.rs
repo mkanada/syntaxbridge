@@ -2812,15 +2812,30 @@ fn declaration_identity(declaration: &FunctionDeclaration) -> String {
 /// an existing definition, and never duplicates: see `VisitorState.seen`'s
 /// doc comment for why a plain membership set isn't enough here.
 fn push_declaration(state: &mut VisitorState<'_>, declaration: FunctionDeclaration) {
+    push_declaration_into(state.declarations, state.seen, declaration);
+}
+
+/// `push_declaration`'s own logic, taking its two collections directly
+/// rather than the whole `VisitorState` — `record_call`'s
+/// `CallVisitorState` needs the identical dedup/upgrade behavior (F6/tarefa
+/// 07, Metade B: cataloging a system-header free function the moment it's
+/// first *called*, not from the top-level declaration walk — see
+/// `catalog_system_header_free_function_call`) without borrowing a whole
+/// `VisitorState` it doesn't otherwise have access to.
+fn push_declaration_into(
+    declarations: &mut Vec<FunctionDeclaration>,
+    seen: &mut HashMap<String, usize>,
+    declaration: FunctionDeclaration,
+) {
     let identity = declaration_identity(&declaration);
-    match state.seen.get(&identity) {
+    match seen.get(&identity) {
         None => {
-            state.seen.insert(identity, state.declarations.len());
-            state.declarations.push(declaration);
+            seen.insert(identity, declarations.len());
+            declarations.push(declaration);
         }
         Some(&index) => {
-            if !state.declarations[index].has_definition && declaration.has_definition {
-                state.declarations[index] = declaration;
+            if !declarations[index].has_definition && declaration.has_definition {
+                declarations[index] = declaration;
             }
         }
     }
@@ -3118,6 +3133,8 @@ extern "C" fn visit_cursor(
                 ir_functions: &mut *state.ir_functions,
                 ir_function_is_prototype: &mut *state.ir_function_is_prototype,
                 ir_seen: &mut *state.ir_seen,
+                declarations: &mut *state.declarations,
+                declaration_seen: &mut *state.seen,
                 pending_overload: None,
             };
             unsafe {
@@ -3155,6 +3172,15 @@ struct CallVisitorState<'a> {
     /// template instantiation, never a prototype-only stand-in.
     ir_function_is_prototype: &'a mut Vec<bool>,
     ir_seen: &'a mut HashSet<String>,
+    /// F6/tarefa 07, Metade B: the same catalog `VisitorState.declarations`
+    /// holds, reborrowed so `record_call` can catalog a system-header free
+    /// function (libc/POSIX — `memset`, `fclose`, ...) the moment it's
+    /// first *called*, via `push_declaration_into` — see
+    /// `catalog_system_header_free_function_call`'s own doc comment for why
+    /// this can't happen at `visit_cursor`'s top-level declaration walk the
+    /// way an in-project prototype's cataloging does.
+    declarations: &'a mut Vec<FunctionDeclaration>,
+    declaration_seen: &'a mut HashMap<String, usize>,
     /// Set by `visit_call_site` when the immediately preceding sibling
     /// cursor was an unresolved `CXCursor_OverloadedDeclRef` (case B04) —
     /// consumed by the very next callback, whichever cursor that turns out
@@ -3386,6 +3412,12 @@ fn record_call(cursor: clang_sys::CXCursor, state: &mut CallVisitorState<'_>) {
                     reason: "resolved callee has no stable identity".to_owned(),
                 }
             } else {
+                if !is_template_instantiation && referenced_kind == clang_sys::CXCursor_FunctionDecl
+                {
+                    unsafe {
+                        catalog_system_header_free_function_call(referenced, &callee_usr, state);
+                    }
+                }
                 CallResolution::Resolved {
                     callee_usr,
                     is_dynamic_dispatch,
@@ -3409,6 +3441,99 @@ fn record_call(cursor: clang_sys::CXCursor, state: &mut CallVisitorState<'_>) {
     if state.call_seen.insert(call_identity(&edge)) {
         state.calls.push(edge);
     }
+}
+
+/// F6/tarefa 07, Metade B: the moment a call resolves to a **non-template**
+/// free function declared in a system header (libc/POSIX — `memset`,
+/// `fclose`, `stat`, ...) that Metade A's curated `std::` adapters don't
+/// already translate (`lower::cpp::is_bridged_stdlib_free_function`), this
+/// catalogs it and synthesizes a mock `ir::Function` for it — the same
+/// "declared but never defined" shape `visit_cursor` already gives an
+/// in-project prototype (`is_uncatalogued_free_prototype`), just reached
+/// from the call site instead of the top-level declaration walk. It has to
+/// happen here: `type_catalog::cursor_site` (what both `describe_function`
+/// and `lower::cpp::lower_function` require) unconditionally filters out
+/// every system-header location, and the top-level walk itself
+/// deliberately never catalogs one at all
+/// (`is_uncatalogued_free_prototype`'s own doc comment: "every
+/// libc/toolchain prototype reachable through an #include would otherwise
+/// flood the catalog with thousands of entries nothing ever calls") —
+/// cataloging only the ones a call site actually resolved to is what keeps
+/// that flood out while still giving `externals.rs`'s auto-detection
+/// (`AutoUndefinedFunction`) a real, named, imported Dart adapter to mock
+/// instead of a bare, undefined-in-Dart identifier at the call site.
+///
+/// Excludes every operator overload (Dart has no free-standing operators to
+/// begin with — `is_plain_dart_identifier`) and, via the caller's own
+/// `!is_template_instantiation` guard, every C++ template algorithm
+/// (`std::sort`/`std::find_if`/..., deliberately left for a future
+/// idiom-level translation — tarefa 13 — rather than permanently mocked as
+/// an unimplementable external boundary). Dedups on `state.ir_seen`, shared
+/// with the E08 monomorphized-function synthesis just above: both key on a
+/// usr that, once present, never needs a second `ir::Function` pushed for
+/// it.
+unsafe fn catalog_system_header_free_function_call(
+    referenced: clang_sys::CXCursor,
+    callee_usr: &str,
+    state: &mut CallVisitorState<'_>,
+) {
+    if unsafe {
+        clang_sys::clang_Location_isInSystemHeader(clang_sys::clang_getCursorLocation(referenced))
+    } == 0
+    {
+        return;
+    }
+    let name =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced)) };
+    if !lower::cpp::is_plain_dart_identifier(&name)
+        || unsafe { lower::cpp::is_bridged_stdlib_free_function(referenced) }
+        || !state.ir_seen.insert(callee_usr.to_owned())
+    {
+        return;
+    }
+    let Some((file, line, column)) = type_catalog::system_header_cursor_site(referenced) else {
+        return;
+    };
+    let namespace = unsafe { type_catalog::namespace_of(referenced) };
+    let (end_line, end_column) = unsafe { type_catalog::extent_end(referenced) };
+    let signature = unsafe {
+        build_signature(
+            referenced,
+            &name,
+            FunctionDeclarationKind::FreeFunction,
+            false,
+        )
+    };
+    push_declaration_into(
+        state.declarations,
+        state.declaration_seen,
+        FunctionDeclaration {
+            name,
+            kind: FunctionDeclarationKind::FreeFunction,
+            namespace,
+            owning_class_usr: None,
+            signature,
+            file: file.clone(),
+            line,
+            column,
+            end_line,
+            end_column,
+            usr: callee_usr.to_owned(),
+            is_static: false,
+            is_virtual: false,
+            is_pure_virtual: false,
+            is_defaulted: false,
+            overridden_usrs: Vec::new(),
+            has_definition: false,
+        },
+    );
+
+    let origin = ir::Origin { file, line, column };
+    let function_ir = unsafe {
+        lower::cpp::lower_system_header_free_function_mock(referenced, callee_usr, origin)
+    };
+    state.ir_functions.push(function_ir);
+    state.ir_function_is_prototype.push(true);
 }
 
 fn function_declaration_kind_for(kind: clang_sys::CXCursorKind) -> Option<FunctionDeclarationKind> {

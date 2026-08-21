@@ -3731,7 +3731,7 @@ int via_wrapped_statement(int yAboveStem, int staffHeight) {
     );
 
     assert!(
-        source.contains("(yIn = max(yAboveStem, -staffHeight));"),
+        source.contains("(yIn = math.max(yAboveStem, -staffHeight));"),
         "expected the wrapped-statement assignment to lower to a parenthesized assignment expression, got:\n{source}"
     );
     assert!(
@@ -5369,5 +5369,278 @@ struct Thing {
     assert!(
         source.contains("throw UnimplementedError("),
         "expected an honest bailout instead, got:\n{source}"
+    );
+}
+
+/// F6/tarefa 07, Metade A: `std::max`/`std::min`/`std::abs`/`std::to_string`
+/// as free functions — the causa raiz the prompt names is that these all
+/// fell through `lower_call_expr`'s generic path (accepted because
+/// `is_plain_dart_identifier("max")` is true) and printed as a bare,
+/// undefined-in-Dart identifier, read as `this.max(...)` when called from
+/// inside a method. `lower_stdlib_free_function_call` now recognizes each
+/// one before that fallback.
+#[test]
+fn std_max_min_abs_to_string_lower_to_their_dart_equivalents() {
+    let source = lower_and_emit(
+        "lower-cpp-std-free-functions",
+        r#"
+#include <algorithm>
+#include <cmath>
+#include <string>
+
+int clamp_ish(int a, int b, int c) {
+    int hi = std::max(a, b);
+    int lo = std::min(a, b);
+    int magnitude = std::abs(c);
+    std::string text = std::to_string(c);
+    return hi + lo + magnitude + (int)text.size();
+}
+"#,
+    );
+
+    assert!(
+        source.contains("math.max(a, b)"),
+        "expected std::max to lower to math.max, got:\n{source}"
+    );
+    assert!(
+        source.contains("math.min(a, b)"),
+        "expected std::min to lower to math.min, got:\n{source}"
+    );
+    assert!(
+        source.contains("c.abs()"),
+        "expected std::abs(c) to lower to c.abs(), got:\n{source}"
+    );
+    assert!(
+        source.contains("c.toString()"),
+        "expected std::to_string(c) to lower to c.toString(), got:\n{source}"
+    );
+    assert!(
+        source.contains("import 'dart:math' as math;"),
+        "expected a namespaced dart:math import, got:\n{source}"
+    );
+    assert!(
+        !source.contains("throw UnimplementedError("),
+        "got:\n{source}"
+    );
+}
+
+/// F6/tarefa 07, Metade A: `std::make_pair(a, b)` and the equivalent direct
+/// `std::pair<A, B>(a, b)` construction both target `SyntaxBridgePair` —
+/// `Type::Pair`'s own Dart representation, already used by
+/// `mock_value_for_type`/pointee-shape lookups but never, before this,
+/// actually constructed from live values.
+#[test]
+fn std_make_pair_and_pair_construction_lower_to_syntax_bridge_pair() {
+    let source = lower_and_emit(
+        "lower-cpp-std-pair",
+        r#"
+#include <utility>
+
+std::pair<int, int> via_make_pair(int a, int b) {
+    return std::make_pair(a, b);
+}
+
+std::pair<int, int> via_direct_construction(int a, int b) {
+    return std::pair<int, int>(a, b);
+}
+"#,
+    );
+
+    assert!(
+        source.contains("SyntaxBridgePair(a, b)"),
+        "expected both std::make_pair and std::pair(...) to build a SyntaxBridgePair, got:\n{source}"
+    );
+    assert!(
+        source.contains("import 'syntax_bridge_support.dart';"),
+        "expected the support-file import for SyntaxBridgePair, got:\n{source}"
+    );
+    assert!(
+        !source.contains("throw UnimplementedError("),
+        "got:\n{source}"
+    );
+}
+
+/// F6/tarefa 07, Metade A: `std::swap(a, b);` mutates both operands, so it
+/// can't rewrite to a single expression the way `std::max`/`std::abs` do —
+/// it expands into a hoisted temporary plus two assignments.
+#[test]
+fn std_swap_lowers_to_a_temp_variable_and_two_assignments() {
+    let source = lower_and_emit(
+        "lower-cpp-std-swap",
+        r#"
+#include <algorithm>
+
+void trade(int& a, int& b) {
+    std::swap(a, b);
+}
+"#,
+    );
+
+    assert!(
+        source.contains("int _syntaxBridgeSwapTemp = a;"),
+        "expected a hoisted temp holding a's original value, got:\n{source}"
+    );
+    assert!(
+        source.contains("a = b;"),
+        "expected a to take b's value, got:\n{source}"
+    );
+    assert!(
+        source.contains("b = _syntaxBridgeSwapTemp;"),
+        "expected b to take a's original value back from the temp, got:\n{source}"
+    );
+    assert!(!source.contains("swap(a, b)"), "got:\n{source}");
+    assert!(
+        !source.contains("throw UnimplementedError("),
+        "got:\n{source}"
+    );
+}
+
+/// F6/tarefa 07, Metade B: a call to `memset` (libc, declared in a system
+/// header, never defined by this project) must become a real, imported,
+/// named Dart adapter — visible as its own function, its call site
+/// importing it — never a bare, undefined-in-Dart identifier printed
+/// literally (the doc's own real trigger: `zip_file.cpp`'s `free(pComp);`).
+/// Exercises the full pipeline `project_service::build_transpiled_package`
+/// itself uses: catalog → `externals::effective_external_set` → `emit::
+/// dart::emit_module_with_externals` — a plain `emit_module` (what
+/// `lower_and_emit` calls) never mocks anything, external or not.
+#[test]
+fn a_libc_free_function_call_becomes_a_named_external_adapter() {
+    let workspace =
+        TempWorkspace::new("lower-cpp-libc-external-memset").expect("create temporary workspace");
+    let unit = write_fixture(
+        workspace.path(),
+        r#"
+#include <cstring>
+
+void clear(void* p, int n) {
+    memset(p, 0, n);
+}
+"#,
+        "probe.cpp",
+    );
+    let catalog = function_catalog::extract_function_catalog(&[unit], workspace.path(), None)
+        .expect("extract function catalog");
+
+    let memset_declaration = catalog
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "memset")
+        .expect("expected memset to be cataloged from its call site");
+    assert!(
+        !memset_declaration.has_definition,
+        "expected memset to be cataloged as undefined by this project"
+    );
+
+    let external_usr_owned: Vec<String> = syntax_bridge_server::externals::effective_external_set(
+        &[],
+        &catalog.declarations,
+        &catalog.calls,
+        &[],
+        &[],
+        &[],
+        &[],
+    )
+    .into_iter()
+    .filter(|status| status.effective)
+    .map(|status| status.usr)
+    .collect();
+    let external_usrs: std::collections::HashSet<&str> =
+        external_usr_owned.iter().map(String::as_str).collect();
+    assert!(
+        external_usrs.contains(memset_declaration.usr.as_str()),
+        "expected memset's usr to be auto-detected as external, got: {external_usrs:?}"
+    );
+
+    let module = syntax_bridge_server::ir::Module {
+        functions: catalog.ir_functions.clone(),
+        records: catalog.ir_records.clone(),
+        enums: catalog.ir_enums.clone(),
+    };
+    let source =
+        syntax_bridge_server::emit::dart::emit_module_with_externals(&module, &external_usrs)
+            .into_values()
+            .collect::<Vec<_>>()
+            .join("\n");
+
+    assert!(
+        source.contains("memset(p, 0, n)"),
+        "expected the call site to still reference memset by name, got:\n{source}"
+    );
+    assert!(
+        source.contains("memset("),
+        "expected a real, declared Dart adapter for memset, got:\n{source}"
+    );
+    assert!(
+        !source.contains("throw UnimplementedError("),
+        "expected memset's own body to be a plausible mock, not a throw, got:\n{source}"
+    );
+}
+
+/// F6/tarefa 07, Metade B: `va_list`'s own libc/glibc shape (`typedef struct
+/// __va_list_tag __builtin_va_list[1];`) reaches `lower_type`'s array
+/// branch, whose element is `__va_list_tag` — a *compiler builtin*, not a
+/// declaration from any real header, so `clang_Location_isInSystemHeader`
+/// on it is false and it used to fall through as a bare, undeclared
+/// `Type::Record`, printing `List<__va_list_tag>` (`dart analyze`'s
+/// `non_type_as_type_argument`, 17 of the 19 real Verovio occurrences —
+/// `vrv.cpp`'s varargs helpers).
+#[test]
+fn a_va_list_parameter_never_prints_the_bare_undeclared_va_list_tag_type() {
+    let source = lower_and_emit(
+        "lower-cpp-va-list-tag",
+        r#"
+#include <cstdarg>
+
+void useVaList(va_list args) {
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("<__va_list_tag>"),
+        "__va_list_tag must never print as a bare, undeclared Dart type argument \
+         (appearing inside a bailout's own comment/message is fine), got:\n{source}"
+    );
+    assert!(
+        source.contains("SyntaxBridgeOpaque"),
+        "expected an honest opaque bailout for __va_list_tag instead, got:\n{source}"
+    );
+}
+
+/// F6/tarefa 07: `std::string()`'s default constructor — real Verovio
+/// trigger, `jsonxx.cc`'s `const std::string &attr = std::string()` default
+/// parameter value and `return std::string();` — must lower to Dart's empty
+/// string literal, not fall through to a literal `basic_string()` call
+/// (`dart analyze`'s `undefined_function`; `basic_string` was never
+/// `lower_record`'d, so no such Dart function exists).
+#[test]
+fn a_default_constructed_std_string_lowers_to_an_empty_string_literal() {
+    let source = lower_and_emit(
+        "lower-cpp-default-constructed-std-string",
+        r#"
+#include <string>
+
+std::string withDefault(const std::string& attr = std::string()) {
+    return attr;
+}
+
+std::string returnsEmpty() {
+    return std::string();
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("basic_string()"),
+        "expected no literal basic_string() call, got:\n{source}"
+    );
+    assert!(
+        source.contains("String attr = ''"),
+        "expected the default parameter value to lower to an empty string literal, got:\n{source}"
+    );
+    assert!(
+        source.contains("return '';"),
+        "expected the return statement to lower to an empty string literal, got:\n{source}"
     );
 }

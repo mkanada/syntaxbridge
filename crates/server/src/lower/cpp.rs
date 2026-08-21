@@ -552,6 +552,72 @@ pub fn lower_function(
     })
 }
 
+/// A minimal `ir::Function` for a system-header free function (libc/POSIX
+/// — `memset`, `fclose`, ...) that F6/tarefa 07's Metade B just cataloged
+/// as an external boundary (`function_catalog::
+/// catalog_system_header_free_function_call`). `lower_function` itself
+/// can't be reused here: it requires `type_catalog::cursor_site`, which
+/// unconditionally refuses every system-header location (by design — see
+/// that function's own doc comment on why the ordinary top-level
+/// declaration walk never catalogs one at all). `origin` is built by the
+/// caller from `type_catalog::system_header_cursor_site` instead.
+///
+/// The body is always the same honest "declared but never defined in any
+/// compilation unit of this project" bailout the in-project
+/// uncataloged-prototype path already gives (`function_catalog::
+/// visit_cursor`'s own `is_uncatalogued_free_prototype` branch) — never
+/// actually reached when this usr ends up in the effective external set
+/// (`emit::dart`'s `MockContext` derives a mock body straight from
+/// `return_type`, ignoring `body` entirely), but kept honest for the case
+/// the user manually excludes this auto-detected candidate
+/// (`docs/plans/lista-de-externos.md` decision 4/5).
+pub(crate) unsafe fn lower_system_header_free_function_mock(
+    referenced: clang_sys::CXCursor,
+    usr: &str,
+    origin: ir::Origin,
+) -> ir::Function {
+    let name =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced)) };
+    let return_type = lower_type(unsafe { clang_sys::clang_getCursorResultType(referenced) });
+    let arg_count = unsafe { clang_sys::clang_Cursor_getNumArguments(referenced) };
+    let params = if arg_count < 0 {
+        Vec::new()
+    } else {
+        (0..arg_count as c_uint)
+            .map(|index| {
+                let param_cursor =
+                    unsafe { clang_sys::clang_Cursor_getArgument(referenced, index) };
+                let raw_name = unsafe {
+                    type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(
+                        param_cursor,
+                    ))
+                };
+                let name = if raw_name.is_empty() {
+                    format!("arg{index}")
+                } else {
+                    dart_safe_identifier(&raw_name)
+                };
+                ir::Param {
+                    name,
+                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(param_cursor) }),
+                    default_value: None,
+                }
+            })
+            .collect()
+    };
+    ir::Function {
+        name,
+        usr: usr.to_owned(),
+        params,
+        return_type,
+        body: vec![ir::Stmt::Unsupported {
+            reason: "declared but never defined in any compilation unit of this project".to_owned(),
+            origin: origin.clone(),
+        }],
+        origin,
+    }
+}
+
 /// Lowers a method's *definition* cursor into IR — called from
 /// `function_catalog::visit_cursor` for a `CXXMethodDecl` with a body
 /// (inline or out-of-line), the same way `lower_function` handles a free
@@ -1322,6 +1388,31 @@ unsafe fn member_ref_receiver(
     }
 }
 
+/// Whether `cursor`'s own spelling location resolves to no real file at
+/// all — true for a compiler builtin (`__va_list_tag`, confirmed
+/// empirically: `clang_Location_isInSystemHeader` on it is *false*, since
+/// there's no header it's "in"), never for an ordinary declaration from
+/// project source or a real system header, both of which always have a
+/// genuine file. Deliberately independent of `project_root` (unlike
+/// `type_catalog::cursor_site`) — `lower_type` has no path context to give
+/// it, and doesn't need one: this only ever needs to tell "a real
+/// declaration somewhere" apart from "no declaration at all", not which
+/// project a real one belongs to.
+unsafe fn cursor_has_no_real_file_location(cursor: clang_sys::CXCursor) -> bool {
+    let location = unsafe { clang_sys::clang_getCursorLocation(cursor) };
+    let mut file = std::ptr::null_mut();
+    unsafe {
+        clang_sys::clang_getSpellingLocation(
+            location,
+            &mut file,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+    }
+    file.is_null()
+}
+
 fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
     // `Ponto` (bare, unqualified) resolves to `CXType_Elaborated`, not
     // `CXType_Record`, directly — confirmed empirically on a parameter type
@@ -1828,6 +1919,21 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
             } else if unsafe {
                 clang_sys::clang_Location_isInSystemHeader(clang_sys::clang_getCursorLocation(decl))
             } != 0
+                // `__va_list_tag` (F6/tarefa 07, Metade B: `va_list`'s own
+                // element type, `typedef struct __va_list_tag
+                // __builtin_va_list[1];`) is a *compiler builtin*, not a
+                // declaration `#include`d from any real header — confirmed
+                // empirically: its own `clang_Location_isInSystemHeader` is
+                // false (there's no header to be "in"), so without this it
+                // fell through to the ordinary `Type::Record { usr, name }`
+                // branch below and printed as a bare, undeclared
+                // `__va_list_tag` (inside `List<__va_list_tag>`, since
+                // `va_list`'s array-of-1 shape reaches here through the
+                // `CXType_ConstantArray` branch above) — `dart analyze`'s
+                // `non_type_as_type_argument`. A real project declaration
+                // always has a genuine file location, so this can't misfire
+                // on one.
+                || unsafe { cursor_has_no_real_file_location(decl) }
             {
                 // A named, non-anonymous declaration with a real usr isn't
                 // automatically one of *this project's* records — libstdc++
@@ -2693,7 +2799,92 @@ unsafe fn lower_stmt_into(cursor: clang_sys::CXCursor, project_root: &Path) -> V
             return statements;
         }
     }
+    if kind == clang_sys::CXCursor_CallExpr {
+        let origin = stmt_origin(cursor, project_root);
+        if let Some(statements) = unsafe { lower_std_swap_stmt(cursor, project_root, &origin) } {
+            return statements;
+        }
+    }
     vec![unsafe { lower_stmt(cursor, project_root) }]
+}
+
+/// `std::swap(a, b);` (F6/tarefa 07, Metade A's "outros" bucket) — Dart has
+/// no free `swap` function, and unlike `std::max`/`std::abs` this isn't a
+/// pure-value call that can rewrite to a single expression: it mutates both
+/// operands, so it has to expand into three statements the same way
+/// `lower_string_byte_assign_stmt` already expands a byte-indexed string
+/// write — exactly why this lives in `lower_stmt_into`, not `lower_stmt`.
+/// `None` for anything that isn't a two-argument call to `std::swap` on two
+/// plain assignable lvalues; once that shape is confirmed, an
+/// unassignable-target pair still commits to an honest
+/// `Stmt::Unsupported` rather than falling through to `lower_stmt`'s
+/// generic `ExprStmt` path, which would print a literal, undefined `swap(a,
+/// b);` in Dart.
+unsafe fn lower_std_swap_stmt(
+    cursor: clang_sys::CXCursor,
+    project_root: &Path,
+    origin: &ir::Origin,
+) -> Option<Vec<ir::Stmt>> {
+    let referenced = unsafe { clang_sys::clang_getCursorReferenced(cursor) };
+    if unsafe { clang_sys::clang_Cursor_isNull(referenced) } != 0
+        || unsafe { clang_sys::clang_getCursorKind(referenced) } != clang_sys::CXCursor_FunctionDecl
+    {
+        return None;
+    }
+    let name =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced)) };
+    if name != "swap"
+        || unsafe {
+            clang_sys::clang_Location_isInSystemHeader(clang_sys::clang_getCursorLocation(
+                referenced,
+            ))
+        } == 0
+        || !unsafe { free_function_reachable_from_std(referenced) }
+    {
+        return None;
+    }
+
+    if unsafe { clang_sys::clang_Cursor_getNumArguments(cursor) } != 2 {
+        return Some(vec![ir::Stmt::Unsupported {
+            reason: "unsupported argument shape for std::swap".to_owned(),
+            origin: origin.clone(),
+        }]);
+    }
+    let lhs_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 0) };
+    let rhs_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 1) };
+    let lhs = unsafe { lower_expr(lhs_cursor, project_root) };
+    let rhs = unsafe { lower_expr(rhs_cursor, project_root) };
+    if unassignable_target_reason(&lhs).is_some() || unassignable_target_reason(&rhs).is_some() {
+        return Some(vec![ir::Stmt::Unsupported {
+            reason: "std::swap operand is not representable as a Dart assignment target".to_owned(),
+            origin: origin.clone(),
+        }]);
+    }
+
+    let ty = lower_type(unsafe { clang_sys::clang_getCursorType(lhs_cursor) });
+    let temp_name = "_syntaxBridgeSwapTemp".to_owned();
+    Some(vec![
+        ir::Stmt::VarDecl {
+            name: temp_name.clone(),
+            ty: ty.clone(),
+            init: Some(lhs.clone()),
+            origin: origin.clone(),
+        },
+        ir::Stmt::ExprAssign {
+            target: lhs,
+            value: rhs.clone(),
+            origin: origin.clone(),
+        },
+        ir::Stmt::ExprAssign {
+            target: rhs,
+            value: ir::Expr::Ref {
+                name: temp_name,
+                ty,
+                origin: origin.clone(),
+            },
+            origin: origin.clone(),
+        },
+    ])
 }
 
 /// `target[index] = value;` where `target[index]` reads as a byte-indexed
@@ -6094,6 +6285,23 @@ unsafe fn lower_call_expr(
             let arg_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 0) };
             return unsafe { lower_expr(arg_cursor, project_root) };
         }
+        // `std::string()` (F6/tarefa 07: real Verovio trigger —
+        // `jsonxx.cc`'s `const std::string &attr = std::string()` default
+        // parameter value) — the default constructor, zero real arguments
+        // (confirmed empirically: unlike the converting-constructor case
+        // just above, there's no defaulted-allocator argument here at all).
+        // `basic_string` was never `lower_record`'d (`Type::Str`'s own doc
+        // comment), so falling through to the generic constructor-call path
+        // below would name a Dart function that doesn't exist —
+        // `basic_string()`, `dart analyze`'s `undefined_function`. An empty
+        // Dart string is the exact same value a default-constructed
+        // `std::string` already has.
+        if arg_count == 0 && owner_template_name.as_deref() == Some("basic_string") {
+            return ir::Expr::StringLiteral {
+                value: String::new(),
+                origin,
+            };
+        }
         // A Dart nullable value directly models an engaged optional. The
         // constructor has no remaining runtime identity after the type
         // boundary has become T?, so retain just its payload.
@@ -6176,6 +6384,37 @@ unsafe fn lower_call_expr(
                     origin,
                 };
             }
+        }
+        // `std::pair<A, B> p(a, b);` / `std::pair<A, B>(a, b)` — the
+        // constructor counterpart to `lower_stdlib_free_function_call`'s
+        // `make_pair` case above: same Dart target (`SyntaxBridgePair`,
+        // `Type::Pair`'s own representation — see the `PointeeShape::Known`
+        // table above), just reached via direct construction syntax instead
+        // of the free function. `pair` has no defaulted-allocator argument
+        // the way `basic_string`/`vector` do (confirmed empirically), so
+        // `arg_count == 2` is the exact real-argument count, not merely a
+        // floor the way it is for those two.
+        if arg_count == 2
+            && owner_template_name.as_deref() == Some("pair")
+            && let ir::Type::Pair(_, _) =
+                lower_type(unsafe { clang_sys::clang_getCursorType(cursor) })
+        {
+            let ty = lower_type(unsafe { clang_sys::clang_getCursorType(cursor) });
+            let first_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 0) };
+            let second_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 1) };
+            let first = unsafe { lower_expr(first_cursor, project_root) };
+            let second = unsafe { lower_expr(second_cursor, project_root) };
+            return ir::Expr::Call {
+                target: None,
+                callee_usr: unsafe {
+                    type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(referenced))
+                },
+                // Must read the same literal name as `emit::dart::PAIR_TYPE_NAME`.
+                callee_name: "SyntaxBridgePair".to_owned(),
+                args: vec![first, second],
+                ty,
+                origin,
+            };
         }
         // A real (non-copy/move) constructor call — E04. `lower_decl_stmt`
         // already routes the *trivial implicit* default constructor (no
@@ -6516,7 +6755,7 @@ unsafe fn lower_callable_value_call(
 /// generic `Call`-construction fallback in this module: a call target this
 /// rejects has no valid literal spelling in Dart, so it must become
 /// `Expr::Unsupported` instead of a `Call` `emit::dart` would print verbatim.
-fn is_plain_dart_identifier(name: &str) -> bool {
+pub(crate) fn is_plain_dart_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
@@ -8220,17 +8459,97 @@ unsafe fn lower_iterator_for_loop(
     })
 }
 
-/// `std::gcd(a, b)` (`<numeric>`, E13's `Fraction::Reduce`) — the one
-/// non-operator, non-method `std` free function this corpus needs a bridge
-/// for. Dart's `int` already has this exact method natively
-/// (`5.gcd(6) == 1`, confirmed with real `dart analyze`/`dart run` — no
-/// helper function needed at all, unlike `Expr::StringByteLength`'s UTF-8
-/// bridge), so this maps the two-argument free call directly onto a method
-/// call on the first argument (`a.gcd(b)`) rather than emitting a
-/// `Call` to a top-level `gcd` that doesn't exist in Dart. Gated on
-/// `clang_Location_isInSystemHeader` and the owning namespace being `std`,
-/// the same two-part guard `lower_stdlib_operator_call` uses, so a
-/// project's own free function named `gcd` is never mistaken for this one.
+/// Whether `decl` (a `FunctionDecl` already confirmed to live in a system
+/// header) is reachable from `std` — either declared directly inside
+/// `namespace std` (or one of its inline namespaces, e.g. libstdc++'s
+/// `std::__cxx11` for `to_string`, confirmed via `clang++ -Xclang
+/// -ast-dump`: walked the same way `stdlib_template_name` already walks a
+/// template's ancestors) or declared directly in the *global* namespace and
+/// reached only through a `using` declaration `std` itself resolves through
+/// (confirmed for `std::abs(int)`: libstdc++'s `<cstdlib>` does `using
+/// ::abs;`, so `clang_getCursorReferenced` on the call already resolves
+/// straight past the `UsingShadowDecl` to glibc's real, global-scope `::abs`
+/// — there is no libclang API left, by that point, to ask "was this reached
+/// via `std::`", so a global-scope declaration is accepted outright here).
+/// The false-positive this can't rule out — a project's own vendored
+/// third-party header happening to declare an unrelated global `abs`/`max`/…
+/// and *also* being clang-flagged as a system header (`-isystem`) — is the
+/// same pre-existing risk `gcd`'s own guard already carries; not new.
+unsafe fn free_function_reachable_from_std(decl: clang_sys::CXCursor) -> bool {
+    let mut ancestor = unsafe { clang_sys::clang_getCursorSemanticParent(decl) };
+    // Whether the walk has crossed a *named, non-`std`* namespace before
+    // either finding `std` or running out of ancestors. `extern "C" { ... }`
+    // blocks (`CXCursor_LinkageSpec`, glibc's real wrapping for `::abs`)
+    // carry no name of their own and are skipped transparently rather than
+    // tripping this — a bare global-scope declaration (no namespace at all)
+    // still counts as reachable.
+    let mut saw_other_namespace = false;
+    loop {
+        if unsafe { clang_sys::clang_Cursor_isNull(ancestor) } != 0
+            || unsafe { clang_sys::clang_getCursorKind(ancestor) }
+                == clang_sys::CXCursor_TranslationUnit
+        {
+            return !saw_other_namespace;
+        }
+        if unsafe { clang_sys::clang_getCursorKind(ancestor) } == clang_sys::CXCursor_Namespace {
+            let name = unsafe {
+                type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(ancestor))
+            };
+            if name == "std" {
+                return true;
+            }
+            saw_other_namespace = true;
+        }
+        ancestor = unsafe { clang_sys::clang_getCursorSemanticParent(ancestor) };
+    }
+}
+
+/// Every free-function name F6/tarefa 07's Metade A gives a real Dart
+/// translation to — `lower_stdlib_free_function_call`'s own curated list,
+/// plus `swap` (bridged separately, at the statement level, by
+/// `lower_std_swap_stmt`, since it mutates both operands rather than
+/// producing a single value). Shared with
+/// `function_catalog::record_call` (via `is_bridged_stdlib_free_function`
+/// below) so Metade B's external-boundary auto-detection never *also*
+/// mocks a symbol Metade A already translates for real — that would emit
+/// an unused, dead mock function alongside the real call and risk `dart
+/// analyze`'s `unused_element`.
+const BRIDGED_STDLIB_FREE_FUNCTION_NAMES: &[&str] =
+    &["gcd", "max", "min", "abs", "to_string", "make_pair", "swap"];
+
+/// Whether `referenced` (a resolved call target already confirmed to be a
+/// `CXCursor_FunctionDecl`) is one of Metade A's curated `std::` adapters —
+/// see `BRIDGED_STDLIB_FREE_FUNCTION_NAMES`'s own doc comment for why
+/// `function_catalog::record_call` needs this exclusion.
+pub(crate) unsafe fn is_bridged_stdlib_free_function(referenced: clang_sys::CXCursor) -> bool {
+    let name =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced)) };
+    BRIDGED_STDLIB_FREE_FUNCTION_NAMES.contains(&name.as_str())
+        && unsafe {
+            clang_sys::clang_Location_isInSystemHeader(clang_sys::clang_getCursorLocation(
+                referenced,
+            ))
+        } != 0
+        && unsafe { free_function_reachable_from_std(referenced) }
+}
+
+/// `std` free functions with a direct, unconditional Dart equivalent — no
+/// per-project mapping decision needed, the same way `lower_stdlib_operator_call`
+/// below needs none: every one of these names means the exact same thing in
+/// every C++ program that spells it, so there is no "which Dart target did
+/// the user mean" question to ask (unlike, say, a record's own method,
+/// where US-7's `mapping::MappingDecision` exists precisely because the
+/// answer depends on the project). Gated on `clang_Location_isInSystemHeader`
+/// and the owning namespace being `std`, the same two-part guard
+/// `lower_stdlib_operator_call` uses, so a project's own free function named
+/// `max`/`abs`/`swap`/… is never mistaken for the standard library's.
+///
+/// Once a name matches and the guard passes, this is committed to being
+/// `std::<name>` — an argument shape this doesn't recognize falls to
+/// `Expr::UnsupportedTyped` rather than `None`, which would let the call
+/// fall through to the generic path below and print a literal, undefined
+/// Dart identifier (F6/tarefa 07's whole premise: "silêncio é proibido"
+/// applies here exactly as it does to `lower_stdlib_method_call`).
 unsafe fn lower_stdlib_free_function_call(
     call_cursor: clang_sys::CXCursor,
     referenced: clang_sys::CXCursor,
@@ -8238,7 +8557,7 @@ unsafe fn lower_stdlib_free_function_call(
     project_root: &Path,
     origin: &ir::Origin,
 ) -> Option<ir::Expr> {
-    if callee_name != "gcd" {
+    if !BRIDGED_STDLIB_FREE_FUNCTION_NAMES.contains(&callee_name) || callee_name == "swap" {
         return None;
     }
     if unsafe {
@@ -8247,41 +8566,142 @@ unsafe fn lower_stdlib_free_function_call(
     {
         return None;
     }
-    let owner = unsafe { clang_sys::clang_getCursorSemanticParent(referenced) };
-    let owner_name =
-        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(owner)) };
-    if owner_name != "std" {
+    if !unsafe { free_function_reachable_from_std(referenced) } {
         return None;
     }
 
+    let callee_usr =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(referenced)) };
     let arg_count = unsafe { clang_sys::clang_Cursor_getNumArguments(call_cursor) };
-    if arg_count != 2 {
-        return None;
-    }
-    let lhs_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
-    let rhs_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 1) };
-    let target = unsafe { lower_expr(lhs_cursor, project_root) };
-    let arg = unsafe { lower_expr(rhs_cursor, project_root) };
-    // Not `lower_type(clang_getCursorType(call_cursor))`: `std::gcd`'s real
-    // C++ return type is `std::common_type_t<M, N>`, a library-internal
-    // alias `lower_type` can't resolve to anything meaningful (confirmed the
-    // hard way — E13's own `Fraction::Reduce` regressed to a whole-body
-    // bailout once `lower_type` stopped mis-resolving an unrecognized
-    // system-header type as a bogus `Type::Record`). This bridge already
-    // asserts the semantic fact that Dart's `int.gcd()` is the exact match
-    // (this doc comment's own opening line) — for the two-`int`-argument
-    // shape it's gated to, that method always returns `int`, so the result
-    // is typed directly rather than through the alien C++ type expression.
-    Some(ir::Expr::Call {
-        target: Some(Box::new(target)),
-        callee_usr: unsafe {
-            type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(referenced))
-        },
-        callee_name: "gcd".to_owned(),
-        args: vec![arg],
-        ty: ir::Type::Int,
+    let unsupported = || ir::Expr::UnsupportedTyped {
+        reason: format!("unsupported argument shape for std::{callee_name}"),
+        ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
         origin: origin.clone(),
-    })
+    };
+
+    match callee_name {
+        "gcd" => {
+            if arg_count != 2 {
+                return None;
+            }
+            let lhs_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
+            let rhs_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 1) };
+            let target = unsafe { lower_expr(lhs_cursor, project_root) };
+            let arg = unsafe { lower_expr(rhs_cursor, project_root) };
+            // Not `lower_type(clang_getCursorType(call_cursor))`: `std::gcd`'s
+            // real C++ return type is `std::common_type_t<M, N>`, a
+            // library-internal alias `lower_type` can't resolve to anything
+            // meaningful (confirmed the hard way — E13's own
+            // `Fraction::Reduce` regressed to a whole-body bailout once
+            // `lower_type` stopped mis-resolving an unrecognized
+            // system-header type as a bogus `Type::Record`). This bridge
+            // already asserts the semantic fact that Dart's `int.gcd()` is
+            // the exact match — for the two-`int`-argument shape it's gated
+            // to, that method always returns `int`, so the result is typed
+            // directly rather than through the alien C++ type expression.
+            Some(ir::Expr::Call {
+                target: Some(Box::new(target)),
+                callee_usr,
+                callee_name: "gcd".to_owned(),
+                args: vec![arg],
+                ty: ir::Type::Int,
+                origin: origin.clone(),
+            })
+        }
+        // `std::max(a, b)`/`std::min(a, b)` — Dart 3's `dart:math` exposes
+        // the exact same two-argument free function under the same name
+        // (`math.max`/`math.min`, confirmed against real `dart analyze`),
+        // so this is a straight rename rather than a method-call rewrite
+        // the way `gcd` needs. `std::max`/`min`'s real return type is
+        // `const T&`; `lower_type` already strips `CXType_LValueReference`
+        // down to `T` (see its own `CXType_LValueReference` branch), so the
+        // call cursor's own type is safe to use directly here, unlike
+        // `gcd`'s alien `common_type_t`.
+        "max" | "min" => {
+            if arg_count != 2 {
+                return Some(unsupported());
+            }
+            let lhs_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
+            let rhs_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 1) };
+            let lhs = unsafe { lower_expr(lhs_cursor, project_root) };
+            let rhs = unsafe { lower_expr(rhs_cursor, project_root) };
+            let ty = lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) });
+            Some(ir::Expr::Call {
+                target: None,
+                callee_usr,
+                callee_name: format!("math.{callee_name}"),
+                args: vec![lhs, rhs],
+                ty,
+                origin: origin.clone(),
+            })
+        }
+        // `std::abs(x)` — Dart's numeric types carry this as an instance
+        // method (`x.abs()`), not a top-level function, the same shape
+        // `gcd` already bridges to `a.gcd(b)`.
+        "abs" => {
+            if arg_count != 1 {
+                return Some(unsupported());
+            }
+            let arg_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
+            let target = unsafe { lower_expr(arg_cursor, project_root) };
+            let ty = lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) });
+            Some(ir::Expr::Call {
+                target: Some(Box::new(target)),
+                callee_usr,
+                callee_name: "abs".to_owned(),
+                args: Vec::new(),
+                ty,
+                origin: origin.clone(),
+            })
+        }
+        // `std::to_string(x)` — Dart's `.toString()` is the same instance
+        // method every value already carries, no `dart:core` import needed.
+        "to_string" => {
+            if arg_count != 1 {
+                return Some(unsupported());
+            }
+            let arg_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
+            let target = unsafe { lower_expr(arg_cursor, project_root) };
+            Some(ir::Expr::Call {
+                target: Some(Box::new(target)),
+                callee_usr,
+                callee_name: "toString".to_owned(),
+                args: Vec::new(),
+                ty: ir::Type::Str,
+                origin: origin.clone(),
+            })
+        }
+        // `std::make_pair(a, b)` — `Type::Pair`'s own Dart representation,
+        // `SyntaxBridgePair` (`emit::dart::PAIR_TYPE_NAME`), already exists
+        // for the *type* (used by `mock_value_for_type`/pointee-shape
+        // lookups); this is the first place that actually *constructs* one
+        // from a live pair of values, so `make_pair`'s two arguments become
+        // its two constructor arguments directly.
+        "make_pair" => {
+            if arg_count != 2 {
+                return Some(unsupported());
+            }
+            let lhs_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
+            let rhs_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 1) };
+            let lhs = unsafe { lower_expr(lhs_cursor, project_root) };
+            let rhs = unsafe { lower_expr(rhs_cursor, project_root) };
+            let ty = lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) });
+            let ir::Type::Pair(first_ty, second_ty) = ty else {
+                return Some(unsupported());
+            };
+            Some(ir::Expr::Call {
+                target: None,
+                callee_usr,
+                // Must read the same literal name as
+                // `emit::dart::PAIR_TYPE_NAME`.
+                callee_name: "SyntaxBridgePair".to_owned(),
+                args: vec![lhs, rhs],
+                ty: ir::Type::Pair(first_ty, second_ty),
+                origin: origin.clone(),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// A call to a *free* operator overload (`"a" + b`, `a == b`) whose operand

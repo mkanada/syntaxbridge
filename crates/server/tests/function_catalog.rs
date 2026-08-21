@@ -944,15 +944,38 @@ fn a_declared_but_never_defined_free_function_is_cataloged_with_a_mockable_signa
         never_defined_ir.body
     );
 
+    // F6/tarefa 07, Metade B: unlike an in-project prototype (cataloged
+    // from the top-level declaration walk, gated to `!is_system_header` so
+    // the flood this comment used to warn about never happens), a
+    // system-header free function is only ever cataloged the moment a call
+    // site actually resolves to it — `printf` here is genuinely *called*,
+    // so it earns a real, named, mockable Dart adapter (`externals.rs`'s
+    // `AutoUndefinedFunction` auto-detection is what turns this into a
+    // named external boundary at the emit step, `emit::dart::
+    // emit_module_with_externals`'s own scope, not this catalog step's).
+    let printf_declaration = catalog
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "printf")
+        .unwrap_or_else(|| {
+            panic!(
+                "expected printf to be cataloged, since the fixture calls it: {:#?}",
+                catalog.declarations
+            )
+        });
     assert!(
-        !catalog
-            .declarations
+        !printf_declaration.has_definition,
+        "expected has_definition == false for a system-header symbol this project never \
+         defines: {printf_declaration:#?}"
+    );
+    assert!(
+        catalog
+            .ir_functions
             .iter()
-            .any(|declaration| declaration.name == "printf"),
-        "a system-header prototype must never be cataloged just because it \
-         was declared, or every libc symbol reachable through an #include \
-         would flood the catalog: {:#?}",
-        catalog.declarations
+            .any(|function| function.usr == printf_declaration.usr),
+        "expected an ir::Function synthesized for printf's usr {:?}: {:#?}",
+        printf_declaration.usr,
+        catalog.ir_functions
     );
 }
 
