@@ -433,6 +433,17 @@ pub(crate) fn finish_function_catalog(partials: Vec<FunctionCatalogPartial>) -> 
     // matter between the two, but matches declaration order above).
     apply_record_name_disambiguation(&mut ir_functions, &mut ir_records);
 
+    // F4 (`docs/prompts/2026-08-21-02-mixin-ou-classe-decisao-global.md`):
+    // `emit::dart::mixin_usrs`'s class-vs-mixin decision is global, but used
+    // to stop at each record's own declaration — a record `extends` a base
+    // that decision turns into a `mixin` (`extends_non_class`), or a mixin
+    // record is still constructed directly by some other call site
+    // (`extra_positional_arguments`, since a Dart `mixin` can't have a
+    // constructor). Runs after disambiguation, so it works with final Dart
+    // names, and before RAII/enum-rejection, neither of which cares about
+    // `base_class`/`mixins` shape.
+    apply_mixin_forms(&mut ir_functions, &mut ir_records);
+
     // Has to run after the loop above, when `ir_enums` is finally complete:
     // only then is "no declaration for this usr" a settled fact rather than
     // an enum that a later translation unit still might contribute.
@@ -975,11 +986,14 @@ fn rename_record_refs_in_expr(expr: &mut ir::Expr, renames: &HashMap<String, Str
                 *name = new_name.clone();
             }
         },
-        on_record_construct: &mut |type_usr: &str, type_name: &mut String| {
+        on_record_construct: &mut |type_usr: &str,
+                                   type_name: &mut String,
+                                   _index: Option<&mut usize>| {
             if let Some(new_name) = renames.get(type_usr) {
                 *type_name = new_name.clone();
             }
         },
+        on_expr: &mut |_| {},
     }
     .visit_expr(expr);
 }
@@ -1051,7 +1065,9 @@ fn reject_in_params(params: &mut [ir::Param], reject: &mut dyn FnMut(&mut ir::Ty
         if let Some(default_value) = &mut param.default_value {
             IrRefVisitor {
                 on_type: reject,
-                on_record_construct: &mut |_usr: &str, _name: &mut String| {},
+                on_record_construct:
+                    &mut |_usr: &str, _name: &mut String, _index: Option<&mut usize>| {},
+                on_expr: &mut |_| {},
             }
             .visit_expr(default_value);
         }
@@ -1061,16 +1077,21 @@ fn reject_in_params(params: &mut [ir::Param], reject: &mut dyn FnMut(&mut ir::Ty
 fn reject_in_stmts(stmts: &mut [ir::Stmt], reject: &mut dyn FnMut(&mut ir::Type)) {
     IrRefVisitor {
         on_type: reject,
-        on_record_construct: &mut |_usr: &str, _name: &mut String| {},
+        on_record_construct: &mut |_usr: &str, _name: &mut String, _index: Option<&mut usize>| {},
+        on_expr: &mut |_| {},
     }
     .visit_stmts(stmts);
 }
 
-/// The two things a post-pass can want to rewrite as it walks a lowered
-/// body: every `ir::Type` that appears anywhere in it, and the
-/// `type_usr`/`type_name` pair a `RecordConstruct`/`ConstructorCall`
-/// carries out-of-band (a construction site names its Dart class in a
-/// `String`, not in an `ir::Type`, so a type-only visitor would miss it).
+/// The three things a post-pass can want to rewrite as it walks a lowered
+/// body: every `ir::Type` that appears anywhere in it, the
+/// `type_usr`/`type_name` (and, for `ConstructorCall`, `constructor_index`)
+/// a `RecordConstruct`/`ConstructorCall` carries out-of-band (a construction
+/// site names its Dart class in a `String`, not in an `ir::Type`, so a
+/// type-only visitor would miss it), and — for a pass that needs to inspect
+/// or replace a whole expression node once its children are already
+/// rewritten (`apply_mixin_forms`'s provably-safe `is`-check simplification)
+/// — every `ir::Expr`, visited post-order.
 ///
 /// One traversal serves every such pass. Each one that spelled out its own
 /// walk would be a second place that has to stay exhaustive as `ir::Stmt`
@@ -1078,7 +1099,10 @@ fn reject_in_stmts(stmts: &mut [ir::Stmt], reject: &mut dyn FnMut(&mut ir::Type)
 /// exactly the half-rewritten IR these passes exist to prevent.
 struct IrRefVisitor<'a> {
     on_type: &'a mut dyn FnMut(&mut ir::Type),
-    on_record_construct: &'a mut dyn FnMut(&str, &mut String),
+    /// `Option<&mut usize>` is `None` for a `RecordConstruct` (no ordinal to
+    /// rewrite) and `Some` for a `ConstructorCall`'s `constructor_index`.
+    on_record_construct: &'a mut dyn FnMut(&str, &mut String, Option<&mut usize>),
+    on_expr: &'a mut dyn FnMut(&mut ir::Expr),
 }
 
 impl IrRefVisitor<'_> {
@@ -1207,6 +1231,11 @@ impl IrRefVisitor<'_> {
     }
 
     fn visit_expr(&mut self, expr: &mut ir::Expr) {
+        self.visit_expr_children(expr);
+        (self.on_expr)(expr);
+    }
+
+    fn visit_expr_children(&mut self, expr: &mut ir::Expr) {
         match expr {
             ir::Expr::IntLiteral { .. }
             | ir::Expr::DoubleLiteral { .. }
@@ -1260,7 +1289,7 @@ impl IrRefVisitor<'_> {
                 fields,
                 ..
             } => {
-                (self.on_record_construct)(type_usr, type_name);
+                (self.on_record_construct)(type_usr, type_name, None);
                 for (_name, value) in fields {
                     self.visit_expr(value);
                 }
@@ -1268,10 +1297,11 @@ impl IrRefVisitor<'_> {
             ir::Expr::ConstructorCall {
                 type_usr,
                 type_name,
+                constructor_index,
                 args,
                 ..
             } => {
-                (self.on_record_construct)(type_usr, type_name);
+                (self.on_record_construct)(type_usr, type_name, Some(constructor_index));
                 for arg in args {
                     self.visit_expr(arg);
                 }
@@ -1397,11 +1427,14 @@ fn rename_record_refs_in_stmts(stmts: &mut [ir::Stmt], renames: &HashMap<String,
                 *name = new_name.clone();
             }
         },
-        on_record_construct: &mut |type_usr: &str, type_name: &mut String| {
+        on_record_construct: &mut |type_usr: &str,
+                                   type_name: &mut String,
+                                   _index: Option<&mut usize>| {
             if let Some(new_name) = renames.get(type_usr) {
                 *type_name = new_name.clone();
             }
         },
+        on_expr: &mut |_| {},
     }
     .visit_stmts(stmts);
 }
@@ -1412,6 +1445,400 @@ fn rename_calls_in_params(params: &mut [ir::Param], renames: &HashMap<String, St
             rename_calls_in_expr(default_value, renames);
         }
     }
+}
+
+/// F4 (`docs/prompts/2026-08-21-02-mixin-ou-classe-decisao-global.md`):
+/// makes `emit::dart::mixin_usrs`'s global class-vs-mixin decision (already
+/// shared by `emit::dart::emit_record`/`crate::validate::dart`) actually
+/// consistent for every *use* of a mixin-decided record, not just its own
+/// declaration:
+///
+/// - A record whose single `base_class` names another record this decision
+///   turns into a `mixin` migrates that base into `mixins` instead — Dart
+///   rejects `extends` on anything but a `class` (`extends_non_class`).
+/// - A `mixin`-decided record that's still constructed directly somewhere
+///   (`ir::Expr::RecordConstruct`/`ConstructorCall` naming its `usr`) gets a
+///   private, `with`-applying sibling record (`_{Name}Impl`) that actually
+///   holds the constructor Dart forbids on a `mixin`, plus a
+///   `static create`/`create2`/… factory per constructor that returns it
+///   typed as the mixin itself — chosen over an `{Name}Impl` sibling *class*
+///   so every other reference to the record (fields, return types,
+///   `extends`/`with`) keeps naming the same class the C++ source did (the
+///   product decision behind this file's own prompt). Every construction
+///   call site naming that `usr` is rewritten to call the matching factory
+///   instead of the now Dart-illegal bare constructor
+///   (`extra_positional_arguments`).
+/// - A `this is T ? this : null` (`lower::cpp`'s only `dynamic_cast`
+///   lowering) where `T` is already one of the enclosing record's own
+///   ancestors is a proven-always-true upcast in C++ as much as in Dart —
+///   simplified to a bare `this`, rather than left for `dart analyze` to
+///   flag as `unnecessary_type_check`.
+fn apply_mixin_forms(ir_functions: &mut [ir::Function], ir_records: &mut Vec<ir::Record>) {
+    let mixin_usrs: HashSet<String> = crate::emit::dart::mixin_usrs(ir_records)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    if mixin_usrs.is_empty() {
+        return;
+    }
+
+    for record in ir_records.iter_mut() {
+        let migrates = record
+            .base_class
+            .as_ref()
+            .is_some_and(|base| mixin_usrs.contains(&base.usr));
+        if migrates {
+            let base = record.base_class.take().expect("just matched Some above");
+            record.mixins.insert(0, base);
+        }
+    }
+
+    // Independent of the migration just above: it only moves an edge
+    // between `base_class` and `mixins`, never adds or removes one, so the
+    // ancestor set an edge reaches is the same either way.
+    let ancestors_by_usr = ancestor_closures(ir_records);
+
+    let constructed_usrs = collect_constructed_usrs(ir_functions, ir_records);
+
+    let mut impls_to_add: Vec<ir::Record> = Vec::new();
+    let mut factory_methods_by_usr: HashMap<String, Vec<ir::Method>> = HashMap::new();
+    for record in ir_records.iter() {
+        if !mixin_usrs.contains(&record.usr) || !constructed_usrs.contains(&record.usr) {
+            continue;
+        }
+        let (impl_record, factories) = build_mixin_impl(record);
+        factory_methods_by_usr.insert(record.usr.clone(), factories);
+        impls_to_add.push(impl_record);
+    }
+    for record in ir_records.iter_mut() {
+        if let Some(factories) = factory_methods_by_usr.remove(&record.usr) {
+            record.methods.extend(factories);
+        }
+    }
+    ir_records.extend(impls_to_add);
+
+    let construct_rewrite: HashMap<String, String> = ir_records
+        .iter()
+        .filter(|record| mixin_usrs.contains(&record.usr) && constructed_usrs.contains(&record.usr))
+        .map(|record| (record.usr.clone(), record.name.clone()))
+        .collect();
+
+    for function in ir_functions.iter_mut() {
+        rewrite_mixin_constructions_in_stmts(&mut function.body, &construct_rewrite);
+    }
+    for record in ir_records.iter_mut() {
+        for constructor in &mut record.constructors {
+            rewrite_mixin_constructions_in_stmts(&mut constructor.body, &construct_rewrite);
+        }
+        for method in &mut record.methods {
+            if let Some(body) = &mut method.body {
+                rewrite_mixin_constructions_in_stmts(body, &construct_rewrite);
+            }
+        }
+        if let Some(destructor) = &mut record.destructor {
+            rewrite_mixin_constructions_in_stmts(destructor, &construct_rewrite);
+        }
+    }
+
+    for record in ir_records.iter_mut() {
+        let Some(ancestors) = ancestors_by_usr.get(&record.usr) else {
+            continue;
+        };
+        for constructor in &mut record.constructors {
+            simplify_provably_true_is_checks_in_stmts(&mut constructor.body, ancestors);
+        }
+        for method in &mut record.methods {
+            if let Some(body) = &mut method.body {
+                simplify_provably_true_is_checks_in_stmts(body, ancestors);
+            }
+        }
+        if let Some(destructor) = &mut record.destructor {
+            simplify_provably_true_is_checks_in_stmts(destructor, ancestors);
+        }
+    }
+}
+
+/// `usr -> transitive base_class/mixins usrs` for every record — what the
+/// `is`-check simplification in `apply_mixin_forms` needs to tell "this
+/// dynamic_cast target is already one of my own bases" from "it isn't".
+fn ancestor_closures(records: &[ir::Record]) -> HashMap<String, HashSet<String>> {
+    let records_by_usr: HashMap<&str, &ir::Record> = records
+        .iter()
+        .map(|record| (record.usr.as_str(), record))
+        .collect();
+
+    fn visit(usr: &str, records_by_usr: &HashMap<&str, &ir::Record>, result: &mut HashSet<String>) {
+        let Some(record) = records_by_usr.get(usr) else {
+            return;
+        };
+        for base in record.base_class.iter().chain(record.mixins.iter()) {
+            if result.insert(base.usr.clone()) {
+                visit(&base.usr, records_by_usr, result);
+            }
+        }
+    }
+
+    records
+        .iter()
+        .map(|record| {
+            let mut ancestors = HashSet::new();
+            visit(&record.usr, &records_by_usr, &mut ancestors);
+            (record.usr.clone(), ancestors)
+        })
+        .collect()
+}
+
+/// Every `usr` a `RecordConstruct`/`ConstructorCall` names anywhere in the
+/// module — free functions, and every record's own constructors/methods/
+/// destructor. Only a mixin-decided record in this set actually needs the
+/// private impl sibling `apply_mixin_forms` builds; one that's never
+/// constructed directly needs no factory at all.
+fn collect_constructed_usrs(
+    ir_functions: &mut [ir::Function],
+    ir_records: &mut [ir::Record],
+) -> HashSet<String> {
+    let mut result = HashSet::new();
+    for function in ir_functions.iter_mut() {
+        scan_stmts_for_constructions(&mut function.body, &mut result);
+    }
+    for record in ir_records.iter_mut() {
+        for constructor in &mut record.constructors {
+            scan_stmts_for_constructions(&mut constructor.body, &mut result);
+        }
+        for method in &mut record.methods {
+            if let Some(body) = &mut method.body {
+                scan_stmts_for_constructions(body, &mut result);
+            }
+        }
+        if let Some(destructor) = &mut record.destructor {
+            scan_stmts_for_constructions(destructor, &mut result);
+        }
+    }
+    result
+}
+
+fn scan_stmts_for_constructions(stmts: &mut [ir::Stmt], result: &mut HashSet<String>) {
+    IrRefVisitor {
+        on_type: &mut |_ty: &mut ir::Type| {},
+        on_record_construct: &mut |type_usr: &str,
+                                   _type_name: &mut String,
+                                   _index: Option<&mut usize>| {
+            result.insert(type_usr.to_owned());
+        },
+        on_expr: &mut |_expr: &mut ir::Expr| {},
+    }
+    .visit_stmts(stmts);
+}
+
+/// Builds `record`'s private `with`-applying impl sibling (`_{Name}Impl`)
+/// and the `static` factory method(s) on `record` itself that construct it —
+/// see `apply_mixin_forms`'s own doc comment for why a sibling *record*
+/// (not just a bare method) is needed at all: Dart forbids a constructor on
+/// a `mixin` declaration, so something else has to hold the real one.
+///
+/// A `record` with no constructor of its own (E03's aggregate shape) gets a
+/// single synthesized one, one parameter per field, assigning each by name
+/// (`this.field` initializing-formal syntax only works for a field declared
+/// on the *same* class — `record`'s fields live in the `mixin` declaration,
+/// inherited, not redeclared here). A `record` with real constructors of
+/// its own reuses their bodies verbatim: every one of them already assigns
+/// fields through ordinary statements (`emit::dart::emit_constructor` never
+/// prints initializing formals for a hand-written constructor), which reads
+/// correctly unchanged regardless of which class the statements end up in.
+fn build_mixin_impl(record: &ir::Record) -> (ir::Record, Vec<ir::Method>) {
+    let impl_name = format!("_{}Impl", record.name);
+    let impl_usr = format!("{}#mixin_impl", record.usr);
+    let impl_origin = record.origin.clone();
+
+    let constructors: Vec<ir::Constructor> = if record.constructors.is_empty() {
+        vec![ir::Constructor {
+            usr: format!("{}#mixin_impl_ctor", record.usr),
+            constructor_index: 0,
+            params: record
+                .fields
+                .iter()
+                .map(|field| ir::Param {
+                    name: field.name.clone(),
+                    ty: field.ty.clone(),
+                    default_value: None,
+                })
+                .collect(),
+            body: record
+                .fields
+                .iter()
+                .map(|field| ir::Stmt::FieldAssign {
+                    target: ir::Expr::This {
+                        ty: ir::Type::Record {
+                            usr: impl_usr.clone(),
+                            name: impl_name.clone(),
+                        },
+                        origin: impl_origin.clone(),
+                    },
+                    field: field.name.clone(),
+                    value: ir::Expr::Ref {
+                        name: field.name.clone(),
+                        ty: field.ty.clone(),
+                        origin: impl_origin.clone(),
+                    },
+                    origin: impl_origin.clone(),
+                })
+                .collect(),
+            origin: impl_origin.clone(),
+        }]
+    } else {
+        record.constructors.clone()
+    };
+
+    let impl_record = ir::Record {
+        name: impl_name.clone(),
+        usr: impl_usr.clone(),
+        namespace: record.namespace.clone(),
+        fields: Vec::new(),
+        static_fields: Vec::new(),
+        constructors: constructors.clone(),
+        methods: Vec::new(),
+        base_class: None,
+        mixins: vec![ir::BaseClass {
+            usr: record.usr.clone(),
+            name: record.name.clone(),
+        }],
+        destructor: None,
+        origin: impl_origin.clone(),
+    };
+
+    let mut sorted_constructors = constructors;
+    sorted_constructors.sort_by_key(|constructor| constructor.constructor_index);
+    let factories = sorted_constructors
+        .into_iter()
+        .map(|constructor| {
+            let factory_name = if constructor.constructor_index == 0 {
+                "create".to_owned()
+            } else {
+                format!("create{}", constructor.constructor_index + 1)
+            };
+            let args = constructor
+                .params
+                .iter()
+                .map(|param| ir::Expr::Ref {
+                    name: param.name.clone(),
+                    ty: param.ty.clone(),
+                    origin: impl_origin.clone(),
+                })
+                .collect();
+            ir::Method {
+                name: factory_name,
+                usr: format!(
+                    "{}#mixin_factory_{}",
+                    record.usr, constructor.constructor_index
+                ),
+                params: constructor.params.clone(),
+                return_type: ir::Type::Record {
+                    usr: record.usr.clone(),
+                    name: record.name.clone(),
+                },
+                body: Some(vec![ir::Stmt::Return {
+                    value: Some(ir::Expr::ConstructorCall {
+                        type_usr: impl_usr.clone(),
+                        type_name: impl_name.clone(),
+                        constructor_index: constructor.constructor_index,
+                        args,
+                        origin: impl_origin.clone(),
+                    }),
+                    origin: impl_origin.clone(),
+                }]),
+                is_static: true,
+                is_override: false,
+                origin: impl_origin.clone(),
+            }
+        })
+        .collect();
+
+    (impl_record, factories)
+}
+
+/// Rewrites every `RecordConstruct`/`ConstructorCall` naming a `usr` in
+/// `construct_rewrite` (a mixin-decided, directly-constructed record) to
+/// call its `static` factory instead — `Base(args)`/`Base.ctor2(args)`
+/// become `Base.create(args)`/`Base.create2(args)`. Folds the ordinal into
+/// `type_name` itself and resets `constructor_index` to `0` so
+/// `emit::dart::dart_constructor_name`'s own index-based naming (`ctorN`)
+/// leaves the already-complete factory name untouched.
+fn rewrite_mixin_constructions_in_stmts(
+    stmts: &mut [ir::Stmt],
+    construct_rewrite: &HashMap<String, String>,
+) {
+    IrRefVisitor {
+        on_type: &mut |_ty: &mut ir::Type| {},
+        on_record_construct: &mut |type_usr: &str,
+                                   type_name: &mut String,
+                                   index: Option<&mut usize>| {
+            let Some(base_name) = construct_rewrite.get(type_usr) else {
+                return;
+            };
+            let factory = match index {
+                None => "create".to_owned(),
+                Some(index_ref) => {
+                    let factory = if *index_ref == 0 {
+                        "create".to_owned()
+                    } else {
+                        format!("create{}", *index_ref + 1)
+                    };
+                    *index_ref = 0;
+                    factory
+                }
+            };
+            *type_name = format!("{base_name}.{factory}");
+        },
+        on_expr: &mut |_expr: &mut ir::Expr| {},
+    }
+    .visit_stmts(stmts);
+}
+
+/// Simplifies `this is T ? this : null` (the only shape
+/// `lower::cpp::lower_dynamic_cast_expr` produces) to a bare `this` when `T`
+/// is already in `ancestors` — the enclosing record's own transitive
+/// `base_class`/`mixins` closure. C++'s `dynamic_cast` can't fail on such an
+/// upcast either, so this isn't a bailout, just skipping a check Dart's own
+/// analyzer already proves unconditionally true
+/// (`unnecessary_type_check`) — a *different* operand (not `this`) is left
+/// untouched, since nothing here proves its static type includes `T`.
+fn simplify_provably_true_is_checks_in_stmts(stmts: &mut [ir::Stmt], ancestors: &HashSet<String>) {
+    IrRefVisitor {
+        on_type: &mut |_ty: &mut ir::Type| {},
+        on_record_construct: &mut |_usr: &str, _name: &mut String, _index: Option<&mut usize>| {},
+        on_expr: &mut |expr: &mut ir::Expr| {
+            let replacement = if let ir::Expr::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+                ..
+            } = expr
+            {
+                let is_provably_true = if let ir::Expr::Is {
+                    operand,
+                    target_type:
+                        ir::Type::Record {
+                            usr: target_usr, ..
+                        },
+                    ..
+                } = condition.as_ref()
+                {
+                    matches!(operand.as_ref(), ir::Expr::This { .. })
+                        && matches!(else_expr.as_ref(), ir::Expr::NullLiteral { .. })
+                        && ancestors.contains(target_usr.as_str())
+                } else {
+                    false
+                };
+                is_provably_true.then(|| (**then_expr).clone())
+            } else {
+                None
+            };
+            if let Some(replacement) = replacement {
+                *expr = replacement;
+            }
+        },
+    }
+    .visit_stmts(stmts);
 }
 
 /// E12: RAII. C++ runs a local's destructor deterministically the moment it
@@ -3256,7 +3683,14 @@ mod merge_tests {
     }
 
     fn empty_partial() -> FunctionCatalogPartial {
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
     }
 
     fn record_with(mutate: impl FnOnce(&mut ir::Record)) -> ir::Record {
@@ -3312,7 +3746,11 @@ mod merge_tests {
 
         assert_eq!(catalog.ir_records.len(), 1);
         let merged = &catalog.ir_records[0];
-        assert_eq!(merged.methods.len(), 1, "out-of-line method was dropped by the merge");
+        assert_eq!(
+            merged.methods.len(),
+            1,
+            "out-of-line method was dropped by the merge"
+        );
         assert_eq!(merged.methods[0].usr, method_usr);
         assert!(merged.methods[0].body.is_some());
     }
@@ -3403,5 +3841,401 @@ mod merge_tests {
 
         assert_eq!(catalog.ir_records.len(), 1);
         assert!(catalog.ir_records[0].destructor.is_some());
+    }
+}
+
+#[cfg(test)]
+mod mixin_form_tests {
+    //! F4 (`docs/prompts/2026-08-21-02-mixin-ou-classe-decisao-global.md`):
+    //! `emit::dart::mixin_usrs`'s class-vs-mixin decision only ever changed
+    //! how a record declares *itself* — a base pointing at a newly-mixin
+    //! record still tried `extends` it, and a direct construction of that
+    //! record still passed positional arguments to a constructor Dart no
+    //! longer lets it have. Built by hand the same way `merge_tests` does.
+    use super::*;
+    use crate::emit::dart::emit_module;
+
+    fn origin(line: u32) -> ir::Origin {
+        ir::Origin {
+            file: "include/foo.h".to_owned(),
+            line,
+            column: 1,
+        }
+    }
+
+    fn base_of(record: &ir::Record) -> ir::BaseClass {
+        ir::BaseClass {
+            usr: record.usr.clone(),
+            name: record.name.clone(),
+        }
+    }
+
+    fn empty_record(usr: &str, name: &str) -> ir::Record {
+        ir::Record {
+            name: name.to_owned(),
+            usr: usr.to_owned(),
+            namespace: String::new(),
+            fields: Vec::new(),
+            static_fields: Vec::new(),
+            constructors: Vec::new(),
+            methods: Vec::new(),
+            base_class: None,
+            mixins: Vec::new(),
+            destructor: None,
+            origin: origin(1),
+        }
+    }
+
+    fn empty_partial() -> FunctionCatalogPartial {
+        (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    /// The fixture the prompt itself asks for: `A` is `B`'s single base
+    /// (would be `extends`) and, at the same time, one of `C`'s two bases
+    /// (forces `A` to become a `mixin`) — with `B` constructed somewhere.
+    /// `B` itself never becomes a mixin (no one inherits it multiply), so
+    /// its own construction must keep compiling unchanged; only its
+    /// relationship to `A` needs to change from `extends` to `with`.
+    #[test]
+    fn a_base_forced_to_mixin_by_a_sibling_record_stops_being_extended() {
+        let mut a = empty_record("c:@S@A", "A");
+        a.fields.push(ir::Field {
+            name: "value".to_owned(),
+            ty: ir::Type::Int,
+        });
+
+        let mut b = empty_record("c:@S@B", "B");
+        b.base_class = Some(base_of(&a));
+        b.fields.push(ir::Field {
+            name: "n".to_owned(),
+            ty: ir::Type::Int,
+        });
+
+        let mut c = empty_record("c:@S@C", "C");
+        c.mixins = vec![
+            base_of(&a),
+            ir::BaseClass {
+                usr: "c:@S@D".to_owned(),
+                name: "D".to_owned(),
+            },
+        ];
+
+        let makes_b = ir::Function {
+            name: "makes_b".to_owned(),
+            usr: "c:@F@makes_b#".to_owned(),
+            params: Vec::new(),
+            return_type: ir::Type::Record {
+                usr: b.usr.clone(),
+                name: b.name.clone(),
+            },
+            body: vec![ir::Stmt::Return {
+                value: Some(ir::Expr::RecordConstruct {
+                    type_usr: b.usr.clone(),
+                    type_name: b.name.clone(),
+                    fields: vec![(
+                        "n".to_owned(),
+                        ir::Expr::IntLiteral {
+                            value: 1,
+                            origin: origin(2),
+                        },
+                    )],
+                    origin: origin(2),
+                }),
+                origin: origin(2),
+            }],
+            origin: origin(2),
+        };
+
+        let mut partial = empty_partial();
+        partial.2.push(makes_b);
+        partial.3.push(false);
+        partial.4.push(a);
+        partial.4.push(b);
+        partial.4.push(c);
+
+        let catalog = finish_function_catalog(vec![partial]);
+
+        let b = catalog
+            .ir_records
+            .iter()
+            .find(|record| record.name == "B")
+            .expect("B survives the pass");
+        assert!(
+            b.base_class.is_none(),
+            "B's base migrated to `mixins`, `base_class` should be empty, got {:?}",
+            b.base_class
+        );
+        assert_eq!(
+            b.mixins
+                .iter()
+                .map(|base| base.usr.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c:@S@A"],
+            "B's `extends A` should have become `with A` once A is decided a mixin"
+        );
+
+        let makes_b = catalog
+            .ir_functions
+            .iter()
+            .find(|function| function.name == "makes_b")
+            .expect("makes_b survives the pass");
+        let ir::Stmt::Return {
+            value: Some(ir::Expr::RecordConstruct { type_name, .. }),
+            ..
+        } = &makes_b.body[0]
+        else {
+            panic!("expected the return statement to still construct B directly");
+        };
+        assert_eq!(
+            type_name, "B",
+            "B is not itself a mixin, its own construction must stay unchanged"
+        );
+
+        let module = ir::Module {
+            functions: catalog.ir_functions,
+            records: catalog.ir_records,
+            enums: catalog.ir_enums,
+        };
+        let files = emit_module(&module);
+        let source = files
+            .get("lib/foo.dart")
+            .expect("foo.h lowers into foo.dart");
+        assert!(
+            !source.contains("extends A"),
+            "extends_non_class: A is a mixin, B must not `extends` it, got:\n{source}"
+        );
+        assert!(
+            source.contains("class B") && source.contains("with A"),
+            "expected B to apply A via `with`, got:\n{source}"
+        );
+        assert!(
+            source.contains("mixin A"),
+            "expected A itself to be declared `mixin`, got:\n{source}"
+        );
+    }
+
+    /// A mixin-decided record that's still constructed directly somewhere
+    /// (E03's aggregate shape: no constructor of its own) needs a private
+    /// impl sibling to actually hold a constructor, plus a `static create`
+    /// factory the call site can route through instead — a bare `A(args)`
+    /// is Dart-illegal the moment `A` is a `mixin`.
+    #[test]
+    fn a_directly_constructed_mixin_gets_a_private_impl_and_a_static_factory() {
+        let mut a = empty_record("c:@S@A", "A");
+        a.fields.push(ir::Field {
+            name: "value".to_owned(),
+            ty: ir::Type::Int,
+        });
+
+        let mut multi = empty_record("c:@S@Multi", "Multi");
+        multi.mixins = vec![
+            base_of(&a),
+            ir::BaseClass {
+                usr: "c:@S@Other".to_owned(),
+                name: "Other".to_owned(),
+            },
+        ];
+
+        let makes_a = ir::Function {
+            name: "makes_a".to_owned(),
+            usr: "c:@F@makes_a#".to_owned(),
+            params: Vec::new(),
+            return_type: ir::Type::Record {
+                usr: a.usr.clone(),
+                name: a.name.clone(),
+            },
+            body: vec![ir::Stmt::Return {
+                value: Some(ir::Expr::RecordConstruct {
+                    type_usr: a.usr.clone(),
+                    type_name: a.name.clone(),
+                    fields: vec![(
+                        "value".to_owned(),
+                        ir::Expr::IntLiteral {
+                            value: 7,
+                            origin: origin(2),
+                        },
+                    )],
+                    origin: origin(2),
+                }),
+                origin: origin(2),
+            }],
+            origin: origin(2),
+        };
+
+        let mut partial = empty_partial();
+        partial.2.push(makes_a);
+        partial.3.push(false);
+        partial.4.push(a);
+        partial.4.push(multi);
+
+        let catalog = finish_function_catalog(vec![partial]);
+
+        let a = catalog
+            .ir_records
+            .iter()
+            .find(|record| record.name == "A")
+            .expect("A survives the pass");
+        let create = a
+            .methods
+            .iter()
+            .find(|method| method.name == "create")
+            .expect("A gets a `create` factory");
+        assert!(create.is_static, "the factory must be static");
+        assert_eq!(create.params.len(), 1);
+        assert_eq!(create.params[0].name, "value");
+
+        let impl_record = catalog
+            .ir_records
+            .iter()
+            .find(|record| record.name == "_AImpl")
+            .expect("a private impl sibling was synthesized");
+        assert_eq!(impl_record.mixins.len(), 1);
+        assert_eq!(impl_record.mixins[0].usr, "c:@S@A");
+        assert_eq!(impl_record.constructors.len(), 1);
+        assert_eq!(impl_record.constructors[0].params.len(), 1);
+
+        let makes_a = catalog
+            .ir_functions
+            .iter()
+            .find(|function| function.name == "makes_a")
+            .expect("makes_a survives the pass");
+        let ir::Stmt::Return {
+            value: Some(ir::Expr::RecordConstruct { type_name, .. }),
+            ..
+        } = &makes_a.body[0]
+        else {
+            panic!("expected the return statement to still be a RecordConstruct");
+        };
+        assert_eq!(
+            type_name, "A.create",
+            "extra_positional_arguments: the call site must route through the factory"
+        );
+
+        let module = ir::Module {
+            functions: catalog.ir_functions,
+            records: catalog.ir_records,
+            enums: catalog.ir_enums,
+        };
+        let files = emit_module(&module);
+        let source = files
+            .get("lib/foo.dart")
+            .expect("foo.h lowers into foo.dart");
+        assert!(source.contains("mixin A"), "got:\n{source}");
+        assert!(
+            source.contains("static A create(int value)"),
+            "got:\n{source}"
+        );
+        assert!(source.contains("class _AImpl with A"), "got:\n{source}");
+        assert!(
+            source.contains("A.create("),
+            "call site should read `A.create(...)`, got:\n{source}"
+        );
+    }
+
+    /// Side effect of the same causa raiz: `lower::cpp`'s only
+    /// `dynamic_cast` lowering, `this is T ? this : null`, becomes Dart's
+    /// `unnecessary_type_check` the moment `T` is proven (by the mixin
+    /// decision) to already be one of the enclosing record's own bases —
+    /// which is also, independently, why the equivalent C++ upcast could
+    /// never fail either. Simplified to a bare `this` instead of left for
+    /// `dart analyze` to flag.
+    #[test]
+    fn a_dynamic_cast_to_an_already_applied_mixin_simplifies_to_a_bare_this() {
+        let mut a = empty_record("c:@S@A", "A");
+
+        let mut multi = empty_record("c:@S@Multi", "Multi");
+        multi.mixins = vec![
+            base_of(&a),
+            ir::BaseClass {
+                usr: "c:@S@Other".to_owned(),
+                name: "Other".to_owned(),
+            },
+        ];
+
+        let mut r = empty_record("c:@S@R", "R");
+        r.base_class = Some(base_of(&a));
+        r.methods.push(ir::Method {
+            name: "asA".to_owned(),
+            usr: "c:@S@R@F@asA#".to_owned(),
+            params: Vec::new(),
+            return_type: ir::Type::Nullable(Box::new(ir::Type::Record {
+                usr: a.usr.clone(),
+                name: a.name.clone(),
+            })),
+            body: Some(vec![ir::Stmt::Return {
+                value: Some(ir::Expr::Conditional {
+                    condition: Box::new(ir::Expr::Is {
+                        operand: Box::new(ir::Expr::This {
+                            ty: ir::Type::Record {
+                                usr: r.usr.clone(),
+                                name: r.name.clone(),
+                            },
+                            origin: origin(3),
+                        }),
+                        target_type: ir::Type::Record {
+                            usr: a.usr.clone(),
+                            name: a.name.clone(),
+                        },
+                        origin: origin(3),
+                    }),
+                    then_expr: Box::new(ir::Expr::This {
+                        ty: ir::Type::Record {
+                            usr: r.usr.clone(),
+                            name: r.name.clone(),
+                        },
+                        origin: origin(3),
+                    }),
+                    else_expr: Box::new(ir::Expr::NullLiteral { origin: origin(3) }),
+                    ty: ir::Type::Nullable(Box::new(ir::Type::Record {
+                        usr: a.usr.clone(),
+                        name: a.name.clone(),
+                    })),
+                    origin: origin(3),
+                }),
+                origin: origin(3),
+            }]),
+            is_static: false,
+            is_override: false,
+            origin: origin(3),
+        });
+        a.fields.push(ir::Field {
+            name: "value".to_owned(),
+            ty: ir::Type::Int,
+        });
+
+        let mut partial = empty_partial();
+        partial.4.push(a);
+        partial.4.push(multi);
+        partial.4.push(r);
+
+        let catalog = finish_function_catalog(vec![partial]);
+
+        let r = catalog
+            .ir_records
+            .iter()
+            .find(|record| record.name == "R")
+            .expect("R survives the pass");
+        let method = r
+            .methods
+            .iter()
+            .find(|method| method.name == "asA")
+            .expect("asA survives the pass");
+        let body = method.body.as_ref().expect("asA keeps a real body");
+        match &body[0] {
+            ir::Stmt::Return {
+                value: Some(ir::Expr::This { .. }),
+                ..
+            } => {}
+            other => panic!(
+                "expected the dynamic_cast-shaped conditional to simplify to a bare `this`, got {other:?}"
+            ),
+        }
     }
 }

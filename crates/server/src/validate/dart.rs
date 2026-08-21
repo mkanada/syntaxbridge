@@ -243,7 +243,7 @@ fn locate_origin(
 /// text can never match a later declaration's header before an earlier
 /// one's.
 fn declaration_markers<'a>(module: &'a Module, dart_stem: &str) -> Vec<(String, &'a Origin)> {
-    let mixins = mixin_usrs(module);
+    let mixins = mixin_usrs(&module.records);
 
     let mut enums: Vec<&Enum> = module
         .enums

@@ -64,7 +64,7 @@ pub fn emit_module_with_externals(
     // constructor at all, unlike the ordinary synthetic positional one E03
     // gives every other record with fields — see `Record::mixins`'s doc
     // comment).
-    let mixin_usrs = mixin_usrs(module);
+    let mixin_usrs = mixin_usrs(&module.records);
 
     // Needed by `expand_mixin_chain`: a leaf class's `with` clause must
     // transitively pull in the `on` dependencies of every mixin it lists
@@ -222,16 +222,14 @@ pub fn emit_module_with_externals(
 /// Closing over the same `base_class`/`mixins` edges `expand_mixin_chain`
 /// itself walks keeps the two from disagreeing about what needs the `mixin`
 /// keyword.
-pub(crate) fn mixin_usrs(module: &Module) -> HashSet<&str> {
-    let records_by_usr: HashMap<&str, &Record> = module
-        .records
+pub(crate) fn mixin_usrs(records: &[Record]) -> HashSet<&str> {
+    let records_by_usr: HashMap<&str, &Record> = records
         .iter()
         .map(|record| (record.usr.as_str(), record))
         .collect();
 
     let mut result: HashSet<&str> = HashSet::new();
-    let mut stack: Vec<&str> = module
-        .records
+    let mut stack: Vec<&str> = records
         .iter()
         .flat_map(|record| record.mixins.iter().map(|base| base.usr.as_str()))
         .collect();
