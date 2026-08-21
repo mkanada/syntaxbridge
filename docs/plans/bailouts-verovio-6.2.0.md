@@ -1475,6 +1475,51 @@ uma dessas é uma extensão de escopo genuína, não um bug a corrigir — a
 próxima rodada pode medir qual delas domina o resíduo antes de decidir se
 vale a pena estender mais.
 
+### Atualização de 2026-08-20 (21ª rodada) — escrita indexada por byte em `std::string`
+
+Executado pelo loop autônomo, continuação da sessão. Baseline: tipos
+1.526/234, expressões 5.272/351, statements 348/17 — total 7.146.
+
+**Feature: `keyString[i] = valor;` (escrita, não leitura) numa
+`std::string`.** Achado real, grepado diretamente: `ioabc.cpp`'s
+`keyString[i] = tolower(keyString[i]);`, `json/jsonxx.cc`'s `input[size -
+2] = ' ';`. Dart não tem atribuição indexada in-place em `String`
+(imutável) — a variável/campo alvo inteiro é reatribuído, passando por
+bytes UTF-8 (o mesmo modelo de byte que o lado de *leitura*
+`Expr::StringByteAt` já usa — `utf8.encode`/`.indexOf`, não code units
+UTF-16): codifica para bytes, escreve o byte, decodifica de volta. Três
+statements a partir de um só statement C++, via `lower_stmt_into` (já
+devolve `Vec<Stmt>` para `DeclStmt`/`CompoundStmt`/o padrão de `if` de
+out-param da 20ª rodada) — sem variante de IR nova, reaproveitando
+`VarDecl`/`ExprAssign`/`Expr::Index`/`Expr::Call` já existentes.
+
+Bug real encontrado no caminho: o `Expr::Call` genérico nunca marcava
+`used_utf8_encode` para uma chamada `target: None` cujo nome precisasse de
+`dart:convert` — só os três renderizadores dedicados existentes
+(`StringByteAt`/`StringByteLength`/`find`) faziam isso, cada um no próprio
+ponto de emissão. Sem o import, esta feature teria produzido Dart com
+`utf8` não importado — corrigido no renderizador genérico de `Expr::Call`,
+checando o prefixo `"utf8."` do nome.
+
+**Candidato investigado, não implementado**: estender
+`lower_dynamic_cast_expr` (rodada 9) para aceitar acesso de campo como
+operando, não só referência simples. Grepando a fonte real, o resíduo
+(121 ocorrências) é dominado por dois casos que a extensão não ajudaria:
+`iter->second` (acesso de campo através de um iterador de `map` —
+bloqueado pela mesma lacuna de iteração de mapa já registrada como fora de
+escopo desde a 18ª rodada, não pela restrição do próprio `dynamic_cast`) e
+chamadas de método genuínas (`dynamic_cast<Measure
+*>(m_midiDoc->FindDescendantByComparison(...))`) — que precisam continuar
+excluídas pela mesma razão de efeito colateral já documentada. Não vale a
+pena estender até a iteração de mapa existir.
+
+**Medição:** tipos e expressões inalterados (1.526/234, 5.272/351 — a
+feature é só de statement); statements 348/17 → **339/17** (−9, mesma
+causa: "assignment target is not a simple local variable or a field"
+201→192); total 7.146 → **7.137** (−9, −0,1%); **1/301 arquivos
+inválidos** (mesmo `pugixml.dart`, sem regressão); `dart analyze`
+inalterado (15.752/9.053). Conferido: zero tokens `dynamic`, zero panics.
+
 ## 1. Tipos sem mapeamento — snapshot-base de 4.384 ocorrências
 
 ### Progresso executado
