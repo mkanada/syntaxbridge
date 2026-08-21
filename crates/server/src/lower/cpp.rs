@@ -3581,7 +3581,34 @@ unsafe fn lower_stdlib_mutating_sequence_stmt(
     let (new_length, fill) = match args.as_slice() {
         [new_length] => (
             new_length.clone(),
-            default_scalar_value(&element_ty, origin),
+            // `default_scalar_value` alone falls straight to
+            // `Unsupported` for *any* `Type::Record` element — even one
+            // this bridge could trivially zero-construct field by field
+            // (real trigger: `humlib.h`'s `MyCoord { int x; int y; }`,
+            // used as `std::vector<MyCoord>`, round 22). `default_field_
+            // value` tries the recursive `default_record_construct_at_
+            // depth` construction first, falling back to
+            // `default_scalar_value` (still honestly `Unsupported`) only
+            // when that itself can't resolve — the same helper a nested
+            // `Record`-typed *field*'s own default already goes through,
+            // just reached here from a container's element type instead
+            // of a field type. Needs the element's own `CXType`, not just
+            // its already-lowered `ir::Type` (`element_ty`): recomputed
+            // directly from `owner`'s first template argument, the exact
+            // same derivation `stdlib_sequence_element_type` itself uses
+            // internally, since only the `ir::Type` half of that reaches
+            // this call site today.
+            unsafe {
+                default_field_value(
+                    &element_ty,
+                    clang_sys::clang_Type_getTemplateArgumentAsType(
+                        clang_sys::clang_getCursorType(owner),
+                        0,
+                    ),
+                    origin,
+                    0,
+                )
+            },
         ),
         [new_length, fill] => (new_length.clone(), fill.clone()),
         _ => {

@@ -2258,6 +2258,41 @@ void shrink(std::vector<int>& values, int count) {
     );
 }
 
+/// Round 22: growing a `std::vector<Record>` needs the *record's* zero
+/// value, not just a scalar's — real trigger `humlib.h`'s `MyCoord { int
+/// x; int y; }`, used as `std::vector<MyCoord> sclef;` then
+/// `sclef.resize(0)` (`MeasureInfo::clear`). The one-argument overload's
+/// default fill used to fall straight to `default_scalar_value`, which
+/// bails on *any* `Type::Record` element unconditionally — even one this
+/// bridge can trivially zero-construct field by field.
+#[test]
+fn vector_resize_grows_a_record_element_with_a_field_by_field_default() {
+    let source = lower_and_emit(
+        "lower-cpp-vector-resize-record-element",
+        r#"
+#include <vector>
+
+struct Coord {
+    int x;
+    int y;
+};
+
+void grow(std::vector<Coord>& values, int count) {
+    values.resize(count);
+}
+"#,
+    );
+
+    assert!(
+        source.contains("values.addAll(List.filled(count - values.length, Coord(0, 0)));"),
+        "expected the record element's own field-by-field zero value, got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "growing a vector of a trivially-defaultable record must not bail out, got:\n{source}"
+    );
+}
+
 /// compare and substr have direct, typed Dart String counterparts. The C++
 /// length overload of substr is translated to an exclusive Dart end index.
 #[test]
