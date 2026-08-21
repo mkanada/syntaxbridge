@@ -1567,12 +1567,20 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
                 // order (see their own comment just below) — order is a
                 // separate behavioral concern from the type boundary
                 // itself, not a reason to erase it.
+                // `std::stack<T>` (default `std::deque<T>`-backed adapter,
+                // LIFO-only) shares the same first-template-argument
+                // element type and `List<T>` Dart shape as the sequence
+                // containers below; the LIFO-only access pattern is a
+                // method-dispatch concern (`lower_stdlib_method_call`'s
+                // `"stack"` arms: `top`→`.last`, `push`→`.add`,
+                // `pop`→`.removeLast`), not a type-mapping one.
                 Some("vector")
                 | Some("list")
                 | Some("deque")
                 | Some("array")
                 | Some("initializer_list")
-                | Some("multiset") => {
+                | Some("multiset")
+                | Some("stack") => {
                     let element =
                         if unsafe { clang_sys::clang_Type_getNumTemplateArguments(cx_type) } >= 1 {
                             lower_type(unsafe {
@@ -6870,7 +6878,7 @@ unsafe fn lower_stdlib_method_call(
             target: Box::new(target),
             origin: origin.clone(),
         }),
-        ("vector" | "list" | "deque", "size") => Some(ir::Expr::FieldAccess {
+        ("vector" | "list" | "deque" | "stack", "size") => Some(ir::Expr::FieldAccess {
             target: Box::new(target),
             field: "length".to_owned(),
             ty: ir::Type::Int,
@@ -6886,6 +6894,7 @@ unsafe fn lower_stdlib_method_call(
         | ("vector", "empty")
         | ("list", "empty")
         | ("deque", "empty")
+        | ("stack", "empty")
         | ("map", "empty")
         | ("set", "empty") => Some(ir::Expr::FieldAccess {
             target: Box::new(target),
@@ -7186,6 +7195,169 @@ unsafe fn lower_stdlib_method_call(
                 target: Box::new(target),
                 index: Box::new(index),
                 ty: unsafe { stdlib_sequence_element_type(owner, &template_name) },
+                origin: origin.clone(),
+            })
+        }
+        // `std::stack<T>` (default `std::deque<T>`-backed) is LIFO-only,
+        // but its element-type resolution and Dart target are identical to
+        // `vector`/`list`/`deque`'s (`lower_type`'s stdlib-template branch
+        // maps it to the same `List<T>`) — `.top()` is the last element,
+        // `.push`/`.pop` are `.add`/`.removeLast`, `.empty`/`.size` mirror
+        // the vector arms just below. Real corpus triggers (`view_page.cpp`
+        // etc.): `stack<Brush|Pen>` (drawing-context save/restore) and
+        // `stack<FontInfo *|Object *>` (both project-pointer element
+        // types, already representable).
+        ("stack", "top") => {
+            let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
+            if !args.is_empty() {
+                return Some(ir::Expr::Unsupported {
+                    reason: format!(
+                        "std::stack::top had {} arguments, expected none",
+                        args.len()
+                    ),
+                    origin: origin.clone(),
+                });
+            }
+            Some(ir::Expr::Index {
+                target: Box::new(target.clone()),
+                index: Box::new(ir::Expr::Binary {
+                    op: ir::BinaryOp::Sub,
+                    lhs: Box::new(ir::Expr::FieldAccess {
+                        target: Box::new(target),
+                        field: "length".to_owned(),
+                        ty: ir::Type::Int,
+                        origin: origin.clone(),
+                    }),
+                    rhs: Box::new(ir::Expr::IntLiteral {
+                        value: 1,
+                        origin: origin.clone(),
+                    }),
+                    ty: ir::Type::Int,
+                    origin: origin.clone(),
+                }),
+                ty: unsafe { stdlib_sequence_element_type(owner, &template_name) },
+                origin: origin.clone(),
+            })
+        }
+        ("stack", "push") => {
+            let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
+            if args.len() != 1 {
+                return Some(ir::Expr::Unsupported {
+                    reason: format!(
+                        "std::stack::push had {} arguments, expected exactly 1",
+                        args.len()
+                    ),
+                    origin: origin.clone(),
+                });
+            }
+            Some(ir::Expr::Call {
+                target: Some(Box::new(target)),
+                callee_usr: String::new(),
+                callee_name: "add".to_owned(),
+                args,
+                ty: ir::Type::Void,
+                origin: origin.clone(),
+            })
+        }
+        ("stack", "pop") => {
+            let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
+            if !args.is_empty() {
+                return Some(ir::Expr::Unsupported {
+                    reason: format!(
+                        "std::stack::pop had {} arguments, expected none",
+                        args.len()
+                    ),
+                    origin: origin.clone(),
+                });
+            }
+            Some(ir::Expr::Call {
+                target: Some(Box::new(target)),
+                callee_usr: String::new(),
+                callee_name: "removeLast".to_owned(),
+                args,
+                ty: ir::Type::Void,
+                origin: origin.clone(),
+            })
+        }
+        // `map`/`unordered_map` already lower to `Map<K, V>`. `.at(key)`
+        // asks for a value that must exist (C++ throws `out_of_range`
+        // otherwise) — `map[key]!` preserves that "must exist" intent with
+        // a real Dart runtime failure on a missing key, even though the
+        // thrown type differs from `std::out_of_range` (the same documented
+        // trade-off already accepted for other STL methods this module
+        // maps to a near-equivalent rather than a byte-for-byte behavioral
+        // twin, e.g. `dynamic_cast`'s round 9).
+        ("map" | "unordered_map", "at") => {
+            let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
+            let [key] = args.as_slice() else {
+                return Some(ir::Expr::Unsupported {
+                    reason: format!(
+                        "std::{template_name}::at had {} arguments, expected exactly 1",
+                        args.len()
+                    ),
+                    origin: origin.clone(),
+                });
+            };
+            let value_type = match &target {
+                ir::Expr::Ref { ty, .. } | ir::Expr::FieldAccess { ty, .. } => match ty {
+                    ir::Type::Map(_, value_type) => (**value_type).clone(),
+                    _ => {
+                        return Some(ir::Expr::Unsupported {
+                            reason: format!(
+                                "std::{template_name}::at receiver did not lower to a Dart Map"
+                            ),
+                            origin: origin.clone(),
+                        });
+                    }
+                },
+                _ => {
+                    return Some(ir::Expr::Unsupported {
+                        reason: format!(
+                            "std::{template_name}::at receiver has no recoverable map type"
+                        ),
+                        origin: origin.clone(),
+                    });
+                }
+            };
+            // `Expr::Convert` to a non-`Nullable` target from a
+            // `Nullable`-typed operand already renders as the `!` force-
+            // unwrap (`emit::dart`'s `Expr::Convert` arm, the same one that
+            // renders a raw-pointer dereference) — reused here instead of a
+            // new IR node.
+            Some(ir::Expr::Convert {
+                operand: Box::new(ir::Expr::Index {
+                    target: Box::new(target),
+                    index: Box::new(key.clone()),
+                    ty: ir::Type::Nullable(Box::new(value_type.clone())),
+                    origin: origin.clone(),
+                }),
+                ty: value_type,
+                origin: origin.clone(),
+            })
+        }
+        // `optional`/smart pointers already lower to `T?` at the type level
+        // (`lower_type`'s `optional`/`unique_ptr`/`shared_ptr`/`weak_ptr`
+        // branch) — reading the wrapped value back is identity, the same
+        // value the receiver already denotes. This does not claim to
+        // preserve C++'s throw-on-empty-access behavior of
+        // `optional::value()`/`unique_ptr::operator*` — the same documented
+        // limitation `lower_type`'s own comment already states for this
+        // family (ownership/control-block mechanics aren't modeled, only
+        // presence/absence). Real corpus trigger: `Object::m_plistReferences`
+        // (`std::unique_ptr<ListOfConstObjects>`), read via `.get()` and
+        // `->` (`push_back`).
+        (
+            "optional" | "unique_ptr" | "shared_ptr" | "weak_ptr",
+            "get" | "value" | "operator*" | "operator->",
+        ) => Some(target),
+        ("optional" | "unique_ptr" | "shared_ptr" | "weak_ptr", "has_value") => {
+            Some(ir::Expr::Binary {
+                op: ir::BinaryOp::Ne,
+                lhs: Box::new(target),
+                rhs: Box::new(ir::Expr::NullLiteral {
+                    origin: origin.clone(),
+                }),
+                ty: ir::Type::Bool,
                 origin: origin.clone(),
             })
         }

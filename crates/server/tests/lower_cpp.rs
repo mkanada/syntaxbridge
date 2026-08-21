@@ -4984,3 +4984,104 @@ std::string f() {
         "must never call the nonexistent Dart function basic_string(), got:\n{source}"
     );
 }
+
+/// Round 23: `std::stack<T>` is LIFO-only but element-typed exactly like
+/// `vector`/`list`/`deque` — real trigger `view_page.cpp`'s
+/// `stack<Brush>`/`stack<Pen>` (drawing-context save/restore). `.top()` is
+/// the last element, `.push`/`.pop` are `.add`/`.removeLast`.
+#[test]
+fn stack_push_pop_top_map_to_list_add_removelast_last() {
+    let source = lower_and_emit(
+        "lower-cpp-stack",
+        r#"
+#include <stack>
+
+int f(std::stack<int>& s, int v) {
+    s.push(v);
+    int t = s.top();
+    s.pop();
+    return t;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("s.add(v);"),
+        "expected push to become add, got:\n{source}"
+    );
+    assert!(
+        source.contains("s[s.length - 1]"),
+        "expected top to index the last element, got:\n{source}"
+    );
+    assert!(
+        source.contains("s.removeLast();"),
+        "expected pop to become removeLast, got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "stack push/top/pop must not bail out, got:\n{source}"
+    );
+}
+
+/// Round 23: `std::map::at(key)` must fetch a value that is required to
+/// exist (C++ throws `out_of_range` otherwise) — `map[key]!` preserves that
+/// "must exist" intent with a real Dart failure on a missing key.
+#[test]
+fn map_at_force_unwraps_the_looked_up_value() {
+    let source = lower_and_emit(
+        "lower-cpp-map-at",
+        r#"
+#include <map>
+#include <string>
+
+int f(std::map<std::string, int>& m, const std::string& key) {
+    return m.at(key);
+}
+"#,
+    );
+
+    assert!(
+        source.contains("m[key]!"),
+        "expected map::at to force-unwrap the indexed value, got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "map::at must not bail out, got:\n{source}"
+    );
+}
+
+/// Round 23: `unique_ptr<T>`/`shared_ptr<T>`/`optional<T>` already lower to
+/// `T?` at the type level — reading the wrapped value back (`.get()`,
+/// `operator->`) is identity. Real trigger: `Object`'s
+/// `std::unique_ptr<ListOfConstObjects> m_plistReferences`, read via
+/// `.get()` in a getter and `->push_back(...)` in `object.cpp`.
+#[test]
+fn unique_ptr_get_and_arrow_are_identity_on_the_nullable_value() {
+    let source = lower_and_emit(
+        "lower-cpp-unique-ptr-get-arrow",
+        r#"
+#include <memory>
+#include <vector>
+
+struct Holder {
+    std::unique_ptr<std::vector<int>> m_items;
+
+    const std::vector<int> *Get() const { return m_items.get(); }
+    void Add(int v) { m_items->push_back(v); }
+};
+"#,
+    );
+
+    assert!(
+        source.contains("return m_items;"),
+        "expected .get() to be identity on the nullable field, got:\n{source}"
+    );
+    assert!(
+        source.contains("m_items!.add(v);"),
+        "expected operator-> to force-unwrap then dispatch the method, got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "unique_ptr get/operator-> must not bail out, got:\n{source}"
+    );
+}
