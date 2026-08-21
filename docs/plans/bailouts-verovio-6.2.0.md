@@ -1520,6 +1520,68 @@ causa: "assignment target is not a simple local variable or a field"
 inválidos** (mesmo `pugixml.dart`, sem regressão); `dart analyze`
 inalterado (15.752/9.053). Conferido: zero tokens `dynamic`, zero panics.
 
+### Atualização de 2026-08-20 (22ª rodada) — base de classe que é adaptador de biblioteca nunca vira `extends`/`with` inválido; bloqueio real confirmado para `HumdrumToken`
+
+Executado pelo loop autônomo, continuação da sessão. Baseline: tipos
+1.526/234, expressões 5.272/351, statements 339/17 — total 7.137.
+
+**Investigação: `HumdrumToken → Str`, a maior família de expressão
+(680 ocorrências combinadas, `docs/plans/diagnostico-verovio-6.2.0.md`,
+desenho já esboçado na 5ª rodada desta sessão).** `HumdrumToken` herda
+publicamente de `std::string` (`humlib.h:1473`) e guarda seu conteúdo de
+texto inteiramente através do construtor-base, nunca no corpo:
+`HumdrumToken::HumdrumToken(const string& aString) : string(aString) { ...
+outro trabalho real... }` (`humlib.cpp`, todo construtor real segue essa
+forma). Confirmado diretamente, não suposto: `CXCursor_CXXCtorInitializer`
+**não existe em nenhum lugar dos bindings gerados do `clang-sys`** —
+`libclang`'s API pública em C não tem cursor nenhum para uma entrada de
+lista de inicialização de construtor. Um harness de depuração confirmou
+que `clang_visitChildren` no cursor do construtor nunca expõe essa
+informação, mesmo para um fixture mínimo isolado. **Isso é um bloqueio
+técnico real do próprio `libclang`, não uma lacuna de implementação deste
+módulo** — sem uma fonte de dados alternativa (ex.: parsear a saída de
+`clang -Xclang -ast-dump=json` em paralelo à API de cursor, uma mudança de
+arquitetura bem maior que este loop não deveria tentar de improviso), a
+feature completa (campo `_content` sintetizado, roteamento de método)
+**não é viável com o toolchain atual**. Registrado aqui para nenhuma
+rodada futura repetir a mesma investigação do zero.
+
+**Bug real encontrado e corrigido no caminho, menor mas genuíno**: sem
+essa feature, `base_classes_of` ainda incluía `std::string` como base
+igual a qualquer outra, produzindo `class HumdrumToken with string,
+HumHash {` no pacote emitido — `string` nunca é declarado em lugar nenhum,
+um `undefined_class` real do `dart analyze`, confirmado contra o pacote
+real. Corrigido restringindo a apenas bases que resolvem para
+`Type::Record`/`Type::Enum` (as únicas formas para as quais este bridge
+já declara uma classe Dart de verdade) — `HumdrumToken` mantém `HumHash`
+como mixin/extends, descarta `std::string` silenciosamente em vez de
+referenciar um nome que nada declara. **Isso não move nenhuma das três
+tabelas do diagnóstico** (não é um bailout, é um bug de emissão de
+`extends`/`with` — uma categoria que o inventário de causas deste loop não
+rastreia por definição), mas é uma correção real de Dart inválido,
+dentro do espírito do AGENTS.md.
+
+**Medição:** tipos/expressões/statements **inalterados** (1.526/234,
+5.272/351, 339/17 — confirma que esta correção não toca nenhuma causa
+rastreada); **1/301 arquivos inválidos** (sem mudança); `dart analyze`
+15.752 → **15.744** erros (−8, o `undefined_class` de `string` some para
+as poucas classes do corpus real que herdam de `std::string`), 9.053
+avisos (sem mudança). Conferido: zero tokens `dynamic`, zero panics.
+
+**Achado negativo, também registrado**: cogitei que remover a base
+`std::string` inválida pudesse destravar `default_record_construct_at_depth`
+para `HumdrumToken` como elemento de `List<HumdrumToken>` (resíduo de "no
+default value available for this field's type yet", 222 ocorrências,
+`sclef`/`skeysig`/`skey`/`stimesig`/`_m_notes` em `humlib.h`, todos
+`List<HumdrumToken>.resize(n)` crescendo). Não é o caso — a contagem ficou
+em exatamente 222, inalterada — porque `default_record_construct_at_depth`
+já opera só sobre `record_fields_of` (campos), nunca sobre `base_class`,
+então a presença ou ausência da base nunca influenciou esse caminho. A
+causa raiz real do "no default value" continua não identificada — próxima
+rodada natural: instrumentar `default_record_construct_at_depth` para
+registrar em qual campo aninhado de `HumdrumToken` a recursão realmente
+falha, em vez de adivinhar a partir do nome da classe.
+
 ## 1. Tipos sem mapeamento — snapshot-base de 4.384 ocorrências
 
 ### Progresso executado
