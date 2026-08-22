@@ -183,6 +183,34 @@ unsafe fn out_param_indices(cursor: clang_sys::CXCursor) -> Vec<usize> {
         .collect()
 }
 
+/// Whether every one of `cursor`'s own out-param `indices` is the *pointer*
+/// form (`int *out`), never the reference form (`int &out`) — the exact
+/// eligibility bar `apply_out_param_bridge` applies before bridging a
+/// non-`void`-returning function/method (see its own doc comment on why:
+/// a reference out-param's call-site argument is a bare name, so an
+/// unrecognized call to a non-`void` reference-bridged function would
+/// silently keep assuming the callee's *original* scalar return type
+/// instead of the tuple it was never actually rewritten to return —
+/// `call_out_param_arg_indices` needs this exact same bar for a call
+/// site to never disagree with whether its callee's *declaration* was
+/// actually bridged (F8/tarefa 10, real trigger `Verse::AdjustPosition(int
+/// &overlap, int freeSpace, const Doc *doc)`: non-`void` return, reference-
+/// form out-param — `apply_out_param_bridge` correctly leaves its
+/// declaration alone, but before this check existed, `call_out_param_arg_
+/// indices` recognized the call anyway, producing a `(overlap,) = ...`
+/// destructure against a callee that still just returns a bare `int`).
+/// `cursor` may be either the declaration being bridged or a call's
+/// resolved callee, exactly like `out_param_indices` itself.
+unsafe fn out_param_indices_are_all_pointer_form(
+    cursor: clang_sys::CXCursor,
+    indices: &[usize],
+) -> bool {
+    indices.iter().all(|&index| {
+        let param_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, index as c_uint) };
+        unsafe { clang_sys::clang_getCursorType(param_cursor) }.kind == clang_sys::CXType_Pointer
+    })
+}
+
 unsafe fn is_non_const_scalar_out_param_type(cx_type: clang_sys::CXType) -> bool {
     if cx_type.kind != clang_sys::CXType_LValueReference
         && cx_type.kind != clang_sys::CXType_Pointer
@@ -357,16 +385,8 @@ unsafe fn apply_out_param_bridge(
     // honest bailout on its own arguments), never a clean-looking call to
     // the wrong Dart signature.
     let had_void_return = *return_type == ir::Type::Void;
-    if !had_void_return {
-        let all_pointer_form = indices.iter().all(|&index| {
-            let param_cursor =
-                unsafe { clang_sys::clang_Cursor_getArgument(cursor, index as c_uint) };
-            unsafe { clang_sys::clang_getCursorType(param_cursor) }.kind
-                == clang_sys::CXType_Pointer
-        });
-        if !all_pointer_form {
-            return;
-        }
+    if !had_void_return && !unsafe { out_param_indices_are_all_pointer_form(cursor, &indices) } {
+        return;
     }
 
     // The reference form of an out-param already gets the right Dart
@@ -537,6 +557,143 @@ fn replace_return_with_out_param_tuple(
     }
 }
 
+/// F8/tarefa 10's last gap: a caller-side local declared with no C++
+/// initializer (`int x;`), later reused by an out-param-bridged call as
+/// *both* an input argument and a destructuring target (`GetBoundingBox(x,
+/// y, w, h)` / `(x, y, w, h) = ...` — the same reuse `lower_stmt`'s own
+/// `Stmt::TupleAssign` construction always does, correct for a callee that
+/// genuinely reads-and-modifies its out-param, like `Fraction::
+/// ReduceStatic`'s `num = num / 2`). `emit::dart` turns a no-initializer
+/// `VarDecl` into `late T name;`, deferring initialization to first use —
+/// correct for a local truly untouched until a later statement, but wrong
+/// here: the call reads each local's value (as an argument) before its own
+/// destructuring assignment ever writes to it, a real read of a still-
+/// unassigned `late` local (`definitely_unassigned_late_local_variable`,
+/// real trigger `Doc::GetGlyphHeight`'s `int x; int y; int w; int h;
+/// Resources resources = GetResources(); Glyph *glyph =
+/// resources.GetGlyph(code); ...GetBoundingBox(x, y, w, h);` — note the
+/// unrelated declarations sitting *between* the out-param locals and the
+/// call, ruling out an adjacency-only scan). A neutral default value
+/// (`default_scalar_value`, the same stand-in `default_field_value`
+/// already gives an uninitialized field) is exactly as safe as whatever
+/// indeterminate value C++ itself would have left there. Scans forward
+/// from each no-initializer declaration for the first later statement, at
+/// the same nesting level, that either bridges it (patch and stop) or
+/// plainly reassigns it first (`Stmt::Assign`/`Stmt::ExprAssign` naming it
+/// — already gets a real value before any risky read, so `late` was
+/// already fine; stop without patching) — anything else in between (an
+/// unrelated declaration, an unrelated call, ...) is simply skipped over.
+fn neutralize_out_param_call_input_locals(stmts: &mut [ir::Stmt]) {
+    for decl_index in 0..stmts.len() {
+        let ir::Stmt::VarDecl {
+            name, init: None, ..
+        } = &stmts[decl_index]
+        else {
+            continue;
+        };
+        let name = name.clone();
+        let mut qualifies = false;
+        for peek in &stmts[decl_index + 1..] {
+            match peek {
+                ir::Stmt::Assign {
+                    name: assigned_name,
+                    ..
+                } if *assigned_name == name => break,
+                ir::Stmt::ExprAssign {
+                    target:
+                        ir::Expr::Ref {
+                            name: target_name, ..
+                        },
+                    ..
+                } if *target_name == name => break,
+                ir::Stmt::TupleAssign {
+                    targets,
+                    value: ir::Expr::Call { args, .. },
+                    ..
+                } => {
+                    let is_call_input = args.iter().any(
+                        |arg| matches!(arg, ir::Expr::Ref { name: arg_name, .. } if *arg_name == name),
+                    );
+                    let is_destructure_target = targets.iter().any(
+                        |target| matches!(target, ir::Expr::Ref { name: target_name, .. } if *target_name == name),
+                    );
+                    if is_call_input && is_destructure_target {
+                        qualifies = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if qualifies {
+            let ir::Stmt::VarDecl {
+                ty, init, origin, ..
+            } = &mut stmts[decl_index]
+            else {
+                unreachable!("re-matched the same VarDecl just inspected above")
+            };
+            *init = Some(default_scalar_value(ty, origin));
+        }
+    }
+    for stmt in stmts.iter_mut() {
+        recurse_neutralize_out_param_call_input_locals(stmt);
+    }
+}
+
+fn recurse_neutralize_out_param_call_input_locals(stmt: &mut ir::Stmt) {
+    match stmt {
+        ir::Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            neutralize_out_param_call_input_locals(then_branch);
+            neutralize_out_param_call_input_locals(else_branch);
+        }
+        ir::Stmt::While { body, .. } | ir::Stmt::DoWhile { body, .. } => {
+            neutralize_out_param_call_input_locals(body)
+        }
+        ir::Stmt::For { body, .. } => neutralize_out_param_call_input_locals(body),
+        ir::Stmt::ForEach { body, .. } => neutralize_out_param_call_input_locals(body),
+        ir::Stmt::TryCatch {
+            try_body,
+            catch_body,
+            ..
+        } => {
+            neutralize_out_param_call_input_locals(try_body);
+            neutralize_out_param_call_input_locals(catch_body);
+        }
+        ir::Stmt::TryFinally {
+            try_body,
+            finally_body,
+            ..
+        } => {
+            neutralize_out_param_call_input_locals(try_body);
+            neutralize_out_param_call_input_locals(finally_body);
+        }
+        ir::Stmt::Switch { cases, default, .. } => {
+            for case in cases {
+                neutralize_out_param_call_input_locals(&mut case.body);
+            }
+            if let Some(default) = default {
+                neutralize_out_param_call_input_locals(default);
+            }
+        }
+        ir::Stmt::Return { .. }
+        | ir::Stmt::VarDecl { .. }
+        | ir::Stmt::Assign { .. }
+        | ir::Stmt::FieldAssign { .. }
+        | ir::Stmt::ExprAssign { .. }
+        | ir::Stmt::ExprStmt { .. }
+        | ir::Stmt::Break { .. }
+        | ir::Stmt::Continue { .. }
+        | ir::Stmt::ContinueLabel { .. }
+        | ir::Stmt::Throw { .. }
+        | ir::Stmt::TupleAssign { .. }
+        | ir::Stmt::Unsupported { .. } => {}
+    }
+}
+
 /// Lowers one free function's definition cursor into IR. `usr` is passed in
 /// rather than re-derived, since the caller (`function_catalog::visit_cursor`)
 /// already computed it as the catalog's join key for this same cursor.
@@ -568,6 +725,7 @@ pub fn lower_function(
     };
     pop_active_pointer_out_params(pointer_out_params.len());
     body.splice(0..0, clone_prelude);
+    neutralize_out_param_call_input_locals(&mut body);
     unsafe { apply_out_param_bridge(cursor, &mut params, &mut return_type, &mut body, &origin) };
 
     Some(ir::Function {
@@ -758,6 +916,7 @@ pub fn lower_method(
         pop_active_method_owner_usr();
         pop_active_pointer_out_params(pointer_out_params.len());
         body.splice(0..0, clone_prelude);
+        neutralize_out_param_call_input_locals(&mut body);
         unsafe {
             apply_out_param_bridge(cursor, &mut params, &mut return_type, &mut body, &origin)
         };
@@ -841,6 +1000,7 @@ pub fn lower_constructor(
     };
     pop_active_method_owner_usr();
     body.splice(0..0, clone_prelude);
+    neutralize_out_param_call_input_locals(&mut body);
 
     Some(ir::Constructor {
         usr,
@@ -3722,15 +3882,30 @@ unsafe fn lower_stmt(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::St
     // a destructuring assignment (`(numerador, denominador) = ...;`), not a
     // plain `ExprStmt` that discards the record. Checked before the
     // `is_known_expression_kind` fallback below, which would otherwise
-    // treat this exactly like any other bare call.
-    if kind == clang_sys::CXCursor_CallExpr {
-        let referenced = unsafe { clang_sys::clang_getCursorReferenced(cursor) };
+    // treat this exactly like any other bare call. Unwrapped through
+    // `unwrap_transparent_value_cursor` first (F8/tarefa 10, real trigger
+    // `Alignment::GetLeftRight`'s own trailing default argument, `const
+    // std::vector<ClassId> &excludes = {}`): a bare-statement call that
+    // *omits* a trailing default argument needing non-trivial destruction —
+    // Verovio's own default-constructed `std::vector` — sits inside an
+    // `ExprWithCleanups` wrapper (libclang exposes it as
+    // `CXCursor_UnexposedExpr`, the same sugar `is_transparent_wrapper`
+    // already unwraps everywhere else), so the bare `kind ==
+    // CXCursor_CallExpr` check below never matched at all and this whole
+    // out-param bridge was silently skipped — the same shape
+    // `lower_if_with_out_param_call`'s own condition cursor already had to
+    // unwrap for exactly this reason.
+    let call_expr_cursor = unsafe { unwrap_transparent_value_cursor(cursor) };
+    if unsafe { clang_sys::clang_getCursorKind(call_expr_cursor) } == clang_sys::CXCursor_CallExpr {
+        let referenced = unsafe { clang_sys::clang_getCursorReferenced(call_expr_cursor) };
         if unsafe { clang_sys::clang_Cursor_isNull(referenced) } == 0 {
             let out_indices = unsafe { call_out_param_arg_indices(referenced) };
             if !out_indices.is_empty() {
                 let target_cursors: Option<Vec<clang_sys::CXCursor>> = out_indices
                     .iter()
-                    .map(|&index| unsafe { out_arg_target_cursor(referenced, cursor, index) })
+                    .map(|&index| unsafe {
+                        out_arg_target_cursor(referenced, call_expr_cursor, index)
+                    })
                     .collect();
                 return match target_cursors {
                     Some(target_cursors) => {
@@ -3752,7 +3927,7 @@ unsafe fn lower_stmt(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::St
                         {
                             return ir::Stmt::Unsupported { reason, origin };
                         }
-                        let mut value = unsafe { lower_expr(cursor, project_root) };
+                        let mut value = unsafe { lower_expr(call_expr_cursor, project_root) };
                         // The pointer form's raw C++ argument is `&a`, not a
                         // Dart-representable value on its own — `lower_expr`
                         // above just lowered it generically (an
@@ -4316,21 +4491,57 @@ unsafe fn lower_stdlib_assignment_stmt(
 /// argument passed to a bridged out-param (see `apply_out_param_bridge`) —
 /// recomputed independently from `referenced` (the call's resolved
 /// callee), the same "never disagree" discipline `out_param_indices`'s own
-/// doc comment describes. Only recognizes a call to a free function or a
-/// `static` method: `lower_call_arguments`'s own doc comment already
-/// establishes that shape's raw argument index lines up 1:1 with the
-/// callee's declared parameter index (no receiver consuming argument 0 the
-/// way an instance-method or operator call's does) — an instance-method
-/// out-param isn't supported here, since no fixture yet needs one.
+/// doc comment describes. Recognizes a call to a free function, a `static`
+/// method, or an *ordinary* (non-`static`, non-operator-syntax) instance
+/// method: `lower_call_arguments`'s own doc comment already establishes that
+/// a free function's raw argument index lines up 1:1 with the callee's
+/// declared parameter index (no receiver consuming argument 0), and
+/// `lower_method_call`'s own `arg_skip` derivation establishes the exact
+/// same 1:1 alignment for a plain `obj.method(args)` call — only an
+/// operator-syntax call (`a == b`, `pred(a, b)` through `operator()`, ...)
+/// has the receiver folded into argument 0 instead, which is why that shape
+/// stays excluded (checked the same way `lower_method_call` itself
+/// disambiguates it: the callee's raw spelling starts with `"operator"`).
+/// F8/tarefa 10's real trigger (`docs/prompts/
+/// 2026-08-21-10-parametros-de-saida-por-referencia.md`): `StaffAlignment::
+/// GetLeftRight(int, int&, int&) const`, an ordinary instance method, called
+/// as `topNote->GetAlignment()->GetLeftRight(staffN, minLeft, maxRight)` —
+/// `apply_out_param_bridge` already rewrote its *declaration* to return a
+/// tuple (it runs unconditionally from `lower_method`), but every call site
+/// fell through to the unbridged call path, leaving the caller's own
+/// out-param locals a `late` that's never assigned.
 unsafe fn call_out_param_arg_indices(referenced: clang_sys::CXCursor) -> Vec<usize> {
     let referenced_kind = unsafe { clang_sys::clang_getCursorKind(referenced) };
-    let is_free_or_static = referenced_kind == clang_sys::CXCursor_FunctionDecl
-        || (referenced_kind == clang_sys::CXCursor_CXXMethod
-            && unsafe { clang_sys::clang_CXXMethod_isStatic(referenced) } != 0);
-    if !is_free_or_static {
+    let is_free_function = referenced_kind == clang_sys::CXCursor_FunctionDecl;
+    let is_ordinary_method = referenced_kind == clang_sys::CXCursor_CXXMethod && {
+        let raw_name = unsafe {
+            type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced))
+        };
+        let is_static = unsafe { clang_sys::clang_CXXMethod_isStatic(referenced) } != 0;
+        is_static || !raw_name.starts_with("operator")
+    };
+    if !is_free_function && !is_ordinary_method {
         return Vec::new();
     }
-    unsafe { out_param_indices(referenced) }
+    let indices = unsafe { out_param_indices(referenced) };
+    if indices.is_empty() {
+        return indices;
+    }
+    // `apply_out_param_bridge` never rewrites a non-`void`-returning
+    // function/method whose out-params are the *reference* form — only the
+    // *pointer* form is eligible there (see its own doc comment). A callee
+    // this shape (real trigger: `Verse::AdjustPosition(int &overlap, int
+    // freeSpace, const Doc *doc)`) keeps its original, unbridged
+    // declaration untouched, so a call site must never treat it as bridged
+    // either — `out_param_indices_are_all_pointer_form`'s own doc comment
+    // has the full story.
+    let return_type = lower_type(unsafe { clang_sys::clang_getCursorResultType(referenced) });
+    if return_type != ir::Type::Void
+        && !unsafe { out_param_indices_are_all_pointer_form(referenced, &indices) }
+    {
+        return Vec::new();
+    }
+    indices
 }
 
 /// Whether `referenced` (a callee already confirmed out-param-bridged —
@@ -4350,12 +4561,7 @@ unsafe fn out_param_bridge_leading_return_type(
     if return_type == ir::Type::Void {
         return None;
     }
-    let all_pointer_form = indices.iter().all(|&index| {
-        let param_cursor =
-            unsafe { clang_sys::clang_Cursor_getArgument(referenced, index as c_uint) };
-        unsafe { clang_sys::clang_getCursorType(param_cursor) }.kind == clang_sys::CXType_Pointer
-    });
-    all_pointer_form.then_some(return_type)
+    unsafe { out_param_indices_are_all_pointer_form(referenced, indices) }.then_some(return_type)
 }
 
 /// The cursor a bridged out-arg (position `index` in `call_cursor`'s raw

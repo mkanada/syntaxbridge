@@ -2848,17 +2848,45 @@ fn invalidate_ref_targets(targets: &[Expr], promoted: &mut Promoted) {
 /// *inside* a pattern element, which Dart's pattern-assignment grammar
 /// rejects (`dart format`: "Expected to find ')'" right at the `!`,
 /// confirmed empirically against a real Verovio file — see this variant's
-/// own doc comment on `emit_stmt`'s `Stmt::TupleAssign` arm).
+/// own doc comment on `emit_stmt`'s `Stmt::TupleAssign` arm) — or when any
+/// target contains an `Index` anywhere in its chain at all, regardless of
+/// nullability (F8/tarefa 10, real trigger `View::CalcOffsetBezier`'s
+/// `CalcOffsetSpanningStartY(dc, points[0].y, spanningType)`, an
+/// instance-method out-param call newly bridged once `lower::cpp::
+/// call_out_param_arg_indices` stopped excluding ordinary instance methods):
+/// Dart's pattern grammar has no production for a subscript expression as a
+/// pattern element at all — `(points[0].y,) = call();` fails to parse
+/// ("Expected to find ')'") *and* fails to type-check
+/// (`pattern_type_mismatch_in_irrefutable_context`, misreading `points[0].y`
+/// as `points` itself being destructured), confirmed empirically the same
+/// way the nullable-receiver case above was. Every other `Expr` shape this
+/// module can emit as an lvalue (`Ref`, a plain non-nullable `FieldAccess`
+/// chain) parses fine as a pattern element on its own.
 fn tuple_assign_needs_temp_block(targets: &[Expr]) -> bool {
-    targets.iter().any(|target| match target {
+    targets.iter().any(target_needs_tuple_assign_temp_block)
+}
+
+fn target_needs_tuple_assign_temp_block(target: &Expr) -> bool {
+    match target {
         Expr::FieldAccess {
             target: receiver, ..
-        }
-        | Expr::Index {
-            target: receiver, ..
-        } => !receiver_bang_by_type(receiver).is_empty(),
+        } => !receiver_bang_by_type(receiver).is_empty() || target_contains_index(receiver),
+        Expr::Index { .. } => true,
         _ => false,
-    })
+    }
+}
+
+/// Whether `expr`'s own chain (following `FieldAccess`'s `target` field)
+/// ever reaches an `Index` — see `target_needs_tuple_assign_temp_block`'s
+/// own doc comment for why any `Index` anywhere in a `Stmt::TupleAssign`
+/// target disqualifies the whole target from Dart's pattern-assignment
+/// grammar, not just an `Index` at the target's own top level.
+fn target_contains_index(expr: &Expr) -> bool {
+    match expr {
+        Expr::Index { .. } => true,
+        Expr::FieldAccess { target, .. } => target_contains_index(target),
+        _ => false,
+    }
 }
 
 /// Names of local variables/parameters Dart's flow-sensitive type promotion

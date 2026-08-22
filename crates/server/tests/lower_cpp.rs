@@ -4784,6 +4784,340 @@ int use_it() {
     );
 }
 
+/// F8/tarefa 10 (`docs/prompts/2026-08-21-10-parametros-de-saida-por-referencia.md`):
+/// every out-param call site recognized so far (`call_out_param_arg_indices`)
+/// was a free function or a `static` method, whose raw call-cursor arguments
+/// line up 1:1 with the callee's own declared parameters. An *ordinary*
+/// (non-static, non-operator) instance method called through plain
+/// `obj.method(...)` syntax has that exact same alignment — `lower_method_call`'s
+/// own `arg_skip = 0` for that shape already establishes it — but
+/// `call_out_param_arg_indices` never recognized the callee as bridged at
+/// all, so the call site fell through to the ordinary (unbridged) call
+/// lowering: the callee's own signature had already been rewritten to return
+/// a tuple (`apply_out_param_bridge` runs unconditionally from `lower_method`),
+/// but the caller kept passing its `int`s by value into a callee that no
+/// longer writes through them, leaving the caller's own out-param locals a
+/// `late` that's never assigned (`definitely_unassigned_late_local_variable`).
+/// Real corpus repro: `StaffAlignment::GetLeftRight(int, int&, int&) const`
+/// called as `topNote->GetAlignment()->GetLeftRight(staffN, minLeft, maxRight)`
+/// from `AdjustArpegFunctor::VisitArpeg`.
+#[test]
+fn a_reference_out_param_on_an_ordinary_instance_method_bridges_to_a_dart_tuple_return() {
+    let source = lower_and_emit(
+        "lower-cpp-instance-method-reference-out-param",
+        r#"
+class StaffAlignment {
+public:
+    void GetLeftRight(int staffN, int &minLeft, int &maxRight) const {
+        minLeft = staffN - 1;
+        maxRight = staffN + 1;
+    }
+};
+
+int use_it(StaffAlignment &align, int staffN) {
+    int minLeft = 0;
+    int maxRight = 0;
+    align.GetLeftRight(staffN, minLeft, maxRight);
+    return minLeft + maxRight;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("(int, int) GetLeftRight(int staffN, int minLeft, int maxRight)"),
+        "expected the instance method's reference out-params to become a Dart tuple \
+         return, got:\n{source}"
+    );
+    assert!(
+        source.contains("(minLeft, maxRight) = align.GetLeftRight(staffN, minLeft, maxRight);"),
+        "expected the call site to destructure the callee's tuple back into the \
+         caller's own variables, got:\n{source}"
+    );
+    assert!(
+        !source.contains("late int"),
+        "an out-param local must never be left as an unassigned `late`, got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "an instance-method out-param call must not bail out, got:\n{source}"
+    );
+}
+
+/// F8/tarefa 10, second gap the previous test's fixture didn't reach: once
+/// an ordinary instance method's out-param call is recognized at all, a
+/// target reached through an array index (`points[0].y`, real trigger
+/// `View::CalcOffsetBezier`'s `CalcOffsetSpanningStartY(dc, points[0].y,
+/// spanningType)`) can't sit inside `Stmt::TupleAssign`'s ordinary
+/// record-pattern syntax either — confirmed empirically with a real `dart
+/// analyze`/`dart format` run against exactly this shape:
+/// `(points[0].y,) = call();` both fails to parse ("Expected to find ')'")
+/// and, before that syntax error, mis-typechecks as
+/// `pattern_type_mismatch_in_irrefutable_context` (the analyzer reads
+/// `points[0].y` as `points` itself being destructured). Same "route around
+/// the pattern grammar with a temp-block" fix `tuple_assign_needs_temp_block`
+/// already applies to a nullable-receiver field target, extended to any
+/// target with an `Index` anywhere in its chain.
+#[test]
+fn a_tuple_assign_target_reached_through_an_array_index_avoids_pattern_assignment_syntax() {
+    let source = lower_and_emit(
+        "lower-cpp-tuple-assign-index-target",
+        r#"
+struct Point {
+    int y;
+};
+
+class View {
+public:
+    void CalcOffsetY(int &y, int spanningType) const {
+        y = y + spanningType;
+    }
+
+    void CalcOffsetBezier(Point points[4], int spanningType) {
+        CalcOffsetY(points[0].y, spanningType);
+    }
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("(points[0].y,) ="),
+        "an array-indexed target must never appear inside a Dart pattern-assignment \
+         target, got:\n{source}"
+    );
+    assert!(
+        source.contains("points[0].y = _syntaxBridgeTupleAssign.$1;"),
+        "expected the target assigned individually, via ordinary assignment syntax, \
+         got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "an array-indexed out-param target must not bail out, got:\n{source}"
+    );
+}
+
+/// F8/tarefa 10, third gap: `apply_out_param_bridge` deliberately never
+/// bridges a non-`void`-returning function/method whose out-param is the
+/// *reference* form (its own doc comment: only the *pointer* form is
+/// eligible there) — real trigger `Verse::AdjustPosition(int &overlap, int
+/// freeSpace, const Doc *doc)`, called as `_m_previousVerse->AdjustPosition(
+/// overlap, m_freeSpace, m_doc)`. Before `out_param_indices_are_all_pointer_
+/// form` existed, `call_out_param_arg_indices` recognized this call as
+/// bridged anyway (the reference-form out-param alone was enough), emitting
+/// `(overlap,) = ...AdjustPosition(...);` against a callee whose declaration
+/// `apply_out_param_bridge` correctly left as a plain `int`-returning
+/// method — a real `dart analyze` run against exactly this shape confirmed
+/// `pattern_type_mismatch_in_irrefutable_context` ("matched value of type
+/// 'int' isn't assignable to the required type '(Object?,)'"). The call
+/// site must agree with its callee's own (unbridged) declaration: an
+/// ordinary call whose own (int) return value the caller uses however the
+/// C++ source did.
+#[test]
+fn a_non_void_returning_instance_method_with_a_reference_out_param_is_never_treated_as_bridged() {
+    let source = lower_and_emit(
+        "lower-cpp-non-void-reference-out-param-instance-method",
+        r#"
+class Verse {
+public:
+    int AdjustPosition(int &overlap, int freeSpace) {
+        overlap = overlap - freeSpace;
+        return overlap;
+    }
+};
+
+int use_it(Verse &verse, int overlap, int freeSpace) {
+    verse.AdjustPosition(overlap, freeSpace);
+    return overlap;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("int AdjustPosition(int overlap, int freeSpace)"),
+        "a non-void-returning method with a reference out-param must keep its plain, \
+         unbridged declaration, got:\n{source}"
+    );
+    assert!(
+        !source.contains("(overlap,)") && !source.contains("(int,) AdjustPosition"),
+        "the callee was never bridged into a tuple return, so the call site must never \
+         treat it as one, got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "an unbridged non-void out-param call must not bail out, got:\n{source}"
+    );
+}
+
+/// F8/tarefa 10, fourth gap: a bare-statement out-param call that *omits* a
+/// trailing default argument needing non-trivial destruction (real trigger
+/// `Alignment::GetLeftRight(int, int&, int&, const std::vector<ClassId>
+/// &excludes = {})`, called as `leftAlignment->GetLeftRight(staffN, minLeft,
+/// maxRight);` from `HorizontalAligner::SetOverflowAboveTuning`/`
+/// SetOverflowBelowTuning`) sits inside an `ExprWithCleanups` wrapper —
+/// libclang exposes it as the same `CXCursor_UnexposedExpr` sugar
+/// `is_transparent_wrapper` already unwraps everywhere else, since the
+/// default-constructed `std::vector` temporary needs a destructor call.
+/// `lower_stmt`'s own bare-`CallExpr` special case checked `kind ==
+/// CXCursor_CallExpr` against the *wrapped* cursor directly, so it silently
+/// never matched here, and the call fell through to the ordinary (unbridged)
+/// path even though the callee's own declaration was genuinely bridged —
+/// confirmed only by comparing this exact call, with vs. without an
+/// explicit trailing argument, against a real Verovio file
+/// (`horizontalaligner.cpp`'s own two call shapes at lines 304 vs. 441).
+#[test]
+fn a_bare_out_param_call_omitting_a_trailing_default_argument_still_bridges() {
+    let source = lower_and_emit(
+        "lower-cpp-out-param-omitted-default-arg",
+        r#"
+#include <vector>
+
+class Alignment {
+public:
+    void GetLeftRight(int staffN, int &minLeft, int &maxRight, const std::vector<int> &excludes = {}) const {
+        minLeft = staffN - 1;
+        maxRight = staffN + 1;
+    }
+};
+
+int with_default_omitted(Alignment &align, int staffN) {
+    int minLeft = 0;
+    int maxRight = 0;
+    align.GetLeftRight(staffN, minLeft, maxRight);
+    return minLeft + maxRight;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("(minLeft, maxRight) = align.GetLeftRight(staffN, minLeft, maxRight);"),
+        "expected the omitted-default-argument call to still destructure the callee's \
+         tuple back into the caller's own variables, got:\n{source}"
+    );
+    assert!(
+        !source.contains("late int"),
+        "an out-param local must never be left as an unassigned `late`, got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "an omitted-default-argument out-param call must not bail out, got:\n{source}"
+    );
+}
+
+/// F8/tarefa 10, fifth (and last) gap: a caller-side local declared with no
+/// C++ initializer, immediately followed by an out-param-bridged call that
+/// reuses it as *both* an input argument and a destructuring target — real
+/// trigger `AdjustArpegFunctor::VisitArpeg`'s `int minTopLeft; int
+/// maxTopRight; ...GetLeftRight(staffN, minTopLeft, maxTopRight);`. Even
+/// once every earlier gap in this family is fixed, the call site correctly
+/// becomes `(minTopLeft, maxTopRight) = ...GetLeftRight(staffN, minTopLeft,
+/// maxTopRight);` — but the two locals were still emitted as bare `late
+/// int`, deferring initialization to "first use", and the *very first* use
+/// is this same statement's own call reading them as arguments *before*
+/// its own destructuring assignment ever runs — a genuine
+/// `definitely_unassigned_late_local_variable`, confirmed against the real
+/// Verovio corpus. A neutral default value stands in for whatever the
+/// caller never actually set, exactly as safe as C++'s own indeterminate
+/// initial value.
+#[test]
+fn a_caller_local_reused_as_both_out_param_call_input_and_target_gets_a_neutral_default_not_late() {
+    let source = lower_and_emit(
+        "lower-cpp-out-param-neutral-default-input",
+        r#"
+class StaffAlignment {
+public:
+    void GetLeftRight(int staffN, int &minLeft, int &maxRight) const {
+        minLeft = staffN - 1;
+        maxRight = staffN + 1;
+    }
+};
+
+int use_it(StaffAlignment &align, int staffN) {
+    int minLeft;
+    int maxRight;
+    align.GetLeftRight(staffN, minLeft, maxRight);
+    return minLeft + maxRight;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("late int"),
+        "a local reused as a bridged call's own input argument must never be left as an \
+         unassigned `late`, got:\n{source}"
+    );
+    assert!(
+        source.contains("int minLeft = 0;") && source.contains("int maxRight = 0;"),
+        "expected a neutral default value instead of `late`, got:\n{source}"
+    );
+    assert!(
+        source.contains("(minLeft, maxRight) = align.GetLeftRight(staffN, minLeft, maxRight);"),
+        "expected the call site to still destructure the callee's tuple back into the \
+         caller's own variables, got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "must not bail out, got:\n{source}"
+    );
+}
+
+/// F8/tarefa 10, the same neutral-default gap but with unrelated
+/// declarations sitting *between* the out-param locals and the bridged
+/// call — real trigger `Doc::GetGlyphHeight`'s `int x; int y; int w; int
+/// h; Resources resources = GetResources(); Glyph *glyph =
+/// resources.GetGlyph(code); ...GetBoundingBox(x, y, w, h);`. An
+/// adjacency-only backward scan (this family's first version) stops at the
+/// very first non-matching statement and never reaches `x`/`y`/`w`/`h` at
+/// all; the fix has to skip over statements unrelated to the out-param
+/// locals instead of stopping at them.
+#[test]
+fn a_neutral_default_still_applies_across_unrelated_statements_before_the_bridged_call() {
+    let source = lower_and_emit(
+        "lower-cpp-out-param-neutral-default-with-gap",
+        r#"
+class Glyph {
+public:
+    void GetBoundingBox(int &x, int &y, int &w, int &h) const {
+        x = 0;
+        y = 0;
+        w = 10;
+        h = 10;
+    }
+};
+
+class Resources {
+public:
+    Glyph GetGlyph(int code) const {
+        return Glyph();
+    }
+};
+
+int use_it(Resources &resources, int code) {
+    int x;
+    int y;
+    int w;
+    int h;
+    Glyph glyph = resources.GetGlyph(code);
+    glyph.GetBoundingBox(x, y, w, h);
+    return x + y + w + h;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("late int"),
+        "an out-param local separated from its bridged call by unrelated statements must \
+         still never be left as an unassigned `late`, got:\n{source}"
+    );
+    assert!(
+        source.contains("(x, y, w, h) = glyph.GetBoundingBox(x, y, w, h);"),
+        "expected the call site to still destructure the callee's tuple back into the \
+         caller's own variables, got:\n{source}"
+    );
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "must not bail out, got:\n{source}"
+    );
+}
+
 /// `std::stringstream`/`std::ostringstream` accumulation (round 19, real
 /// trigger `options.cpp`'s `OptionArray::GetStr`): `ss << a << b;` used as
 /// its own statement, across several separate insertions (including inside
