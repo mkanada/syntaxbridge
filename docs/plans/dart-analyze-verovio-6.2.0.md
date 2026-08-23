@@ -1,5 +1,12 @@
 # `dart analyze` sobre o Verovio 6.2.0 — agrupamento, causas raiz e backlog
 
+> **Superado em 2026-08-23.** As 15 famílias deste documento (F1–F15) foram
+> todas executadas (commits `f3cead2`…`32dd1df`) e as contagens abaixo são da
+> rodada de 2026-08-21 (commit `e0728a6`), portanto obsoletas. O backlog ativo
+> passou a ser `docs/plans/estado-da-transpilacao-verovio-6.2.md`, com as
+> famílias T1–T14 e os prompts `docs/prompts/2026-08-23-NN-*.md`. Este arquivo
+> fica como registro do que foi diagnosticado e corrigido naquela rodada.
+
 Este documento é o **backlog** dos erros que o `dart analyze` reporta sobre o
 pacote Dart emitido a partir do Verovio 6.2.0 real, não modificado. Ele
 complementa `docs/plans/diagnostico-verovio-6.2.0.md`, que é o log dos achados
