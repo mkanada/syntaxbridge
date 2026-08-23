@@ -27,6 +27,13 @@ const OPAQUE_TYPE_NAME: &str = "SyntaxBridgeOpaque";
 const PAIR_TYPE_NAME: &str = "SyntaxBridgePair";
 /// Must read the same literal name as `lower::cpp::NATIVE_HANDLE_TYPE_NAME`.
 const NATIVE_HANDLE_TYPE_NAME: &str = "SyntaxBridgeNativeHandle";
+/// `foreach_binding_type_text`'s own marker: nothing else in this emitter
+/// ever spells out Dart's built-in `MapEntry<`, so its presence in a printed
+/// file is a safe, unambiguous signal that the file needs
+/// `emit_map_entry_pair_extension`'s `first`/`second` extension (F15/tarefa
+/// 15.5) — the same "distinctive printed text, not a separate tracked flag"
+/// pattern `OPAQUE_TYPE_NAME`/`PAIR_TYPE_NAME`/etc. already use.
+const MAP_ENTRY_MARKER: &str = "MapEntry<";
 /// F10/tarefa 13's `find_if` "declare, guard, dereference" idiom (see
 /// `lower::cpp::lower_compound_stmt`'s find/find_if fusion) needs "the first
 /// element satisfying a predicate, or null" — `dart:core`'s `Iterable` has
@@ -213,11 +220,15 @@ pub fn emit_module_with_externals(
     let needs_list_cursor_support = files
         .values()
         .any(|source| source.contains(LIST_CURSOR_TYPE_NAME));
+    let needs_map_entry_pair_extension = files
+        .values()
+        .any(|source| source.contains(MAP_ENTRY_MARKER));
     if needs_opaque_support
         || needs_pair_support
         || needs_native_handle_support
         || needs_first_where_support
         || needs_list_cursor_support
+        || needs_map_entry_pair_extension
     {
         let mut support = String::new();
         if needs_opaque_support {
@@ -246,6 +257,12 @@ pub fn emit_module_with_externals(
                 support.push('\n');
             }
             support.push_str(&emit_list_cursor_support());
+        }
+        if needs_map_entry_pair_extension {
+            if !support.is_empty() {
+                support.push('\n');
+            }
+            support.push_str(&emit_map_entry_pair_extension());
         }
         files.insert(format!("lib/{SUPPORT_FILE_NAME}"), support);
     }
@@ -535,6 +552,7 @@ fn emit_file(
         || source.contains(NATIVE_HANDLE_TYPE_NAME)
         || source.contains(FIRST_WHERE_HELPER_NAME)
         || source.contains(LIST_CURSOR_TYPE_NAME)
+        || source.contains(MAP_ENTRY_MARKER)
     {
         import_lines.push(format!("import '{SUPPORT_FILE_NAME}';"));
     }
@@ -575,6 +593,41 @@ fn emit_pair_support() -> String {
     format!(
         "final class {PAIR_TYPE_NAME}<A, B> {{\n{INDENT}{PAIR_TYPE_NAME}(this.first, this.second);\n\n{INDENT}A first;\n{INDENT}B second;\n}}\n"
     )
+}
+
+/// F15/tarefa 15.5: a `for (auto &kv : mapa)` range-for over a `std::map<K,
+/// V>` lowers its iterable to `mapa.entries` (`lower::cpp`'s
+/// `CXXForRangeStmt` case — Dart's `Map` isn't `Iterable`, `Map.entries` is)
+/// while keeping the binding's own `Type::Pair(K, V)` — the same type a
+/// real `std::pair` variable gets, so the body's own `kv.first`/`kv.second`
+/// (`std::pair`'s member names) lower unchanged, as an ordinary
+/// `Expr::FieldAccess`. Dart's own `MapEntry<K, V>` (what `.entries` really
+/// yields, and what `foreach_binding_type_text` prints for this shape) only
+/// exposes `.key`/`.value`, not `.first`/`.second` — this extension supplies
+/// them, so lowering never needs to rewrite every `.first`/`.second`
+/// occurrence inside the loop body into `.key`/`.value` itself.
+fn emit_map_entry_pair_extension() -> String {
+    format!(
+        "extension SyntaxBridgeMapEntryPair<K, V> on MapEntry<K, V> {{\n{INDENT}K get first => key;\n{INDENT}V get second => value;\n}}\n"
+    )
+}
+
+/// The Dart type text a `Stmt::ForEach` binding is declared with. Ordinarily
+/// just `emit_type(ty)` — but when `ty` is `Type::Pair(K, V)` *and*
+/// `iterable` is the `.entries` access `lower::cpp`'s `CXXForRangeStmt` case
+/// synthesizes for a `std::map` range-for (see `emit_map_entry_pair_
+/// extension`'s doc comment), the binding is really Dart's own
+/// `MapEntry<K, V>` — printing `SyntaxBridgePair<K, V>` instead would be
+/// simply wrong (that's not what `.entries` yields) even before
+/// `.first`/`.second` enter into it.
+fn foreach_binding_type_text(ty: &Type, iterable: &Expr) -> String {
+    if let Type::Pair(key_ty, value_ty) = ty
+        && let Expr::FieldAccess { field, .. } = iterable
+        && field == "entries"
+    {
+        return format!("MapEntry<{}, {}>", emit_type(key_ty), emit_type(value_ty));
+    }
+    emit_type(ty)
 }
 
 /// `std::find_if(X.begin(), X.end(), pred)`'s "first match, or none" —
@@ -2531,7 +2584,7 @@ fn emit_stmt(
             let binding = if *is_final { "final " } else { "" };
             let mut source = format!(
                 "{pad}for ({binding}{} {name} in {iterable_text}) {{\n",
-                emit_type(ty)
+                foreach_binding_type_text(ty, iterable)
             );
             source.push_str(&emit_scoped_block(
                 body,

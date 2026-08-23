@@ -2089,6 +2089,85 @@ int first_nonzero(const std::vector<int>& values) {
     );
 }
 
+/// F15/tarefa 15.5: `for (auto c : str)` treats `str` (a `std::string`,
+/// `Type::Str`) as a character sequence — valid C++, but Dart's `String`
+/// isn't `Iterable`, so a straight-through `for (int c in str)` fails
+/// `for_in_of_invalid_type`. `char` always lowers to `Type::Int` here, so
+/// the binding is always an int reading each UTF-16 code unit: `.codeUnits`.
+/// Real trigger: `bboxdevicecontext.dart:343`.
+#[test]
+fn range_for_over_a_string_iterates_its_code_units() {
+    let source = lower_and_emit(
+        "lower-cpp-range-for-string",
+        r#"
+#include <string>
+
+int count_spaces(const std::string &text) {
+    int spaces = 0;
+    for (char c : text) {
+        if (c == ' ') {
+            spaces++;
+        }
+    }
+    return spaces;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "got:\n{source}"
+    );
+    assert!(
+        source.contains("for (int c in text.codeUnits)"),
+        "expected the string to iterate its code units, got:\n{source}"
+    );
+}
+
+/// F15/tarefa 15.5: `for (auto &kv : mapa)` treats `mapa` (a `std::map<K,
+/// V>`, `Type::Map`) as a sequence of `std::pair<const K, V>` — valid C++,
+/// but Dart's `Map` isn't `Iterable`, so a straight-through `for (kv in
+/// mapa)` fails `for_in_of_invalid_type`. Dart's own `Map.entries` gives an
+/// `Iterable<MapEntry<K, V>>`; the body's own `kv.first`/`kv.second`
+/// (`std::pair`'s member names) survive unchanged via a `first`/`second`
+/// extension on `MapEntry` in the shared support file, rather than every
+/// occurrence needing rewriting to `.key`/`.value`. Real trigger:
+/// `adjustaccidxfunctor.dart:31`.
+#[test]
+fn range_for_over_a_map_iterates_its_entries() {
+    let source = lower_and_emit(
+        "lower-cpp-range-for-map",
+        r#"
+#include <map>
+
+int sum_values(const std::map<int, int> &counts) {
+    int total = 0;
+    for (auto kv : counts) {
+        total += kv.second;
+    }
+    return total;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "got:\n{source}"
+    );
+    assert!(
+        source.contains("MapEntry<int, int> kv in counts.entries)"),
+        "expected the map to iterate its entries as MapEntry<int, int>, got:\n{source}"
+    );
+    assert!(
+        source.contains("total = total + kv.second;") || source.contains("total += kv.second;"),
+        "expected the pair member access to survive unchanged, got:\n{source}"
+    );
+    assert!(
+        source.contains("import 'syntax_bridge_support.dart';"),
+        "expected the support-file import for the MapEntry first/second extension, got:\n{source}"
+    );
+}
+
 /// A do-while body runs once before its condition is checked; Dart has the
 /// identical construct, so it must not become a plain while-loop bailout.
 #[test]

@@ -3936,6 +3936,35 @@ unsafe fn lower_stmt(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::St
                         binding_type,
                     )) != 0)
         };
+        let iterable_expr = unsafe { lower_expr(*iterable_cursor, project_root) };
+        // F15/tarefa 15.5: Dart's `for`-`in` requires an `Iterable` — neither
+        // `String` nor `Map` is one, so a straight-through `for (auto c :
+        // str)`/`for (auto &kv : mapa)` fails `for_in_of_invalid_type`. Both
+        // get an adapter getter on the iterable itself instead: `char`
+        // always lowers to `Type::Int` (`lower_type`'s own doc comment), so
+        // a `String`'s binding is always an int reading each UTF-16 code
+        // unit (`.codeUnits`); a `Map<K, V>`'s `.entries` gives
+        // `Iterable<MapEntry<K, V>>` — `emit::dart`'s `Stmt::ForEach` arm
+        // recognizes this exact shape (a `Type::Pair` binding fed by a
+        // `.entries` access) and prints the binding as Dart's own
+        // `MapEntry<K, V>`, whose `first`/`second` extension (the shared
+        // support file) lets the body's own `kv.first`/`kv.second`
+        // (`std::pair`'s member names) survive unchanged.
+        let iterable = match &iterable_type {
+            ir::Type::Str => ir::Expr::FieldAccess {
+                target: Box::new(iterable_expr),
+                field: "codeUnits".to_owned(),
+                ty: ir::Type::List(Box::new(ir::Type::Int)),
+                origin: origin.clone(),
+            },
+            ir::Type::Map(key_ty, value_ty) => ir::Expr::FieldAccess {
+                target: Box::new(iterable_expr),
+                field: "entries".to_owned(),
+                ty: ir::Type::List(Box::new(ir::Type::Pair(key_ty.clone(), value_ty.clone()))),
+                origin: origin.clone(),
+            },
+            _ => iterable_expr,
+        };
         return ir::Stmt::ForEach {
             name: unsafe {
                 type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(
@@ -3945,7 +3974,7 @@ unsafe fn lower_stmt(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::St
             ty: lower_type(binding_type),
             is_final,
             write_back: is_mutable_reference,
-            iterable: unsafe { lower_expr(*iterable_cursor, project_root) },
+            iterable,
             body: unsafe { lower_branch(*body_cursor, project_root) },
             origin,
         };
