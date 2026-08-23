@@ -757,6 +757,60 @@ int increment(int value, int step) {
     );
 }
 
+/// F15/tarefa 15.4: a `double` parameter defaulted from an integer literal
+/// (`double rotate = 0`) lowers its default through the same path as any
+/// other int-to-double conversion, becoming a runtime `0.toDouble()` call —
+/// but Dart requires a parameter default to be a compile-time constant
+/// (`const_eval_method_invocation`), and `0.toDouble()` is a method call, not
+/// a literal. Real trigger: `editortoolkit_neume.dart:2695`'s
+/// `distanceToBB`.
+#[test]
+fn an_int_literal_default_for_a_double_parameter_folds_to_a_double_literal() {
+    let source = lower_and_emit(
+        "lower-cpp-double-default-from-int-literal",
+        r#"
+int distance_to_bb(int ulx, double rotate = 0) {
+    return ulx;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("toDouble()"),
+        "expected the default to fold to a literal, not a runtime conversion call, got:\n{source}"
+    );
+    assert!(
+        source.contains("[double rotate = 0"),
+        "expected a Dart-const-safe double default, got:\n{source}"
+    );
+}
+
+/// F15/tarefa 15.4: an `int` parameter defaulted from an unscoped C++ enum
+/// constant (`int style = PEN_SOLID`) lowers its default the same way any
+/// other enum-to-int implicit conversion does, as `PenStyle.PEN_SOLID.value`
+/// — a getter call, never a compile-time constant in Dart even on a const
+/// receiver (`const_eval_property_access`). Real trigger:
+/// `devicecontext.dart:146`'s `SetBackground`.
+#[test]
+fn an_enum_constant_default_for_an_int_parameter_folds_to_an_int_literal() {
+    let source = lower_and_emit(
+        "lower-cpp-int-default-from-enum-constant",
+        r#"
+enum PenStyle { PEN_SOLID, PEN_DASH };
+void set_background(int color, int style = PEN_SOLID) {}
+"#,
+    );
+
+    assert!(
+        !source.contains("PEN_SOLID.value"),
+        "expected the default to fold to a plain int literal, not a getter call, got:\n{source}"
+    );
+    assert!(
+        source.contains("[int style = 0]"),
+        "expected a Dart-const-safe int default (PEN_SOLID's own value), got:\n{source}"
+    );
+}
+
 /// These standard-library wrappers preserve a value shape Dart already has:
 /// fixed-size and deque containers are lists, the unordered variants use the
 /// same `Set`/`Map` interface, `optional` is nullable, smart pointers are

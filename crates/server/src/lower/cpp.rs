@@ -2764,7 +2764,9 @@ unsafe fn collect_params_with_clone_prelude(
                             | clang_sys::CXCursor_TemplateRef
                     )
                 })
-                .map(|default_cursor| unsafe { lower_expr(default_cursor, project_root) })
+                .map(|default_cursor| unsafe {
+                    default_argument_value(default_cursor, &ty, project_root, origin)
+                })
         };
 
         params.push(ir::Param {
@@ -3016,6 +3018,70 @@ fn is_case_terminator(stmt: &ir::Stmt) -> bool {
 /// to already be an integer constant expression, so this fold only fails
 /// for a label shape this function doesn't yet recognize as safe (`None`,
 /// which `lower_switch_stmt` turns into a whole-switch bailout).
+/// A parameter default's value, made Dart-const-safe (F15/tarefa 15.4).
+/// Dart requires a parameter default to be a compile-time constant
+/// expression, but `lower_expr`'s ordinary lowering can turn a genuine C++
+/// constant into a Dart *runtime* expression: an integer literal implicitly
+/// converted to the parameter's `double` type becomes a `Expr::Convert`,
+/// printed as `0.toDouble()` (a method call — real trigger:
+/// `editortoolkit_neume.dart:2695`'s `distanceToBB`), and an unscoped enum
+/// constant implicitly converted to `int` becomes `PenStyle.PEN_SOLID.value`
+/// (a getter call, never constant even on a const receiver — real trigger:
+/// `devicecontext.dart:146`'s `SetBackground`). Both are real C++ constant
+/// expressions (`clang_Cursor_Evaluate` succeeds on both), so — mirroring
+/// `switch_case_label_value`'s own already-safe-shapes-pass-through-else-fold
+/// pattern — this only reaches for the evaluator when the naive lowering
+/// isn't already one of Dart's own constant-pattern shapes.
+unsafe fn default_argument_value(
+    default_cursor: clang_sys::CXCursor,
+    param_ty: &ir::Type,
+    project_root: &Path,
+    origin: &ir::Origin,
+) -> ir::Expr {
+    let lowered = unsafe { lower_expr(default_cursor, project_root) };
+    if matches!(
+        lowered,
+        ir::Expr::Ref { .. }
+            | ir::Expr::IntLiteral { .. }
+            | ir::Expr::DoubleLiteral { .. }
+            | ir::Expr::BoolLiteral { .. }
+            | ir::Expr::StringLiteral { .. }
+    ) {
+        return lowered;
+    }
+
+    match param_ty {
+        ir::Type::Double => {
+            // `clang_Cursor_Evaluate` folds a cursor by its own type, not
+            // the parameter's — an integer-literal default implicitly
+            // converted to `double` (`double rotate = 0`) evaluates as
+            // `CXEval_Int`, not `CXEval_Float`, so both are tried.
+            if let Some(value) = unsafe { evaluate_float_eval_result(default_cursor) } {
+                return ir::Expr::DoubleLiteral {
+                    value,
+                    origin: origin.clone(),
+                };
+            }
+            if let Some(value) = unsafe { evaluate_int_eval_result(default_cursor) } {
+                return ir::Expr::DoubleLiteral {
+                    value: value as f64,
+                    origin: origin.clone(),
+                };
+            }
+        }
+        ir::Type::Int => {
+            if let Some(value) = unsafe { evaluate_int_eval_result(default_cursor) } {
+                return ir::Expr::IntLiteral {
+                    value,
+                    origin: origin.clone(),
+                };
+            }
+        }
+        _ => {}
+    }
+    lowered
+}
+
 unsafe fn switch_case_label_value(
     cursor: clang_sys::CXCursor,
     project_root: &Path,
