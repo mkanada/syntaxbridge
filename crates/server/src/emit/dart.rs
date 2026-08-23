@@ -16,8 +16,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use crate::ir::{
-    BinaryOp, Constructor, Enum, Expr, Function, Method, Module, Origin, Param, Record, Stmt, Type,
-    UnaryOp,
+    BinaryOp, Constructor, ConstructorInit, Enum, Expr, Function, Method, Module, Origin, Param,
+    Record, Stmt, Type, UnaryOp,
 };
 use crate::lower::cpp::dart_operator_bridge_name;
 
@@ -719,6 +719,19 @@ fn collect_referenced_usrs_in_record<'a>(
         for param in &constructor.params {
             collect_referenced_usrs_in_type(&param.ty, out);
         }
+        for init in &constructor.inits {
+            match init {
+                ConstructorInit::Field { value, .. } => {
+                    collect_referenced_usrs_in_expr(value, out);
+                }
+                ConstructorInit::Base { usr, args, .. } => {
+                    out.insert(usr.as_str());
+                    for arg in args {
+                        collect_referenced_usrs_in_expr(arg, out);
+                    }
+                }
+            }
+        }
         // See `body_bails_out`'s doc comment: a type only named by a
         // statement the printed constructor never keeps must not count as
         // an import dependency.
@@ -1119,6 +1132,22 @@ fn emit_record(
     enums_by_usr: &HashMap<&str, &Enum>,
     mock: &MockContext<'_>,
 ) -> String {
+    // A record that is globally a `mixin` (`is_mixin`) but has a
+    // constructor with a base initializer (`: Base(...)`) cannot remain a
+    // `mixin` in Dart: a `mixin` may not declare a constructor and `super`
+    // does not exist. The original T1 plan (prompt 2026-08-23-01) calls this
+    // out explicitly as a product decision — either turn the initializer into
+    // an explicit init-method call/bailout or force the record to `class`.
+    // This emitter chooses the latter (honest, minimal churn): a mixin that
+    // would need `super` is emitted as `class` so the initializer is not
+    // silently discarded. The same fallback applies to any written
+    // initializer (field or base) — a `mixin` with a constructor that would
+    // otherwise be omitted entirely would discard observable initialization.
+    let has_ctor_inits = record
+        .constructors
+        .iter()
+        .any(|ctor| !ctor.inits.is_empty());
+    let effective_is_mixin = is_mixin && !has_ctor_inits;
     // `abstract` is required the moment a class has any unimplemented
     // member — derived, not stored: a separate `Record.is_abstract` flag
     // could disagree with the method list it's supposed to summarize, so
@@ -1127,7 +1156,8 @@ fn emit_record(
     // `mixin` declaration (Dart's `mixin` keyword has no `abstract` variant
     // — a mixin can't be instantiated at all, so nothing to mark abstract),
     // so skipped entirely for that case.
-    let abstract_keyword = if !is_mixin && record.methods.iter().any(|method| method.body.is_none())
+    let abstract_keyword = if !effective_is_mixin
+        && record.methods.iter().any(|method| method.body.is_none())
     {
         "abstract "
     } else {
@@ -1142,7 +1172,9 @@ fn emit_record(
     // become a single `on` clause instead. Composing the actual
     // implementation back together is pushed down to whichever concrete
     // `class` ends up applying the whole chain via `with` (below).
-    let bases_clause = if is_mixin {
+    // `effective_is_mixin` above already forced a fallback to `class` when a
+    // constructor would otherwise need `super`/initializer emission.
+    let bases_clause = if effective_is_mixin {
         let on_bases: Vec<&str> = record
             .base_class
             .iter()
@@ -1183,7 +1215,7 @@ fn emit_record(
         };
         format!("{extends_clause}{with_clause}")
     };
-    let keyword = if is_mixin { "mixin" } else { "class" };
+    let keyword = if effective_is_mixin { "mixin" } else { "class" };
     let mut source = format!(
         "{abstract_keyword}{keyword} {}{bases_clause} {{\n",
         record.name
@@ -1202,7 +1234,8 @@ fn emit_record(
         // `mixin` (E09) always needs the same zero-value default regardless
         // — it can't have *any* constructor (Dart forbids one on a `mixin`
         // declaration), so nothing else would ever initialize its fields.
-        if !is_mixin && record.constructors.is_empty() {
+        // `effective_is_mixin` already accounts for the T1 fallback above.
+        if !effective_is_mixin && record.constructors.is_empty() {
             source.push_str(&format!(
                 "{INDENT}{} {};\n",
                 emit_type(&field.ty),
@@ -1226,11 +1259,12 @@ fn emit_record(
         ));
     }
 
-    if is_mixin {
+    if effective_is_mixin {
         // A `mixin` declaration can't have a constructor at all (Dart
         // rejects one outright) — every field already got its zero-value
         // default above, which is the only initialization a mixin's own
-        // fields ever get.
+        // fields ever get. `effective_is_mixin` already forced a fallback
+        // to `class` when inits exist, so this branch truly has none.
     } else if record.constructors.is_empty() {
         let ctor_params = record
             .fields
@@ -1501,6 +1535,55 @@ fn emit_mock_body(
     }
 }
 
+fn expr_contains_this(expr: &Expr) -> bool {
+    match expr {
+        Expr::This { .. } => true,
+        Expr::Ref { .. }
+        | Expr::IntLiteral { .. }
+        | Expr::DoubleLiteral { .. }
+        | Expr::BoolLiteral { .. }
+        | Expr::NullLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::Unsupported { .. } => false,
+        Expr::UnsupportedTyped { .. } => false,
+        Expr::Binary { lhs, rhs, .. } => expr_contains_this(lhs) || expr_contains_this(rhs),
+        Expr::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+            ..
+        } => expr_contains_this(condition) || expr_contains_this(then_expr) || expr_contains_this(else_expr),
+        Expr::Unary { operand, .. } => expr_contains_this(operand),
+        Expr::Convert { operand, .. } => expr_contains_this(operand),
+        Expr::Call { target, args, .. } => {
+            target.as_ref().is_some_and(|t| expr_contains_this(t)) || args.iter().any(expr_contains_this)
+        }
+        Expr::FieldAccess { target, .. } => expr_contains_this(target),
+        Expr::RecordConstruct { fields, .. } => fields.iter().any(|(_, v)| expr_contains_this(v)),
+        Expr::ConstructorCall { args, .. } => args.iter().any(expr_contains_this),
+        Expr::Index { target, index, .. } => expr_contains_this(target) || expr_contains_this(index),
+        Expr::MapIndexOrInsert {
+            target,
+            index,
+            default_value,
+            ..
+        } => expr_contains_this(target) || expr_contains_this(index) || expr_contains_this(default_value),
+        Expr::StringByteLength { target, .. } => expr_contains_this(target),
+        Expr::StringByteIndexOf { target, needle, .. } => {
+            expr_contains_this(target) || expr_contains_this(needle)
+        }
+        Expr::StringByteAt { target, index, .. } => expr_contains_this(target) || expr_contains_this(index),
+        Expr::Tuple { values, .. } => values.iter().any(expr_contains_this),
+        Expr::ListLiteral { items, .. } => items.iter().any(expr_contains_this),
+        Expr::MapLiteral { entries, .. } => entries
+            .iter()
+            .any(|(k, v)| expr_contains_this(k) || expr_contains_this(v)),
+        Expr::Is { operand, .. } => expr_contains_this(operand),
+        Expr::As { operand, .. } => expr_contains_this(operand),
+        Expr::Assign { target, value, .. } => expr_contains_this(target) || expr_contains_this(value),
+    }
+}
+
 fn emit_constructor(
     record_name: &str,
     constructor: &Constructor,
@@ -1515,23 +1598,107 @@ fn emit_constructor(
     // (`emit_field_declaration`, always consulted once a record has any
     // real constructor at all), so an external constructor's mock body is
     // simply empty: the object still comes out fully, validly initialized.
-    let body = if mock.is_external(&constructor.usr) {
-        format!(
+    if mock.is_external(&constructor.usr) {
+        let body = format!(
             "{}// syntax-bridge: externo, corpo mockado\n",
             INDENT.repeat(2)
-        )
+        );
+        return format!("{INDENT}{dart_name}({params}) {{\n{body}{INDENT}}}\n");
+    }
+
+    // Split initializer list into Dart-legal initializer part and body
+    // assignments. `super` must be last, only one exists, and no initializer
+    // expression may read `this` (Dart rule) — the `Field` whose `value`
+    // references another field of the same object is moved to the first line
+    // of the body as a plain assignment. This is the only
+    // order-observable transformation T1 permits, and it is safe because the
+    // field already has a default at its declaration.
+    let mut field_inits_for_list: Vec<(&String, &Expr)> = Vec::new();
+    let mut field_inits_for_body: Vec<(&String, &Expr)> = Vec::new();
+    let mut base_init: Option<(&String, &String, &Vec<Expr>)> = None;
+    let mut extra_base_bailouts: Vec<String> = Vec::new();
+
+    for init in &constructor.inits {
+        match init {
+            ConstructorInit::Field { name, value } => {
+                if expr_contains_this(value) {
+                    field_inits_for_body.push((name, value));
+                } else {
+                    field_inits_for_list.push((name, value));
+                }
+            }
+            ConstructorInit::Base { usr, name, args } => {
+                if base_init.is_none() {
+                    // Super args also may not read `this`; if they do, the
+                    // initializer is not Dart-legal and must become a bailout.
+                    let reads_this = args.iter().any(expr_contains_this);
+                    if reads_this {
+                        extra_base_bailouts.push(format!(
+                            "base initializer `{name}` reads `this` and cannot be in the initializer list"
+                        ));
+                    } else {
+                        base_init = Some((usr, name, args));
+                    }
+                } else {
+                    extra_base_bailouts.push(format!(
+                        "extra base initializer `{name}` — Dart only allows one `super`"
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut init_parts: Vec<String> = Vec::new();
+    for (name, value) in &field_inits_for_list {
+        let val_text = emit_expr(value, used_expr_helper, used_utf8_encode, &mut Promoted::new());
+        init_parts.push(format!("{name} = {val_text}"));
+    }
+    if let Some((_, _, args)) = base_init {
+        let args_text = args
+            .iter()
+            .map(|arg| emit_expr(arg, used_expr_helper, used_utf8_encode, &mut Promoted::new()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        init_parts.push(format!("super({args_text})"));
+    }
+    let initializer = if init_parts.is_empty() {
+        String::new()
     } else {
-        emit_body(
-            &constructor.params,
-            None,
-            &constructor.body,
-            &constructor.origin,
-            used_expr_helper,
-            used_utf8_encode,
-            2,
-        )
+        format!(" : {}", init_parts.join(", "))
     };
-    format!("{INDENT}{dart_name}({params}) {{\n{body}{INDENT}}}\n")
+
+    // Body: moved field inits first, then extra base bailouts, then original
+    // body. Moved field inits become `field = value;` (implicit `this`).
+    let mut body_stmts: Vec<Stmt> = Vec::new();
+    for (name, value) in field_inits_for_body {
+        body_stmts.push(Stmt::FieldAssign {
+            target: Expr::This {
+                ty: Type::Void,
+                origin: constructor.origin.clone(),
+            },
+            field: (*name).clone(),
+            value: (*value).clone(),
+            origin: constructor.origin.clone(),
+        });
+    }
+    for reason in extra_base_bailouts {
+        body_stmts.push(Stmt::Unsupported {
+            reason,
+            origin: constructor.origin.clone(),
+        });
+    }
+    body_stmts.extend(constructor.body.clone());
+
+    let body = emit_body(
+        &constructor.params,
+        None,
+        &body_stmts,
+        &constructor.origin,
+        used_expr_helper,
+        used_utf8_encode,
+        2,
+    );
+    format!("{INDENT}{dart_name}({params}){initializer} {{\n{body}{INDENT}}}\n")
 }
 
 /// `constructor_index == 0` is always the primary, unnamed constructor;

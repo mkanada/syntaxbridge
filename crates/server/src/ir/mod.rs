@@ -875,6 +875,33 @@ pub struct Method {
     pub origin: Origin,
 }
 
+/// One initializer from a constructor's member-initializer list — the
+/// ` : x(expr), Base(args)` part that runs *before* the constructor's
+/// `CompoundStmt` body. Only initializers **written** in the source appear
+/// (`libclang` filters by `isWritten()`), which is exactly the set the Dart
+/// emitter needs to reproduce: an unwritten implicit default-initialization
+/// is already covered by the field's own `emit_field_declaration` default,
+/// not an initializer to emit.
+///
+/// Ordering matches declaration order (the order `clang_visitChildren` reports
+/// them, before the `CompoundStmt`), the same order C++ itself guarantees for
+/// initialization.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum ConstructorInit {
+    /// `: x(expr)` — initializes the field `name` of the record being
+    /// constructed with `value`. `name` is already the *Dart* name (through
+    /// `lower::cpp::dart_member_name`, the same path the field's own
+    /// declaration uses), so the two never disagree on whether the field is
+    /// `_private`.
+    Field { name: String, value: Expr },
+    /// `: Base(args)` — calls the base class constructor `name`/`usr` with
+    /// `args`. `usr` is the join key back to the base `Record`; `name` rides
+    /// along so emission doesn't need the whole `Module` in scope, mirroring
+    /// `Type::Record`/`BaseClass`.
+    Base { usr: String, name: String, args: Vec<Expr> },
+}
+
 /// One of a record's own constructors, in declaration order — see
 /// `Expr::ConstructorCall` for why order (not name) is the identity that
 /// matters. Never a compiler-generated copy/move constructor: `lower::cpp`
@@ -894,6 +921,13 @@ pub struct Constructor {
     /// unnamed.
     pub constructor_index: usize,
     pub params: Vec<Param>,
+    /// Initializers from the member-initializer list, in declaration order.
+    /// `emit::dart::emit_constructor` turns each into a Dart initializer
+    /// (`: x = expr`, `super(args)`) or, when the Dart initializer list
+    /// cannot legally reference `this`, into an ordinary assignment at the top
+    /// of the constructor body.
+    #[serde(default)]
+    pub inits: Vec<ConstructorInit>,
     pub body: Vec<Stmt>,
     pub origin: Origin,
 }

@@ -2,7 +2,7 @@ class Fraction {
   int _m_numerator = 0;
   int _m_denominator = 0;
 
-  Fraction([int num = 0]) {}
+  Fraction([int num = 0]) : _m_numerator = num, _m_denominator = 1 {}
 
   Fraction.ctor2(int num, int denom) {
     _m_numerator = num;

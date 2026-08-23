@@ -1129,6 +1129,20 @@ pub fn lower_constructor(
     let owner_usr =
         unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(owner)) };
     push_active_method_owner_usr(owner_usr);
+    // Confirmado empiricamente, não assumido: um teste que faz o lowering de
+    // `struct P { int x; P(int a) : x(a) {} };` e imprime `clang_getCursorKind`
+    // + `clang_getCursorSpelling` de cada filho do cursor do construtor mostra
+    // que o libclang expõe cada inicializador *escrito* como filho direto do
+    // cursor do construtor, antes do `CompoundStmt`, na forma:
+    // - `: x(a)` → `MemberRef` (campo `x`) → `UnexposedExpr`/`CallExpr`/literal
+    //   da expressão `a`;
+    // - `: Base(v)` → `TypeRef` (base `Base`) → `CallExpr`/`CXXConstructExpr`
+    //   da expressão de construção.
+    // Só inicializadores com `isWritten()` aparecem — exatamente o conjunto que
+    // interessa. `CXCursor_CXXCtorInitializer` não existe na API pública do
+    // libclang como kind, mas os filhos acima são observáveis via
+    // `clang_visitChildren` (probe `probe_ctor_init` em 2026-08-23).
+    let inits = unsafe { collect_constructor_inits(cursor, project_root) };
     let mut body = match body_cursor {
         Some(compound) => unsafe { lower_compound_stmt(compound, project_root) },
         None => Vec::new(),
@@ -1141,9 +1155,162 @@ pub fn lower_constructor(
         usr,
         constructor_index,
         params,
+        inits,
         body,
         origin,
     })
+}
+
+/// Collects a constructor's member-initializer list (`: x(a), Base(v)`) as
+/// `ir::ConstructorInit`s. Confirmado empiricamente, não assumido: `MemberRef`
+/// + expressão para `Field`, `TypeRef` + `CallExpr`/`CXXConstructExpr` para
+/// `Base`, antes do `CompoundStmt`, só quando `isWritten()` (probe
+/// `probe_ctor_init` 2026-08-23). O nome do campo passa por
+/// `dart_member_name` para nunca discordar da declaração.
+unsafe fn collect_constructor_inits(
+    cursor: clang_sys::CXCursor,
+    project_root: &Path,
+) -> Vec<ir::ConstructorInit> {
+    let owner = unsafe { clang_sys::clang_getCursorSemanticParent(cursor) };
+    let owner_usr =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(owner)) };
+    let children = unsafe { collect_children(cursor) };
+    let compound_index = children
+        .iter()
+        .position(|child| unsafe { clang_sys::clang_getCursorKind(*child) } == clang_sys::CXCursor_CompoundStmt);
+    let end = compound_index.unwrap_or(children.len());
+    let mut inits = Vec::new();
+    let mut index = 0;
+    while index < end {
+        let kind = unsafe { clang_sys::clang_getCursorKind(children[index]) };
+        if kind == clang_sys::CXCursor_ParmDecl {
+            index += 1;
+            continue;
+        }
+        // Out-of-line definition `Class::Class(...)` has a leading
+        // `TypeRef` for the qualifier (`Class`) before the `ParmDecl`s —
+        // not a base initializer. Distinguish by usr: qualifier's usr ==
+        // owner, base's usr != owner. Also guard against the `TypeRef`
+        // + `ParmDecl`/`CompoundStmt` adjacency that never occurs for a
+        // real base initializer (which is `TypeRef` + `CallExpr`).
+        if kind == clang_sys::CXCursor_TypeRef && index + 1 < end {
+            let next_kind = unsafe { clang_sys::clang_getCursorKind(children[index + 1]) };
+            if next_kind == clang_sys::CXCursor_ParmDecl
+                || next_kind == clang_sys::CXCursor_CompoundStmt
+            {
+                let type_ref_cursor = children[index];
+                let referenced = unsafe { clang_sys::clang_getCursorReferenced(type_ref_cursor) };
+                let ref_usr = if unsafe { clang_sys::clang_Cursor_isNull(referenced) } == 0 {
+                    unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(referenced)) }
+                } else {
+                    String::new()
+                };
+                if ref_usr == owner_usr || ref_usr.is_empty() {
+                    index += 1;
+                    continue;
+                }
+            }
+        }
+        if kind == clang_sys::CXCursor_MemberRef {
+            if index + 1 >= end {
+                index += 1;
+                continue;
+            }
+            let field_cursor = children[index];
+            let referenced = unsafe { clang_sys::clang_getCursorReferenced(field_cursor) };
+            let name = if unsafe { clang_sys::clang_Cursor_isNull(referenced) } == 0 {
+                unsafe { dart_member_name(referenced) }
+            } else {
+                let cpp_name =
+                    unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(field_cursor)) };
+                dart_safe_identifier(&cpp_name)
+            };
+            let value_cursor = children[index + 1];
+            let value = unsafe { lower_expr(value_cursor, project_root) };
+            inits.push(ir::ConstructorInit::Field { name, value });
+            index += 2;
+            continue;
+        }
+        if kind == clang_sys::CXCursor_TypeRef {
+            if index + 1 >= end {
+                index += 1;
+                continue;
+            }
+            let type_ref_cursor = children[index];
+            let referenced = unsafe { clang_sys::clang_getCursorReferenced(type_ref_cursor) };
+            let (usr, name) = if unsafe { clang_sys::clang_Cursor_isNull(referenced) } == 0 {
+                let usr =
+                    unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(referenced)) };
+                let name =
+                    unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced)) };
+                (usr, name)
+            } else {
+                let ty = unsafe { clang_sys::clang_getCursorType(type_ref_cursor) };
+                let decl = unsafe { clang_sys::clang_getTypeDeclaration(ty) };
+                let usr =
+                    unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(decl)) };
+                let name =
+                    unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(decl)) };
+                (usr, name)
+            };
+            if usr.is_empty() || name.is_empty() {
+                index += 2;
+                continue;
+            }
+            let next_kind = unsafe { clang_sys::clang_getCursorKind(children[index + 1]) };
+            if next_kind == clang_sys::CXCursor_CompoundStmt {
+                inits.push(ir::ConstructorInit::Base {
+                    usr,
+                    name,
+                    args: Vec::new(),
+                });
+                index += 1;
+                continue;
+            }
+            let init_expr_cursor = children[index + 1];
+            let args = {
+                let raw_children = unsafe { collect_children(init_expr_cursor) };
+                if raw_children.is_empty() {
+                    // The init expression itself may be a simple literal/decl ref
+                    // with no children (e.g., `Base(42)` where 42 is an
+                    // IntegerLiteral directly? But CallExpr always has children.
+                    // Fallback: treat the init cursor itself as a single arg if
+                    // it is not a call-like cursor.
+                    let k = unsafe { clang_sys::clang_getCursorKind(init_expr_cursor) };
+                    if k == clang_sys::CXCursor_CallExpr {
+                        Vec::new()
+                    } else {
+                        vec![unsafe { lower_expr(init_expr_cursor, project_root) }]
+                    }
+                } else {
+                    let mut result = Vec::new();
+                    for child in raw_children {
+                        let ck = unsafe { clang_sys::clang_getCursorKind(child) };
+                        if matches!(
+                            ck,
+                            clang_sys::CXCursor_TypeRef
+                                | clang_sys::CXCursor_NamespaceRef
+                                | clang_sys::CXCursor_TemplateRef
+                        ) {
+                            continue;
+                        }
+                        result.push(unsafe { lower_expr(child, project_root) });
+                    }
+                    // If the CallExpr had no arg children but the init cursor
+                    // itself is a more complex construct (e.g., an
+                    // UnexposedExpr wrapping a single literal), the above will
+                    // correctly produce one arg. If it truly has zero args
+                    // (default ctor), result stays empty.
+                    result
+                }
+            };
+            inits.push(ir::ConstructorInit::Base { usr, name, args });
+            index += 2;
+            continue;
+        }
+        index += 1;
+    }
+    inits
 }
 
 /// Lowers a `struct`/`class` *definition* cursor into IR — called from
@@ -1475,15 +1642,18 @@ unsafe fn base_classes_of(cursor: clang_sys::CXCursor) -> Vec<ir::BaseClass> {
             // inheritance never happened — `HumdrumToken`'s own use as a
             // `Str` (assignment, comparison, `.find`/`.substr`, ...) stays
             // its own honest bailout (`unsupported implicit conversion
-            // from Record{HumdrumToken} to Str`), since fully modeling a
-            // string-backed base needs the base's own constructor
-            // arguments — a C++ member-initializer-list entry
-            // (`: std::string(s)`), which `clang_visitChildren` never
-            // exposes as a cursor at all (`CXCursor_CXXCtorInitializer`
-            // doesn't exist in `libclang`'s public C API — confirmed
-            // directly against `clang-sys`'s own generated bindings, not
-            // assumed) — a real, separate blocker this filter doesn't
-            // attempt to work around.
+            // from Record{HumdrumToken} to Str`). Fully modeling a
+            // string-backed base would also need its constructor arguments
+            // from the member-initializer list (`: std::string(s)`) —
+            // `collect_constructor_inits` now exposes every *written*
+            // initializer as `MemberRef`/`TypeRef` + expression children
+            // before the `CompoundStmt` (confirmado empiricamente, não
+            // assumido — `CXCursor_CXXCtorInitializer` não existe como
+            // kind na API pública, mas os filhos acima são observáveis
+            // via `clang_visitChildren`), so the data is no longer
+            // unobservable; the remaining blocker is the Dart
+            // mapping itself, which this filter does not attempt to work
+            // around.
             match lower_type(base_type) {
                 ir::Type::Record { .. } | ir::Type::Enum { .. } => {
                     Some(ir::BaseClass { usr, name })

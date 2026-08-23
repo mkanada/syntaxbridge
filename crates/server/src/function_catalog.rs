@@ -593,11 +593,12 @@ fn merge_constructors(existing: &mut Vec<ir::Constructor>, incoming: Vec<ir::Con
         } else if let Some(existing_constructor) = existing
             .iter()
             .find(|candidate| candidate.usr == constructor.usr)
-            && existing_constructor.body != constructor.body
+            && (existing_constructor.body != constructor.body
+                || existing_constructor.inits != constructor.inits)
         {
             log_function_catalog(format_args!(
-                "finish_function_catalog: constructor {} has a different body \
-                 in two compilation units — kept the first partial's body",
+                "finish_function_catalog: constructor {} has a different body/inits \
+                 in two compilation units — kept the first partial's body/inits",
                 constructor.usr
             ));
         }
@@ -877,6 +878,18 @@ fn apply_renames(
         }
         for constructor in &mut record.constructors {
             rename_calls_in_params(&mut constructor.params, renames);
+            for init in &mut constructor.inits {
+                match init {
+                    ir::ConstructorInit::Field { value, .. } => {
+                        rename_calls_in_expr(value, renames);
+                    }
+                    ir::ConstructorInit::Base { args, .. } => {
+                        for arg in args {
+                            rename_calls_in_expr(arg, renames);
+                        }
+                    }
+                }
+            }
             rename_calls_in_stmts(&mut constructor.body, renames);
         }
     }
@@ -1013,6 +1026,21 @@ fn apply_record_name_disambiguation(
         }
         for constructor in &mut record.constructors {
             rename_record_refs_in_params(&mut constructor.params, &renames);
+            for init in &mut constructor.inits {
+                match init {
+                    ir::ConstructorInit::Field { value, .. } => {
+                        rename_record_refs_in_expr(value, &renames);
+                    }
+                    ir::ConstructorInit::Base { usr, name, args } => {
+                        if let Some(new_name) = renames.get(usr) {
+                            *name = new_name.clone();
+                        }
+                        for arg in args {
+                            rename_record_refs_in_expr(arg, &renames);
+                        }
+                    }
+                }
+            }
             rename_record_refs_in_stmts(&mut constructor.body, &renames);
         }
         for method in &mut record.methods {
@@ -1174,6 +1202,28 @@ fn reject_undeclared_enum_refs(
         }
         for constructor in &mut record.constructors {
             reject_in_params(&mut constructor.params, &mut reject);
+            for init in &mut constructor.inits {
+                match init {
+                    ir::ConstructorInit::Field { value, .. } => {
+                        IrRefVisitor {
+                            on_type: &mut reject,
+                            on_record_construct: &mut |_, _, _| {},
+                            on_expr: &mut |_| {},
+                        }
+                        .visit_expr(value);
+                    }
+                    ir::ConstructorInit::Base { args, .. } => {
+                        for arg in args {
+                            IrRefVisitor {
+                                on_type: &mut reject,
+                                on_record_construct: &mut |_, _, _| {},
+                                on_expr: &mut |_| {},
+                            }
+                            .visit_expr(arg);
+                        }
+                    }
+                }
+            }
             reject_in_stmts(&mut constructor.body, &mut reject);
         }
         for method in &mut record.methods {
@@ -1938,6 +1988,7 @@ fn build_mixin_impl(record: &ir::Record) -> (ir::Record, Vec<ir::Method>) {
                     default_value: None,
                 })
                 .collect(),
+            inits: Vec::new(),
             body: record
                 .fields
                 .iter()
@@ -4205,7 +4256,8 @@ mod merge_tests {
                 usr: constructor_usr.to_owned(),
                 constructor_index: 0,
                 params: Vec::new(),
-                body: Vec::new(),
+                inits: Vec::new(),
+            body: Vec::new(),
                 origin: origin(3),
             });
         });

@@ -511,6 +511,7 @@ fn a_package_with_externally_mocked_callables_passes_dart_analyze_and_dart_forma
             usr: "c:@S@Shape@F@Shape#".to_owned(),
             constructor_index: 0,
             params: Vec::new(),
+            inits: Vec::new(),
             body: undefined_placeholder(13),
             origin: origin_at(13),
         }],
