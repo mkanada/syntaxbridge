@@ -1054,9 +1054,10 @@ fn rename_record_refs_in_type(ty: &mut ir::Type, renames: &HashMap<String, Strin
                 *name = new_name.clone();
             }
         }
-        ir::Type::List(element) | ir::Type::Set(element) | ir::Type::Nullable(element) => {
-            rename_record_refs_in_type(element, renames)
-        }
+        ir::Type::List(element)
+        | ir::Type::Set(element)
+        | ir::Type::Nullable(element)
+        | ir::Type::ListCursor(element) => rename_record_refs_in_type(element, renames),
         ir::Type::Map(key, value) => {
             rename_record_refs_in_type(key, renames);
             rename_record_refs_in_type(value, renames);
@@ -1511,9 +1512,10 @@ impl IrRefVisitor<'_> {
     /// were never offered to it.
     fn visit_type(&mut self, ty: &mut ir::Type) {
         match ty {
-            ir::Type::List(element) | ir::Type::Set(element) | ir::Type::Nullable(element) => {
-                self.visit_type(element)
-            }
+            ir::Type::List(element)
+            | ir::Type::Set(element)
+            | ir::Type::Nullable(element)
+            | ir::Type::ListCursor(element) => self.visit_type(element),
             ir::Type::Map(key, value) => {
                 self.visit_type(key);
                 self.visit_type(value);

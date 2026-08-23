@@ -27,6 +27,21 @@ const OPAQUE_TYPE_NAME: &str = "SyntaxBridgeOpaque";
 const PAIR_TYPE_NAME: &str = "SyntaxBridgePair";
 /// Must read the same literal name as `lower::cpp::NATIVE_HANDLE_TYPE_NAME`.
 const NATIVE_HANDLE_TYPE_NAME: &str = "SyntaxBridgeNativeHandle";
+/// F10/tarefa 13's `find_if` "declare, guard, dereference" idiom (see
+/// `lower::cpp::lower_compound_stmt`'s find/find_if fusion) needs "the first
+/// element satisfying a predicate, or null" — `dart:core`'s `Iterable` has
+/// no such member (only `package:collection`'s `IterableExtension` does,
+/// and AGENTS.md asks for a justified reason before adding any new
+/// dependency), so this is a named, single-pass helper in the support file
+/// instead, the same "adaptador nomeado" answer `SyntaxBridgePair` already
+/// gives `std::make_pair`.
+const FIRST_WHERE_HELPER_NAME: &str = "syntaxBridgeFirstWhere";
+/// `lower::cpp::Type::ListCursor`'s own Dart shape — a named adapter for a
+/// long-lived `std::vector<T>::iterator`/`std::string::iterator` (a field,
+/// or a local outliving the one recognized guard-and-deref/for-each idiom),
+/// the same "named bridge, not an erased type" answer `SyntaxBridgePair`
+/// already gives `std::pair`.
+const LIST_CURSOR_TYPE_NAME: &str = "SyntaxBridgeListCursor";
 const SUPPORT_FILE_NAME: &str = "syntax_bridge_support.dart";
 
 /// Groups `module`'s records and functions by the C++ source file they came
@@ -192,7 +207,18 @@ pub fn emit_module_with_externals(
     let needs_native_handle_support = files
         .values()
         .any(|source| source.contains(NATIVE_HANDLE_TYPE_NAME));
-    if needs_opaque_support || needs_pair_support || needs_native_handle_support {
+    let needs_first_where_support = files
+        .values()
+        .any(|source| source.contains(FIRST_WHERE_HELPER_NAME));
+    let needs_list_cursor_support = files
+        .values()
+        .any(|source| source.contains(LIST_CURSOR_TYPE_NAME));
+    if needs_opaque_support
+        || needs_pair_support
+        || needs_native_handle_support
+        || needs_first_where_support
+        || needs_list_cursor_support
+    {
         let mut support = String::new();
         if needs_opaque_support {
             support.push_str(&emit_opaque_type());
@@ -208,6 +234,18 @@ pub fn emit_module_with_externals(
                 support.push('\n');
             }
             support.push_str(&emit_native_handle_support());
+        }
+        if needs_first_where_support {
+            if !support.is_empty() {
+                support.push('\n');
+            }
+            support.push_str(&emit_first_where_support());
+        }
+        if needs_list_cursor_support {
+            if !support.is_empty() {
+                support.push('\n');
+            }
+            support.push_str(&emit_list_cursor_support());
         }
         files.insert(format!("lib/{SUPPORT_FILE_NAME}"), support);
     }
@@ -486,6 +524,8 @@ fn emit_file(
     if source.contains(OPAQUE_TYPE_NAME)
         || source.contains(PAIR_TYPE_NAME)
         || source.contains(NATIVE_HANDLE_TYPE_NAME)
+        || source.contains(FIRST_WHERE_HELPER_NAME)
+        || source.contains(LIST_CURSOR_TYPE_NAME)
     {
         import_lines.push(format!("import '{SUPPORT_FILE_NAME}';"));
     }
@@ -515,6 +555,43 @@ fn emit_opaque_type() -> String {
 fn emit_pair_support() -> String {
     format!(
         "final class {PAIR_TYPE_NAME}<A, B> {{\n{INDENT}const {PAIR_TYPE_NAME}(this.first, this.second);\n\n{INDENT}final A first;\n{INDENT}final B second;\n}}\n"
+    )
+}
+
+/// `std::find_if(X.begin(), X.end(), pred)`'s "first match, or none" —
+/// single-pass and side-effect-safe (`pred` runs at most once per element,
+/// unlike a `where(pred).isEmpty ? null : where(pred).first` rewrite, which
+/// would evaluate it twice over the same prefix).
+fn emit_first_where_support() -> String {
+    format!(
+        "T? {FIRST_WHERE_HELPER_NAME}<T>(Iterable<T> iterable, bool Function(T) test) {{\n\
+         {INDENT}for (final item in iterable) {{\n\
+         {INDENT}{INDENT}if (test(item)) return item;\n\
+         {INDENT}}}\n\
+         {INDENT}return null;\n\
+         }}\n"
+    )
+}
+
+/// `lower::cpp::Type::ListCursor`'s Dart shape: a position over a `List<T>`
+/// (`current`/`moveNext`/`isEnd`), the named adapter a long-lived
+/// `std::vector<T>::iterator`/`std::string::iterator` (`__gnu_cxx::
+/// __normal_iterator<...>`) needs when it survives past the one idiom
+/// `lower::cpp::lower_find_iterator_guard_idiom`/`lower_iterator_for_loop`
+/// can erase entirely — a field, or a local reassigned/held across more than
+/// one statement.
+fn emit_list_cursor_support() -> String {
+    format!(
+        "final class {LIST_CURSOR_TYPE_NAME}<T> {{\n\
+         {INDENT}{LIST_CURSOR_TYPE_NAME}(this._items, [this._index = 0]);\n\n\
+         {INDENT}final List<T> _items;\n\
+         {INDENT}int _index;\n\n\
+         {INDENT}bool get isEnd => _index >= _items.length;\n\
+         {INDENT}T get current => _items[_index];\n\
+         {INDENT}void moveNext() {{\n\
+         {INDENT}{INDENT}_index++;\n\
+         {INDENT}}}\n\
+         }}\n"
     )
 }
 
@@ -588,7 +665,9 @@ fn collect_referenced_usrs_in_type<'a>(ty: &'a Type, out: &mut HashSet<&'a str>)
         Type::Record { usr, .. } | Type::Enum { usr, .. } => {
             out.insert(usr.as_str());
         }
-        Type::List(element) | Type::Set(element) => collect_referenced_usrs_in_type(element, out),
+        Type::List(element) | Type::Set(element) | Type::ListCursor(element) => {
+            collect_referenced_usrs_in_type(element, out)
+        }
         Type::Map(key, value) | Type::Pair(key, value) => {
             collect_referenced_usrs_in_type(key, out);
             collect_referenced_usrs_in_type(value, out);
@@ -1188,6 +1267,7 @@ fn field_default_literal(ty: &Type, enums_by_usr: &HashMap<&str, &Enum>) -> Opti
         }
         Type::Record { .. }
         | Type::Pair(_, _)
+        | Type::ListCursor(_)
         | Type::Callback { .. }
         | Type::Tuple(_)
         | Type::Void
@@ -2111,6 +2191,7 @@ fn emit_type(ty: &Type) -> String {
             emit_type(first),
             emit_type(second)
         ),
+        Type::ListCursor(element) => format!("{LIST_CURSOR_TYPE_NAME}<{}>", emit_type(element)),
         Type::Callback {
             return_type,
             params,

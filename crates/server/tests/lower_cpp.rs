@@ -6344,3 +6344,307 @@ std::string returnsEmpty() {
         "expected the return statement to lower to an empty string literal, got:\n{source}"
     );
 }
+
+/// F10/tarefa 13: `std::find_if(X.begin(), X.end(), pred) != X.end()` — the
+/// same "does X satisfy pred for some element?" idiom
+/// `a_find_against_end_comparison_lowers_to_a_dart_contains_call` already
+/// covers for `std::find` + a value, generalized to a predicate. Dart's
+/// `Iterable.any` is the exact match: no iterator value ever needs a
+/// representation, same as `contains` above.
+#[test]
+fn a_find_if_against_end_comparison_lowers_to_a_dart_any_call() {
+    let source = lower_and_emit(
+        "lower-cpp-find-if-any",
+        r#"
+#include <vector>
+#include <algorithm>
+struct IsNegative {
+    bool operator()(int x) const { return x < 0; }
+};
+bool has_negative(std::vector<int>& values) {
+    if (std::find_if(values.begin(), values.end(), IsNegative()) != values.end()) {
+        return true;
+    }
+    return false;
+}
+bool none_negative(std::vector<int>& values) {
+    return std::find_if(values.begin(), values.end(), IsNegative()) == values.end();
+}
+"#,
+    );
+
+    assert!(
+        source.contains("if (values.any(IsNegative())) {"),
+        "expected the != form to become a plain any call, got:\n{source}"
+    );
+    assert!(
+        source.contains("return !(values.any(IsNegative()));"),
+        "expected the == form to become a negated any call, got:\n{source}"
+    );
+    assert!(
+        !source.contains("operator!=") && !source.contains("operator=="),
+        "got:\n{source}"
+    );
+    assert!(!source.contains("__normal_iterator"), "got:\n{source}");
+}
+
+/// F10/tarefa 13: `std::count_if(X.begin(), X.end(), pred)` as a bare
+/// value-producing expression — always safe regardless of what its result
+/// feeds into, unlike `find_if`'s own value (which needs the full
+/// guard-and-deref idiom to be sound). `Iterable.where(pred).length` is the
+/// direct Dart equivalent.
+#[test]
+fn std_count_if_lowers_to_a_where_length_expression() {
+    let source = lower_and_emit(
+        "lower-cpp-count-if",
+        r#"
+#include <vector>
+#include <algorithm>
+struct IsNegative {
+    bool operator()(int x) const { return x < 0; }
+};
+int count_negatives(std::vector<int>& values) {
+    return std::count_if(values.begin(), values.end(), IsNegative());
+}
+"#,
+    );
+
+    assert!(
+        source.contains("return values.where(IsNegative()).length;"),
+        "expected count_if to lower to a where(...).length expression, got:\n{source}"
+    );
+    assert!(
+        !source.contains("count_if") && !source.contains("__normal_iterator"),
+        "got:\n{source}"
+    );
+}
+
+/// F10/tarefa 13: `std::sort(X.begin(), X.end())` / `std::sort(X.begin(),
+/// X.end(), cmp)` — both forms are common Verovio idioms and map directly to
+/// Dart's own in-place `List.sort`/`List.sort(compare)`.
+#[test]
+fn std_sort_lowers_to_dart_list_sort() {
+    let source = lower_and_emit(
+        "lower-cpp-sort",
+        r#"
+#include <vector>
+#include <algorithm>
+bool descending(int a, int b) { return a > b; }
+void sort_ascending(std::vector<int>& values) {
+    std::sort(values.begin(), values.end());
+}
+void sort_descending(std::vector<int>& values) {
+    std::sort(values.begin(), values.end(), descending);
+}
+"#,
+    );
+
+    assert!(
+        source.contains("values.sort();"),
+        "expected the two-argument form to become a plain sort() call, got:\n{source}"
+    );
+    assert!(
+        source.contains("values.sort(descending);"),
+        "expected the three-argument form to pass the comparator through, got:\n{source}"
+    );
+    assert!(
+        !source.contains("std::sort") && !source.contains(" sort(values"),
+        "got:\n{source}"
+    );
+}
+
+/// F10/tarefa 13: `std::for_each(X.begin(), X.end(), f)` — Dart's
+/// `Iterable.forEach` is the direct equivalent.
+#[test]
+fn std_for_each_lowers_to_dart_for_each() {
+    let source = lower_and_emit(
+        "lower-cpp-for-each",
+        r#"
+#include <vector>
+#include <algorithm>
+void print_one(int x);
+void print_all(std::vector<int>& values) {
+    std::for_each(values.begin(), values.end(), print_one);
+}
+"#,
+    );
+
+    assert!(
+        source.contains("values.forEach(print_one);"),
+        "expected for_each to lower to a forEach call, got:\n{source}"
+    );
+}
+
+/// F10/tarefa 13: `std::remove_if`/`find`/`find_if` reached bare — not
+/// through one of the recognized idioms above — must still fail honestly
+/// (`Type::Unsupported`-typed bailout with no literal, undefined Dart call
+/// printed), never the pre-existing bug this whole family fixes: printing
+/// `remove_if(...)`/`find_if(...)` as a literal call to a Dart identifier
+/// that doesn't exist.
+#[test]
+fn a_bare_remove_if_call_is_an_honest_bailout_not_a_literal_call() {
+    let source = lower_and_emit(
+        "lower-cpp-bare-remove-if",
+        r#"
+#include <vector>
+#include <algorithm>
+struct IsNegative {
+    bool operator()(int x) const { return x < 0; }
+};
+void discard(std::vector<int>& values) {
+    auto newEnd = std::remove_if(values.begin(), values.end(), IsNegative());
+    (void)newEnd;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("remove_if("),
+        "expected no literal remove_if(...) call, got:\n{source}"
+    );
+    assert!(
+        source.contains("throw UnimplementedError(") || source.contains("_syntaxBridgeUnsupported"),
+        "expected an honest bailout instead, got:\n{source}"
+    );
+}
+
+/// F10/tarefa 13: the erase-remove idiom, `v.erase(std::remove_if(v.begin(),
+/// v.end(), pred), v.end());` — one C++ statement, no separate temporary —
+/// becomes Dart's own single-pass `removeWhere`.
+#[test]
+fn erase_remove_if_idiom_lowers_to_remove_where() {
+    let source = lower_and_emit(
+        "lower-cpp-erase-remove-if",
+        r#"
+#include <vector>
+#include <algorithm>
+struct IsNegative {
+    bool operator()(int x) const { return x < 0; }
+};
+void discard_negatives(std::vector<int>& values) {
+    values.erase(std::remove_if(values.begin(), values.end(), IsNegative()), values.end());
+}
+"#,
+    );
+
+    assert!(
+        source.contains("values.removeWhere(IsNegative());"),
+        "expected the erase-remove idiom to become a single removeWhere call, got:\n{source}"
+    );
+    assert!(
+        !source.contains("remove_if") && !source.contains(".erase("),
+        "got:\n{source}"
+    );
+}
+
+/// F10/tarefa 13's headline example, straight from the prompt: `auto it =
+/// std::find(v.begin(), v.end(), alvo); if (it != v.end()) return *it;` — a
+/// three-statement idiom (declare, guard, dereference) that has no sound
+/// partial translation; recognizing only part of it would be worse than
+/// leaving it as a bailout. Dart's own null safety already models "found or
+/// not" without any iterator standing in.
+#[test]
+fn find_declare_guard_dereference_idiom_lowers_to_a_nullable_binding() {
+    let source = lower_and_emit(
+        "lower-cpp-find-guard-deref",
+        r#"
+#include <vector>
+#include <algorithm>
+int achar(const std::vector<int>& v, int alvo) {
+    auto it = std::find(v.begin(), v.end(), alvo);
+    if (it != v.end()) {
+        return *it;
+    }
+    return -1;
+}
+"#,
+    );
+
+    assert!(!source.contains("__normal_iterator"), "got:\n{source}");
+    assert!(
+        source.contains("if (it != null) {"),
+        "expected the guard to become a null check, got:\n{source}"
+    );
+    assert!(
+        source.contains("return it;"),
+        "expected the dereference to become a plain reference to the bound value, got:\n{source}"
+    );
+    assert!(
+        !source.contains("throw UnimplementedError(")
+            && !source.contains("_syntaxBridgeUnsupported"),
+        "expected a real translation, not a bailout, got:\n{source}"
+    );
+}
+
+/// The `find_if` counterpart of the headline example above — the predicate
+/// form needs the named `syntaxBridgeFirstWhere` support helper (no
+/// `firstOrNull` available without adding `package:collection` as a new
+/// dependency), since it has to find the *value*, not just answer a yes/no
+/// question the way the inline `any`-comparison idiom does.
+#[test]
+fn find_if_declare_guard_dereference_idiom_lowers_to_a_nullable_binding() {
+    let source = lower_and_emit(
+        "lower-cpp-find-if-guard-deref",
+        r#"
+#include <vector>
+#include <algorithm>
+struct IsNegative {
+    bool operator()(int x) const { return x < 0; }
+};
+int first_negative_or(const std::vector<int>& v, int fallback) {
+    auto it = std::find_if(v.begin(), v.end(), IsNegative());
+    if (it != v.end()) {
+        return *it;
+    }
+    return fallback;
+}
+"#,
+    );
+
+    assert!(!source.contains("__normal_iterator"), "got:\n{source}");
+    assert!(
+        source.contains("syntaxBridgeFirstWhere(v, IsNegative())"),
+        "expected the declaration to use the named first-match helper, got:\n{source}"
+    );
+    assert!(
+        source.contains("if (it != null) {"),
+        "expected the guard to become a null check, got:\n{source}"
+    );
+    assert!(
+        source.contains("return it;"),
+        "expected the dereference to become a plain reference to the bound value, got:\n{source}"
+    );
+    assert!(
+        !source.contains("throw UnimplementedError(")
+            && !source.contains("_syntaxBridgeUnsupported"),
+        "expected a real translation, not a bailout, got:\n{source}"
+    );
+}
+
+/// F10/tarefa 13: a long-lived iterator stored in a *field* (real Verovio
+/// trigger: `convertfunctor.dart:354`'s `late __normal_iterator
+/// _m_currentMeasure;`) has no enclosing guard-and-deref idiom to recognize
+/// — the answer per `AGENTS.md` is a named adapter, not a type erasure.
+#[test]
+fn a_long_lived_iterator_field_lowers_to_a_named_cursor_adapter() {
+    let source = lower_and_emit(
+        "lower-cpp-iterator-field",
+        r#"
+#include <vector>
+class Walker {
+public:
+    std::vector<int>::iterator m_current;
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("__normal_iterator"),
+        "a system-header iterator type must never print as a bare, undeclared Dart type \
+         (appearing inside a bailout's own message string is fine), got:\n{source}"
+    );
+    assert!(
+        source.contains("SyntaxBridgeListCursor<int>"),
+        "expected the field to lower to a named cursor adapter, got:\n{source}"
+    );
+}

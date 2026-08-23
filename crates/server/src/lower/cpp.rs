@@ -58,6 +58,7 @@ pub fn overload_type_suffix(ty: &ir::Type) -> String {
             overload_type_suffix(first),
             overload_type_suffix(second)
         ),
+        ir::Type::ListCursor(element) => format!("ListCursor{}", overload_type_suffix(element)),
         ir::Type::Callback {
             return_type,
             params,
@@ -1689,6 +1690,24 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
         return lower_type(unsafe { clang_sys::clang_getPointeeType(cx_type) });
     }
 
+    // A bare (undecayed) function type — real trigger: a free function's
+    // *name* used directly as a value (F10/tarefa 13's `std::sort(b, e,
+    // descending)`/`std::for_each(b, e, print_one)`, where the comparator/
+    // callback argument is a plain `DeclRefExpr` to a top-level function,
+    // never wrapped in an explicit `&`). C++'s own AST keeps that
+    // `DeclRefExpr`'s static type as the function type itself
+    // (`CXType_FunctionProto`), not the pointer it decays to at the actual
+    // call — confirmed empirically: only an *explicit* function-pointer
+    // *variable*/parameter type reaches the `CXType_Pointer` branch below.
+    // Dart draws no such distinction — referencing a top-level function by
+    // name already produces a first-class function value with the exact
+    // call shape `lower_callback_type` already extracts from a function
+    // pointer's pointee type, so this reuses it directly rather than
+    // requiring the pointer wrapper this AST shape never has.
+    if cx_type.kind == clang_sys::CXType_FunctionProto {
+        return unsafe { lower_callback_type(cx_type) };
+    }
+
     // `T*` — E10 recognized honestly refusing every raw pointer as
     // `dart:ffi` territory ("talvez a resposta certa seja recusar"), and
     // that stayed the whole story until the Verovio 6.2.0 diagnosis
@@ -1917,6 +1936,52 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
                     type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(cx_type))
                 };
                 return ir::Type::Unsupported(format!("union {spelling}"));
+            }
+            // `__gnu_cxx::__normal_iterator<Ptr, Container>` — libstdc++'s
+            // real implementation of `std::vector<T>::iterator`/
+            // `std::string::iterator` (a `typedef` down to this, confirmed
+            // via `clang++ -Xclang -ast-dump`). Checked before
+            // `stdlib_template_name` (whose own ancestor walk only accepts
+            // `std`, not `__gnu_cxx` — see `is_normal_iterator_decl`'s doc
+            // comment for why that's deliberate, not an oversight) via its
+            // own narrow, dedicated check. A *long-lived* one (a field,
+            // F10/tarefa 13's own `convertfunctor.dart:354` trigger — `late
+            // __normal_iterator _m_currentMeasure;`) has no single
+            // recognized idiom to erase it the way
+            // `lower_find_iterator_guard_idiom`/`lower_iterator_for_loop` do
+            // for one scoped to a single statement/loop, so it needs its own
+            // standing representation — `Type::ListCursor`,
+            // `SyntaxBridgeListCursor<T>`'s Dart shape — rather than falling
+            // to `Type::Unsupported` and printing the internal libstdc++
+            // name as a bare, undeclared Dart type (`dart analyze`'s
+            // `undefined_class`/`non_type_as_type_argument`, this same
+            // family's whole premise). The iterator's own second template
+            // argument is the container it iterates (confirmed via
+            // `-ast-dump`); `lower_type` on that container already gives the
+            // exact element type this project already computes for it
+            // (`Type::List`/`Type::Set`) — scoped to those two shapes only:
+            // a `basic_string::iterator`'s "element" is a code unit, not a
+            // value this cursor's `List<T>`-backed shape fits, so that
+            // (rarer) case stays the honest bailout below rather than a
+            // wrong translation.
+            if unsafe { is_normal_iterator_decl(decl) } {
+                let container_ty =
+                    if unsafe { clang_sys::clang_Type_getNumTemplateArguments(cx_type) } >= 2 {
+                        Some(lower_type(unsafe {
+                            clang_sys::clang_Type_getTemplateArgumentAsType(cx_type, 1)
+                        }))
+                    } else {
+                        None
+                    };
+                if let Some(ir::Type::List(element) | ir::Type::Set(element)) = container_ty {
+                    return ir::Type::ListCursor(element);
+                }
+                let spelling = unsafe {
+                    type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(cx_type))
+                };
+                return ir::Type::Unsupported(format!(
+                    "std::__normal_iterator (spelling: {spelling})"
+                ));
             }
             let stdlib_name = unsafe { stdlib_template_name(decl) };
             match stdlib_name.as_deref() {
@@ -2317,6 +2382,53 @@ unsafe fn stdlib_template_name(decl: clang_sys::CXCursor) -> Option<String> {
     }
 
     Some(unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(template)) })
+}
+
+/// Whether `decl` is (transitively) a specialization of `__gnu_cxx::
+/// __normal_iterator` — libstdc++'s real (out-of-`std`) implementation of
+/// `std::vector<T>::iterator`/`std::string::iterator`. Deliberately a
+/// separate, narrow check rather than widening `stdlib_template_name`'s own
+/// ancestor walk to also accept `__gnu_cxx`: that was tried first and
+/// reached much further than intended — `stdlib_template_name` is also
+/// `lower_stdlib_method_call`'s *general* per-call-site template-name
+/// resolver, so accepting `__gnu_cxx` there changed the bailout reason (and,
+/// worse, sometimes the *shape*) of every other `__normal_iterator` method
+/// call in the whole codebase (`operator=`, `operator++`, ...), not just the
+/// `operator*`/`operator->` dereference this bridge actually recognizes —
+/// confirmed the hard way on the real Verovio 6.2.0 corpus: it unmasked a
+/// pre-existing, unrelated bug in the generic manual-`for`-loop lowering
+/// (previously hidden behind a whole-function bailout that this widening
+/// incidentally stopped triggering) and produced genuinely unparseable Dart
+/// in three real files. Used only by `lower_type`'s own `Type::ListCursor`
+/// mapping and by `lower_stdlib_method_call`'s `operator*`/`operator->` arm
+/// — both narrowly scoped to the one idiom each actually recognizes, so
+/// nothing else in the corpus can be affected in shape or spelling.
+unsafe fn is_normal_iterator_decl(decl: clang_sys::CXCursor) -> bool {
+    let template = unsafe { clang_sys::clang_getSpecializedCursorTemplate(decl) };
+    if unsafe { clang_sys::clang_Cursor_isNull(template) } != 0 {
+        return false;
+    }
+    if unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(template)) }
+        != "__normal_iterator"
+    {
+        return false;
+    }
+    let mut ancestor = unsafe { clang_sys::clang_getCursorSemanticParent(template) };
+    loop {
+        if unsafe { clang_sys::clang_Cursor_isNull(ancestor) } != 0
+            || unsafe { clang_sys::clang_getCursorKind(ancestor) }
+                == clang_sys::CXCursor_TranslationUnit
+        {
+            return false;
+        }
+        let name = unsafe {
+            type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(ancestor))
+        };
+        if name == "__gnu_cxx" {
+            return true;
+        }
+        ancestor = unsafe { clang_sys::clang_getCursorSemanticParent(ancestor) };
+    }
 }
 
 /// Resolves a standard-library template through a type declaration. Member
@@ -2964,10 +3076,29 @@ unsafe fn find_compound_stmt_child(cursor: clang_sys::CXCursor) -> Option<clang_
 }
 
 unsafe fn lower_compound_stmt(cursor: clang_sys::CXCursor, project_root: &Path) -> Vec<ir::Stmt> {
-    unsafe { collect_children(cursor) }
-        .into_iter()
-        .flat_map(|child| unsafe { lower_stmt_into(child, project_root) })
-        .collect()
+    let children = unsafe { collect_children(cursor) };
+    let mut result = Vec::new();
+    let mut index = 0;
+    while index < children.len() {
+        // F10/tarefa 13's "declare, guard, dereference" idiom
+        // (`lower_find_iterator_guard_idiom`) spans two adjacent sibling
+        // statements — a shape `lower_stmt_into`'s per-child dispatch can
+        // never see on its own, since it only ever looks at one statement
+        // cursor at a time. Checked here, one lookahead pair at a time,
+        // before falling back to the ordinary single-statement path.
+        if index + 1 < children.len()
+            && let Some(fused) = unsafe {
+                lower_find_iterator_guard_idiom(children[index], children[index + 1], project_root)
+            }
+        {
+            result.extend(fused);
+            index += 2;
+            continue;
+        }
+        result.extend(unsafe { lower_stmt_into(children[index], project_root) });
+        index += 1;
+    }
+    result
 }
 
 /// Lowers one statement cursor into zero, one, or many `ir::Stmt`s — the
@@ -4953,6 +5084,7 @@ fn default_scalar_value(ty: &ir::Type, origin: &ir::Origin) -> ir::Expr {
         ir::Type::Record { .. }
         | ir::Type::Enum { .. }
         | ir::Type::Pair(_, _)
+        | ir::Type::ListCursor(_)
         | ir::Type::Callback { .. }
         | ir::Type::Tuple(_)
         | ir::Type::Void
@@ -6643,6 +6775,39 @@ unsafe fn lower_call_expr(
             let arg_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 0) };
             return unsafe { lower_expr(arg_cursor, project_root) };
         }
+        // A `__gnu_cxx::__normal_iterator` value materializes through one of
+        // *several* constructors, not just copy/move (real trigger:
+        // `floatingobject.cpp:160`'s `auto it = std::find(...)`, whose
+        // implicit materialization resolves to the templated
+        // pointer-to-iterator converting constructor, which
+        // `clang_CXXConstructor_isCopyConstructor`/`isMoveConstructor` both
+        // report `false` for) — falling through to the generic
+        // `lower_constructor_call` path below, like `basic_string`'s own
+        // converting constructor two checks down, would build an
+        // `Expr::ConstructorCall` naming `__normal_iterator`, a class this
+        // project never `lower_record`'d, printing a literal call to a
+        // Dart-undefined identifier (`__normal_iterator(...)`, confirmed the
+        // hard way on the real Verovio 6.2.0 corpus — F10/tarefa 13's own
+        // `undefined_method` regression, exactly the "silêncio é proibido"
+        // failure this whole family exists to prevent). Every one of this
+        // class's constructors takes exactly one argument (the value being
+        // wrapped/converted), so the same transparent unwrap `is_copy_or_move`
+        // uses above is exact here too, regardless of which specific
+        // overload resolved; a shape with a different argument count (none
+        // observed, but not proven impossible) falls to an honest typed
+        // bailout instead of guessing.
+        if unsafe { is_normal_iterator_decl(clang_sys::clang_getCursorSemanticParent(referenced)) }
+        {
+            if arg_count == 1 {
+                let arg_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 0) };
+                return unsafe { lower_expr(arg_cursor, project_root) };
+            }
+            return ir::Expr::UnsupportedTyped {
+                reason: "unsupported __normal_iterator construction shape".to_owned(),
+                ty: lower_type(unsafe { clang_sys::clang_getCursorType(cursor) }),
+                origin,
+            };
+        }
         // `return "Au au";` from a function returning `std::string` (E06)
         // implicitly invokes `basic_string`'s converting constructor from
         // `const char*` — a `CXXConstructExpr`, surfacing here exactly like
@@ -6975,6 +7140,11 @@ unsafe fn lower_call_expr(
     }
     if let Some(special) = unsafe {
         lower_stdlib_free_function_call(cursor, referenced, &callee_name, project_root, &origin)
+    } {
+        return special;
+    }
+    if let Some(special) = unsafe {
+        lower_stdlib_algorithm_call(cursor, referenced, &callee_name, project_root, &origin)
     } {
         return special;
     }
@@ -7571,6 +7741,81 @@ unsafe fn lower_stringstream_insertion_stmt(
     })
 }
 
+/// `*it` / `it->field` inside a loop `lower_iterator_for_loop` recognized,
+/// or inside the guarded `then` branch `lower_find_iterator_guard_idiom`
+/// recognized — both register the iterator variable's Dart binding in
+/// `ACTIVE_ITERATOR_LOOPS` before lowering the body/branch that can
+/// dereference it. Deliberately *not* using a generic receiver lowering:
+/// `it`'s own declared type is the never-representable iterator, so
+/// `lower_expr` on the (`ImplicitCastExpr`-wrapped, confirmed via
+/// `-ast-dump`) receiver cursor runs straight into the generic
+/// implicit-conversion wrapper and produces a compound
+/// `Expr::UnsupportedTyped`, not the plain `Expr::Ref` this needs — the
+/// receiver's *identity* (which declaration it names) is all that's needed
+/// here, not a full expression lowering of a type this bridge can't
+/// represent. `clang_getCursorReferenced` resolves straight through the
+/// cast to the `VarDecl`, exactly like `lower_iterator_for_loop`'s own
+/// condition/increment checks do. If that name is currently bound in
+/// `ACTIVE_ITERATOR_LOOPS`, it *is* the loop's/branch's own Dart element
+/// binding — `Expr::Ref` to that same name, now correctly typed as the
+/// element rather than the iterator. `operator->` returns the identical
+/// `Ref`, not a `FieldAccess` itself: the field name isn't available at
+/// this call site (this function only ever sees the `operator->` call in
+/// isolation), so the surrounding member-access lowering that invoked this
+/// — the same one that already wraps a plain `.field`/`->field` around any
+/// other receiver — wraps the field around this corrected `Ref` the same
+/// way. An iterator variable used *outside* a recognized idiom (stored in a
+/// field, produced by a bare `std::find`, reassigned mid-loop via
+/// `operator=`) has nothing registered for its name and falls through to
+/// the honest bailout below, unchanged. Not scoped to a specific iterator
+/// template name (`_List_iterator`, `_Rb_tree_const_iterator`/
+/// `_Rb_tree_iterator` for `set`, `__normal_iterator` for `vector`, ...):
+/// the registry lookup below is what actually gates correctness — it can
+/// only match a name one of those two idioms itself pushed, which already
+/// restricted the container to `Type::List`/`Type::Set` — so a real
+/// receiver neither recognizer ever produced (a smart pointer's own
+/// `operator*`, for instance) would just fail the lookup and fall through
+/// unchanged.
+unsafe fn lower_stdlib_dereference_call(
+    call_cursor: clang_sys::CXCursor,
+    template_name: &str,
+    callee_name: &str,
+    origin: &ir::Origin,
+) -> Option<ir::Expr> {
+    if unsafe { clang_sys::clang_Cursor_getNumArguments(call_cursor) } < 1 {
+        return Some(ir::Expr::UnsupportedTyped {
+            reason: format!("unsupported std::{template_name}::{callee_name} call"),
+            ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
+            origin: origin.clone(),
+        });
+    }
+    let receiver_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
+    let receiver_referenced = unsafe { clang_sys::clang_getCursorReferenced(receiver_cursor) };
+    let receiver_name = if unsafe { clang_sys::clang_Cursor_isNull(receiver_referenced) } == 0 {
+        Some(dart_safe_identifier(&unsafe {
+            type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(
+                receiver_referenced,
+            ))
+        }))
+    } else {
+        None
+    };
+    match receiver_name
+        .and_then(|name| active_iterator_loop_element_type(&name).map(|ty| (name, ty)))
+    {
+        Some((name, elem_ty)) => Some(ir::Expr::Ref {
+            name,
+            ty: elem_ty,
+            origin: origin.clone(),
+        }),
+        None => Some(ir::Expr::UnsupportedTyped {
+            reason: format!("unsupported std::{template_name}::{callee_name} call"),
+            ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
+            origin: origin.clone(),
+        }),
+    }
+}
+
 unsafe fn lower_stdlib_method_call(
     call_cursor: clang_sys::CXCursor,
     referenced: clang_sys::CXCursor,
@@ -7578,9 +7823,29 @@ unsafe fn lower_stdlib_method_call(
     origin: &ir::Origin,
 ) -> Option<ir::Expr> {
     let owner = unsafe { clang_sys::clang_getCursorSemanticParent(referenced) };
-    let template_name = unsafe { stdlib_template_name(owner) }?;
     let callee_name =
         unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced)) };
+
+    // `*it`/`it->field` on a `__gnu_cxx::__normal_iterator` (`std::vector`'s/
+    // `std::string`'s real iterator implementation, outside `namespace
+    // std`) — checked before `stdlib_template_name(owner)?` below, whose own
+    // ancestor walk only accepts `std` (deliberately: see
+    // `is_normal_iterator_decl`'s doc comment for why a shared, general
+    // template-name resolver is the wrong place to widen this). Delegates to
+    // the exact same generic-template dispatch below by simply treating this
+    // as `template_name == "__normal_iterator"` — the dereference arm inside
+    // that big match doesn't care which specific stdlib template it is
+    // (matches on `(_, "operator*" | "operator->")`), so this only needs to
+    // get there, not duplicate its logic.
+    if matches!(callee_name.as_str(), "operator*" | "operator->")
+        && unsafe { is_normal_iterator_decl(owner) }
+    {
+        return unsafe {
+            lower_stdlib_dereference_call(call_cursor, "__normal_iterator", &callee_name, origin)
+        };
+    }
+
+    let template_name = unsafe { stdlib_template_name(owner) }?;
 
     // `operator[]` doesn't share `.size()`'s AST shape, even though both are
     // `CXXMethod`s of the same class: a dot-call's receiver is wrapped in a
@@ -7790,6 +8055,34 @@ unsafe fn lower_stdlib_method_call(
             ty: ir::Type::Bool,
             origin: origin.clone(),
         }),
+        // `v.erase(std::remove_if(v.begin(), v.end(), pred), v.end());` — the
+        // classic erase-remove idiom, one C++ statement (no separate
+        // temporary iterator), F10/tarefa 13
+        // (`docs/prompts/2026-08-21-13-iteradores-stl.md`). `remove_if`'s own
+        // return value (an iterator to the new logical end) has no
+        // representation this bridge gives it on its own, same reasoning as
+        // `lower_find_contains_idiom`'s `std::find`: the *whole* two-call
+        // idiom is recognized together, requiring the erase receiver and
+        // every `begin`/`end` mention inside `remove_if`'s own arguments and
+        // the outer `end()` argument to all agree
+        // (`container_begin_or_end_receiver`/`same_receiver_ignoring_origin`,
+        // the same machinery `lower_find_contains_idiom` already uses).
+        // `remove_if` reached any other way (no enclosing `.erase(...)`, a
+        // mismatched receiver) is handled by `lower_stdlib_algorithm_call`'s
+        // own honest bailout instead — it never reaches here at all, since
+        // this arm only fires once `.erase(...)`'s own first argument is
+        // already known to *be* a `remove_if` call.
+        ("vector" | "list" | "deque", "erase") => {
+            match unsafe { lower_erase_remove_if_idiom(&target, call_cursor, project_root, origin) }
+            {
+                Some(removed) => Some(removed),
+                None => Some(ir::Expr::UnsupportedTyped {
+                    reason: format!("unsupported std::{template_name}::erase call"),
+                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
+                    origin: origin.clone(),
+                }),
+            }
+        }
         ("map", "contains") => {
             let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
             if args.len() != 1 {
@@ -8312,35 +8605,7 @@ unsafe fn lower_stdlib_method_call(
         // instance) would just fail the lookup and fall through unchanged.
         (_, "operator*" | "operator->")
             if unsafe { clang_sys::clang_Cursor_getNumArguments(call_cursor) } >= 1 =>
-        {
-            let receiver_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
-            let receiver_referenced =
-                unsafe { clang_sys::clang_getCursorReferenced(receiver_cursor) };
-            let receiver_name =
-                if unsafe { clang_sys::clang_Cursor_isNull(receiver_referenced) } == 0 {
-                    Some(dart_safe_identifier(&unsafe {
-                        type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(
-                            receiver_referenced,
-                        ))
-                    }))
-                } else {
-                    None
-                };
-            match receiver_name
-                .and_then(|name| active_iterator_loop_element_type(&name).map(|ty| (name, ty)))
-            {
-                Some((name, elem_ty)) => Some(ir::Expr::Ref {
-                    name,
-                    ty: elem_ty,
-                    origin: origin.clone(),
-                }),
-                None => Some(ir::Expr::UnsupportedTyped {
-                    reason: format!("unsupported std::{template_name}::{callee_name} call"),
-                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
-                    origin: origin.clone(),
-                }),
-            }
-        }
+        unsafe { lower_stdlib_dereference_call(call_cursor, &template_name, &callee_name, origin) },
         _ => Some(ir::Expr::UnsupportedTyped {
             reason: format!("unsupported std::{template_name}::{callee_name} call"),
             ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
@@ -8528,6 +8793,16 @@ fn same_receiver_ignoring_origin(a: &ir::Expr, b: &ir::Expr) -> bool {
 /// independent extractions that all have to land on the same lowered
 /// receiver expression. `is_negated` is `true` for `!=` (the common "is
 /// present" form), `false` for `==` ("is absent", wrapped in `!`).
+///
+/// `std::find_if(X.begin(), X.end(), pred) != X.end()` (F10/tarefa 13,
+/// `docs/prompts/2026-08-21-13-iteradores-stl.md`) is the exact same idiom
+/// with a predicate standing in for a value — "does some element of `X`
+/// satisfy `pred`?" — so it shares every structural check below and only
+/// differs in which Dart method the match becomes (`any(pred)` instead of
+/// `contains(v)`) and in what its one distinguishing argument lowers to (a
+/// predicate expression — usually a functor construction, already lowered
+/// generically since `operator()` bridges to Dart's own `call` — rather
+/// than a plain value).
 unsafe fn lower_find_contains_idiom(
     is_negated: bool,
     find_call_cursor: clang_sys::CXCursor,
@@ -8547,9 +8822,11 @@ unsafe fn lower_find_contains_idiom(
     let find_name = unsafe {
         type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(find_referenced))
     };
-    if find_name != "find" {
-        return None;
-    }
+    let dart_method_name = match find_name.as_str() {
+        "find" => "contains",
+        "find_if" => "any",
+        _ => return None,
+    };
     if unsafe {
         clang_sys::clang_Location_isInSystemHeader(clang_sys::clang_getCursorLocation(
             find_referenced,
@@ -8586,13 +8863,13 @@ unsafe fn lower_find_contains_idiom(
         return None;
     }
 
-    let value = unsafe { lower_expr(value_cursor, project_root) };
+    let value_or_pred = unsafe { lower_expr(value_cursor, project_root) };
     let contains = ir::Expr::Call {
         base_qualifier: None,
         target: Some(Box::new(begin_receiver)),
         callee_usr: String::new(),
-        callee_name: "contains".to_owned(),
-        args: vec![value],
+        callee_name: dart_method_name.to_owned(),
+        args: vec![value_or_pred],
         ty: ir::Type::Bool,
         origin: origin.clone(),
     };
@@ -8605,6 +8882,115 @@ unsafe fn lower_find_contains_idiom(
             ty: ir::Type::Bool,
             origin: origin.clone(),
         }
+    })
+}
+
+/// Strips an implicit copy/move-construction wrapper materializing a
+/// by-value class-type temporary (`remove_if`'s/`end()`'s own iterator
+/// return value, passed as a real function argument) — confirmed
+/// empirically as a real, distinct shape from anything
+/// `unwrap_transparent_value_cursor` already strips: it's a genuine
+/// `CXCursor_CallExpr` whose own `clang_getCursorReferenced` resolves to
+/// the constructor (`CXCursor_Constructor`) rather than the ordinary
+/// `CXCursor_FunctionDecl` a real call resolves to, with the actual wrapped
+/// call as its single argument. Loops (not a single strip) since
+/// `unwrap_transparent_value_cursor` may need another pass once the
+/// materialization is gone (a plain sugar wrapper, e.g. `ExprWithCleanups`,
+/// can sit on either side of it). A cursor this doesn't apply to (an
+/// ordinary call, with a real `FunctionDecl` target) passes through
+/// unchanged after at most one failed check.
+unsafe fn unwrap_value_materialization(mut cursor: clang_sys::CXCursor) -> clang_sys::CXCursor {
+    loop {
+        cursor = unsafe { unwrap_transparent_value_cursor(cursor) };
+        if unsafe { clang_sys::clang_getCursorKind(cursor) } != clang_sys::CXCursor_CallExpr {
+            return cursor;
+        }
+        let referenced = unsafe { clang_sys::clang_getCursorReferenced(cursor) };
+        if unsafe { clang_sys::clang_Cursor_isNull(referenced) } != 0
+            || unsafe { clang_sys::clang_getCursorKind(referenced) }
+                != clang_sys::CXCursor_Constructor
+            || unsafe { clang_sys::clang_Cursor_getNumArguments(cursor) } != 1
+        {
+            return cursor;
+        }
+        cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 0) };
+    }
+}
+
+/// `erase_call_cursor` is a `.erase(a, b)` dot-call already known to be on
+/// one of the sequence containers `lower_stdlib_method_call`'s own `"erase"`
+/// arm recognizes, with `erase_receiver` its already-lowered receiver
+/// (`target`, in that function's own naming) — `X` in `X.erase(std::
+/// remove_if(X.begin(), X.end(), pred), X.end())`. `None` for anything that
+/// isn't exactly that shape (a different first argument, a mismatched
+/// receiver anywhere in the chain); `lower_stdlib_method_call`'s own caller
+/// turns that into an honest bailout rather than guessing.
+unsafe fn lower_erase_remove_if_idiom(
+    erase_receiver: &ir::Expr,
+    erase_call_cursor: clang_sys::CXCursor,
+    project_root: &Path,
+    origin: &ir::Origin,
+) -> Option<ir::Expr> {
+    if unsafe { clang_sys::clang_Cursor_getNumArguments(erase_call_cursor) } != 2 {
+        return None;
+    }
+    let remove_if_cursor = unsafe {
+        unwrap_value_materialization(clang_sys::clang_Cursor_getArgument(erase_call_cursor, 0))
+    };
+    let outer_end_cursor = unsafe {
+        unwrap_value_materialization(clang_sys::clang_Cursor_getArgument(erase_call_cursor, 1))
+    };
+
+    if unsafe { clang_sys::clang_getCursorKind(remove_if_cursor) } != clang_sys::CXCursor_CallExpr {
+        return None;
+    }
+    let remove_if_referenced = unsafe { clang_sys::clang_getCursorReferenced(remove_if_cursor) };
+    if unsafe { clang_sys::clang_Cursor_isNull(remove_if_referenced) } != 0 {
+        return None;
+    }
+    let remove_if_name = unsafe {
+        type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(remove_if_referenced))
+    };
+    if remove_if_name != "remove_if"
+        || unsafe {
+            clang_sys::clang_Location_isInSystemHeader(clang_sys::clang_getCursorLocation(
+                remove_if_referenced,
+            ))
+        } == 0
+        || !unsafe { free_function_reachable_from_std(remove_if_referenced) }
+        || unsafe { clang_sys::clang_Cursor_getNumArguments(remove_if_cursor) } != 3
+    {
+        return None;
+    }
+
+    let begin_cursor = unsafe { clang_sys::clang_Cursor_getArgument(remove_if_cursor, 0) };
+    let end_cursor_in_remove_if =
+        unsafe { clang_sys::clang_Cursor_getArgument(remove_if_cursor, 1) };
+    let pred_cursor = unsafe { clang_sys::clang_Cursor_getArgument(remove_if_cursor, 2) };
+
+    let begin_receiver =
+        unsafe { container_begin_or_end_receiver(begin_cursor, true, project_root, origin) }?;
+    let end_receiver_in_remove_if = unsafe {
+        container_begin_or_end_receiver(end_cursor_in_remove_if, false, project_root, origin)
+    }?;
+    let end_receiver_outer =
+        unsafe { container_begin_or_end_receiver(outer_end_cursor, false, project_root, origin) }?;
+    if !same_receiver_ignoring_origin(&begin_receiver, &end_receiver_in_remove_if)
+        || !same_receiver_ignoring_origin(&begin_receiver, &end_receiver_outer)
+        || !same_receiver_ignoring_origin(&begin_receiver, erase_receiver)
+    {
+        return None;
+    }
+
+    let pred = unsafe { lower_expr(pred_cursor, project_root) };
+    Some(ir::Expr::Call {
+        base_qualifier: None,
+        target: Some(Box::new(begin_receiver)),
+        callee_usr: String::new(),
+        callee_name: "removeWhere".to_owned(),
+        args: vec![pred],
+        ty: ir::Type::Void,
+        origin: origin.clone(),
     })
 }
 
@@ -8869,6 +9255,259 @@ unsafe fn lower_iterator_for_loop(
     })
 }
 
+/// `T it = std::find[_if](X.begin(), X.end(), value_or_pred); if (it !=
+/// X.end()) { ...*it...it->... } [else { ... }]` — F10/tarefa 13's headline
+/// three-statement idiom
+/// (`docs/prompts/2026-08-21-13-iteradores-stl.md`): declare, guard,
+/// dereference. Unlike `lower_find_contains_idiom` (the same `find`/
+/// `find_if` call compared against `end()` *inline*, a pure boolean
+/// question), here the iterator is *bound to a name* and dereferenced in a
+/// later statement — the found value has to survive across two statements,
+/// which Dart's own null safety already models directly: `it` becomes a
+/// nullable binding holding the found element (or `null`), the guard
+/// becomes a null check, and every `*it`/`it->field` inside the guarded
+/// branch resolves through the same `ACTIVE_ITERATOR_LOOPS` registry
+/// `lower_iterator_for_loop` already populates for its own loop variable —
+/// this idiom just populates it for the guarded `then` branch instead of a
+/// loop body.
+///
+/// Recognized as one whole unit here, not as two independently-dispatched
+/// statements, because a partial match would be worse than none (the
+/// prompt's own words): a `find`/`find_if` call this doesn't recognize as
+/// part of a larger idiom reaches `lower_call_expr`'s free-function
+/// dispatch on its own, where `lower_stdlib_algorithm_call`'s honest
+/// bailout catches it — never a silent half-translation.
+///
+/// `decl_cursor`/`if_cursor` must be two adjacent children of the same
+/// `CompoundStmt`, in source order (`lower_compound_stmt`'s own lookahead
+/// window). `None` for anything that isn't exactly this shape — the caller
+/// falls back to lowering each independently.
+unsafe fn lower_find_iterator_guard_idiom(
+    decl_cursor: clang_sys::CXCursor,
+    if_cursor: clang_sys::CXCursor,
+    project_root: &Path,
+) -> Option<Vec<ir::Stmt>> {
+    if unsafe { clang_sys::clang_getCursorKind(decl_cursor) } != clang_sys::CXCursor_DeclStmt {
+        return None;
+    }
+    let decl_children = unsafe { collect_children(decl_cursor) };
+    let [it_decl_cursor] = decl_children.as_slice() else {
+        return None;
+    };
+    if unsafe { clang_sys::clang_getCursorKind(*it_decl_cursor) } != clang_sys::CXCursor_VarDecl {
+        return None;
+    }
+    let it_name = dart_safe_identifier(&unsafe {
+        type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(*it_decl_cursor))
+    });
+    let it_init_candidates: Vec<clang_sys::CXCursor> = unsafe { collect_children(*it_decl_cursor) }
+        .into_iter()
+        .filter(|child| {
+            !matches!(
+                unsafe { clang_sys::clang_getCursorKind(*child) },
+                clang_sys::CXCursor_TypeRef
+                    | clang_sys::CXCursor_NamespaceRef
+                    | clang_sys::CXCursor_TemplateRef
+            )
+        })
+        .collect();
+    let [it_init_cursor] = it_init_candidates.as_slice() else {
+        return None;
+    };
+    let find_call_cursor = unsafe { unwrap_value_materialization(*it_init_cursor) };
+    if unsafe { clang_sys::clang_getCursorKind(find_call_cursor) } != clang_sys::CXCursor_CallExpr {
+        return None;
+    }
+    let find_referenced = unsafe { clang_sys::clang_getCursorReferenced(find_call_cursor) };
+    if unsafe { clang_sys::clang_Cursor_isNull(find_referenced) } != 0 {
+        return None;
+    }
+    let find_name = unsafe {
+        type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(find_referenced))
+    };
+    if !matches!(find_name.as_str(), "find" | "find_if")
+        || unsafe {
+            clang_sys::clang_Location_isInSystemHeader(clang_sys::clang_getCursorLocation(
+                find_referenced,
+            ))
+        } == 0
+        || !unsafe { free_function_reachable_from_std(find_referenced) }
+        || unsafe { clang_sys::clang_Cursor_getNumArguments(find_call_cursor) } != 3
+    {
+        return None;
+    }
+
+    let origin = stmt_origin(decl_cursor, project_root);
+    let begin_cursor = unsafe { clang_sys::clang_Cursor_getArgument(find_call_cursor, 0) };
+    let end_cursor_in_find = unsafe { clang_sys::clang_Cursor_getArgument(find_call_cursor, 1) };
+    let value_or_pred_cursor = unsafe { clang_sys::clang_Cursor_getArgument(find_call_cursor, 2) };
+
+    let begin_receiver =
+        unsafe { container_begin_or_end_receiver(begin_cursor, true, project_root, &origin) }?;
+    let end_receiver_in_find = unsafe {
+        container_begin_or_end_receiver(end_cursor_in_find, false, project_root, &origin)
+    }?;
+    if !same_receiver_ignoring_origin(&begin_receiver, &end_receiver_in_find) {
+        return None;
+    }
+    let elem_ty = container_element_type(&begin_receiver)?;
+
+    if unsafe { clang_sys::clang_getCursorKind(if_cursor) } != clang_sys::CXCursor_IfStmt {
+        return None;
+    }
+    let if_children = unsafe { collect_children(if_cursor) };
+    let (condition_cursor, then_cursor, else_cursor) = match if_children.as_slice() {
+        [condition_cursor, then_cursor] => (*condition_cursor, *then_cursor, None),
+        [condition_cursor, then_cursor, else_cursor] => {
+            (*condition_cursor, *then_cursor, Some(*else_cursor))
+        }
+        _ => return None,
+    };
+    // `it != X.end()` — same C++20 rewritten-`!=`-as-`!(operator==)` shape
+    // `lower_iterator_for_loop`'s own condition check already handles (see
+    // that function's doc comment for why: a real `CXXRewrittenBinaryOperator`
+    // reported as a transparent `CXCursor_UnexposedExpr` wrapping a genuine
+    // `UnaryOperator '!'`, which `is_transparent_wrapper` correctly leaves
+    // alone).
+    let condition_cursor = unsafe { unwrap_transparent_value_cursor(condition_cursor) };
+    let (condition_operator_cursor, expected_name) = if unsafe {
+        clang_sys::clang_getCursorKind(condition_cursor) == clang_sys::CXCursor_UnaryOperator
+    } && unsafe {
+        clang_sys::clang_getCursorUnaryOperatorKind(condition_cursor)
+    } == clang_sys::CXUnaryOperator_LNot
+    {
+        let not_children = unsafe { collect_children(condition_cursor) };
+        let [operand_cursor] = not_children.as_slice() else {
+            return None;
+        };
+        (*operand_cursor, "operator==")
+    } else {
+        (condition_cursor, "operator!=")
+    };
+    if unsafe { clang_sys::clang_getCursorKind(condition_operator_cursor) }
+        != clang_sys::CXCursor_CallExpr
+    {
+        return None;
+    }
+    let condition_referenced =
+        unsafe { clang_sys::clang_getCursorReferenced(condition_operator_cursor) };
+    if unsafe { clang_sys::clang_Cursor_isNull(condition_referenced) } != 0 {
+        return None;
+    }
+    let condition_name = unsafe {
+        type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(condition_referenced))
+    };
+    if condition_name != expected_name
+        || unsafe { clang_sys::clang_Cursor_getNumArguments(condition_operator_cursor) } != 2
+    {
+        return None;
+    }
+    let condition_lhs =
+        unsafe { clang_sys::clang_Cursor_getArgument(condition_operator_cursor, 0) };
+    let condition_rhs =
+        unsafe { clang_sys::clang_Cursor_getArgument(condition_operator_cursor, 1) };
+    let condition_lhs_referenced = unsafe { clang_sys::clang_getCursorReferenced(condition_lhs) };
+    if unsafe { clang_sys::clang_Cursor_isNull(condition_lhs_referenced) } != 0
+        || unsafe { clang_sys::clang_equalCursors(condition_lhs_referenced, *it_decl_cursor) } == 0
+    {
+        return None;
+    }
+    let condition_rhs = unsafe { unwrap_transparent_value_cursor(condition_rhs) };
+    let end_receiver_condition =
+        unsafe { container_begin_or_end_receiver(condition_rhs, false, project_root, &origin) }?;
+    if !same_receiver_ignoring_origin(&begin_receiver, &end_receiver_condition) {
+        return None;
+    }
+
+    // Every structural check passed — build the fused replacement: a
+    // nullable binding, then a null-check `If` in place of the original
+    // two statements. `elem_ty` can already be `Nullable` on its own (a
+    // `vector<Object*>`'s element, real Verovio trigger:
+    // `alignfunctor.cpp`'s `std::find_if(... m_timeSpanningElements ...)`
+    // over a vector of pointers) — wrapping it in another `Nullable` would
+    // double up ("not found" and "found a null pointer" collapse to the
+    // same value anyway, so there's no information lost by reusing it) and,
+    // worse, print as Dart's invalid `T??` syntax (confirmed the hard way on
+    // the real Verovio 6.2.0 corpus: `dart format` refused to parse the
+    // result).
+    let it_ty = match &elem_ty {
+        ir::Type::Nullable(_) => elem_ty.clone(),
+        _ => ir::Type::Nullable(Box::new(elem_ty.clone())),
+    };
+    let init_expr = if find_name == "find" {
+        // `X.contains(v) ? v : null` — when found, `*it` and `v` are the
+        // same value by construction (`std::find` found `v` itself), so no
+        // helper is needed the way `find_if` needs one to locate *which*
+        // element matched.
+        let value = unsafe { lower_expr(value_or_pred_cursor, project_root) };
+        ir::Expr::Conditional {
+            condition: Box::new(ir::Expr::Call {
+                base_qualifier: None,
+                target: Some(Box::new(begin_receiver.clone())),
+                callee_usr: String::new(),
+                callee_name: "contains".to_owned(),
+                args: vec![value.clone()],
+                ty: ir::Type::Bool,
+                origin: origin.clone(),
+            }),
+            then_expr: Box::new(value),
+            else_expr: Box::new(ir::Expr::NullLiteral {
+                origin: origin.clone(),
+            }),
+            ty: it_ty.clone(),
+            origin: origin.clone(),
+        }
+    } else {
+        let pred = unsafe { lower_expr(value_or_pred_cursor, project_root) };
+        ir::Expr::Call {
+            base_qualifier: None,
+            target: None,
+            callee_usr: String::new(),
+            // Must read the same literal name as
+            // `emit::dart::FIRST_WHERE_HELPER_NAME`.
+            callee_name: "syntaxBridgeFirstWhere".to_owned(),
+            args: vec![begin_receiver.clone(), pred],
+            ty: it_ty.clone(),
+            origin: origin.clone(),
+        }
+    };
+
+    push_active_iterator_loop(it_name.clone(), elem_ty);
+    let then_branch = unsafe { lower_branch(then_cursor, project_root) };
+    pop_active_iterator_loop();
+    let else_branch = match else_cursor {
+        Some(else_cursor) => unsafe { lower_branch(else_cursor, project_root) },
+        None => Vec::new(),
+    };
+
+    Some(vec![
+        ir::Stmt::VarDecl {
+            name: it_name.clone(),
+            ty: it_ty.clone(),
+            init: Some(init_expr),
+            origin: origin.clone(),
+        },
+        ir::Stmt::If {
+            condition: ir::Expr::Binary {
+                op: ir::BinaryOp::Ne,
+                lhs: Box::new(ir::Expr::Ref {
+                    name: it_name,
+                    ty: it_ty,
+                    origin: origin.clone(),
+                }),
+                rhs: Box::new(ir::Expr::NullLiteral {
+                    origin: origin.clone(),
+                }),
+                ty: ir::Type::Bool,
+                origin: origin.clone(),
+            },
+            then_branch,
+            else_branch,
+            origin,
+        },
+    ])
+}
+
 /// Whether `decl` (a `FunctionDecl` already confirmed to live in a system
 /// header) is reachable from `std` — either declared directly inside
 /// `namespace std` (or one of its inline namespaces, e.g. libstdc++'s
@@ -9116,6 +9755,161 @@ unsafe fn lower_stdlib_free_function_call(
             })
         }
         _ => None,
+    }
+}
+
+/// The element type a `begin`/`end`-recognized container receiver
+/// (`container_begin_or_end_receiver`'s own output shape) carries — `None`
+/// for a receiver whose lowered `Expr`/`Type` combination isn't one of the
+/// two shapes that function ever actually produces. Factored out of
+/// `lower_iterator_for_loop`'s own inline match (kept there unchanged) since
+/// `lower_stdlib_algorithm_call` below needs the exact same extraction for
+/// `count_if`'s intermediate `.where(...)` node.
+fn container_element_type(receiver: &ir::Expr) -> Option<ir::Type> {
+    match receiver {
+        ir::Expr::Ref { ty, .. } | ir::Expr::FieldAccess { ty, .. } => match ty {
+            ir::Type::List(elem) | ir::Type::Set(elem) => Some((**elem).clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `std` algorithm free functions whose first two arguments are a
+/// `begin()`/`end()` pair on the exact same container — the STL "whole
+/// idiom" family F10/tarefa 13 targets
+/// (`docs/prompts/2026-08-21-13-iteradores-stl.md`). Every one of these has
+/// a direct, single-expression Dart equivalent once the begin/end pair is
+/// recognized as "the whole container", the same
+/// `container_begin_or_end_receiver`/`same_receiver_ignoring_origin`
+/// machinery `lower_find_contains_idiom`/`lower_iterator_for_loop` already
+/// use for the same reason.
+///
+/// `find`/`find_if`/`remove_if` are deliberately *not* given a real
+/// translation here: `find`/`find_if` only have a sound one as part of a
+/// larger idiom (compared against `end()` — `lower_find_contains_idiom` — or
+/// declared, then guarded, then dereferenced — the compound-statement
+/// fusion in `lower_compound_stmt`), both of which intercept the call
+/// *before* it ever reaches here as a bare `FunctionDecl` call, structurally
+/// walking the relevant cursors themselves rather than going through
+/// `lower_call_expr`. `remove_if` only has one, paired with `.erase(...)`
+/// (`lower_stdlib_method_call`'s own `"erase"` arm). Reaching this function
+/// with one of those three names bare means neither recognized shape
+/// matched — an honest, typed bailout, never a fall-through to the generic
+/// path below that would print a literal, undefined-in-Dart call (this
+/// whole family's own root cause, per the prompt's own evidence: `find_if`
+/// printed as a literal call because `is_plain_dart_identifier("find_if")`
+/// is true).
+unsafe fn lower_stdlib_algorithm_call(
+    call_cursor: clang_sys::CXCursor,
+    referenced: clang_sys::CXCursor,
+    callee_name: &str,
+    project_root: &Path,
+    origin: &ir::Origin,
+) -> Option<ir::Expr> {
+    if !matches!(
+        callee_name,
+        "find" | "find_if" | "count_if" | "sort" | "for_each" | "remove_if"
+    ) {
+        return None;
+    }
+    if unsafe {
+        clang_sys::clang_Location_isInSystemHeader(clang_sys::clang_getCursorLocation(referenced))
+    } == 0
+    {
+        return None;
+    }
+    if !unsafe { free_function_reachable_from_std(referenced) } {
+        return None;
+    }
+
+    let unsupported = || ir::Expr::UnsupportedTyped {
+        reason: format!("unsupported use of std::{callee_name} — not part of a recognized idiom"),
+        ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
+        origin: origin.clone(),
+    };
+
+    if matches!(callee_name, "find" | "find_if" | "remove_if") {
+        return Some(unsupported());
+    }
+
+    let arg_count = unsafe { clang_sys::clang_Cursor_getNumArguments(call_cursor) };
+    if arg_count < 2 {
+        return Some(unsupported());
+    }
+    let begin_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
+    let end_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 1) };
+    let (Some(begin_receiver), Some(end_receiver)) = (
+        unsafe { container_begin_or_end_receiver(begin_cursor, true, project_root, origin) },
+        unsafe { container_begin_or_end_receiver(end_cursor, false, project_root, origin) },
+    ) else {
+        return Some(unsupported());
+    };
+    if !same_receiver_ignoring_origin(&begin_receiver, &end_receiver) {
+        return Some(unsupported());
+    }
+
+    match callee_name {
+        "count_if" => {
+            if arg_count != 3 {
+                return Some(unsupported());
+            }
+            let Some(elem_ty) = container_element_type(&begin_receiver) else {
+                return Some(unsupported());
+            };
+            let pred_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 2) };
+            let pred = unsafe { lower_expr(pred_cursor, project_root) };
+            Some(ir::Expr::FieldAccess {
+                target: Box::new(ir::Expr::Call {
+                    base_qualifier: None,
+                    target: Some(Box::new(begin_receiver)),
+                    callee_usr: String::new(),
+                    callee_name: "where".to_owned(),
+                    args: vec![pred],
+                    ty: ir::Type::List(Box::new(elem_ty)),
+                    origin: origin.clone(),
+                }),
+                field: "length".to_owned(),
+                ty: ir::Type::Int,
+                origin: origin.clone(),
+            })
+        }
+        "sort" if arg_count == 2 => Some(ir::Expr::Call {
+            base_qualifier: None,
+            target: Some(Box::new(begin_receiver)),
+            callee_usr: String::new(),
+            callee_name: "sort".to_owned(),
+            args: Vec::new(),
+            ty: ir::Type::Void,
+            origin: origin.clone(),
+        }),
+        "sort" if arg_count == 3 => {
+            let cmp_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 2) };
+            let cmp = unsafe { lower_expr(cmp_cursor, project_root) };
+            Some(ir::Expr::Call {
+                base_qualifier: None,
+                target: Some(Box::new(begin_receiver)),
+                callee_usr: String::new(),
+                callee_name: "sort".to_owned(),
+                args: vec![cmp],
+                ty: ir::Type::Void,
+                origin: origin.clone(),
+            })
+        }
+        "for_each" if arg_count == 3 => {
+            let fn_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 2) };
+            let f = unsafe { lower_expr(fn_cursor, project_root) };
+            Some(ir::Expr::Call {
+                base_qualifier: None,
+                target: Some(Box::new(begin_receiver)),
+                callee_usr: String::new(),
+                callee_name: "forEach".to_owned(),
+                args: vec![f],
+                ty: ir::Type::Void,
+                origin: origin.clone(),
+            })
+        }
+        _ => Some(unsupported()),
     }
 }
 

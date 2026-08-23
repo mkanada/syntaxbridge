@@ -534,7 +534,7 @@ fn collect_parameter_bailouts(parameter: &Param, inventory: &mut BailoutInventor
 
 fn collect_type_bailouts(ty: &Type, inventory: &mut BailoutInventory) {
     match ty {
-        Type::List(inner) | Type::Set(inner) | Type::Nullable(inner) => {
+        Type::List(inner) | Type::Set(inner) | Type::Nullable(inner) | Type::ListCursor(inner) => {
             collect_type_bailouts(inner, inventory);
         }
         Type::Map(key, value) => {

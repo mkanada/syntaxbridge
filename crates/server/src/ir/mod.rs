@@ -103,6 +103,19 @@ pub enum Type {
     /// and `second` member names and remains the same nominal Dart type when
     /// it crosses generated source files.
     Pair(Box<Type>, Box<Type>),
+    /// A long-lived `std::vector<T>::iterator`/`std::string::iterator`
+    /// (libstdc++'s `__gnu_cxx::__normal_iterator<...>`) *stored* somewhere
+    /// — a field, or a local that outlives the single recognized idiom
+    /// (`lower::cpp::lower_find_iterator_guard_idiom`,
+    /// `lower::cpp::lower_iterator_for_loop`) that could otherwise erase it
+    /// entirely. F10/tarefa 13
+    /// (`docs/prompts/2026-08-21-13-iteradores-stl.md`)'s own answer per
+    /// `AGENTS.md` for "no direct Dart equivalent": a named adapter, never
+    /// `Type::Unsupported`. A shared generated `SyntaxBridgeListCursor<T>`
+    /// (`current`/`moveNext`/`isEnd` over a `List<T>` plus an index), the
+    /// same "named bridge, not an erased type" shape `Pair` already gives
+    /// `std::pair`.
+    ListCursor(Box<Type>),
     /// A C/C++ function pointer whose parameter and return types are all
     /// represented in this IR. Emitted as a typed Dart closure
     /// (`ReturnType Function(Args...)`); ABI callbacks that need native
