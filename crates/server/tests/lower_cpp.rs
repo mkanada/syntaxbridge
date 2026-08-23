@@ -934,10 +934,18 @@ void consume(std::pair<int, std::string> value) {}
         files["lib/pair.dart"]
     );
     assert!(
-        files["lib/syntax_bridge_support.dart"].contains("final class SyntaxBridgePair<A, B>")
-            && files["lib/syntax_bridge_support.dart"].contains("final A first;")
-            && files["lib/syntax_bridge_support.dart"].contains("final B second;"),
+        files["lib/syntax_bridge_support.dart"].contains("final class SyntaxBridgePair<A, B>"),
         "pair adapter must preserve C++ member names, got:\n{}",
+        files["lib/syntax_bridge_support.dart"]
+    );
+    // F15/tarefa 15.3: `std::pair`'s members are mutable in C++
+    // (`p.first = x;` is legal and common), so the adapter's own fields
+    // must not be `final` — a straight-through `p.first = x;` translation
+    // would otherwise become Dart's `assignment_to_final`.
+    assert!(
+        !files["lib/syntax_bridge_support.dart"].contains("final A first;")
+            && !files["lib/syntax_bridge_support.dart"].contains("final B second;"),
+        "pair members must be mutable, not final, got:\n{}",
         files["lib/syntax_bridge_support.dart"]
     );
 }
@@ -6161,6 +6169,35 @@ int clamp_ish(int a, int b, int c) {
     assert!(
         !source.contains("throw UnimplementedError("),
         "got:\n{source}"
+    );
+}
+
+/// F15/tarefa 15.3: `std::pair` is mutable in C++ — `p.first = x;` is legal
+/// and common (real trigger: `iohumdrum.dart:9192`'s `v.second = i;`) — but
+/// `SyntaxBridgePair`'s `first`/`second` fields used to be declared `final`,
+/// so the same assignment translated straight through became Dart's
+/// `assignment_to_final`. The fields must accept assignment.
+#[test]
+fn assigning_to_a_pairs_first_or_second_member_compiles() {
+    let source = lower_and_emit(
+        "lower-cpp-pair-mutation",
+        r#"
+#include <utility>
+
+void bump(std::pair<int, int> &p, int i) {
+    p.first = i;
+    p.second = i;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "got:\n{source}"
+    );
+    assert!(
+        source.contains("p.first = i;") && source.contains("p.second = i;"),
+        "expected both member assignments to survive lowering, got:\n{source}"
     );
 }
 

@@ -561,9 +561,19 @@ fn emit_opaque_type() -> String {
     format!("final class {OPAQUE_TYPE_NAME} {{\n{INDENT}const {OPAQUE_TYPE_NAME}();\n}}\n")
 }
 
+/// `std::pair`'s members are mutable in C++ (`p.first = x;` is legal and
+/// common — real trigger: `iohumdrum.dart:9192`'s `v.second = i;`,
+/// F15/tarefa 15.3), so `first`/`second` can't be `final` the way the
+/// class's own constructor initializes them — a straight-through member
+/// assignment would otherwise become Dart's `assignment_to_final`. Mutable
+/// fields mean the constructor itself can no longer be `const` (a `const`
+/// constructor requires every field it initializes to be `final`); nothing
+/// in this emitter ever constructs a `SyntaxBridgePair` with the `const`
+/// keyword (`mock_value_for_type`/`lower::cpp`'s pair-construction lowering
+/// both print a plain call), so losing it costs nothing.
 fn emit_pair_support() -> String {
     format!(
-        "final class {PAIR_TYPE_NAME}<A, B> {{\n{INDENT}const {PAIR_TYPE_NAME}(this.first, this.second);\n\n{INDENT}final A first;\n{INDENT}final B second;\n}}\n"
+        "final class {PAIR_TYPE_NAME}<A, B> {{\n{INDENT}{PAIR_TYPE_NAME}(this.first, this.second);\n\n{INDENT}A first;\n{INDENT}B second;\n}}\n"
     )
 }
 
