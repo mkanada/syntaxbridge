@@ -3496,6 +3496,44 @@ Color f(int i) {
     assert!(!source.contains("unordered_map("), "got:\n{source}");
 }
 
+/// F15/tarefa 15.6: an unscoped C++ enum implicitly converts to `int` — a
+/// `std::map<int, V>` initializer list can legally use enum constants as
+/// keys, relying on that conversion (real trigger: `alignfunctor.cpp:44`'s
+/// `durationEq`, keyed by `option_DURATION_EQ` values but declared
+/// `std::map<int, data_DURATION>`). Lowering each key/value expression off
+/// its own cursor, with no target type in play, used to print the enum
+/// member bare (`option_DURATION_EQ.DURATION_EQ_brevis`) inside a literal
+/// declared `Map<int, ...>` — `map_key_type_not_assignable`. The key must
+/// fold to its plain `int` value, same as any other unscoped-enum-to-int
+/// implicit conversion this emitter already renders as `.value`.
+#[test]
+fn a_map_literal_with_enum_valued_keys_erases_them_to_their_int_value() {
+    let source = lower_and_emit(
+        "lower-cpp-map-init-list-enum-key",
+        r#"
+#include <map>
+enum DurationEq { EQ_BREVIS, EQ_SEMIBREVIS };
+int f() {
+    static const std::map<int, int> durationEq{
+        { EQ_BREVIS, 1 },
+        { EQ_SEMIBREVIS, 2 },
+    };
+    return durationEq.at(0);
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "got:\n{source}"
+    );
+    assert!(
+        source.contains("DurationEq.EQ_BREVIS.value: 1")
+            && source.contains("DurationEq.EQ_SEMIBREVIS.value: 2"),
+        "expected each enum key to fold to its int value, got:\n{source}"
+    );
+}
+
 /// Real trigger: `adjustaccidxfunctor.cpp:25`'s `m_currentMeasure = NULL;`
 /// (a constructor field-init assignment), plus the same idiom in a
 /// comparison and a local-variable initializer — the pre-`nullptr`

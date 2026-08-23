@@ -6421,6 +6421,7 @@ unsafe fn unwrap_transparent_value_cursor(mut cursor: clang_sys::CXCursor) -> cl
 /// back to the ordinary bailout rather than guessing.
 unsafe fn map_literal_entries(
     init_list_cursor: clang_sys::CXCursor,
+    key_ty: &ir::Type,
     project_root: &Path,
 ) -> Option<Vec<(ir::Expr, ir::Expr)>> {
     unsafe { collect_children(init_list_cursor) }
@@ -6435,11 +6436,38 @@ unsafe fn map_literal_entries(
             let [key_cursor, value_cursor] = pair_children.as_slice() else {
                 return None;
             };
-            let key = unsafe { lower_expr(*key_cursor, project_root) };
+            let key =
+                coerce_map_literal_key(unsafe { lower_expr(*key_cursor, project_root) }, key_ty);
             let value = unsafe { lower_expr(*value_cursor, project_root) };
             Some((key, value))
         })
         .collect()
+}
+
+/// A map literal's declared key type (`ir::Type::Map`'s first component)
+/// can differ from one entry's own key expression type when C++'s
+/// unscoped-enum-to-`int`-implicit-conversion is in play — real trigger:
+/// `alignfunctor.cpp:44`'s `durationEq`, a `std::map<int, data_DURATION>`
+/// keyed by `option_DURATION_EQ` constants (F15/tarefa 15.6).
+/// `map_literal_entries` lowers each pair's key straight off its own
+/// cursor, with no implicit-cast wrapper cursor libclang exposes inside a
+/// braced-init-list entry the way `lower_binary_operand`/
+/// `default_argument_value` catch this for other implicit-conversion
+/// contexts — so a bare enum member reached a `Map<int, ...>` literal
+/// unconverted, `map_key_type_not_assignable`. Folds it down to
+/// `Expr::Convert { ty: Int, .. }`, the same node any other
+/// unscoped-enum-to-`int` conversion in this emitter already becomes,
+/// which `emit::dart` renders as `.value`.
+fn coerce_map_literal_key(key: ir::Expr, declared_key_ty: &ir::Type) -> ir::Expr {
+    if *declared_key_ty == ir::Type::Int && matches!(key.ty(), Some(ir::Type::Enum { .. })) {
+        let origin = key.origin().clone();
+        return ir::Expr::Convert {
+            operand: Box::new(key),
+            ty: ir::Type::Int,
+            origin,
+        };
+    }
+    key
 }
 
 /// Lowers an operand of a binary arithmetic or relational operator.
@@ -7042,17 +7070,16 @@ unsafe fn lower_call_expr(
                 owner_template_name.as_deref(),
                 Some("map") | Some("unordered_map")
             )
-            && let ir::Type::Map(_, _) =
-                lower_type(unsafe { clang_sys::clang_getCursorType(cursor) })
+            && let ty = lower_type(unsafe { clang_sys::clang_getCursorType(cursor) })
+            && let ir::Type::Map(key_ty, _) = &ty
         {
             let arg_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 0) };
             let init_list_cursor = unsafe { unwrap_transparent_value_cursor(arg_cursor) };
             if unsafe { clang_sys::clang_getCursorKind(init_list_cursor) }
                 == clang_sys::CXCursor_InitListExpr
                 && let Some(entries) =
-                    unsafe { map_literal_entries(init_list_cursor, project_root) }
+                    unsafe { map_literal_entries(init_list_cursor, key_ty, project_root) }
             {
-                let ty = lower_type(unsafe { clang_sys::clang_getCursorType(cursor) });
                 return ir::Expr::MapLiteral {
                     entries,
                     ty,
