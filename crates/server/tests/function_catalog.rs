@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use syntax_bridge_server::function_catalog::{self, CallResolution, FunctionDeclarationKind};
 use syntax_bridge_server::ingest::CompilationUnit;
+use syntax_bridge_server::ir;
 
 /// Deliberately contains, per US-5's testability conditions: a hierarchy with
 /// a virtual method redefined (`Circle::area` overrides `Shape::area`) and
@@ -466,6 +467,383 @@ void Escrever(double* valor) {}
         function_names[0], function_names[1],
         "overloads distinguished only by different Unsupported parameter types must not \
          collide under the same Dart name: {function_names:?}"
+    );
+}
+
+/// F13/tarefa 12, test 1
+/// (`docs/prompts/2026-08-21-12-overloads-const-e-colisoes-de-nome.md`): a
+/// const/non-const pair with bodies, called from two call sites whose own
+/// `const`-ness picks a different overload (a `Box&` receiver resolves to
+/// the non-const `GetX`, a `const Box&` receiver to the `const` one) — not
+/// just that the two declarations end up with distinct Dart names, but that
+/// each call site's `callee_usr`/`callee_name` still points at the *correct*
+/// one after the rename (the failure mode the prompt calls out explicitly:
+/// reaching the declaration but not every call site).
+#[test]
+fn a_const_and_non_const_overload_route_calls_to_the_matching_renamed_method() {
+    let workspace = TempWorkspace::new("function-catalog-const-overload-calls")
+        .expect("create temporary workspace");
+    let project_root = workspace.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project dir");
+    fs::write(
+        project_root.join("box.cpp"),
+        r#"
+class Box {
+public:
+    int GetX() { return 1; }
+    int GetX() const { return 2; }
+};
+
+int ReadMutable(Box& box) { return box.GetX(); }
+int ReadConst(const Box& box) { return box.GetX(); }
+"#,
+    )
+    .expect("write box.cpp");
+
+    let unit = CompilationUnit {
+        directory: project_root.display().to_string(),
+        file: project_root.join("box.cpp").display().to_string(),
+        command: None,
+        arguments: vec!["clang++".to_owned(), "-std=c++17".to_owned()],
+    };
+
+    let catalog = function_catalog::extract_function_catalog(
+        std::slice::from_ref(&unit),
+        &project_root,
+        None,
+    )
+    .expect("extract function catalog");
+
+    let box_record = catalog
+        .ir_records
+        .iter()
+        .find(|record| record.name == "Box")
+        .unwrap_or_else(|| panic!("expected a Box record: {:#?}", catalog.ir_records));
+    assert_eq!(box_record.methods.len(), 2, "{:#?}", box_record.methods);
+    assert_ne!(
+        box_record.methods[0].name, box_record.methods[1].name,
+        "the const and non-const GetX overloads must not collide: {:?}",
+        box_record.methods
+    );
+
+    let get_x_decls: Vec<_> = catalog
+        .declarations
+        .iter()
+        .filter(|declaration| declaration.name == "GetX")
+        .collect();
+    assert_eq!(get_x_decls.len(), 2, "{get_x_decls:#?}");
+    let const_decl = get_x_decls
+        .iter()
+        .find(|declaration| declaration.signature.contains("const"))
+        .expect("a const GetX overload");
+    let non_const_decl = get_x_decls
+        .iter()
+        .find(|declaration| !declaration.signature.contains("const"))
+        .expect("a non-const GetX overload");
+
+    let name_for_usr = |usr: &str| -> String {
+        box_record
+            .methods
+            .iter()
+            .find(|method| method.usr == usr)
+            .unwrap_or_else(|| panic!("no Box method for usr {usr}: {:#?}", box_record.methods))
+            .name
+            .clone()
+    };
+    let const_name = name_for_usr(&const_decl.usr);
+    let non_const_name = name_for_usr(&non_const_decl.usr);
+
+    fn call_target(body: &[ir::Stmt]) -> (String, String) {
+        for stmt in body {
+            if let ir::Stmt::Return {
+                value:
+                    Some(ir::Expr::Call {
+                        callee_usr,
+                        callee_name,
+                        ..
+                    }),
+                ..
+            } = stmt
+            {
+                return (callee_usr.clone(), callee_name.clone());
+            }
+        }
+        panic!("expected a Call expr in a Return statement: {body:#?}");
+    }
+
+    let read_mutable = catalog
+        .ir_functions
+        .iter()
+        .find(|function| function.name == "ReadMutable")
+        .expect("ReadMutable");
+    let read_const = catalog
+        .ir_functions
+        .iter()
+        .find(|function| function.name == "ReadConst")
+        .expect("ReadConst");
+
+    let (mutable_callee_usr, mutable_callee_name) = call_target(&read_mutable.body);
+    let (const_callee_usr, const_callee_name) = call_target(&read_const.body);
+
+    assert_eq!(mutable_callee_usr, non_const_decl.usr);
+    assert_eq!(mutable_callee_name, non_const_name);
+    assert_eq!(const_callee_usr, const_decl.usr);
+    assert_eq!(const_callee_name, const_name);
+}
+
+/// F13/tarefa 12, test 2: two free-function `operator<<` overloads in the
+/// same file (Verovio's real shape — `lower::cpp::dart_operator_bridge_name`
+/// maps every `operator<<` to the same `"streamInsert"` bridge name,
+/// regardless of which class it inserts) must bridge to *distinct* Dart
+/// names, and each call site (`a << 2`, overload-resolved by `a`'s static
+/// type) must still call the right one.
+#[test]
+fn two_free_operator_overloads_bridge_to_distinct_names_and_calls_resolve() {
+    let workspace = TempWorkspace::new("function-catalog-operator-bridge-overload")
+        .expect("create temporary workspace");
+    let project_root = workspace.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project dir");
+    fs::write(
+        project_root.join("shift.cpp"),
+        r#"
+class Foo {
+public:
+    int value = 0;
+};
+
+class Bar {
+public:
+    int amount = 0;
+};
+
+Foo operator<<(const Foo& a, int shift) {
+    Foo result;
+    result.value = a.value << shift;
+    return result;
+}
+
+Bar operator<<(const Bar& a, int shift) {
+    Bar result;
+    result.amount = a.amount << shift;
+    return result;
+}
+
+Foo ShiftFoo(const Foo& a) {
+    return a << 2;
+}
+
+Bar ShiftBar(const Bar& a) {
+    return a << 2;
+}
+"#,
+    )
+    .expect("write shift.cpp");
+
+    let unit = CompilationUnit {
+        directory: project_root.display().to_string(),
+        file: project_root.join("shift.cpp").display().to_string(),
+        command: None,
+        arguments: vec!["clang++".to_owned(), "-std=c++17".to_owned()],
+    };
+
+    let catalog = function_catalog::extract_function_catalog(
+        std::slice::from_ref(&unit),
+        &project_root,
+        None,
+    )
+    .expect("extract function catalog");
+
+    let operator_decls: Vec<_> = catalog
+        .declarations
+        .iter()
+        .filter(|declaration| declaration.name == "operator<<")
+        .collect();
+    assert_eq!(operator_decls.len(), 2, "{operator_decls:#?}");
+
+    let name_for_usr = |usr: &str| -> String {
+        catalog
+            .ir_functions
+            .iter()
+            .find(|function| function.usr == usr)
+            .unwrap_or_else(|| panic!("no ir function for usr {usr}: {:#?}", catalog.ir_functions))
+            .name
+            .clone()
+    };
+
+    let foo_decl = operator_decls
+        .iter()
+        .find(|declaration| declaration.signature.contains("Foo"))
+        .expect("the Foo overload");
+    let bar_decl = operator_decls
+        .iter()
+        .find(|declaration| declaration.signature.contains("Bar"))
+        .expect("the Bar overload");
+    let foo_name = name_for_usr(&foo_decl.usr);
+    let bar_name = name_for_usr(&bar_decl.usr);
+    assert_ne!(
+        foo_name, bar_name,
+        "the two operator<< bridge names must not collide"
+    );
+    for name in [&foo_name, &bar_name] {
+        assert!(
+            !name.starts_with("operator"),
+            "expected a bridged Dart-safe name, got {name:?}"
+        );
+    }
+
+    fn call_target(body: &[ir::Stmt]) -> (String, String) {
+        for stmt in body {
+            if let ir::Stmt::Return {
+                value:
+                    Some(ir::Expr::Call {
+                        callee_usr,
+                        callee_name,
+                        ..
+                    }),
+                ..
+            } = stmt
+            {
+                return (callee_usr.clone(), callee_name.clone());
+            }
+        }
+        panic!("expected a Call expr in a Return statement: {body:#?}");
+    }
+
+    let shift_foo = catalog
+        .ir_functions
+        .iter()
+        .find(|function| function.name == "ShiftFoo")
+        .expect("ShiftFoo");
+    let shift_bar = catalog
+        .ir_functions
+        .iter()
+        .find(|function| function.name == "ShiftBar")
+        .expect("ShiftBar");
+
+    let (foo_callee_usr, foo_callee_name) = call_target(&shift_foo.body);
+    let (bar_callee_usr, bar_callee_name) = call_target(&shift_bar.body);
+
+    assert_eq!(foo_callee_usr, foo_decl.usr);
+    assert_eq!(foo_callee_name, foo_name);
+    assert_eq!(bar_callee_usr, bar_decl.usr);
+    assert_eq!(bar_callee_name, bar_name);
+}
+
+/// F13/tarefa 12, test 3 (residual case): two overloads whose parameter
+/// types are only distinguished in C++ (`const char*` vs. `char*`) but map
+/// to the *identical* Dart type (`String?`) — `dart_overload_name`'s suffix
+/// can't tell them apart, so this is the family's own last-resort ordinal
+/// fallback, not the type-suffix mechanism the other tests exercise.
+#[test]
+fn two_overloads_that_map_to_the_identical_dart_signature_still_get_distinct_names() {
+    let workspace = TempWorkspace::new("function-catalog-residual-overload")
+        .expect("create temporary workspace");
+    let project_root = workspace.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project dir");
+    fs::write(
+        project_root.join("ponte.cpp"),
+        r#"
+void Escrever(const char* valor) {}
+void Escrever(char* valor) {}
+"#,
+    )
+    .expect("write ponte.cpp");
+
+    let unit = CompilationUnit {
+        directory: project_root.display().to_string(),
+        file: project_root.join("ponte.cpp").display().to_string(),
+        command: None,
+        arguments: vec!["clang++".to_owned(), "-std=c++17".to_owned()],
+    };
+
+    let catalog = function_catalog::extract_function_catalog(
+        std::slice::from_ref(&unit),
+        &project_root,
+        None,
+    )
+    .expect("extract function catalog");
+
+    let function_names: Vec<&str> = catalog
+        .ir_functions
+        .iter()
+        .map(|function| function.name.as_str())
+        .collect();
+    assert_eq!(
+        function_names.len(),
+        2,
+        "expected both overloads to survive lowering: {function_names:?}"
+    );
+    assert_ne!(
+        function_names[0], function_names[1],
+        "overloads that map to the identical Dart parameter type must still get distinct \
+         names: {function_names:?}"
+    );
+}
+
+/// F13/tarefa 12, test 4: Verovio's real `HumTool::run`/`Options::setValue`
+/// shape — overloads differing in *both* arity and, within a shared arity,
+/// parameter type, every one returning the same type. Before this fix,
+/// `mapping::overload_options_for` read "arities differ, return types agree"
+/// alone as `"parametro-opcional"` (fold into one Dart member with an
+/// optional parameter) without checking that each arity actually has a
+/// single signature to fold — a fold `apply_overload_renames` never performs
+/// anyway, so the whole group survived lowering under its shared original
+/// name, `duplicate_definition`. All three must end up distinctly named.
+#[test]
+fn overloads_mixing_arity_and_same_arity_type_differences_all_get_distinct_names() {
+    let workspace = TempWorkspace::new("function-catalog-mixed-arity-type-overload")
+        .expect("create temporary workspace");
+    let project_root = workspace.path().join("project");
+    fs::create_dir_all(&project_root).expect("create project dir");
+    fs::write(
+        project_root.join("tool.cpp"),
+        r#"
+class Tool {
+public:
+    bool Run(int input) { return input > 0; }
+    bool Run(int input, int extra) { return input > extra; }
+    bool Run(double input) { return input > 0.0; }
+};
+"#,
+    )
+    .expect("write tool.cpp");
+
+    let unit = CompilationUnit {
+        directory: project_root.display().to_string(),
+        file: project_root.join("tool.cpp").display().to_string(),
+        command: None,
+        arguments: vec!["clang++".to_owned(), "-std=c++17".to_owned()],
+    };
+
+    let catalog = function_catalog::extract_function_catalog(
+        std::slice::from_ref(&unit),
+        &project_root,
+        None,
+    )
+    .expect("extract function catalog");
+
+    let tool = catalog
+        .ir_records
+        .iter()
+        .find(|record| record.name == "Tool")
+        .unwrap_or_else(|| panic!("expected a Tool record: {:#?}", catalog.ir_records));
+    let method_names: Vec<&str> = tool
+        .methods
+        .iter()
+        .map(|method| method.name.as_str())
+        .collect();
+    assert_eq!(
+        method_names.len(),
+        3,
+        "expected all three Run overloads to survive lowering: {method_names:?}"
+    );
+    let mut unique_names: Vec<&str> = method_names.clone();
+    unique_names.sort_unstable();
+    unique_names.dedup();
+    assert_eq!(
+        unique_names.len(),
+        3,
+        "the three Run overloads must not collide under the same Dart name: {method_names:?}"
     );
 }
 

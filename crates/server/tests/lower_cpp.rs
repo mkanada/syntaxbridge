@@ -1798,6 +1798,48 @@ int g(Base* b) {
     );
 }
 
+/// F13/tarefa 12
+/// (`docs/prompts/2026-08-21-12-overloads-const-e-colisoes-de-nome.md`):
+/// a call to a member *operator template* instantiation (jsonxx's real
+/// `Object& operator<<(const T&)` shape, called with a string literal so
+/// only the template overload — not the concrete `operator<<(int)` sibling —
+/// can match) must not silently print a call to a bridge name
+/// (`streamInsert`, computed purely from the symbol and arity) that no
+/// declaration in the emitted Dart actually carries: this project has no
+/// member-template monomorphization (only the free-function path does), so
+/// the instantiation is never lowered as a real method. Before this fix, an
+/// unrelated non-template sibling overload of the same operator symbol could
+/// coincidentally share that exact bridge name and mask the gap — as soon as
+/// F13's own type-based disambiguation (tested above) renames that sibling
+/// away, the call becomes a `dart analyze` `undefined_method`, "reaching a
+/// declaration but not every call site". The honest failure is an explicit
+/// bailout, not a call to a name nothing declares.
+#[test]
+fn a_call_to_a_member_operator_template_instantiation_bails_out_explicitly() {
+    let source = lower_and_emit(
+        "lower-cpp-member-operator-template-instantiation",
+        r#"
+struct Builder {
+    template <typename T>
+    Builder& operator<<(const T& value) { return *this; }
+};
+
+void Use(Builder& b) {
+    b << "hello";
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("streamInsert"),
+        "must not print a call to a bridge name no declaration carries, got:\n{source}"
+    );
+    assert!(
+        source.contains("UnimplementedError"),
+        "expected an explicit bailout for the unmonomorphized template instantiation, got:\n{source}"
+    );
+}
+
 /// A user-defined C++ assignment operator may carry invariants beyond a
 /// field-for-field copy. Dart has no overloadable assignment, so preserve its
 /// body in a named instance method and route `destination = source` through

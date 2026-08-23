@@ -608,24 +608,30 @@ fn merge_constructors(existing: &mut Vec<ir::Constructor>, incoming: Vec<ir::Con
 /// consults `mapping::overload_options_for` for each group of
 /// same-(owning-class, name) declarations (US-7; E07 is the first degrau
 /// where the generation pipeline itself calls this solver, not just its own
-/// unit tests) and, when the decision requires a rename
-/// (`"renomear-por-tipo"`/`"renomear-const-nao-const"`), renames the
+/// unit tests) and, when the decision requires a rename, renames the
 /// corresponding `ir::Function`/`ir::Method` *and* every call site
 /// referencing it by USR — computed once per group and applied everywhere,
 /// the same "can never disagree" discipline `lower::cpp::constructor_ordinal`
 /// already uses for E04's multiple constructors, so a call site can never
 /// end up pointing at a name that no longer exists.
 ///
-/// A decision that *doesn't* require a rename (`"assinatura-unica"`,
-/// `"parametro-opcional"`) leaves the group untouched. `"parametro-opcional"`
-/// (overloads differing only in arity) is deliberately not acted on here —
-/// unlike a rename, folding it into Dart would mean *merging* two separate
-/// `Function`/`Method` IR entries into one with an optional trailing
-/// parameter, a different kind of change, and no fixture in this corpus
-/// forces it yet (see `examples/E07-sobrecarga-e-parametros-default/NOTES.md`).
-/// Leaving such a group's declarations with their shared original name is
-/// not silent, either: two same-named top-level Dart declarations fail to
-/// compile, so `dart analyze` surfaces the gap loudly if it's ever reached.
+/// Only `"assinatura-unica"` (a single declaration, nothing to disambiguate)
+/// leaves a group untouched. F13/tarefa 12
+/// (`docs/prompts/2026-08-21-12-overloads-const-e-colisoes-de-nome.md`):
+/// `"parametro-opcional"` used to be left unrenamed too — folding it into a
+/// single Dart member with a trailing optional parameter is a *merge* of two
+/// IR entries, a different kind of change than a rename, and no fixture
+/// forced it (see `examples/E07-sobrecarga-e-parametros-default/NOTES.md`).
+/// But the real Verovio 6.2.0 corpus now has one:
+/// `HumTool::run`/`Options::setValue`-shaped groups where some arities are
+/// *also* individually overloaded by parameter type (`"parametro-opcional"`'s
+/// own `overload_options_for` heuristic only checks that arities differ and
+/// return types agree across the *whole* group, not that each arity has a
+/// single signature) — folding was never going to be sound there, and lacking
+/// it left the whole group under its shared original name,
+/// `duplicate_definition`. Rather than implement the merge this task doesn't
+/// need, `"parametro-opcional"` is renamed exactly like `"renomear-por-tipo"`
+/// below: a real member per Dart name beats a silent collision.
 fn apply_overload_renames(
     ir_functions: &mut [ir::Function],
     ir_records: &mut [ir::Record],
@@ -682,7 +688,7 @@ fn apply_overload_renames(
         };
         // E13: a static/instance name collision can't be told apart by
         // parameter *type* the way `dart_overload_name` does for the other
-        // two ids — the instance side may take zero parameters (`Reduce()`),
+        // ids — the instance side may take zero parameters (`Reduce()`),
         // leaving nothing to build a distinguishing suffix from at all.
         // Only the `static` declaration(s) get a suffix; the instance one
         // keeps its original name (already unambiguous among *other*
@@ -696,38 +702,137 @@ fn apply_overload_renames(
             }
             continue;
         }
-        // Achado 1 (`docs/plans/diagnostico-verovio-6.2.0.md`): this id
-        // means the two declarations have the *same parameter list*
-        // (`mapping::overload_options_for`'s own `same_params` check) —
-        // `dart_overload_name` below computes its suffix purely from
-        // parameter types, so handing it both sides here would compute the
-        // same (usually empty) suffix twice and rename them to the same
-        // name, the exact bug this id exists to catch. Constness never
-        // survives into the IR (`ir::Method` has no such field — Dart
-        // doesn't dispatch on it), so it's read directly off each
-        // declaration's own signature text via `mapping::signature_is_const`
-        // instead. Only the `const` side is renamed, the same "leave the
-        // other one be" shape `"renomear-estatico-instancia"` already uses
-        // above — the non-`const` side keeps its original name, already
-        // unambiguous among the record's *other* members.
-        if option.id == "renomear-const-nao-const" {
-            for declaration in group {
-                if mapping::signature_is_const(&declaration.signature) {
-                    renames.insert(declaration.usr.clone(), format!("{name}Const"));
+        // F13/tarefa 12: a bridge name for an operator that has no direct
+        // Dart equivalent (`operator<<` -> `streamInsert`,
+        // `lower::cpp::dart_operator_bridge_name`) is computed purely from
+        // the operator symbol and arity — every `operator<<` in a file
+        // collided under the same name until this branch existed, the
+        // family's own achado (b). Disambiguated by the (Dart-mapped)
+        // operand types, same `dart_overload_name` suffix scheme as an
+        // ordinary overload, applied to the bridge name instead of the raw
+        // C++ name — computed once here and picked up everywhere
+        // `dart_operator_bridge_name` is called (`emit::dart`'s declaration
+        // emission, `lower::cpp`'s call lowering) through the same usr-keyed
+        // `apply_renames` every other id above already relies on.
+        //
+        // `NATIVE_BINARY_OPERATORS` (`operator==`/`operator()` too) are
+        // excluded: their call sites never go through that shared
+        // `callee_usr`-keyed `Call` mechanism at all.
+        // `lower::cpp::lower_record_operator_call` lowers `a + b`/`a == b`/…
+        // straight to `ir::Expr::Binary` — no `callee_usr`, so
+        // `apply_renames`'s call-site rewrite can't reach it — and
+        // `emit::dart::emit_method` dispatches `operator==`/`operator()` on
+        // their *literal* C++ name unconditionally (Dart `==`/callable-object
+        // sugar), never consulting `dart_operator_bridge_name` either.
+        // Renaming any of these away from their literal name would desync
+        // the declaration from that call-site/emission assumption with no
+        // corresponding fix on the other side — confirmed the hard way, as a
+        // `dart analyze` `undefined_operator` regression on the real Verovio
+        // 6.2.0 corpus, not anticipated up front. A colliding group of these
+        // stays unrenamed, same as before this fix — a real gap, but a
+        // pre-existing one this task doesn't reach (it would need
+        // `lower_record_operator_call` itself to know about the collision,
+        // not just this post-hoc renaming pass).
+        const NATIVE_BINARY_OPERATORS: &[&str] = &[
+            "operator==",
+            "operator()",
+            "operator+",
+            "operator-",
+            "operator*",
+            "operator/",
+            "operator!=",
+            "operator<",
+            "operator<=",
+            "operator>",
+            "operator>=",
+        ];
+        if name.starts_with("operator") && !NATIVE_BINARY_OPERATORS.contains(&name.as_str()) {
+            if option.id == "operador-sem-equivalente-direto" {
+                for declaration in group {
+                    let params = ir_functions_by_usr
+                        .get(declaration.usr.as_str())
+                        .or_else(|| ir_methods_by_usr.get(declaration.usr.as_str()))
+                        .copied();
+                    if let Some(params) = params {
+                        let base = lower::cpp::dart_operator_bridge_name(name, params.len());
+                        let mut new_name = format!("{base}{}", dart_overload_name("", params));
+                        if mapping::signature_is_const(&declaration.signature) {
+                            new_name.push_str("Const");
+                        }
+                        renames.insert(declaration.usr.clone(), new_name);
+                    }
                 }
             }
             continue;
         }
-        if option.id != "renomear-por-tipo" {
+        if !matches!(
+            option.id.as_str(),
+            "renomear-por-tipo" | "parametro-opcional"
+        ) {
             continue;
         }
+        // Achado 1 (`docs/plans/diagnostico-verovio-6.2.0.md`) plus F13's own
+        // (a): `dart_overload_name` distinguishes by parameter type alone, so
+        // a same-params const/non-const pair caught here (a group of more
+        // than two, where `overload_options_for`'s own dedicated
+        // `"renomear-const-nao-const"` id only fires for a clean pair of
+        // exactly two — see that id's own comment above) would otherwise
+        // compute the identical suffix for both sides. Constness never
+        // survives into the IR (`ir::Method` has no such field — Dart
+        // doesn't dispatch on it), so, same as that id, it's read directly
+        // off each declaration's own signature text via
+        // `mapping::signature_is_const` and appended on top.
         for declaration in group {
             let params = ir_functions_by_usr
                 .get(declaration.usr.as_str())
                 .or_else(|| ir_methods_by_usr.get(declaration.usr.as_str()))
                 .copied();
             if let Some(params) = params {
-                renames.insert(declaration.usr.clone(), dart_overload_name(name, params));
+                let mut new_name = dart_overload_name(name, params);
+                if mapping::signature_is_const(&declaration.signature) {
+                    new_name.push_str("Const");
+                }
+                renames.insert(declaration.usr.clone(), new_name);
+            }
+        }
+    }
+
+    // Last defense, F13/tarefa 12: every branch above computes a
+    // distinguishing suffix from *some* projection of the declaration
+    // (parameter types after Dart mapping, const-ness) — sound almost
+    // always, but two declarations can still land on the identical Dart name
+    // when that projection genuinely can't tell them apart (`const char*`
+    // and `char*` both mapping to `String?`, E07's own
+    // `NOTES.md` residual case). Detected here, once every rename above has
+    // been computed, by grouping each group's members by their *effective*
+    // Dart name (the renamed one if `renames` has an entry, the original
+    // C++ name otherwise — the same lookup `apply_renames` performs) and
+    // handing every name after the first, sorted by `usr` — never by
+    // visitation order, which varies between the parse workers — a stable
+    // ordinal suffix. Silent collision isn't acceptable: unlike a merely
+    // undesirable name, it's a Dart compile error.
+    for group in groups.values() {
+        if group.len() <= 1 {
+            continue;
+        }
+        let mut by_final_name: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+        for declaration in group {
+            let final_name = renames
+                .get(&declaration.usr)
+                .cloned()
+                .unwrap_or_else(|| declaration.name.clone());
+            by_final_name
+                .entry(final_name)
+                .or_default()
+                .push(declaration.usr.as_str());
+        }
+        for (final_name, mut usrs) in by_final_name {
+            if usrs.len() <= 1 {
+                continue;
+            }
+            usrs.sort_unstable();
+            for (ordinal, usr) in usrs.into_iter().enumerate().skip(1) {
+                renames.insert(usr.to_owned(), format!("{final_name}{}", ordinal + 1));
             }
         }
     }

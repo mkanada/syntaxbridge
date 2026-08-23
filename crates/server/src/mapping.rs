@@ -878,7 +878,21 @@ pub fn overload_options_for(
         .len()
         == 1;
 
-    if arities.len() > 1 && returns_agree {
+    // F13/tarefa 12 (`docs/prompts/2026-08-21-12-overloads-const-e-colisoes-de-nome.md`):
+    // folding into optional parameters is only sound when each arity has a
+    // *single* signature — a strict prefix relationship between the shorter
+    // and longer parameter lists. `arities.len() > 1` alone doesn't check
+    // that: Verovio's real `Options::setValue`/`HumTool::run` groups differ
+    // in arity *and* have several differently-typed overloads sharing each
+    // arity (`setValue(key, string)`/`setValue(key, int)`/…, all arity 2) —
+    // `returns_agree` alone let those through as "fold", live over-claiming
+    // that never gets acted on (see `apply_overload_renames`'s doc comment).
+    // `group.len() == arities.len()` is exactly "one declaration per arity";
+    // when it fails, this is a same-arity-different-type overload wearing an
+    // arity-difference disguise, so it falls through to the per-type
+    // renaming below instead, same as if the return types alone had
+    // disagreed.
+    if arities.len() > 1 && arities.len() == group.len() && returns_agree {
         let mut consequences = call_site_consequences(&usrs, facts);
         for function in &group {
             consequences.push(Consequence {

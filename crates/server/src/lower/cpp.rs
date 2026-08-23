@@ -9385,6 +9385,42 @@ unsafe fn lower_method_call(
         raw_callee_name
     };
     if callee_name.starts_with("operator") {
+        // F13/tarefa 12 (`docs/prompts/2026-08-21-12-overloads-const-e-colisoes-de-nome.md`):
+        // a call to a member *operator template* instantiation
+        // (`template <class T> Object& operator<<(const T&)`, jsonxx's real
+        // shape) reaches here with `referenced` already resolved to the
+        // instantiation, but this project has no member-template
+        // monomorphization (only the free-function path does, via
+        // `monomorphized_template_name` above `lower_stdlib_operator_call`)
+        // — the template itself is never lowered into a real `ir::Method`,
+        // so `dart_operator_bridge_name(&callee_name, ...)` below would
+        // print a bridge name (`"streamInsert"`, purely from the symbol and
+        // arity) that names no declaration at all. Confirmed live on the
+        // real Verovio 6.2.0 corpus: unrelated *other* overloads of the same
+        // operator symbol on the same class used to share that exact bridge
+        // name (`duplicate_definition`, this family's own achado), which
+        // coincidentally gave this call *something* to resolve against;
+        // disambiguating those by type (this task) removes that accidental
+        // stand-in and turns the latent gap into a loud `undefined_method` —
+        // "reaching the declaration but not every call site", the failure
+        // mode this task's own method explicitly tests for. Bailing here
+        // explicitly, the same honest-failure shape every other
+        // not-yet-lowered construct in this module already uses, is the fix
+        // that generalizes: it holds regardless of whether a same-named
+        // sibling happens to exist to accidentally mask it.
+        if unsafe {
+            clang_sys::clang_Cursor_isNull(clang_sys::clang_getSpecializedCursorTemplate(
+                referenced,
+            ))
+        } == 0
+        {
+            return ir::Expr::UnsupportedTyped {
+                reason: "call to a member operator template instantiation — not yet monomorphized"
+                    .to_owned(),
+                ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
+                origin,
+            };
+        }
         let args =
             match unsafe { lower_call_arguments_skipping(call_cursor, arg_skip, project_root) } {
                 Some(args) => args,
