@@ -5776,6 +5776,46 @@ int classify(int level) {
     );
 }
 
+/// A `break;` right after a `return`/`throw`/`continue` is legal, common C++
+/// style (many style guides require a terminator on every `case`, even one
+/// that already returns) but unreachable, `dead_code`-flagged Dart — real
+/// trigger: `accid.dart`'s `GetAccidGlyph` (`.diagnosis/dart-package/lib/
+/// accid.dart:238-248`, family F15/tarefa 15.1). The case body already ends
+/// in a jump without the `break`, so it must not survive lowering.
+#[test]
+fn a_break_right_after_a_case_terminator_is_dropped_as_dead_code() {
+    let source = lower_and_emit(
+        "lower-cpp-switch-break-after-return",
+        r#"
+int glyph(int accid) {
+    switch (accid) {
+        case 1:
+            return 57954;
+            break;
+        case 2:
+            return 57952;
+            break;
+        default:
+            return 0;
+    }
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "got:\n{source}"
+    );
+    assert!(
+        !source.contains("break;"),
+        "expected the dead break after return to be dropped, got:\n{source}"
+    );
+    assert!(
+        source.contains("return 57954;") && source.contains("return 57952;"),
+        "expected the returns themselves to survive, got:\n{source}"
+    );
+}
+
 /// Under `-std=c++20` — the *real* standard Verovio 6.2.0 itself builds
 /// with (`cmake/CMakeLists.txt`'s `set(CMAKE_CXX_STANDARD 20)`), not the
 /// `-std=c++17` `lower_and_emit`'s fixtures default to — the manual

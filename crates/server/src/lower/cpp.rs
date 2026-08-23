@@ -2908,6 +2908,20 @@ unsafe fn lower_switch_stmt(
         }
     }
 
+    // A C++ `case` body that already ends in `return`/`throw`/`continue`/
+    // `break` often carries a further `break;` right after it — many style
+    // guides require a terminator on every case regardless, and it's
+    // harmless in C++. Dart flags that trailing statement `dead_code` (real
+    // trigger: `accid.dart`'s `GetAccidGlyph`, family F15/tarefa 15.1), so
+    // anything lowered after the case's first terminator is truncated here,
+    // before the fallthrough pass below inspects each body's last statement.
+    for case in &mut cases {
+        truncate_after_case_terminator(&mut case.body);
+    }
+    if let Some(default) = &mut default {
+        truncate_after_case_terminator(default);
+    }
+
     // Dart, unlike C++, rejects implicit fallthrough out of a non-empty
     // `case` as a compile error — but unlike C++'s error, Dart *does* have
     // an explicit fallthrough form: `continue <label>;`, jumping into a
@@ -2963,6 +2977,16 @@ unsafe fn lower_switch_stmt(
         cases,
         default,
         origin,
+    }
+}
+
+/// Drops every statement after a case body's first terminator
+/// (`break`/`continue`/`return`/`throw`) — anything past it is unreachable,
+/// most commonly a redundant `break;` right after a `return` (see the doc
+/// comment at this function's call site).
+fn truncate_after_case_terminator(body: &mut Vec<ir::Stmt>) {
+    if let Some(index) = body.iter().position(is_case_terminator) {
+        body.truncate(index + 1);
     }
 }
 
