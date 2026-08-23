@@ -2240,6 +2240,101 @@ fn a_leaf_class_imports_every_transitively_expanded_mixin_dependency() {
     );
 }
 
+/// Regression test (F15/tarefa 15.2): `emit_body` collapses a whole
+/// method/function body to a single `throw` the moment *any* statement in it
+/// is `Stmt::Unsupported` (`emit_body`'s own doc comment on why: a later
+/// statement could depend on state an earlier bailed-out one would have
+/// established). `collect_referenced_usrs_in_record` used to walk the
+/// *pre-collapse* body regardless, counting a type only ever mentioned by a
+/// statement that never survives into the printed text (e.g. a `VarDecl` of
+/// a record type, followed later by an unrelated unsupported statement) as a
+/// real dependency — a real trigger in the Verovio 6.2.0 corpus
+/// (`CalcAlignmentPitchPosFunctor::VisitLayerElement`, whose full body
+/// switches on several concrete note-like types before hitting one
+/// unsupported `std::list` iterator use partway through; the printed method
+/// is a single `throw`, but the import list used to still list every one of
+/// those types).
+#[test]
+fn a_type_only_mentioned_before_a_bodys_bailout_statement_is_not_imported() {
+    fn origin_in(file: &str, line: u32) -> Origin {
+        Origin {
+            file: file.to_owned(),
+            line,
+            column: 1,
+        }
+    }
+
+    let beam = Record {
+        name: "Beam".to_owned(),
+        usr: "c:@S@Beam".to_owned(),
+        namespace: String::new(),
+        fields: Vec::new(),
+        static_fields: Vec::new(),
+        constructors: Vec::new(),
+        methods: Vec::new(),
+        base_class: None,
+        mixins: Vec::new(),
+        destructor: None,
+        origin: origin_in("/project/input-source/src/beam.cpp", 1),
+    };
+    let beam_ty = Type::Record {
+        usr: beam.usr.clone(),
+        name: "Beam".to_owned(),
+    };
+    let visit_method = Method {
+        name: "VisitLayerElement".to_owned(),
+        usr: "c:@S@CalcFunctor@F@VisitLayerElement#".to_owned(),
+        params: Vec::new(),
+        return_type: Type::Void,
+        body: Some(vec![
+            Stmt::VarDecl {
+                name: "beam".to_owned(),
+                ty: beam_ty,
+                init: None,
+                origin: origin_in("/project/input-source/src/calc.cpp", 4),
+            },
+            Stmt::Unsupported {
+                reason: "unsupported type in expression: std::_List_const_iterator".to_owned(),
+                origin: origin_in("/project/input-source/src/calc.cpp", 5),
+            },
+        ]),
+        is_static: false,
+        is_override: false,
+        origin: origin_in("/project/input-source/src/calc.cpp", 3),
+    };
+    let calc_functor = Record {
+        name: "CalcFunctor".to_owned(),
+        usr: "c:@S@CalcFunctor".to_owned(),
+        namespace: String::new(),
+        fields: Vec::new(),
+        static_fields: Vec::new(),
+        constructors: Vec::new(),
+        methods: vec![visit_method],
+        base_class: None,
+        mixins: Vec::new(),
+        destructor: None,
+        origin: origin_in("/project/input-source/src/calc.cpp", 1),
+    };
+    let module = Module {
+        records: vec![beam, calc_functor],
+        functions: Vec::new(),
+        enums: Vec::new(),
+    };
+
+    let files = emit_module(&module);
+    let source = &files["lib/calc.dart"];
+
+    assert!(
+        source.contains("throw UnimplementedError("),
+        "expected the whole method to bail out, got:\n{source}"
+    );
+    assert!(
+        !source.contains("import 'beam.dart';"),
+        "`Beam` is never printed once the method collapses to a single throw, so importing \
+         its file is `unused_import` — got:\n{source}"
+    );
+}
+
 /// `docs/plans/lista-de-externos.md` decision 1: "mock = valor plausível,
 /// execução segue" — a free function whose usr is in the effective external
 /// set gets a `return` of a plausible default for its type, never a

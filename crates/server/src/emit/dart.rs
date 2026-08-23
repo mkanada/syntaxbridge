@@ -492,7 +492,16 @@ fn emit_file(
         for param in &function.params {
             collect_referenced_usrs_in_type(&param.ty, &mut referenced_usrs);
         }
-        collect_referenced_usrs_in_stmts(&function.body, &mut referenced_usrs);
+        // See `body_bails_out`'s doc comment: a type only named by a
+        // statement the printed function never keeps must not count as an
+        // import dependency.
+        if !body_bails_out(
+            &function.params,
+            Some(&function.return_type),
+            &function.body,
+        ) {
+            collect_referenced_usrs_in_stmts(&function.body, &mut referenced_usrs);
+        }
     }
     let needed_imports: BTreeSet<&str> = referenced_usrs
         .into_iter()
@@ -647,14 +656,21 @@ fn collect_referenced_usrs_in_record<'a>(
         for param in &constructor.params {
             collect_referenced_usrs_in_type(&param.ty, out);
         }
-        collect_referenced_usrs_in_stmts(&constructor.body, out);
+        // See `body_bails_out`'s doc comment: a type only named by a
+        // statement the printed constructor never keeps must not count as
+        // an import dependency.
+        if !body_bails_out(&constructor.params, None, &constructor.body) {
+            collect_referenced_usrs_in_stmts(&constructor.body, out);
+        }
     }
     for method in &record.methods {
         collect_referenced_usrs_in_type(&method.return_type, out);
         for param in &method.params {
             collect_referenced_usrs_in_type(&param.ty, out);
         }
-        if let Some(body) = &method.body {
+        if let Some(body) = &method.body
+            && !body_bails_out(&method.params, Some(&method.return_type), body)
+        {
             collect_referenced_usrs_in_stmts(body, out);
         }
     }
@@ -1833,6 +1849,26 @@ fn emit_function(
 /// `emit_binary_op`'s truncating-division rule, for one, reads exactly that
 /// type to decide `/` vs `~/`, and a type it doesn't recognize means that
 /// decision can't be trusted either way.
+/// True exactly when `emit_body` collapses `body` into a single bailout
+/// `throw` instead of printing it statement-by-statement — same condition
+/// `emit_body` itself computes (kept here, not called from there, so the two
+/// never need to agree by convention alone: see the doc comment on why this
+/// exists). `collect_referenced_usrs_in_record` and the top-level
+/// free-function loop in `emit_module_with_externals` both need it: a type
+/// only ever named by a statement that gets discarded this way must not
+/// count as a dependency the file needs to import (F15/tarefa 15.2) — real
+/// trigger: `CalcAlignmentPitchPosFunctor::VisitLayerElement` in the real
+/// Verovio 6.2.0 corpus, whose full body switches on several concrete
+/// note-like types before hitting one unsupported `std::list` iterator use
+/// partway through; the printed method is a single `throw`, but the old
+/// import-usr walk still counted every one of those types.
+fn body_bails_out(params: &[Param], return_type: Option<&Type>, body: &[Stmt]) -> bool {
+    return_type.and_then(unsupported_spelling).is_some()
+        || first_unsupported_signature_param(params).is_some()
+        || first_unsupported_type_in_list(body).is_some()
+        || first_unsupported_in_list(body).is_some()
+}
+
 fn emit_body(
     params: &[Param],
     return_type: Option<&Type>,
