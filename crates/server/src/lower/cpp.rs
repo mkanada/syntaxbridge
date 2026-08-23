@@ -730,6 +730,19 @@ pub fn lower_function(
     neutralize_out_param_call_input_locals(&mut body);
     unsafe { apply_out_param_bridge(cursor, &mut params, &mut return_type, &mut body, &origin) };
 
+    // F15/tarefa 15.9: real C++ requires *some* free function literally
+    // named `main` with one of exactly two shapes (`main()`/`main(int,
+    // char **)`, C's third form `char *argv[]` decaying to the same
+    // pointer-to-pointer type) to link at all — matching on name plus this
+    // arity/first-param-type shape is precise enough that a false positive
+    // would need an unrelated free function coincidentally sharing both,
+    // cheaper than proving global scope (which this function has no ready
+    // access to).
+    if name == "main" && (params.is_empty() || (params.len() == 2 && params[0].ty == ir::Type::Int))
+    {
+        apply_main_entry_point_signature(&mut params, &mut return_type, &mut body, &origin);
+    }
+
     Some(ir::Function {
         name,
         usr: usr.to_owned(),
@@ -738,6 +751,126 @@ pub fn lower_function(
         body,
         origin,
     })
+}
+
+/// Rewrites a C `main`'s signature to Dart's own entry-point shape (F15/
+/// tarefa 15.9: `void main()`/`void main(List<String> args)`, the only two
+/// Dart accepts — `main_first_positional_parameter_type` otherwise). When
+/// the original had parameters, prepends a prologue binding the *original*
+/// `argc`/`argv` names to `args.length`/`args`, so every reference already
+/// lowered inside `body` (resolved against the real C++ parameter cursors
+/// during the ordinary body-lowering pass above, unaware of this rewrite)
+/// keeps working unchanged under its own original name. Also rewrites every
+/// `return <value>;` in `body` to a bare `return;`
+/// (`strip_return_values`): a C exit code has no Dart `void main()`
+/// equivalent to carry it to (that would need `dart:io`'s `exit()`, a
+/// different, bigger feature this task doesn't ask for) — dropping it is
+/// the accepted cost of choosing `void main()`, not a silent type-mapping
+/// gap.
+fn apply_main_entry_point_signature(
+    params: &mut Vec<ir::Param>,
+    return_type: &mut ir::Type,
+    body: &mut Vec<ir::Stmt>,
+    origin: &ir::Origin,
+) {
+    *return_type = ir::Type::Void;
+    strip_return_values(body);
+    if params.is_empty() {
+        return;
+    }
+    let argc_name = params[0].name.clone();
+    let argv_name = params.get(1).map(|param| param.name.clone());
+    params.clear();
+    params.push(ir::Param {
+        name: "args".to_owned(),
+        ty: ir::Type::List(Box::new(ir::Type::Str)),
+        default_value: None,
+    });
+    let args_ref = || ir::Expr::Ref {
+        name: "args".to_owned(),
+        ty: ir::Type::List(Box::new(ir::Type::Str)),
+        origin: origin.clone(),
+    };
+    let mut prologue = vec![ir::Stmt::VarDecl {
+        name: argc_name,
+        ty: ir::Type::Int,
+        init: Some(ir::Expr::FieldAccess {
+            target: Box::new(args_ref()),
+            field: "length".to_owned(),
+            ty: ir::Type::Int,
+            origin: origin.clone(),
+        }),
+        origin: origin.clone(),
+    }];
+    if let Some(argv_name) = argv_name {
+        prologue.push(ir::Stmt::VarDecl {
+            name: argv_name,
+            ty: ir::Type::List(Box::new(ir::Type::Str)),
+            init: Some(args_ref()),
+            origin: origin.clone(),
+        });
+    }
+    body.splice(0..0, prologue);
+}
+
+/// Recursively rewrites every `return <value>;` in `stmts` (and any nested
+/// branch/loop/switch/try body) to a bare `return;` —
+/// `apply_main_entry_point_signature`'s own doc comment on why.
+fn strip_return_values(stmts: &mut [ir::Stmt]) {
+    for stmt in stmts {
+        match stmt {
+            ir::Stmt::Return { value, .. } => *value = None,
+            ir::Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                strip_return_values(then_branch);
+                strip_return_values(else_branch);
+            }
+            ir::Stmt::While { body, .. } | ir::Stmt::DoWhile { body, .. } => {
+                strip_return_values(body);
+            }
+            ir::Stmt::For { body, .. } | ir::Stmt::ForEach { body, .. } => {
+                strip_return_values(body);
+            }
+            ir::Stmt::TryCatch {
+                try_body,
+                catch_body,
+                ..
+            } => {
+                strip_return_values(try_body);
+                strip_return_values(catch_body);
+            }
+            ir::Stmt::TryFinally {
+                try_body,
+                finally_body,
+                ..
+            } => {
+                strip_return_values(try_body);
+                strip_return_values(finally_body);
+            }
+            ir::Stmt::Switch { cases, default, .. } => {
+                for case in cases.iter_mut() {
+                    strip_return_values(&mut case.body);
+                }
+                if let Some(default) = default {
+                    strip_return_values(default);
+                }
+            }
+            ir::Stmt::VarDecl { .. }
+            | ir::Stmt::Assign { .. }
+            | ir::Stmt::FieldAssign { .. }
+            | ir::Stmt::ExprAssign { .. }
+            | ir::Stmt::Break { .. }
+            | ir::Stmt::Continue { .. }
+            | ir::Stmt::ContinueLabel { .. }
+            | ir::Stmt::ExprStmt { .. }
+            | ir::Stmt::Throw { .. }
+            | ir::Stmt::TupleAssign { .. }
+            | ir::Stmt::Unsupported { .. } => {}
+        }
+    }
 }
 
 /// A minimal `ir::Function` for a system-header free function (libc/POSIX

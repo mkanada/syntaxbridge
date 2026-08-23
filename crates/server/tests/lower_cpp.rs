@@ -7214,3 +7214,73 @@ int use_marca() {
          got:\n{source}"
     );
 }
+
+/// F15/tarefa 15.9: Dart's own entry point is always exactly `void main()`
+/// or `void main(List<String> args)` — C's `int main(int argc, char
+/// **argv)` has no direct equivalent (`main_first_positional_parameter_type`
+/// otherwise). The original `argc`/`argv` names must still resolve inside
+/// the body, bound to `args.length`/`args` in a prologue; a `return
+/// <value>;` (C's exit code) has nowhere to go in a `void` function, so it
+/// becomes a bare `return;`. Real trigger: `main.dart:43`.
+#[test]
+fn main_with_argc_argv_gets_darts_own_entry_point_signature() {
+    let source = lower_and_emit(
+        "lower-cpp-main-argc-argv",
+        r#"
+int main(int argc, char **argv) {
+    if (argc < 1) {
+        return 1;
+    }
+    return 0;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("Unsupported")
+            && !source.contains("dynamic")
+            && !source.contains("char **"),
+        "got:\n{source}"
+    );
+    assert!(
+        source.contains("void main(List<String> args) {"),
+        "expected Dart's own entry-point signature, got:\n{source}"
+    );
+    assert!(
+        source.contains("int argc = args.length;") && source.contains("List<String> argv = args;"),
+        "expected argc/argv bound in the prologue, got:\n{source}"
+    );
+    assert!(
+        source.contains("if (argc < 1) {\n    return;\n  }") || source.contains("return;\n  }"),
+        "expected the C exit code to be dropped, not passed through a void function, \
+         got:\n{source}"
+    );
+    assert!(
+        !source.contains("return 1;") && !source.contains("return 0;"),
+        "expected every returned exit code to be stripped, got:\n{source}"
+    );
+}
+
+/// Companion: `main()` with no parameters at all needs no prologue and no
+/// `List<String>` parameter — Dart's other valid entry-point shape.
+#[test]
+fn main_with_no_parameters_stays_parameterless() {
+    let source = lower_and_emit(
+        "lower-cpp-main-no-params",
+        r#"
+int main() {
+    return 0;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "got:\n{source}"
+    );
+    assert!(
+        source.contains("void main() {"),
+        "expected the parameterless Dart entry point, got:\n{source}"
+    );
+    assert!(!source.contains("return 0;"), "got:\n{source}");
+}
