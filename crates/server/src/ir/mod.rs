@@ -148,6 +148,17 @@ pub enum Type {
     /// `mapping::pointer_options_for`'s `"ponte-dart-ffi"` case — since
     /// nothing rules out array/pointer-arithmetic use for those.
     Nullable(Box<Type>),
+    /// Dart's own sound top type, `Object` — never `dynamic` (AGENTS.md:
+    /// "`dynamic` nao e uma solucao de transpilar"). The one honest target
+    /// for a C++ variadic parameter's collected trailing arguments (`...`,
+    /// F15/tarefa 15.7): each argument can be any type, and unlike
+    /// `dynamic`, `Object` still requires an explicit cast/type-check
+    /// before any member beyond `Object`'s own is used, so nothing silently
+    /// accepts a wrong-shaped value the way `dynamic` would. Always reached
+    /// as `Nullable(Object)` in practice — `lower::cpp`'s variadic-call
+    /// lowering never asserts non-null on a collected argument — never
+    /// nullable on its own from any other source.
+    Object,
     /// A C++ type the lowering doesn't represent yet, carrying its spelling
     /// (e.g. `"float"`) so the reason is legible instead of silently
     /// dropped.

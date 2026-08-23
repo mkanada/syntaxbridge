@@ -76,6 +76,6 @@ class Fraction {
   }
 }
 
-void LogDebug(String? fmt) {
+void LogDebug(String? fmt, [List<Object?> args = const []]) {
   fmt;
 }

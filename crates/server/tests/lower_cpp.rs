@@ -7094,3 +7094,84 @@ int negate_sum(int a, int b) {
         "expected unary minus to keep its binary operand parenthesized, got:\n{source}"
     );
 }
+
+/// F15/tarefa 15.7: a C++ variadic function (`void LogError(const char
+/// *fmt, ...)`) has no direct Dart equivalent, but AGENTS.md rules out
+/// `dynamic`/silently dropping the extra arguments too — the decided shape
+/// (asked and confirmed as a product decision before fixing) is an explicit
+/// named boundary: the trailing `...` becomes an optional `List<Object?>
+/// args = const []`, and every call site packages its own extra arguments
+/// into that list instead of passing more positional arguments than the
+/// declaration accepts (`extra_positional_arguments`). Real trigger:
+/// `iocmme.dart:153`'s `LogError('%s', str)`.
+#[test]
+fn a_variadic_function_gets_a_trailing_args_list_parameter() {
+    let source = lower_and_emit(
+        "lower-cpp-variadic-signature",
+        r#"
+void log_error(const char *fmt, ...) {}
+"#,
+    );
+
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "got:\n{source}"
+    );
+    assert!(
+        source.contains("void log_error(String? fmt, [List<Object?> args = const []])"),
+        "expected the trailing `...` to become an explicit args list, got:\n{source}"
+    );
+}
+
+/// Companion to `a_variadic_function_gets_a_trailing_args_list_parameter`:
+/// the call site itself must package its extra arguments into the same
+/// list, never pass them as extra positional arguments.
+#[test]
+fn a_variadic_call_packages_its_extra_arguments_into_the_args_list() {
+    let source = lower_and_emit(
+        "lower-cpp-variadic-call-site",
+        r#"
+void log_error(const char *fmt, ...) {}
+
+void report(const char *value) {
+    log_error("%s", value);
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "got:\n{source}"
+    );
+    assert!(
+        source.contains("log_error('%s', <Object?>[value]);"),
+        "expected the extra argument to be collected into an Object? list, got:\n{source}"
+    );
+}
+
+/// A variadic call that supplies none of the trailing arguments must not
+/// force an explicit empty list — Dart's own `const []` default already
+/// covers it, the same as any other C++ default argument this emitter
+/// already omits at a call site that doesn't override it.
+#[test]
+fn a_variadic_call_with_no_extra_arguments_omits_the_args_list() {
+    let source = lower_and_emit(
+        "lower-cpp-variadic-call-site-no-extra-args",
+        r#"
+void log_error(const char *fmt, ...) {}
+
+void report() {
+    log_error("done");
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "got:\n{source}"
+    );
+    assert!(
+        source.contains("log_error('done');"),
+        "expected the call to omit the trailing args list entirely, got:\n{source}"
+    );
+}

@@ -70,6 +70,7 @@ pub fn overload_type_suffix(ty: &ir::Type) -> String {
         ir::Type::Record { name, .. } | ir::Type::Enum { name, .. } => name.clone(),
         ir::Type::Tuple(elements) => elements.iter().map(overload_type_suffix).collect(),
         ir::Type::Nullable(inner) => format!("Nullable{}", overload_type_suffix(inner)),
+        ir::Type::Object => "Object".to_owned(),
         // Achado 1 restante (`docs/plans/diagnostico-verovio-6.2.0.md`): a
         // fixed `"Unsupported"` suffix here made every unrepresentable
         // parameter type indistinguishable from every other one — two
@@ -2776,7 +2777,71 @@ unsafe fn collect_params_with_clone_prelude(
         });
     }
 
+    // A C++ variadic parameter (`, ...`) has no direct Dart equivalent —
+    // Dart has no unlimited-arity parameter list at all — but per-argument
+    // type erasure has an honest one: an *explicit*, nameable boundary,
+    // never `dynamic` (AGENTS.md). A trailing optional `List<Object?> args
+    // = const []` collects every argument beyond the fixed ones; the call
+    // site's own lowering (`regroup_variadic_call_args`) packages them into
+    // exactly that list, so `LogError('%s', str)` becomes
+    // `LogError('%s', <Object?>[str])` rather than a call `dart analyze`
+    // rejects as `extra_positional_arguments` (F15/tarefa 15.7 — the
+    // "fronteira nomeada e explícita" this prompt asked to decide on before
+    // fixing).
+    if unsafe { clang_sys::clang_Cursor_isVariadic(cursor) } != 0 {
+        params.push(ir::Param {
+            name: "args".to_owned(),
+            ty: variadic_args_type(),
+            default_value: Some(ir::Expr::ListLiteral {
+                items: Vec::new(),
+                ty: variadic_args_type(),
+                origin: origin.clone(),
+            }),
+        });
+    }
+
     (params, prelude)
+}
+
+/// The Dart type a C++ variadic parameter's collected trailing arguments
+/// get — see `collect_params_with_clone_prelude`'s own doc comment on why
+/// this, not `dynamic`.
+fn variadic_args_type() -> ir::Type {
+    ir::Type::List(Box::new(ir::Type::Nullable(Box::new(ir::Type::Object))))
+}
+
+/// Repackages a variadic C++ call's trailing arguments into the single
+/// `List<Object?>` the Dart signature exposes for them
+/// (`collect_params_with_clone_prelude`'s own trailing `args` parameter,
+/// F15/tarefa 15.7). `referenced` is the callee's *declaration* cursor —
+/// `clang_Cursor_getNumArguments` on it reports the fixed parameter count
+/// only, never counting the `...` itself (confirmed empirically, the same
+/// API this module already reads a call's own argument count from). A
+/// non-variadic callee, or a variadic call that supplies none of its
+/// trailing arguments (Dart's own default `const []` already covers that
+/// case), comes back unchanged.
+unsafe fn regroup_variadic_call_args(
+    mut args: Vec<ir::Expr>,
+    referenced: clang_sys::CXCursor,
+    origin: &ir::Origin,
+) -> Vec<ir::Expr> {
+    if unsafe { clang_sys::clang_Cursor_isVariadic(referenced) } == 0 {
+        return args;
+    }
+    let fixed_count = unsafe { clang_sys::clang_Cursor_getNumArguments(referenced) };
+    let Ok(fixed_count) = usize::try_from(fixed_count) else {
+        return args;
+    };
+    if args.len() <= fixed_count {
+        return args;
+    }
+    let variadic_tail = args.split_off(fixed_count);
+    args.push(ir::Expr::ListLiteral {
+        items: variadic_tail,
+        ty: variadic_args_type(),
+        origin: origin.clone(),
+    });
+    args
 }
 
 /// One `case`/`default` label found while unwrapping a `CaseStmt`/
@@ -5207,6 +5272,7 @@ fn default_scalar_value(ty: &ir::Type, origin: &ir::Origin) -> ir::Expr {
         | ir::Type::Callback { .. }
         | ir::Type::Tuple(_)
         | ir::Type::Void
+        | ir::Type::Object
         | ir::Type::Unsupported(_) => ir::Expr::UnsupportedTyped {
             reason: "no default value available for this field's type yet".to_owned(),
             ty: ty.clone(),
@@ -7379,6 +7445,7 @@ unsafe fn lower_call_expr(
             };
         }
     };
+    let args = unsafe { regroup_variadic_call_args(args, referenced, &origin) };
 
     let ty = lower_type(unsafe { clang_sys::clang_getCursorType(cursor) });
     ir::Expr::Call {
@@ -10405,6 +10472,7 @@ unsafe fn lower_method_call(
             };
         }
     };
+    let args = unsafe { regroup_variadic_call_args(args, referenced, &origin) };
     let ty = lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) });
 
     ir::Expr::Call {

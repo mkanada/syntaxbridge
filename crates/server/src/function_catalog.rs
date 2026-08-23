@@ -1086,6 +1086,7 @@ fn rename_record_refs_in_type(ty: &mut ir::Type, renames: &HashMap<String, Strin
         | ir::Type::Void
         | ir::Type::Str
         | ir::Type::Bytes
+        | ir::Type::Object
         | ir::Type::Enum { .. }
         | ir::Type::Unsupported(_) => {}
     }
@@ -1544,6 +1545,7 @@ impl IrRefVisitor<'_> {
             | ir::Type::Void
             | ir::Type::Str
             | ir::Type::Bytes
+            | ir::Type::Object
             | ir::Type::Record { .. }
             | ir::Type::Enum { .. }
             | ir::Type::Unsupported(_) => {}

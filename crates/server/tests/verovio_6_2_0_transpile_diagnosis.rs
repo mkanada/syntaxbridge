@@ -572,6 +572,7 @@ fn collect_type_bailouts(ty: &Type, inventory: &mut BailoutInventory) {
         | Type::Record { .. }
         | Type::Enum { .. }
         | Type::Str
+        | Type::Object
         | Type::Bytes => {}
     }
 }

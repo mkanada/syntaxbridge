@@ -772,6 +772,7 @@ fn collect_referenced_usrs_in_type<'a>(ty: &'a Type, out: &mut HashSet<&'a str>)
         | Type::Void
         | Type::Str
         | Type::Bytes
+        | Type::Object
         | Type::Unsupported(_) => {}
     }
 }
@@ -1350,6 +1351,7 @@ fn field_default_literal(ty: &Type, enums_by_usr: &HashMap<&str, &Enum>) -> Opti
         | Type::Callback { .. }
         | Type::Tuple(_)
         | Type::Void
+        | Type::Object
         | Type::Unsupported(_) => None,
     }
 }
@@ -1787,15 +1789,27 @@ fn format_params(
         let optional_text = optional
             .iter()
             .map(|param| {
-                format!(
-                    "{} {} = {}",
-                    emit_type(&param.ty),
-                    param.name,
+                let default = param
+                    .default_value
+                    .as_ref()
+                    .expect("filtered by is_some above");
+                // Dart requires a parameter default to be a compile-time
+                // constant. Every other default this module builds already
+                // is one (`emit_expr`'s own literal/`.value` shapes) except
+                // the empty `List<Object?>` a variadic C++ parameter's
+                // trailing-arguments collector defaults to
+                // (`lower::cpp::collect_params_with_clone_prelude`,
+                // F15/tarefa 15.7): `emit_expr`'s `Expr::ListLiteral` arm
+                // prints a plain (non-`const`) literal, since a list
+                // default is otherwise never produced. `const []` lets Dart
+                // infer the element type from the parameter's own declared
+                // type, so no explicit `<Object?>` is needed here either.
+                let default_text = if matches!(default, Expr::ListLiteral { items, .. } if items.is_empty())
+                {
+                    "const []".to_owned()
+                } else {
                     emit_expr(
-                        param
-                            .default_value
-                            .as_ref()
-                            .expect("filtered by is_some above"),
+                        default,
                         used_expr_helper,
                         used_utf8_encode,
                         // A default-value expression stands alone — never a
@@ -1804,7 +1818,8 @@ fn format_params(
                         // `Promoted` state with the rest of the signature.
                         &mut Promoted::new(),
                     )
-                )
+                };
+                format!("{} {} = {default_text}", emit_type(&param.ty), param.name)
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -2316,6 +2331,7 @@ fn emit_type(ty: &Type) -> String {
                 .join(", ")
         ),
         Type::Nullable(inner) => format!("{}?", emit_type(inner)),
+        Type::Object => "Object".to_owned(),
         Type::Unsupported(spelling) => {
             format!("{OPAQUE_TYPE_NAME} /* unsupported: {spelling} */")
         }
