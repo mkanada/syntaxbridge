@@ -7175,3 +7175,42 @@ void report() {
         "expected the call to omit the trailing args list entirely, got:\n{source}"
     );
 }
+
+/// F15/tarefa 15.8: C++ keeps a type's name and a local variable's name in
+/// separate namespaces — `tm tm = tm(0);` is legal, common C style (real
+/// trigger: `zip_file.dart:1390`) — but Dart has one shared namespace, so
+/// the local shadows the type inside its own initializer: `tm(0)` (meant as
+/// the constructor call) resolves to the not-yet-initialized local instead,
+/// `referenced_before_declaration`. The local must be renamed whenever it
+/// collides with its own declared type's name.
+#[test]
+fn a_local_named_after_its_own_type_is_renamed() {
+    let source = lower_and_emit(
+        "lower-cpp-local-shadows-own-type",
+        r#"
+struct Marca {
+    int x;
+};
+
+int use_marca() {
+    Marca Marca;
+    return Marca.x;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("Unsupported") && !source.contains("dynamic"),
+        "got:\n{source}"
+    );
+    assert!(
+        source.contains("Marca Marca_ = Marca(0);"),
+        "expected the local to be renamed but the constructor call to keep the type's own \
+         name, got:\n{source}"
+    );
+    assert!(
+        source.contains("return Marca_.x;"),
+        "expected every later reference to the local to use the renamed identifier too, \
+         got:\n{source}"
+    );
+}

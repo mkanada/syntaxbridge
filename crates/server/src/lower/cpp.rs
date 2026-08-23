@@ -1243,6 +1243,32 @@ pub(crate) fn dart_safe_identifier(name: &str) -> String {
     }
 }
 
+/// `dart_safe_identifier`, extended for the one further collision unique to
+/// a local variable (never a parameter, field, or free function/method
+/// name): C++ keeps a type's name and a local variable's name in separate
+/// namespaces (`tm tm;` is legal, common C style — real trigger:
+/// `zip_file.dart:1390`), but Dart has one shared namespace, so a local
+/// shadows its own type inside its own initializer — most concretely, the
+/// synthesized default-value constructor call a record-typed local with no
+/// written initializer gets (`lower_one_var_decl`, right below), which
+/// would otherwise resolve to the not-yet-initialized local instead of the
+/// type, `referenced_before_declaration`. `dart_name` is `name` already run
+/// through `dart_safe_identifier`, so the two checks compose in either
+/// order. Only a `Record`/`Enum` type can collide this way — Dart's own
+/// scalar type names (`int`, `String`, ...) are never valid C++ identifiers
+/// in the first place, so no local can ever be spelled to match one.
+fn dart_safe_local_name(dart_name: &str, ty: &ir::Type) -> String {
+    let shadows_own_type = matches!(
+        ty,
+        ir::Type::Record { name, .. } | ir::Type::Enum { name, .. } if name == dart_name
+    );
+    if shadows_own_type {
+        format!("{dart_name}_")
+    } else {
+        dart_name.to_owned()
+    }
+}
+
 /// A C++ enumerator's name as a Dart enum constant. Every valid C++
 /// identifier is already a valid Dart one, so the only rewriting needed is
 /// for names Dart won't accept *in this position*: `dart_safe_identifier`'s
@@ -1522,6 +1548,15 @@ unsafe fn qualified_static_member_name(referenced: clang_sys::CXCursor) -> Strin
         && owner_kind != clang_sys::CXCursor_StructDecl
         && owner_kind != clang_sys::CXCursor_EnumDecl
     {
+        // A genuine block-scope local (never a static member — those all
+        // have a Class/Struct/Enum owner, just excluded above) — the other
+        // half of `lower_one_var_decl`'s own `dart_safe_local_name` rename,
+        // applied here so every later *read* of the same local agrees with
+        // its declaration (F15/tarefa 15.8).
+        if referenced_kind == clang_sys::CXCursor_VarDecl {
+            let ty = lower_type(unsafe { clang_sys::clang_getCursorType(referenced) });
+            return dart_safe_local_name(&name, &ty);
+        }
         return name;
     }
     // For an enum owner this has to be the *same* `dart_enum_type_name` the
@@ -5017,11 +5052,23 @@ unsafe fn lower_one_var_decl(
     // covers it the same way. Every reference to this local inside the
     // body resolves through the same function (`qualified_static_member_name`
     // → `dart_member_name`'s public branch), so the two can never disagree.
-    let name = dart_safe_identifier(&unsafe {
-        type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(*var_decl_cursor))
-    });
     let cx_type = unsafe { clang_sys::clang_getCursorType(*var_decl_cursor) };
     let ty = lower_type(cx_type);
+    // F15/tarefa 15.8: `struct tm tm;` (real trigger: `zip_file.dart:1390`)
+    // keeps `tm` the type and `tm` the local in separate C++ namespaces —
+    // Dart has one shared namespace, so the local shadows the type the
+    // moment both share a spelling, and this record's own synthesized
+    // default-value constructor call (`tm(0, 0, ...)`, right below) would
+    // resolve to the not-yet-initialized local instead of the type,
+    // `referenced_before_declaration`. `qualified_static_member_name`
+    // applies this identical rename to every later *read* of the same
+    // local, so the two can't disagree either.
+    let name = dart_safe_local_name(
+        &dart_safe_identifier(&unsafe {
+            type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(*var_decl_cursor))
+        }),
+        &ty,
+    );
 
     // A record-typed `VarDecl` always has at least one child that isn't a
     // real initializer: `libclang` emits a leading `TypeRef` (pointing at
