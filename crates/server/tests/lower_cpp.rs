@@ -6648,3 +6648,201 @@ public:
         "expected the field to lower to a named cursor adapter, got:\n{source}"
     );
 }
+
+/// F14/tarefa 14, caso 1. `solo == true` with `solo` a `bool` parameter
+/// still routes both operands through C++'s usual bool→int comparison
+/// promotion (confirmed via `-Xclang -ast-dump`), so the left operand
+/// lowers to `Expr::Convert{ty: Int, operand: Bool}` — rendered as the
+/// ternary `solo ? 1 : 0` (`lowers_an_implicit_bool_to_int_conversion_into_
+/// an_explicit_ternary` above). Printed bare as the left operand of `==`,
+/// Dart's own (much lower) ternary precedence reassociates the whole
+/// condition as `solo ? 1 : (0 == true.toInt())` — a real Verovio
+/// regression (`iohumdrum.dart:9035`, `docs/plans/dart-analyze-
+/// verovio-6.2.0.md`'s F14) that `dart analyze` only caught because the
+/// resulting `int` failed `non_bool_condition`; with matching types it
+/// would have compiled silently wrong.
+#[test]
+fn a_synthesized_bool_to_int_ternary_used_in_a_condition_is_parenthesized() {
+    let source = lower_and_emit(
+        "f14-case1-ternary-in-condition",
+        r#"
+bool solo_flag(bool solo) {
+    if (solo == true) {
+        return true;
+    }
+    return false;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("if ((solo ? 1 : 0) == true.toInt())"),
+        "expected the synthesized ternary to be parenthesized so the `==` binds \
+         the whole ternary, not just its else-branch, got:\n{source}"
+    );
+}
+
+/// F14/tarefa 14, caso 2. `lower_dynamic_cast_expr` synthesizes `x is T ? x
+/// : null` for a `dynamic_cast<T*>(x)` (`crates/server/src/lower/cpp.rs`).
+/// Used inline as a call receiver, the ternary's own low precedence means a
+/// bare `!`/`.` glued directly after it binds to just the `null` literal —
+/// `sparent is Layer ? sparent : null!.GetCurrentClef()` calls a method on
+/// `null` and always throws (`editortoolkit_neume.dart:1835`'s real
+/// `null_check_always_fails` + `receiver_of_type_never` regression). The
+/// receiver must be parenthesized before the bang and the member access
+/// apply to the ternary's *result*.
+#[test]
+fn a_dynamic_cast_receiver_is_parenthesized_before_the_bang_and_member_access() {
+    let source = lower_and_emit(
+        "f14-case2-dynamic-cast-receiver",
+        r#"
+class Base {
+public:
+    virtual ~Base() {}
+};
+class Layer : public Base {
+public:
+    int GetCurrentClef() { return 1; }
+};
+void f(Base* sparent) {
+    dynamic_cast<Layer*>(sparent)->GetCurrentClef();
+}
+"#,
+    );
+
+    assert!(
+        source.contains("(sparent is Layer ? sparent : null)!.GetCurrentClef()"),
+        "expected the dynamic_cast ternary to be parenthesized before the bang \
+         and the member access, got:\n{source}"
+    );
+}
+
+/// F14/tarefa 14, gap found alongside the doc's own three cases while
+/// re-checking the corpus after the first pass (`just verovio-diagnosis`,
+/// real `view.dart:3820` regression): `if (dynamic_cast<Chord*>(element))`
+/// — a bare truthy pointer check on a downcast, the idiomatic C++ RTTI
+/// spelling — lowers the dynamic_cast ternary into `Expr::Convert{ty:
+/// Bool}`'s own `!=` branch (`emit_expr`'s `Expr::Convert` arm). That
+/// branch's *own* operand rendering wasn't covered by the caso 2 fix above
+/// (which only wraps a ternary glued in from *outside* `Expr::Convert`,
+/// not one `Expr::Convert` embeds itself): printed bare, `element is Chord
+/// ? element : null != null` reads as `element is Chord ? element : (null
+/// != null)` — the synthesized `!= null` gets swallowed into the
+/// ternary's own *else* branch instead of comparing the whole cast result,
+/// so the condition is always true whenever the cast succeeds *or* fails.
+#[test]
+fn a_dynamic_cast_used_as_a_bare_truthy_condition_parenthesizes_the_ternary_before_the_bool_conversion()
+ {
+    let source = lower_and_emit(
+        "f14-case2b-dynamic-cast-truthy-condition",
+        r#"
+class Base {
+public:
+    virtual ~Base() {}
+};
+class Chord : public Base {
+public:
+    int GetCount() { return 1; }
+};
+int f(Base* element) {
+    if (dynamic_cast<Chord*>(element)) {
+        return 1;
+    }
+    return 0;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("if ((element is Chord ? element : null) != null)"),
+        "expected the dynamic_cast ternary to be parenthesized before the \
+         synthesized bool conversion's own '!= null', got:\n{source}"
+    );
+}
+
+/// F14/tarefa 14, caso 3. A pointer decrement dereferenced inline
+/// (`*(--end)` — `pugixml.dart:3926`'s real `swap(*begin++, *--end)`
+/// trigger, `crates/server/src/lower/cpp.rs`'s `CXUnaryOperator_Deref`
+/// handling wrapping the `Expr::Unary{PreDecrement, ..}` operand in
+/// `Expr::Convert` for the non-null assertion) must keep the decrement and
+/// the bang grouped as `(--end)!` — decrement the actual (assignable)
+/// variable first, then unwrap the result — never `--end!`, which Dart
+/// rejects outright (`missing_assignable_selector`: `!`'s result isn't an
+/// assignable target `--` can apply to).
+#[test]
+fn a_dereferenced_pointer_decrement_keeps_the_decrement_and_bang_grouped() {
+    let source = lower_and_emit(
+        "f14-case3-pointer-decrement-deref",
+        r#"
+class Node {
+public:
+    int value = 0;
+};
+void consume(Node& n) {}
+void f(Node* begin, Node* end) {
+    consume(*begin++);
+    consume(*--end);
+}
+"#,
+    );
+
+    assert!(
+        source.contains("(begin++)!") && source.contains("(--end)!"),
+        "expected both the post-increment and pre-decrement dereferences to keep \
+         the operator and the bang grouped together, got:\n{source}"
+    );
+    assert!(
+        !source.contains("--end!") && !source.contains("begin++!"),
+        "the bang must never trail the raw operator text outside its own parens, \
+         got:\n{source}"
+    );
+}
+
+/// F14/tarefa 14, "teste de amplitude": a nested arithmetic expression must
+/// produce Dart that computes the *same value* as the C++ it came from —
+/// not just Dart that happens to compile. This is the shape of bug the
+/// diagnosed `code`s (`non_bool_condition`, `null_check_always_fails`, ...)
+/// only catch by accident, when the misgrouped expression happens to hit a
+/// type mismatch too.
+#[test]
+fn a_nested_arithmetic_expression_evaluates_to_the_same_value_as_the_source() {
+    let source = lower_and_emit(
+        "f14-amplitude-arithmetic",
+        r#"
+int compute(int a, int b, int c, int d, int e, int f) {
+    return a * (b + c) - d / (e - f);
+}
+"#,
+    );
+
+    // a=2, b=3, c=4, d=20, e=9, f=4 -> 2*7 - 20/5 = 14 - 4 = 10
+    assert!(
+        source.contains("return a * (b + c) - d ~/ (e - f);"),
+        "expected the emitted expression to preserve the source's own grouping \
+         exactly, got:\n{source}"
+    );
+}
+
+/// F14/tarefa 14, gap found alongside the doc's own three cases while
+/// covering "operando de unário": unary minus's operand only ever gets
+/// wrapped for the unrelated lexical reason of two adjacent `-` characters
+/// merging into `--` (`emit::dart::Expr::Unary`'s own doc comment) — a
+/// composite operand was never wrapped for precedence at all. `-(a + b)`
+/// printed bare as `-a + b` silently negates only `a`, changing the value
+/// (`-(2 + 3) = -5` vs `-2 + 3 = 1`) without ever tripping `dart analyze`.
+#[test]
+fn unary_minus_over_a_binary_operand_is_parenthesized() {
+    let source = lower_and_emit(
+        "f14-unary-minus-binary-operand",
+        r#"
+int negate_sum(int a, int b) {
+    return -(a + b);
+}
+"#,
+    );
+
+    assert!(
+        source.contains("return -(a + b);"),
+        "expected unary minus to keep its binary operand parenthesized, got:\n{source}"
+    );
+}

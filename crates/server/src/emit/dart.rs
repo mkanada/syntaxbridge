@@ -2281,7 +2281,8 @@ fn emit_stmt(
                 format!("{pad}{field} = {value_text};\n")
             }
             _ => {
-                let target_text = emit_expr(target, used_expr_helper, used_utf8_encode, promoted);
+                let target_text =
+                    emit_receiver(target, used_expr_helper, used_utf8_encode, promoted);
                 let bang = receiver_bang(target, promoted);
                 let value_text = emit_expr(value, used_expr_helper, used_utf8_encode, promoted);
                 format!("{pad}{target_text}{bang}.{field} = {value_text};\n")
@@ -2294,7 +2295,7 @@ fn emit_stmt(
             value,
             ..
         } => {
-            let map_text = emit_expr(map, used_expr_helper, used_utf8_encode, promoted);
+            let map_text = emit_receiver(map, used_expr_helper, used_utf8_encode, promoted);
             let bang = receiver_bang(map, promoted);
             let index_text = emit_expr(index, used_expr_helper, used_utf8_encode, promoted);
             let value_text = emit_expr(value, used_expr_helper, used_utf8_encode, promoted);
@@ -2787,7 +2788,7 @@ fn emit_for_clause(
             value,
             ..
         } => {
-            let map_text = emit_expr(map, used_expr_helper, used_utf8_encode, promoted);
+            let map_text = emit_receiver(map, used_expr_helper, used_utf8_encode, promoted);
             let bang = receiver_bang(map, promoted);
             let index_text = emit_expr(index, used_expr_helper, used_utf8_encode, promoted);
             let value_text = emit_expr(value, used_expr_helper, used_utf8_encode, promoted);
@@ -2997,6 +2998,50 @@ fn receiver_bang(receiver: &Expr, promoted: &mut Promoted) -> &'static str {
         return "";
     }
     receiver_bang_by_type(receiver)
+}
+
+/// Whether `receiver`, printed right before `.field`/`[index]`/`(args)`/
+/// `.putIfAbsent(...)` glues on, needs parentheses first. `Expr::As`/
+/// `Expr::Assign` already self-parenthesize unconditionally at their own
+/// `emit_expr` arms (see each one's own doc comment), so they need nothing
+/// extra here. Every other composite shape this checks prints with lower
+/// precedence than postfix member access, so gluing that postfix syntax on
+/// bare reassociates it onto only part of the receiver instead of its
+/// whole result: `sparent is Layer ? sparent : null!.GetCurrentClef()`
+/// calls a method on the bare `null` literal, not the ternary's own result
+/// (F14/tarefa 14's caso 2, a real Verovio `null_check_always_fails` +
+/// `receiver_of_type_never` regression — `editortoolkit_neume.dart:1835`,
+/// from `lower::cpp::lower_dynamic_cast_expr`'s synthesized `x is T ? x :
+/// null`). Postfix member access binds tighter than every one of these
+/// shapes, `Comparison` (`!=`) included, so — unlike `binary_child_needs_
+/// parens`'s own `Expr::Convert` arm — there's no precedence-relative case
+/// to spare here: any non-`Simple` `ConvertShape` always needs wrapping
+/// (`convert_shape`'s own doc comment on why `Convert` doesn't carry this
+/// as its own IR tag for this `match` to see directly).
+fn receiver_needs_parens(receiver: &Expr) -> bool {
+    matches!(
+        receiver,
+        Expr::Binary { .. } | Expr::Unary { .. } | Expr::Conditional { .. } | Expr::Is { .. }
+    ) || !matches!(convert_shape(receiver), ConvertShape::Simple)
+}
+
+/// Renders `receiver`, wrapped in parens first when `receiver_needs_parens`
+/// says so — every call site that glues `.field`/`[index]`/`(args)`/
+/// `.putIfAbsent(...)` onto a receiver's text uses this instead of calling
+/// `emit_expr` on it directly, so none of them can individually forget the
+/// check (F14/tarefa 14).
+fn emit_receiver(
+    receiver: &Expr,
+    used_expr_helper: &mut bool,
+    used_utf8_encode: &mut bool,
+    promoted: &mut Promoted,
+) -> String {
+    let text = emit_expr(receiver, used_expr_helper, used_utf8_encode, promoted);
+    if receiver_needs_parens(receiver) {
+        format!("({text})")
+    } else {
+        text
+    }
 }
 
 /// If `expr` is `x != null`/`null != x` (when `op` is `BinaryOp::Ne`) or
@@ -3261,6 +3306,58 @@ fn convert_operand_needs_parens(operand: &Expr) -> bool {
     }
 }
 
+/// The syntactic shape an `Expr::Convert` node actually renders as —
+/// `Convert` doesn't carry this in its own IR tag, so callers that need to
+/// know the shape without re-rendering the text (F14/tarefa 14:
+/// `binary_child_needs_parens`, the `Expr::Unary` arm's operand check, and
+/// `receiver_needs_parens`) call `convert_shape` instead of duplicating
+/// `emit_expr`'s own `Expr::Convert` match. The two variants beyond
+/// `Simple` need different treatment: a ternary has the lowest precedence
+/// of anything this module ever prints, so it always needs wrapping the
+/// same as a literal `Expr::Conditional`, unconditionally — but a `!=`
+/// comparison is precedence-sensitive exactly like a literal
+/// `Expr::Binary{op: Ne, ..}` child, so treating it as *always* needing
+/// wrapping is itself a bug: it over-wraps a safe case like `x != null &&
+/// y` (`!=` already binds tighter than `&&`) into `(x != null) && y` —
+/// harmless there, but it broke `an_or_nested_inside_an_and_is_
+/// parenthesized_so_dart_reads_the_same_tree_this_module_does`'s *exact*
+/// expected grouping the first time this shipped, since over-wrapping
+/// changes the printed text even where it doesn't change the parse.
+enum ConvertShape {
+    /// A plain postfix chain (`.toInt()`, `.toDouble()`, `.value`, `!`, or a
+    /// pass-through) — always safe to embed unwrapped, in every position
+    /// this module ever puts it.
+    Simple,
+    /// `x ? 1 : 0` (`Bool`→`Int`) — `docs/prompts/2026-08-21-14-
+    /// parentizacao-e-precedencia.md`'s caso 1: glued bare as a binary
+    /// operand, Dart's own low ternary precedence reassociates the whole
+    /// expression around it.
+    Ternary,
+    /// `x != y` (`_`→`Bool`).
+    Comparison,
+}
+
+fn convert_shape(expr: &Expr) -> ConvertShape {
+    let Expr::Convert { operand, ty, .. } = expr else {
+        return ConvertShape::Simple;
+    };
+    if matches!(expr_ty(operand), Some(Type::Nullable(inner)) if inner.as_ref() == ty)
+        || (matches!(expr_ty(operand), Some(Type::Nullable(_)))
+            && !matches!(
+                ty,
+                Type::Double | Type::Int | Type::Bool | Type::Nullable(_)
+            ))
+    {
+        return ConvertShape::Simple;
+    }
+    match ty {
+        Type::Int if matches!(expr_ty(operand), Some(Type::Bool)) => ConvertShape::Ternary,
+        Type::Bool => ConvertShape::Comparison,
+        Type::Nullable(_) => convert_shape(operand),
+        _ => ConvertShape::Simple,
+    }
+}
+
 /// Renders `operand` for an `Expr::Convert` branch that chains a postfix
 /// suffix directly onto it (`.toInt()`, `.toDouble()`, `.value`, `!`) —
 /// parenthesized when `operand` has lower precedence than postfix member
@@ -3417,8 +3514,26 @@ fn emit_expr(
             // can't apply to a literal (`dart format`: "Missing selector",
             // confirmed empirically). Checking whether the operand's own
             // text starts with the same character catches that regardless
-            // of how deep the nesting goes.
-            if *op == UnaryOp::Not || operand_text.starts_with(op_text) {
+            // of how deep the nesting goes. A third, independent reason
+            // (F14/tarefa 14): a `Neg`/`PreIncrement`/`PreDecrement`
+            // operand that's itself `Binary`/`Conditional`/a synthesized
+            // ternary or comparison (`convert_shape`) needs the same
+            // protection `Not` already always gets — prefix unary binds
+            // tighter than every one of those shapes (`Comparison`
+            // included, unlike `binary_child_needs_parens`'s own
+            // precedence-relative treatment of it), so there's no
+            // precedence-relative case to spare here either. Printed bare,
+            // `-(a + b)` reads as `-a + b`, silently negating only `a`
+            // (confirmed empirically: `dart analyze` never flags this,
+            // since both expressions type-check).
+            if *op == UnaryOp::Not
+                || operand_text.starts_with(op_text)
+                || matches!(
+                    operand.as_ref(),
+                    Expr::Binary { .. } | Expr::Conditional { .. }
+                )
+                || !matches!(convert_shape(operand), ConvertShape::Simple)
+            {
                 format!("{op_text}({operand_text})")
             } else {
                 format!("{op_text}{operand_text}")
@@ -3450,10 +3565,26 @@ fn emit_expr(
                     // direction as `.toInt()`) — `lower::cpp`'s three
                     // `child_ty`/`outer_ty` arms that construct this with
                     // `ty: Type::Int`.
-                    Type::Int if matches!(expr_ty(operand), Some(Type::Bool)) => format!(
-                        "{} ? 1 : 0",
-                        emit_expr(operand, used_expr_helper, used_utf8_encode, promoted)
-                    ),
+                    // The synthesized ternary's own *condition* slot: Dart's
+                    // grammar puts a bare `Expr::Conditional` operand there
+                    // out of bounds entirely (a ternary's condition must be
+                    // `ifNullExpression`, one grammar tier above another
+                    // ternary) — same wrapping need as any other embedded
+                    // ternary-shaped child (F14/tarefa 14), just caught as a
+                    // hard syntax error here instead of a silent
+                    // reassociation.
+                    Type::Int if matches!(expr_ty(operand), Some(Type::Bool)) => {
+                        let operand_text =
+                            emit_expr(operand, used_expr_helper, used_utf8_encode, promoted);
+                        let operand_text = if matches!(operand.as_ref(), Expr::Conditional { .. })
+                            || matches!(convert_shape(operand), ConvertShape::Ternary)
+                        {
+                            format!("({operand_text})")
+                        } else {
+                            operand_text
+                        };
+                        format!("{operand_text} ? 1 : 0")
+                    }
                     Type::Int if matches!(expr_ty(operand), Some(Type::Enum { .. })) => format!(
                         "{}.value",
                         emit_convert_operand(operand, used_expr_helper, used_utf8_encode, promoted)
@@ -3462,15 +3593,37 @@ fn emit_expr(
                         "{}.toInt()",
                         emit_convert_operand(operand, used_expr_helper, used_utf8_encode, promoted)
                     ),
-                    Type::Bool => format!(
-                        "{} != {}",
-                        emit_expr(operand, used_expr_helper, used_utf8_encode, promoted),
-                        if matches!(expr_ty(operand), Some(Type::Nullable(_))) {
-                            "null"
-                        } else {
-                            "0"
-                        }
-                    ),
+                    // This synthesizes exactly the same `!=` shape a
+                    // literal `Expr::Binary{op: Ne, ..}` node would, with
+                    // `operand` standing in as its left operand — so it
+                    // needs the identical left-operand wrapping decision
+                    // `binary_child_needs_parens` already makes for a real
+                    // one (F14/tarefa 14: a dynamic_cast ternary used as a
+                    // bare truthy pointer check, `if (dynamic_cast<Chord*>
+                    // (element))`, lowers to exactly this branch —
+                    // unwrapped, `element is Chord ? element : null != 0`'s
+                    // own ternary swallows the `!= 0` into its *else*
+                    // branch instead of comparing the whole cast result,
+                    // confirmed on the real Verovio 6.2.0 corpus:
+                    // `view.dart`'s `non_bool_condition`).
+                    Type::Bool => {
+                        let operand_text =
+                            emit_expr(operand, used_expr_helper, used_utf8_encode, promoted);
+                        let operand_text =
+                            if binary_child_needs_parens(BinaryOp::Ne, operand, false) {
+                                format!("({operand_text})")
+                            } else {
+                                operand_text
+                            };
+                        format!(
+                            "{operand_text} != {}",
+                            if matches!(expr_ty(operand), Some(Type::Nullable(_))) {
+                                "null"
+                            } else {
+                                "0"
+                            }
+                        )
+                    }
                     // C++ address-of widens a known Dart reference `T` to its
                     // nullable pointer representation `T?`; Dart performs that
                     // widening implicitly. A dereference goes the other way and
@@ -3539,7 +3692,7 @@ fn emit_expr(
                     None | Some(Expr::This { .. }) => String::new(),
                     Some(receiver) => {
                         let receiver_text =
-                            emit_expr(receiver, used_expr_helper, used_utf8_encode, promoted);
+                            emit_receiver(receiver, used_expr_helper, used_utf8_encode, promoted);
                         let bang = receiver_bang(receiver, promoted);
                         format!("{receiver_text}{bang}.")
                     }
@@ -3555,7 +3708,8 @@ fn emit_expr(
         Expr::FieldAccess { target, field, .. } => match target.as_ref() {
             Expr::This { .. } => field.clone(),
             _ => {
-                let target_text = emit_expr(target, used_expr_helper, used_utf8_encode, promoted);
+                let target_text =
+                    emit_receiver(target, used_expr_helper, used_utf8_encode, promoted);
                 let bang = receiver_bang(target, promoted);
                 format!("{target_text}{bang}.{field}")
             }
@@ -3595,7 +3749,7 @@ fn emit_expr(
         // (`this` outside a method) rather than panicking the emitter.
         Expr::This { .. } => "this".to_owned(),
         Expr::Index { target, index, .. } => {
-            let target_text = emit_expr(target, used_expr_helper, used_utf8_encode, promoted);
+            let target_text = emit_receiver(target, used_expr_helper, used_utf8_encode, promoted);
             let bang = receiver_bang(target, promoted);
             let index_text = emit_expr(index, used_expr_helper, used_utf8_encode, promoted);
             format!("{target_text}{bang}[{index_text}]")
@@ -3606,7 +3760,7 @@ fn emit_expr(
             default_value,
             ..
         } => {
-            let target_text = emit_expr(target, used_expr_helper, used_utf8_encode, promoted);
+            let target_text = emit_receiver(target, used_expr_helper, used_utf8_encode, promoted);
             let bang = receiver_bang(target, promoted);
             let index_text = emit_expr(index, used_expr_helper, used_utf8_encode, promoted);
             // `default_value` renders inside a `() => ...` closure literal
@@ -3833,6 +3987,34 @@ fn binary_child_needs_parens(outer_op: BinaryOp, child: &Expr, child_is_rhs: boo
                 inner < outer
             }
         }
+        // `Expr::Convert` doesn't carry its rendered shape as an IR tag for
+        // this `match` to see directly (`convert_shape`'s own doc comment).
+        // A `Bool`→`Int` conversion renders a ternary — Dart's lowest
+        // precedence of anything this module prints — so it always needs
+        // wrapping unconditionally, the same as a literal
+        // `Expr::Conditional` child (F14/tarefa 14's caso 1: a synthesized
+        // `solo ? 1 : 0` glued bare as `==`'s left operand reassociated the
+        // whole condition around it). A `_`→`Bool` conversion renders a
+        // `!=` comparison, precedence-sensitive exactly like a literal
+        // `Expr::Binary{op: Ne, ..}` child — treating it as unconditional
+        // too over-wraps a safe case like `x != null && y` into `(x !=
+        // null) && y` (real regression the first time this shipped: see
+        // `convert_shape`'s own doc comment), so this reuses the exact same
+        // precedence check the `Expr::Binary` arm above does, standing in
+        // `BinaryOp::Ne` for the comparison's own (fixed) operator.
+        Expr::Convert { .. } => match convert_shape(child) {
+            ConvertShape::Ternary => true,
+            ConvertShape::Comparison => {
+                let outer = binary_precedence(outer_op);
+                let inner = binary_precedence(BinaryOp::Ne);
+                if child_is_rhs {
+                    inner <= outer
+                } else {
+                    inner < outer
+                }
+            }
+            ConvertShape::Simple => false,
+        },
         _ => false,
     }
 }
