@@ -53,7 +53,7 @@ class Fraction {
   }
 
   double ToDouble() {
-    return _m_numerator.toDouble() / _m_denominator.toDouble();
+    return _m_numerator.toDouble() / _m_denominator;
   }
 
   void Reduce() {

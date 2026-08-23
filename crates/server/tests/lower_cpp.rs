@@ -214,6 +214,90 @@ int truncated(double value) {
     );
 }
 
+/// Round 24 (Tarefa 11): Narrowing `double` → `int` conversion belongs at the
+/// assignment / boundary, not per operand inside an arithmetic expression.
+/// In Dart, `a * 0.5 + b` is valid without converting `a` or `b` to double,
+/// and `.toInt()` is applied to the whole expression.
+#[test]
+fn mixed_arithmetic_double_to_int_converts_at_boundary_not_operands() {
+    let source = lower_and_emit(
+        "lower-cpp-arithmetic-int-double",
+        r#"
+int f(int a, int b) {
+    int x = a * 0.5 + b;
+    return x;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("int x = (a * 0.5 + b).toInt();"),
+        "expected exactly one .toInt() conversion on the whole expression, got:\n{source}"
+    );
+    assert!(
+        !source.contains(".toDouble()"),
+        "expected no redundant .toDouble() on operands, got:\n{source}"
+    );
+    assert!(
+        !source.contains("toDouble().toInt()"),
+        "expected no chained toDouble().toInt(), got:\n{source}"
+    );
+}
+
+#[test]
+fn mixed_arithmetic_negative_factors_converts_at_boundary() {
+    let source = lower_and_emit(
+        "lower-cpp-arithmetic-negative",
+        r#"
+int calc(int a, int b) {
+    int x = a * -0.5 + b;
+    return x;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("int x = (a * -0.5 + b).toInt();"),
+        "expected .toInt() on whole expression with negative float factor, got:\n{source}"
+    );
+}
+
+#[test]
+fn explicit_static_cast_preserves_to_double_in_mixed_arithmetic() {
+    let source = lower_and_emit(
+        "lower-cpp-explicit-cast-arithmetic",
+        r#"
+double f(int a, int b) {
+    double x = static_cast<double>(a) / b;
+    return x;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("a.toDouble() / b"),
+        "expected explicit static_cast to preserve .toDouble(), got:\n{source}"
+    );
+}
+
+#[test]
+fn integer_division_remains_truncating_division_operator() {
+    let source = lower_and_emit(
+        "lower-cpp-int-div",
+        r#"
+int div(int a, int b) {
+    int x = a / b;
+    return x;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("a ~/ b"),
+        "expected int division to use ~/, got:\n{source}"
+    );
+}
+
 #[test]
 fn a_break_statement_keeps_its_control_flow_node_and_origin() {
     const BREAK_CPP: &str = r#"

@@ -541,6 +541,39 @@ impl Expr {
             Self::Ref { .. } | Self::FieldAccess { .. } | Self::Index { .. }
         )
     }
+
+    pub fn ty(&self) -> Option<&Type> {
+        match self {
+            Self::Ref { ty, .. }
+            | Self::Binary { ty, .. }
+            | Self::Conditional { ty, .. }
+            | Self::Unary { ty, .. }
+            | Self::ListLiteral { ty, .. }
+            | Self::MapLiteral { ty, .. }
+            | Self::Assign { ty, .. }
+            | Self::Convert { ty, .. }
+            | Self::As { ty, .. }
+            | Self::Call { ty, .. }
+            | Self::FieldAccess { ty, .. }
+            | Self::This { ty, .. }
+            | Self::Index { ty, .. }
+            | Self::MapIndexOrInsert { ty, .. }
+            | Self::StringByteAt { ty, .. }
+            | Self::UnsupportedTyped { ty, .. } => Some(ty),
+            Self::IntLiteral { .. }
+            | Self::DoubleLiteral { .. }
+            | Self::BoolLiteral { .. }
+            | Self::NullLiteral { .. }
+            | Self::StringLiteral { .. }
+            | Self::RecordConstruct { .. }
+            | Self::ConstructorCall { .. }
+            | Self::StringByteLength { .. }
+            | Self::StringByteIndexOf { .. }
+            | Self::Tuple { .. }
+            | Self::Is { .. }
+            | Self::Unsupported { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

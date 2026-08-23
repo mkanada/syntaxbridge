@@ -2759,36 +2759,7 @@ fn emit_for_clause(
 /// real value, a literal is never a pointer), so `None` is exactly "not
 /// nullable, no `!` needed" for that purpose without needing its own case.
 fn expr_ty(expr: &Expr) -> Option<&Type> {
-    match expr {
-        Expr::Ref { ty, .. }
-        | Expr::Binary { ty, .. }
-        | Expr::Conditional { ty, .. }
-        | Expr::Unary { ty, .. }
-        | Expr::ListLiteral { ty, .. }
-        | Expr::MapLiteral { ty, .. }
-        | Expr::Assign { ty, .. }
-        | Expr::Convert { ty, .. }
-        | Expr::As { ty, .. }
-        | Expr::Call { ty, .. }
-        | Expr::FieldAccess { ty, .. }
-        | Expr::This { ty, .. }
-        | Expr::Index { ty, .. }
-        | Expr::MapIndexOrInsert { ty, .. }
-        | Expr::StringByteAt { ty, .. } => Some(ty),
-        Expr::IntLiteral { .. }
-        | Expr::DoubleLiteral { .. }
-        | Expr::BoolLiteral { .. }
-        | Expr::NullLiteral { .. }
-        | Expr::StringLiteral { .. }
-        | Expr::RecordConstruct { .. }
-        | Expr::ConstructorCall { .. }
-        | Expr::StringByteLength { .. }
-        | Expr::StringByteIndexOf { .. }
-        | Expr::Tuple { .. }
-        | Expr::Is { .. }
-        | Expr::Unsupported { .. } => None,
-        Expr::UnsupportedTyped { ty, .. } => Some(ty),
-    }
+    expr.ty()
 }
 
 /// `"!"` when `receiver`'s own static type is `Type::Nullable` (E10/E13's
@@ -3184,19 +3155,35 @@ fn collect_assigned_names(stmts: &[Stmt], out: &mut HashSet<String>) {
     }
 }
 
+/// Whether `operand` needs wrapping parentheses before chaining a postfix
+/// suffix (`.toInt()`, `.toDouble()`, `.value`, `!`).
+///
+/// In Dart, postfix call / member access binds tighter than binary operators,
+/// conditionals, assignments, and unary operators. Any operand whose outermost
+/// syntactic operator has lower precedence must be parenthesized so that the
+/// postfix operator applies to the whole expression rather than its rightmost
+/// token (e.g. `(a * 0.5 + b).toInt()` rather than `a * 0.5 + b.toInt()`).
+fn convert_operand_needs_parens(operand: &Expr) -> bool {
+    match operand {
+        Expr::Binary { .. }
+        | Expr::Conditional { .. }
+        | Expr::Unary { .. }
+        | Expr::Assign { .. }
+        | Expr::Is { .. }
+        | Expr::As { .. } => true,
+        Expr::Convert { ty, operand, .. } => match ty {
+            Type::Bool => true,
+            Type::Int if matches!(expr_ty(operand), Some(Type::Bool)) => true,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Renders `operand` for an `Expr::Convert` branch that chains a postfix
 /// suffix directly onto it (`.toInt()`, `.toDouble()`, `.value`, `!`) —
-/// parenthesized when `operand` is itself a postfix `++`/`--` (real bug
-/// found in the Verovio corpus, round 19: `*pSrc++` — C's dereference-
-/// then-advance idiom — lowers to `Expr::Convert{ operand:
-/// Unary{PostIncrement, pSrc}, ty: Int }`, which this function used to
-/// render bare as `pSrc++.toInt()`, invalid Dart — `dart format` itself
-/// rejects it, "Expected to find ';'." — since a suffix can't chain
-/// directly onto a postfix increment/decrement the way it can onto any
-/// other primary expression). A prefix `++x`/`--x` has no such ambiguity
-/// (its own suffix is exactly one token that never invites another chained
-/// straight after in the shapes this module constructs), so only the
-/// postfix operators need the parens.
+/// parenthesized when `operand` has lower precedence than postfix member
+/// access (binary arithmetic, ternary, unary increment/negation, etc.).
 fn emit_convert_operand(
     operand: &Expr,
     used_expr_helper: &mut bool,
@@ -3204,13 +3191,7 @@ fn emit_convert_operand(
     promoted: &mut Promoted,
 ) -> String {
     let text = emit_expr(operand, used_expr_helper, used_utf8_encode, promoted);
-    if matches!(
-        operand,
-        Expr::Unary {
-            op: UnaryOp::PostIncrement | UnaryOp::PostDecrement,
-            ..
-        }
-    ) {
+    if convert_operand_needs_parens(operand) {
         format!("({text})")
     } else {
         text
@@ -3362,59 +3343,76 @@ fn emit_expr(
                 format!("{op_text}{operand_text}")
             }
         }
-        Expr::Convert { operand, ty, .. } => match ty {
-            Type::Double => format!(
-                "{}.toDouble()",
-                emit_convert_operand(operand, used_expr_helper, used_utf8_encode, promoted)
-            ),
-            // `bool` → `int` (C++ implicitly reads a `bool` as `1`/`0`
-            // wherever an integer is expected), `enum` → `int` (the
-            // enumerator's real C++ value — `ir::Enum::values`'s doc
-            // comment on why this is `.value`, never Dart's `.index`), and
-            // the narrowing `double` → `int` (truncates toward zero, same
-            // direction as `.toInt()`) — `lower::cpp`'s three
-            // `child_ty`/`outer_ty` arms that construct this with
-            // `ty: Type::Int`.
-            Type::Int if matches!(expr_ty(operand), Some(Type::Bool)) => format!(
-                "{} ? 1 : 0",
-                emit_expr(operand, used_expr_helper, used_utf8_encode, promoted)
-            ),
-            Type::Int if matches!(expr_ty(operand), Some(Type::Enum { .. })) => format!(
-                "{}.value",
-                emit_convert_operand(operand, used_expr_helper, used_utf8_encode, promoted)
-            ),
-            Type::Int => format!(
-                "{}.toInt()",
-                emit_convert_operand(operand, used_expr_helper, used_utf8_encode, promoted)
-            ),
-            Type::Bool => format!(
-                "{} != {}",
-                emit_expr(operand, used_expr_helper, used_utf8_encode, promoted),
-                if matches!(expr_ty(operand), Some(Type::Nullable(_))) {
-                    "null"
-                } else {
-                    "0"
+        Expr::Convert { operand, ty, .. } => {
+            if matches!(expr_ty(operand), Some(Type::Nullable(inner)) if inner.as_ref() == ty)
+                || (matches!(expr_ty(operand), Some(Type::Nullable(_)))
+                    && !matches!(
+                        ty,
+                        Type::Double | Type::Int | Type::Bool | Type::Nullable(_)
+                    ))
+            {
+                format!(
+                    "{}!",
+                    emit_convert_operand(operand, used_expr_helper, used_utf8_encode, promoted)
+                )
+            } else {
+                match ty {
+                    Type::Double => format!(
+                        "{}.toDouble()",
+                        emit_convert_operand(operand, used_expr_helper, used_utf8_encode, promoted)
+                    ),
+                    // `bool` → `int` (C++ implicitly reads a `bool` as `1`/`0`
+                    // wherever an integer is expected), `enum` → `int` (the
+                    // enumerator's real C++ value — `ir::Enum::values`'s doc
+                    // comment on why this is `.value`, never Dart's `.index`), and
+                    // the narrowing `double` → `int` (truncates toward zero, same
+                    // direction as `.toInt()`) — `lower::cpp`'s three
+                    // `child_ty`/`outer_ty` arms that construct this with
+                    // `ty: Type::Int`.
+                    Type::Int if matches!(expr_ty(operand), Some(Type::Bool)) => format!(
+                        "{} ? 1 : 0",
+                        emit_expr(operand, used_expr_helper, used_utf8_encode, promoted)
+                    ),
+                    Type::Int if matches!(expr_ty(operand), Some(Type::Enum { .. })) => format!(
+                        "{}.value",
+                        emit_convert_operand(operand, used_expr_helper, used_utf8_encode, promoted)
+                    ),
+                    Type::Int => format!(
+                        "{}.toInt()",
+                        emit_convert_operand(operand, used_expr_helper, used_utf8_encode, promoted)
+                    ),
+                    Type::Bool => format!(
+                        "{} != {}",
+                        emit_expr(operand, used_expr_helper, used_utf8_encode, promoted),
+                        if matches!(expr_ty(operand), Some(Type::Nullable(_))) {
+                            "null"
+                        } else {
+                            "0"
+                        }
+                    ),
+                    // C++ address-of widens a known Dart reference `T` to its
+                    // nullable pointer representation `T?`; Dart performs that
+                    // widening implicitly. A dereference goes the other way and
+                    // needs the explicit assertion that mirrors C++'s own unchecked
+                    // pointer access.
+                    Type::Nullable(_) => {
+                        emit_expr(operand, used_expr_helper, used_utf8_encode, promoted)
+                    }
+                    _ if matches!(operand.as_ref(), Expr::This { .. }) => {
+                        emit_expr(operand, used_expr_helper, used_utf8_encode, promoted)
+                    }
+                    _ if matches!(expr_ty(operand), Some(Type::Nullable(_))) => format!(
+                        "{}!",
+                        emit_convert_operand(operand, used_expr_helper, used_utf8_encode, promoted)
+                    ),
+                    _ => unreachable!(
+                        "only represented scalar and nullable-reference conversions construct \
+                         Expr::Convert, got ty={ty:?} operand={operand:?} at {:?}",
+                        expr.origin()
+                    ),
                 }
-            ),
-            // C++ address-of widens a known Dart reference `T` to its
-            // nullable pointer representation `T?`; Dart performs that
-            // widening implicitly. A dereference goes the other way and
-            // needs the explicit assertion that mirrors C++'s own unchecked
-            // pointer access.
-            Type::Nullable(_) => emit_expr(operand, used_expr_helper, used_utf8_encode, promoted),
-            _ if matches!(operand.as_ref(), Expr::This { .. }) => {
-                emit_expr(operand, used_expr_helper, used_utf8_encode, promoted)
             }
-            _ if matches!(expr_ty(operand), Some(Type::Nullable(_))) => format!(
-                "{}!",
-                emit_convert_operand(operand, used_expr_helper, used_utf8_encode, promoted)
-            ),
-            _ => unreachable!(
-                "only represented scalar and nullable-reference conversions construct \
-                 Expr::Convert, got ty={ty:?} operand={operand:?} at {:?}",
-                expr.origin()
-            ),
-        },
+        }
         Expr::Call {
             target,
             base_qualifier,

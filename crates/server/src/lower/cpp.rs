@@ -5080,7 +5080,7 @@ unsafe fn lower_compound_assign_stmt(
     let value = ir::Expr::Binary {
         op,
         lhs: Box::new(unsafe { lower_expr(*lhs_cursor, project_root) }),
-        rhs: Box::new(unsafe { lower_expr(*rhs_cursor, project_root) }),
+        rhs: Box::new(unsafe { lower_binary_operand(*rhs_cursor, project_root) }),
         ty,
         origin: origin.clone(),
     };
@@ -5376,6 +5376,22 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
                 // exactly the same direction `.toInt()` does — safe to
                 // represent directly, the same way the widening `int` →
                 // `double` case above is.
+                //
+                // Chained `int` → `double` → `int` conversions cancel out to
+                // identity on the original `int` expression: converting an `int`
+                // to IEEE-754 double is lossless for 32-bit integers, and
+                // converting back to `int` has no fractional part to truncate,
+                // so `.toDouble().toInt()` is a pure no-op (Tarefa 11).
+                if let ir::Expr::Convert {
+                    operand: inner_op,
+                    ty: ir::Type::Double,
+                    ..
+                } = &inner
+                    && (matches!(inner_op.ty(), Some(ir::Type::Int))
+                        || matches!(inner_op.as_ref(), ir::Expr::IntLiteral { .. }))
+                {
+                    return *inner_op.clone();
+                }
                 ir::Expr::Convert {
                     operand: Box::new(inner),
                     ty: ir::Type::Int,
@@ -6175,6 +6191,45 @@ unsafe fn map_literal_entries(
         .collect()
 }
 
+/// Lowers an operand of a binary arithmetic or relational operator.
+///
+/// In C++, binary operators (e.g. `a * 0.5`) insert an `ImplicitCastExpr`
+/// (<IntegralToFloating>) on integer operands to widen them to `double`.
+/// In Dart, binary arithmetic and comparison operators accept `int` and
+/// `double` operands interchangeably and evaluate to `double` (or `bool`)
+/// without requiring `.toDouble()`.
+///
+/// When `cursor` is an *implicit* promotion (`CXCursor_UnexposedExpr`) from
+/// `Int` to `Double`, this function strips that redundant wrapper and lowers
+/// the underlying expression directly. Explicit casts (`static_cast<double>`,
+/// C-style casts, functional casts) are preserved.
+unsafe fn lower_binary_operand(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Expr {
+    let kind = unsafe { clang_sys::clang_getCursorKind(cursor) };
+    if kind == clang_sys::CXCursor_UnexposedExpr {
+        let outer_ty = lower_type(unsafe { clang_sys::clang_getCursorType(cursor) });
+        let children = unsafe { collect_children(cursor) };
+        let non_nav_children: Vec<_> = children
+            .into_iter()
+            .filter(|c| {
+                !matches!(
+                    unsafe { clang_sys::clang_getCursorKind(*c) },
+                    clang_sys::CXCursor_TypeRef
+                        | clang_sys::CXCursor_NamespaceRef
+                        | clang_sys::CXCursor_TemplateRef
+                )
+            })
+            .collect();
+        if non_nav_children.len() == 1 {
+            let child_cursor = non_nav_children[0];
+            let child_ty = lower_type(unsafe { clang_sys::clang_getCursorType(child_cursor) });
+            if child_ty == ir::Type::Int && outer_ty == ir::Type::Double {
+                return unsafe { lower_expr(child_cursor, project_root) };
+            }
+        }
+    }
+    unsafe { lower_expr(cursor, project_root) }
+}
+
 unsafe fn lower_binary_expr(
     cursor: clang_sys::CXCursor,
     project_root: &Path,
@@ -6290,8 +6345,8 @@ unsafe fn lower_binary_expr(
         };
     };
 
-    let lhs = unsafe { lower_expr(*lhs_cursor, project_root) };
-    let rhs = unsafe { lower_expr(*rhs_cursor, project_root) };
+    let lhs = unsafe { lower_binary_operand(*lhs_cursor, project_root) };
+    let rhs = unsafe { lower_binary_operand(*rhs_cursor, project_root) };
     let ty = lower_type(unsafe { clang_sys::clang_getCursorType(cursor) });
     ir::Expr::Binary {
         op,
