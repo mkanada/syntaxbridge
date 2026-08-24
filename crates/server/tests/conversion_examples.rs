@@ -592,20 +592,32 @@ fn json_literal_for_cpp(value: &Value, records: &[ir::Record]) -> Option<String>
                 .map(|item| json_literal_for_cpp(item, records))
                 .collect::<Option<Vec<_>>>()?
                 .join(", ");
-            Some(format!("std::vector<int>{{{values}}}"))
+            Some(format!("{{{values}}}"))
         }
         Value::Object(fields) => {
-            let record = find_matching_record(records, fields)?;
-            let values = record
-                .fields
-                .iter()
-                .map(|field| json_literal_for_cpp(fields.get(&field.name)?, records))
-                .collect::<Option<Vec<_>>>()?
-                .join(", ");
-            // Valid as both a C++ aggregate-init (`Ponto{3.0, 4.0}`) and a
-            // Dart positional-constructor call — `run_cpp_oracle` uses this
-            // same literal text for C++ too, so it has to parse as both.
-            Some(format!("{}{{{values}}}", record.name))
+            if let Some(record) = find_matching_record(records, fields) {
+                let values = record
+                    .fields
+                    .iter()
+                    .map(|field| json_literal_for_cpp(fields.get(&field.name)?, records))
+                    .collect::<Option<Vec<_>>>()?
+                    .join(", ");
+                // Valid as both a C++ aggregate-init (`Ponto{3.0, 4.0}`) and a
+                // Dart positional-constructor call — `run_cpp_oracle` uses this
+                // same literal text for C++ too, so it has to parse as both.
+                Some(format!("{}{{{values}}}", record.name))
+            } else {
+                let entries = fields
+                    .iter()
+                    .map(|(k, v)| {
+                        let k_lit = quote_string_literal(k);
+                        let v_lit = json_literal_for_cpp(v, records)?;
+                        Some(format!("{{{k_lit}, {v_lit}}}"))
+                    })
+                    .collect::<Option<Vec<_>>>()?
+                    .join(", ");
+                Some(format!("std::map<std::string, int>{{{entries}}}"))
+            }
         }
         _ => None,
     }
@@ -614,19 +626,31 @@ fn json_literal_for_cpp(value: &Value, records: &[ir::Record]) -> Option<String>
 fn json_literal_for_dart(value: &Value, records: &[ir::Record]) -> Option<String> {
     match value {
         Value::Object(fields) => {
-            let record = find_matching_record(records, fields)?;
-            let values = record
-                .fields
-                .iter()
-                .map(|field| json_literal_for_dart(fields.get(&field.name)?, records))
-                .collect::<Option<Vec<_>>>()?
-                .join(", ");
-            // Dart has no brace aggregate-init for a class — the
-            // constructor `emit::dart::emit_record` generates
-            // (`ClassName(this.field1, ...)`) takes the same
-            // declared-order positional arguments though, so the call
-            // syntax differs from C++'s but the value doesn't.
-            Some(format!("{}({values})", record.name))
+            if let Some(record) = find_matching_record(records, fields) {
+                let values = record
+                    .fields
+                    .iter()
+                    .map(|field| json_literal_for_dart(fields.get(&field.name)?, records))
+                    .collect::<Option<Vec<_>>>()?
+                    .join(", ");
+                // Dart has no brace aggregate-init for a class — the
+                // constructor `emit::dart::emit_record` generates
+                // (`ClassName(this.field1, ...)`) takes the same
+                // declared-order positional arguments though, so the call
+                // syntax differs from C++'s but the value doesn't.
+                Some(format!("{}({values})", record.name))
+            } else {
+                let entries = fields
+                    .iter()
+                    .map(|(k, v)| {
+                        let k_lit = quote_string_literal(k);
+                        let v_lit = json_literal_for_dart(v, records)?;
+                        Some(format!("{k_lit}: {v_lit}"))
+                    })
+                    .collect::<Option<Vec<_>>>()?
+                    .join(", ");
+                Some(format!("{{{entries}}}"))
+            }
         }
         // `List<int>` literal syntax (`[1, 2, 3]`) instead of C++'s
         // `std::vector<int>{...}` — same values, different brackets.

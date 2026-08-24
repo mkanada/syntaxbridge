@@ -40,6 +40,46 @@
       "funcao": "maiorValor",
       "args": [[3, 1, 4, 1, 5, 9, 2, 6]],
       "espera": 9
+    },
+    {
+      "funcao": "somaComLista",
+      "args": [[10, 20, 30]],
+      "espera": 60
+    },
+    {
+      "funcao": "somaComLista",
+      "args": [[]],
+      "espera": 0
+    },
+    {
+      "funcao": "contaOcorrencias",
+      "args": [[true, false, true, true]],
+      "espera": 3
+    },
+    {
+      "funcao": "contaOcorrencias",
+      "args": [[]],
+      "espera": 0
+    },
+    {
+      "funcao": "ultimoElementoReverso",
+      "args": [[1, 2, 3]],
+      "espera": 3
+    },
+    {
+      "funcao": "ultimoElementoReverso",
+      "args": [[]],
+      "espera": 0
+    },
+    {
+      "funcao": "valorOuPadrao",
+      "args": [{"a": 1, "b": 2}, "b", 0],
+      "espera": 2
+    },
+    {
+      "funcao": "valorOuPadrao",
+      "args": [{"a": 1, "b": 2}, "c", 42],
+      "espera": 42
     }
   ]
 }

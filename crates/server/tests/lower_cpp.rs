@@ -7843,3 +7843,231 @@ std::string testaGetString(const Caixa &c) {
         "expected caller to invoke `c.getString('txt')`, got:\n{source}"
     );
 }
+
+#[test]
+fn t09_list_iterator_loop_lowers_cleanly() {
+    let source = lower_and_emit(
+        "lower-cpp-t09-list-iterator-loop",
+        r#"
+#include <list>
+
+int somaLista(const std::list<int> &l) {
+    int s = 0;
+    for (auto it = l.begin(); it != l.end(); ++it) s += *it;
+    return s;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("_List_iterator") && !source.contains("dynamic"),
+        "must not contain _List_iterator or dynamic, got:\n{source}"
+    );
+    assert!(
+        source.contains("for (final int it in l)"),
+        "expected for-in loop over list, got:\n{source}"
+    );
+    assert!(
+        !source.contains("throw UnimplementedError(")
+            && !source.contains("_syntaxBridgeUnsupported"),
+        "expected real translation without bailouts, got:\n{source}"
+    );
+}
+
+#[test]
+fn t09_map_find_and_guard_idiom_lowers_cleanly() {
+    let source = lower_and_emit(
+        "lower-cpp-t09-map-find-guard",
+        r#"
+#include <map>
+#include <string>
+
+int achaNoMapa(const std::map<std::string, int> &m, const std::string &k) {
+    auto it = m.find(k);
+    if (it != m.end()) return it->second;
+    return -1;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("_Rb_tree_iterator") && !source.contains("dynamic"),
+        "must not contain _Rb_tree_iterator or dynamic, got:\n{source}"
+    );
+    assert!(
+        !source.contains("throw UnimplementedError(")
+            && !source.contains("_syntaxBridgeUnsupported"),
+        "expected real translation without bailouts, got:\n{source}"
+    );
+    assert!(
+        source.contains("return -1;"),
+        "expected fallback return, got:\n{source}"
+    );
+}
+
+#[test]
+fn t09_vector_reverse_iterator_loop_lowers_to_reversed() {
+    let source = lower_and_emit(
+        "lower-cpp-t09-vector-reverse-iterator",
+        r#"
+#include <vector>
+
+int ultimoReverso(const std::vector<int> &v) {
+    for (auto it = v.rbegin(); it != v.rend(); ++it) return *it;
+    return 0;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("reverse_iterator") && !source.contains("dynamic"),
+        "must not contain reverse_iterator or dynamic, got:\n{source}"
+    );
+    assert!(
+        source.contains("for (final int it in v.reversed)"),
+        "expected loop over v.reversed, got:\n{source}"
+    );
+    assert!(
+        !source.contains("throw UnimplementedError(")
+            && !source.contains("_syntaxBridgeUnsupported"),
+        "expected real translation without bailouts, got:\n{source}"
+    );
+}
+
+#[test]
+fn t09_vector_bool_and_bit_reference_lowers_to_bool() {
+    let source = lower_and_emit(
+        "lower-cpp-t09-vector-bool",
+        r#"
+#include <vector>
+
+bool primeiroBit(const std::vector<bool> &b) {
+    return b[0];
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("_Bit_reference"),
+        "must not contain _Bit_reference, got:\n{source}"
+    );
+    assert!(
+        source.contains("bool primeiroBit(List<bool> b)"),
+        "expected List<bool> parameter type, got:\n{source}"
+    );
+    assert!(
+        source.contains("return b[0];"),
+        "expected direct boolean indexing return, got:\n{source}"
+    );
+    assert!(
+        !source.contains("throw UnimplementedError(")
+            && !source.contains("_syntaxBridgeUnsupported"),
+        "expected real translation without bailouts, got:\n{source}"
+    );
+}
+
+#[test]
+fn t09_long_lived_cursor_supports_arithmetic_and_distance() {
+    let source = lower_and_emit(
+        "lower-cpp-t09-cursor-arithmetic",
+        r#"
+#include <vector>
+
+int arithmeticCursor(const std::vector<int> &v) {
+    auto it = v.begin();
+    auto it2 = it + 1;
+    int dist = it2 - v.begin();
+    return dist;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("__normal_iterator"),
+        "must not contain __normal_iterator, got:\n{source}"
+    );
+    assert!(
+        source.contains("SyntaxBridgeListCursor<int>"),
+        "expected SyntaxBridgeListCursor<int>, got:\n{source}"
+    );
+    assert!(
+        !source.contains("throw UnimplementedError(")
+            && !source.contains("_syntaxBridgeUnsupported"),
+        "expected real translation without bailouts, got:\n{source}"
+    );
+}
+
+#[test]
+fn t09_string_front_back_and_iterator_loop() {
+    let source = lower_and_emit(
+        "lower-cpp-t09-string-front-back",
+        r#"
+#include <string>
+
+int testStringOps(const std::string &s) {
+    int f = s.front();
+    int b = s.back();
+    int total = 0;
+    for (auto it = s.begin(); it != s.end(); ++it) {
+        total += *it;
+    }
+    return f + b + total;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("__normal_iterator") && !source.contains("basic_string"),
+        "must not contain __normal_iterator or basic_string, got:\n{source}"
+    );
+    assert!(
+        source.contains("s.codeUnitAt(0)"),
+        "expected s.codeUnitAt(0) for front, got:\n{source}"
+    );
+    assert!(
+        source.contains("s.codeUnitAt(s.length - 1)"),
+        "expected s.codeUnitAt(s.length - 1) for back, got:\n{source}"
+    );
+    assert!(
+        source.contains("for (final int it in s.codeUnits)"),
+        "expected loop over s.codeUnits, got:\n{source}"
+    );
+    assert!(
+        !source.contains("throw UnimplementedError(")
+            && !source.contains("_syntaxBridgeUnsupported"),
+        "expected real translation without bailouts, got:\n{source}"
+    );
+}
+
+#[test]
+fn t09_map_iterator_loop_lowers_cleanly() {
+    let source = lower_and_emit(
+        "lower-cpp-t09-map-iterator-loop",
+        r#"
+#include <map>
+#include <string>
+
+int somaValores(const std::map<std::string, int> &m) {
+    int total = 0;
+    for (auto it = m.begin(); it != m.end(); ++it) {
+        total += it->second;
+    }
+    return total;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("_Rb_tree_") && !source.contains("dynamic"),
+        "must not contain _Rb_tree_ or dynamic, got:\n{source}"
+    );
+    assert!(
+        source.contains("m.entries"),
+        "expected loop over m.entries, got:\n{source}"
+    );
+    assert!(
+        !source.contains("throw UnimplementedError(")
+            && !source.contains("_syntaxBridgeUnsupported"),
+        "expected real translation without bailouts, got:\n{source}"
+    );
+}

@@ -50,7 +50,7 @@ const INDEX_OF_BYTE_HELPER_NAME: &str = "syntaxBridgeIndexOfByte";
 /// or a local outliving the one recognized guard-and-deref/for-each idiom),
 /// the same "named bridge, not an erased type" answer `SyntaxBridgePair`
 /// already gives `std::pair`.
-const LIST_CURSOR_TYPE_NAME: &str = "SyntaxBridgeListCursor";
+pub const LIST_CURSOR_TYPE_NAME: &str = "SyntaxBridgeListCursor";
 pub const OUTPUT_STREAM_TYPE_NAME: &str = "SyntaxBridgeOutputStream";
 pub const OUTPUT_STREAM_STRING_TYPE_NAME: &str = "SyntaxBridgeStringOutputStream";
 pub const OUTPUT_STREAM_STDOUT_TYPE_NAME: &str = "SyntaxBridgeStdoutStream";
@@ -755,7 +755,7 @@ fn emit_string_byte_index_support() -> String {
 fn emit_list_cursor_support() -> String {
     format!(
         "final class {LIST_CURSOR_TYPE_NAME}<T> {{\n\
-         {INDENT}{LIST_CURSOR_TYPE_NAME}(this._items, [this._index = 0]);\n\n\
+         {INDENT}{LIST_CURSOR_TYPE_NAME}([this._items = const [], this._index = 0]);\n\n\
          {INDENT}final List<T> _items;\n\
          {INDENT}int _index;\n\n\
          {INDENT}bool get isEnd => _index >= _items.length;\n\
@@ -763,6 +763,25 @@ fn emit_list_cursor_support() -> String {
          {INDENT}void moveNext() {{\n\
          {INDENT}{INDENT}_index++;\n\
          {INDENT}}}\n\
+         {INDENT}void movePrevious() {{\n\
+         {INDENT}{INDENT}_index--;\n\
+         {INDENT}}}\n\n\
+         {INDENT}{LIST_CURSOR_TYPE_NAME}<T> operator +(int offset) =>\n\
+         {INDENT}{INDENT}{LIST_CURSOR_TYPE_NAME}<T>(_items, _index + offset);\n\n\
+         {INDENT}Object operator -(Object other) {{\n\
+         {INDENT}{INDENT}if (other is int) {{\n\
+         {INDENT}{INDENT}{INDENT}return {LIST_CURSOR_TYPE_NAME}<T>(_items, _index - other);\n\
+         {INDENT}{INDENT}}}\n\
+         {INDENT}{INDENT}if (other is {LIST_CURSOR_TYPE_NAME}<T>) {{\n\
+         {INDENT}{INDENT}{INDENT}return _index - other._index;\n\
+         {INDENT}{INDENT}}}\n\
+         {INDENT}{INDENT}throw ArgumentError('Invalid operand for -: $other');\n\
+         {INDENT}}}\n\n\
+         {INDENT}bool operator <({LIST_CURSOR_TYPE_NAME}<T> other) => _index < other._index;\n\
+         {INDENT}bool operator <=({LIST_CURSOR_TYPE_NAME}<T> other) => _index <= other._index;\n\
+         {INDENT}bool operator >({LIST_CURSOR_TYPE_NAME}<T> other) => _index > other._index;\n\
+         {INDENT}bool operator >=({LIST_CURSOR_TYPE_NAME}<T> other) => _index >= other._index;\n\n\
+         {INDENT}T operator [](int offset) => _items[_index + offset];\n\
          }}\n"
     )
 }

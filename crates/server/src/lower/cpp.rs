@@ -27,6 +27,7 @@ use std::ffi::c_void;
 use std::os::raw::c_uint;
 use std::path::Path;
 
+use crate::emit::dart::LIST_CURSOR_TYPE_NAME;
 use crate::ir;
 use crate::mapping;
 use crate::type_catalog;
@@ -2529,6 +2530,22 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
                 };
                 return ir::Type::Unsupported(format!("union {spelling}"));
             }
+            let decl_spelling = unsafe {
+                type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(decl))
+            };
+            if decl_spelling == "_Bit_reference"
+                || decl_spelling == "const _Bit_reference"
+                || decl_spelling.starts_with("_Bit_reference")
+            {
+                return ir::Type::Bool;
+            }
+            if decl_spelling == "_Bit_iterator"
+                || decl_spelling == "_Bit_const_iterator"
+                || decl_spelling.starts_with("_Bit_iterator")
+                || decl_spelling.starts_with("_Bit_const_iterator")
+            {
+                return ir::Type::ListCursor(Box::new(ir::Type::Bool));
+            }
             // `__gnu_cxx::__normal_iterator<Ptr, Container>` — libstdc++'s
             // real implementation of `std::vector<T>::iterator`/
             // `std::string::iterator` (a `typedef` down to this, confirmed
@@ -2568,6 +2585,19 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
                 if let Some(ir::Type::List(element) | ir::Type::Set(element)) = container_ty {
                     return ir::Type::ListCursor(element);
                 }
+                if let Some(ir::Type::Str) = container_ty {
+                    return ir::Type::ListCursor(Box::new(ir::Type::Int));
+                }
+                if unsafe { clang_sys::clang_Type_getNumTemplateArguments(cx_type) } >= 1 {
+                    let ptr_ty = lower_type(unsafe {
+                        clang_sys::clang_Type_getTemplateArgumentAsType(cx_type, 0)
+                    });
+                    let elem = match ptr_ty {
+                        ir::Type::Nullable(pointee) => *pointee,
+                        other => other,
+                    };
+                    return ir::Type::ListCursor(Box::new(elem));
+                }
                 let spelling = unsafe {
                     type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(cx_type))
                 };
@@ -2577,6 +2607,53 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
             }
             let stdlib_name = unsafe { stdlib_template_name(decl) };
             match stdlib_name.as_deref() {
+                Some("_List_iterator") | Some("_List_const_iterator") => {
+                    let element =
+                        if unsafe { clang_sys::clang_Type_getNumTemplateArguments(cx_type) } >= 1 {
+                            lower_type(unsafe {
+                                clang_sys::clang_Type_getTemplateArgumentAsType(cx_type, 0)
+                            })
+                        } else {
+                            ir::Type::Unsupported(
+                                "std::_List_iterator with no element type argument".to_owned(),
+                            )
+                        };
+                    return ir::Type::ListCursor(Box::new(element));
+                }
+                Some("_Rb_tree_iterator") | Some("_Rb_tree_const_iterator") => {
+                    let element =
+                        if unsafe { clang_sys::clang_Type_getNumTemplateArguments(cx_type) } >= 1 {
+                            lower_type(unsafe {
+                                clang_sys::clang_Type_getTemplateArgumentAsType(cx_type, 0)
+                            })
+                        } else {
+                            ir::Type::Unsupported(
+                                "std::_Rb_tree_iterator with no element type argument".to_owned(),
+                            )
+                        };
+                    return ir::Type::ListCursor(Box::new(element));
+                }
+                Some("reverse_iterator") => {
+                    let inner_ty =
+                        if unsafe { clang_sys::clang_Type_getNumTemplateArguments(cx_type) } >= 1 {
+                            lower_type(unsafe {
+                                clang_sys::clang_Type_getTemplateArgumentAsType(cx_type, 0)
+                            })
+                        } else {
+                            ir::Type::Unsupported(
+                                "std::reverse_iterator with no type argument".to_owned(),
+                            )
+                        };
+                    let element = match inner_ty {
+                        ir::Type::ListCursor(elem) => *elem,
+                        ir::Type::List(elem) | ir::Type::Set(elem) | ir::Type::Nullable(elem) => {
+                            *elem
+                        }
+                        ir::Type::Str => ir::Type::Int,
+                        other => other,
+                    };
+                    return ir::Type::ListCursor(Box::new(element));
+                }
                 Some("basic_string") => return ir::Type::Str,
                 Some("basic_ostream") | Some("basic_iostream") | Some("basic_ios") => {
                     return ir::Type::Record {
@@ -3043,6 +3120,32 @@ unsafe fn is_normal_iterator_decl(decl: clang_sys::CXCursor) -> bool {
         }
         ancestor = unsafe { clang_sys::clang_getCursorSemanticParent(ancestor) };
     }
+}
+
+/// Whether `decl` is a standard-library iterator declaration (`__normal_iterator`,
+/// `_List_iterator`, `_Rb_tree_iterator`, `reverse_iterator`, `_Bit_iterator`, etc.).
+unsafe fn is_any_iterator_decl(decl: clang_sys::CXCursor) -> bool {
+    if unsafe { is_normal_iterator_decl(decl) } {
+        return true;
+    }
+    let template = unsafe { clang_sys::clang_getSpecializedCursorTemplate(decl) };
+    let target = if unsafe { clang_sys::clang_Cursor_isNull(template) } == 0 {
+        template
+    } else {
+        decl
+    };
+    let spelling =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(target)) };
+    matches!(
+        spelling.as_str(),
+        "_List_iterator"
+            | "_List_const_iterator"
+            | "_Rb_tree_iterator"
+            | "_Rb_tree_const_iterator"
+            | "reverse_iterator"
+            | "_Bit_iterator"
+            | "_Bit_const_iterator"
+    )
 }
 
 /// Resolves a standard-library template through a type declaration. Member
@@ -6715,6 +6818,13 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
         let field = unsafe { dart_member_name(referenced) };
         let target = unsafe { member_ref_receiver(cursor, project_root, &origin) };
         let ty = lower_type(unsafe { clang_sys::clang_getCursorType(cursor) });
+        if let ir::Expr::Ref { ref name, .. } = target
+            && let Some(elem_ty) = active_iterator_loop_element_type(name)
+            && field == "second"
+            && !matches!(elem_ty, ir::Type::Pair(..))
+        {
+            return target;
+        }
         return ir::Expr::FieldAccess {
             target: Box::new(target),
             field,
@@ -7787,14 +7897,36 @@ unsafe fn lower_call_expr(
         // overload resolved; a shape with a different argument count (none
         // observed, but not proven impossible) falls to an honest typed
         // bailout instead of guessing.
-        if unsafe { is_normal_iterator_decl(clang_sys::clang_getCursorSemanticParent(referenced)) }
-        {
+        let parent_decl = unsafe { clang_sys::clang_getCursorSemanticParent(referenced) };
+        let parent_spelling = unsafe {
+            type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(parent_decl))
+        };
+        if parent_spelling == "_Bit_reference" || parent_spelling == "const _Bit_reference" {
+            if arg_count >= 1 {
+                let arg_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 0) };
+                return unsafe { lower_expr(arg_cursor, project_root) };
+            }
+            return ir::Expr::BoolLiteral {
+                value: false,
+                origin,
+            };
+        }
+        if unsafe { is_any_iterator_decl(parent_decl) } {
             if arg_count == 1 {
                 let arg_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 0) };
                 return unsafe { lower_expr(arg_cursor, project_root) };
             }
+            if arg_count == 0 {
+                return ir::Expr::ConstructorCall {
+                    type_usr: String::new(),
+                    type_name: LIST_CURSOR_TYPE_NAME.to_owned(),
+                    constructor_index: 0,
+                    args: Vec::new(),
+                    origin,
+                };
+            }
             return ir::Expr::UnsupportedTyped {
-                reason: "unsupported __normal_iterator construction shape".to_owned(),
+                reason: "unsupported iterator construction shape".to_owned(),
                 ty: lower_type(unsafe { clang_sys::clang_getCursorType(cursor) }),
                 origin,
             };
@@ -8250,6 +8382,92 @@ unsafe fn lower_call_expr(
         }
     {
         return contains_expr;
+    }
+
+    if callee_name.starts_with("operator")
+        && unsafe {
+            clang_sys::clang_Location_isInSystemHeader(clang_sys::clang_getCursorLocation(
+                referenced,
+            ))
+        } != 0
+        && unsafe { clang_sys::clang_Cursor_getNumArguments(cursor) } == 2
+    {
+        let lhs_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 0) };
+        let rhs_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 1) };
+        let lhs_ty = lower_type(unsafe { clang_sys::clang_getCursorType(lhs_cursor) });
+        let rhs_ty = lower_type(unsafe { clang_sys::clang_getCursorType(rhs_cursor) });
+        if matches!(lhs_ty, ir::Type::ListCursor(_)) || matches!(rhs_ty, ir::Type::ListCursor(_)) {
+            match callee_name.as_str() {
+                "operator+" => {
+                    let (cursor_expr, offset_expr, elem) = match (&lhs_ty, &rhs_ty) {
+                        (ir::Type::ListCursor(elem), _) => {
+                            let lhs_expr = unsafe { lower_expr(lhs_cursor, project_root) };
+                            let rhs_expr = unsafe { lower_expr(rhs_cursor, project_root) };
+                            (lhs_expr, rhs_expr, (**elem).clone())
+                        }
+                        (_, ir::Type::ListCursor(elem)) => {
+                            let lhs_expr = unsafe { lower_expr(lhs_cursor, project_root) };
+                            let rhs_expr = unsafe { lower_expr(rhs_cursor, project_root) };
+                            (rhs_expr, lhs_expr, (**elem).clone())
+                        }
+                        _ => unreachable!(),
+                    };
+                    return ir::Expr::Binary {
+                        op: ir::BinaryOp::Add,
+                        lhs: Box::new(cursor_expr),
+                        rhs: Box::new(offset_expr),
+                        ty: ir::Type::ListCursor(Box::new(elem)),
+                        origin,
+                    };
+                }
+                "operator-" => {
+                    let lhs_expr = unsafe { lower_expr(lhs_cursor, project_root) };
+                    let rhs_expr = unsafe { lower_expr(rhs_cursor, project_root) };
+                    if matches!(lhs_ty, ir::Type::ListCursor(_))
+                        && matches!(rhs_ty, ir::Type::ListCursor(_))
+                    {
+                        return ir::Expr::Binary {
+                            op: ir::BinaryOp::Sub,
+                            lhs: Box::new(lhs_expr),
+                            rhs: Box::new(rhs_expr),
+                            ty: ir::Type::Int,
+                            origin,
+                        };
+                    }
+                    if let ir::Type::ListCursor(elem) = lhs_ty {
+                        return ir::Expr::Binary {
+                            op: ir::BinaryOp::Sub,
+                            lhs: Box::new(lhs_expr),
+                            rhs: Box::new(rhs_expr),
+                            ty: ir::Type::ListCursor(elem),
+                            origin,
+                        };
+                    }
+                }
+                "operator==" | "operator!=" | "operator<" | "operator<=" | "operator>"
+                | "operator>=" => {
+                    let op = match callee_name.as_str() {
+                        "operator==" => ir::BinaryOp::Eq,
+                        "operator!=" => ir::BinaryOp::Ne,
+                        "operator<" => ir::BinaryOp::Lt,
+                        "operator<=" => ir::BinaryOp::Le,
+                        "operator>" => ir::BinaryOp::Gt,
+                        "operator>=" => ir::BinaryOp::Ge,
+                        _ => unreachable!(),
+                    };
+                    let lhs_expr = unsafe { lower_expr(lhs_cursor, project_root) };
+                    let rhs_expr = unsafe { lower_expr(rhs_cursor, project_root) };
+                    return ir::Expr::Binary {
+                        op,
+                        lhs: Box::new(lhs_expr),
+                        rhs: Box::new(rhs_expr),
+                        ty: ir::Type::Bool,
+                        origin,
+                    };
+                }
+                _ => {}
+            }
+        }
     }
 
     // Dart only permits operators as instance methods, whereas C++ commonly
@@ -8791,6 +9009,7 @@ unsafe fn lower_stdlib_dereference_call(
     call_cursor: clang_sys::CXCursor,
     template_name: &str,
     callee_name: &str,
+    project_root: &Path,
     origin: &ir::Origin,
 ) -> Option<ir::Expr> {
     if unsafe { clang_sys::clang_Cursor_getNumArguments(call_cursor) } < 1 {
@@ -8811,20 +9030,30 @@ unsafe fn lower_stdlib_dereference_call(
     } else {
         None
     };
-    match receiver_name
-        .and_then(|name| active_iterator_loop_element_type(&name).map(|ty| (name, ty)))
+    if let Some(elem_ty) = receiver_name
+        .as_deref()
+        .and_then(active_iterator_loop_element_type)
     {
-        Some((name, elem_ty)) => Some(ir::Expr::Ref {
-            name,
+        return Some(ir::Expr::Ref {
+            name: receiver_name.unwrap(),
             ty: elem_ty,
             origin: origin.clone(),
-        }),
-        None => Some(ir::Expr::UnsupportedTyped {
-            reason: format!("unsupported std::{template_name}::{callee_name} call"),
-            ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
-            origin: origin.clone(),
-        }),
+        });
     }
+    let receiver_expr = unsafe { lower_expr(receiver_cursor, project_root) };
+    if let Some(ir::Type::ListCursor(elem)) = receiver_expr.clone().ty() {
+        return Some(ir::Expr::FieldAccess {
+            target: Box::new(receiver_expr),
+            field: "current".to_owned(),
+            ty: (**elem).clone(),
+            origin: origin.clone(),
+        });
+    }
+    Some(ir::Expr::UnsupportedTyped {
+        reason: format!("unsupported std::{template_name}::{callee_name} call"),
+        ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
+        origin: origin.clone(),
+    })
 }
 
 fn is_npos_expr(expr: &ir::Expr) -> bool {
@@ -8857,11 +9086,37 @@ unsafe fn lower_stdlib_method_call(
     // (matches on `(_, "operator*" | "operator->")`), so this only needs to
     // get there, not duplicate its logic.
     if matches!(callee_name.as_str(), "operator*" | "operator->")
-        && unsafe { is_normal_iterator_decl(owner) }
+        && unsafe { is_any_iterator_decl(owner) }
     {
         return unsafe {
-            lower_stdlib_dereference_call(call_cursor, "__normal_iterator", &callee_name, origin)
+            lower_stdlib_dereference_call(
+                call_cursor,
+                "iterator",
+                &callee_name,
+                project_root,
+                origin,
+            )
         };
+    }
+    if matches!(callee_name.as_str(), "operator++" | "operator--")
+        && unsafe { is_any_iterator_decl(owner) }
+    {
+        let receiver_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
+        let receiver_expr = unsafe { lower_expr(receiver_cursor, project_root) };
+        let method = if callee_name == "operator++" {
+            "moveNext"
+        } else {
+            "movePrevious"
+        };
+        return Some(ir::Expr::Call {
+            base_qualifier: None,
+            target: Some(Box::new(receiver_expr)),
+            callee_usr: String::new(),
+            callee_name: method.to_owned(),
+            args: Vec::new(),
+            ty: ir::Type::Void,
+            origin: origin.clone(),
+        });
     }
 
     let template_name = unsafe { stdlib_template_name(owner) }?;
@@ -9783,6 +10038,249 @@ unsafe fn lower_stdlib_method_call(
                 origin: origin.clone(),
             })
         }
+        ("basic_string", "front") => {
+            let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
+            if !args.is_empty() {
+                return Some(ir::Expr::UnsupportedTyped {
+                    reason: format!(
+                        "std::basic_string::front had {} arguments, expected none",
+                        args.len()
+                    ),
+                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
+                    origin: origin.clone(),
+                });
+            }
+            Some(ir::Expr::Call {
+                base_qualifier: None,
+                target: Some(Box::new(target)),
+                callee_usr: String::new(),
+                callee_name: "codeUnitAt".to_owned(),
+                args: vec![ir::Expr::IntLiteral {
+                    value: 0,
+                    origin: origin.clone(),
+                }],
+                ty: ir::Type::Int,
+                origin: origin.clone(),
+            })
+        }
+        ("basic_string", "back") => {
+            let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
+            if !args.is_empty() {
+                return Some(ir::Expr::UnsupportedTyped {
+                    reason: format!(
+                        "std::basic_string::back had {} arguments, expected none",
+                        args.len()
+                    ),
+                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
+                    origin: origin.clone(),
+                });
+            }
+            let index = ir::Expr::Binary {
+                op: ir::BinaryOp::Sub,
+                lhs: Box::new(ir::Expr::FieldAccess {
+                    target: Box::new(target.clone()),
+                    field: "length".to_owned(),
+                    ty: ir::Type::Int,
+                    origin: origin.clone(),
+                }),
+                rhs: Box::new(ir::Expr::IntLiteral {
+                    value: 1,
+                    origin: origin.clone(),
+                }),
+                ty: ir::Type::Int,
+                origin: origin.clone(),
+            };
+            Some(ir::Expr::Call {
+                base_qualifier: None,
+                target: Some(Box::new(target)),
+                callee_usr: String::new(),
+                callee_name: "codeUnitAt".to_owned(),
+                args: vec![index],
+                ty: ir::Type::Int,
+                origin: origin.clone(),
+            })
+        }
+        ("vector" | "list" | "deque" | "array", "begin" | "cbegin") => {
+            let elem_ty = unsafe { stdlib_sequence_element_type(owner, &template_name) };
+            let _ = elem_ty;
+            Some(ir::Expr::ConstructorCall {
+                type_usr: String::new(),
+                type_name: LIST_CURSOR_TYPE_NAME.to_owned(),
+                constructor_index: 0,
+                args: vec![
+                    target,
+                    ir::Expr::IntLiteral {
+                        value: 0,
+                        origin: origin.clone(),
+                    },
+                ],
+                origin: origin.clone(),
+            })
+        }
+        ("vector" | "list" | "deque" | "array", "end" | "cend") => {
+            let elem_ty = unsafe { stdlib_sequence_element_type(owner, &template_name) };
+            let _ = elem_ty;
+            let len_expr = ir::Expr::FieldAccess {
+                target: Box::new(target.clone()),
+                field: "length".to_owned(),
+                ty: ir::Type::Int,
+                origin: origin.clone(),
+            };
+            Some(ir::Expr::ConstructorCall {
+                type_usr: String::new(),
+                type_name: LIST_CURSOR_TYPE_NAME.to_owned(),
+                constructor_index: 0,
+                args: vec![target, len_expr],
+                origin: origin.clone(),
+            })
+        }
+        ("vector" | "list" | "deque" | "array", "rbegin" | "crbegin") => {
+            let elem_ty = unsafe { stdlib_sequence_element_type(owner, &template_name) };
+            let rev_list = ir::Expr::Call {
+                base_qualifier: None,
+                target: Some(Box::new(ir::Expr::FieldAccess {
+                    target: Box::new(target),
+                    field: "reversed".to_owned(),
+                    ty: ir::Type::List(Box::new(elem_ty.clone())),
+                    origin: origin.clone(),
+                })),
+                callee_usr: String::new(),
+                callee_name: "toList".to_owned(),
+                args: Vec::new(),
+                ty: ir::Type::List(Box::new(elem_ty)),
+                origin: origin.clone(),
+            };
+            Some(ir::Expr::ConstructorCall {
+                type_usr: String::new(),
+                type_name: LIST_CURSOR_TYPE_NAME.to_owned(),
+                constructor_index: 0,
+                args: vec![
+                    rev_list,
+                    ir::Expr::IntLiteral {
+                        value: 0,
+                        origin: origin.clone(),
+                    },
+                ],
+                origin: origin.clone(),
+            })
+        }
+        ("vector" | "list" | "deque" | "array", "rend" | "crend") => {
+            let elem_ty = unsafe { stdlib_sequence_element_type(owner, &template_name) };
+            let len_expr = ir::Expr::FieldAccess {
+                target: Box::new(target.clone()),
+                field: "length".to_owned(),
+                ty: ir::Type::Int,
+                origin: origin.clone(),
+            };
+            let rev_list = ir::Expr::Call {
+                base_qualifier: None,
+                target: Some(Box::new(ir::Expr::FieldAccess {
+                    target: Box::new(target),
+                    field: "reversed".to_owned(),
+                    ty: ir::Type::List(Box::new(elem_ty.clone())),
+                    origin: origin.clone(),
+                })),
+                callee_usr: String::new(),
+                callee_name: "toList".to_owned(),
+                args: Vec::new(),
+                ty: ir::Type::List(Box::new(elem_ty)),
+                origin: origin.clone(),
+            };
+            Some(ir::Expr::ConstructorCall {
+                type_usr: String::new(),
+                type_name: LIST_CURSOR_TYPE_NAME.to_owned(),
+                constructor_index: 0,
+                args: vec![rev_list, len_expr],
+                origin: origin.clone(),
+            })
+        }
+        ("basic_string", "begin" | "cbegin") => {
+            let code_units = ir::Expr::FieldAccess {
+                target: Box::new(target),
+                field: "codeUnits".to_owned(),
+                ty: ir::Type::List(Box::new(ir::Type::Int)),
+                origin: origin.clone(),
+            };
+            Some(ir::Expr::ConstructorCall {
+                type_usr: String::new(),
+                type_name: LIST_CURSOR_TYPE_NAME.to_owned(),
+                constructor_index: 0,
+                args: vec![
+                    code_units,
+                    ir::Expr::IntLiteral {
+                        value: 0,
+                        origin: origin.clone(),
+                    },
+                ],
+                origin: origin.clone(),
+            })
+        }
+        ("basic_string", "end" | "cend") => {
+            let len_expr = ir::Expr::FieldAccess {
+                target: Box::new(target.clone()),
+                field: "length".to_owned(),
+                ty: ir::Type::Int,
+                origin: origin.clone(),
+            };
+            let code_units = ir::Expr::FieldAccess {
+                target: Box::new(target),
+                field: "codeUnits".to_owned(),
+                ty: ir::Type::List(Box::new(ir::Type::Int)),
+                origin: origin.clone(),
+            };
+            Some(ir::Expr::ConstructorCall {
+                type_usr: String::new(),
+                type_name: LIST_CURSOR_TYPE_NAME.to_owned(),
+                constructor_index: 0,
+                args: vec![code_units, len_expr],
+                origin: origin.clone(),
+            })
+        }
+        ("map" | "unordered_map", "find") => {
+            let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
+            let [key] = args.as_slice() else {
+                return Some(ir::Expr::UnsupportedTyped {
+                    reason: format!(
+                        "std::{template_name}::find had {} arguments, expected 1",
+                        args.len()
+                    ),
+                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
+                    origin: origin.clone(),
+                });
+            };
+            let val_ty = match target.ty() {
+                Some(ir::Type::Map(_, v)) => (**v).clone(),
+                _ => ir::Type::Object,
+            };
+            Some(ir::Expr::Index {
+                target: Box::new(target),
+                index: Box::new(key.clone()),
+                ty: ir::Type::Nullable(Box::new(val_ty)),
+                origin: origin.clone(),
+            })
+        }
+        ("set" | "unordered_set", "find") => {
+            let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
+            let [key] = args.as_slice() else {
+                return Some(ir::Expr::UnsupportedTyped {
+                    reason: format!(
+                        "std::{template_name}::find had {} arguments, expected 1",
+                        args.len()
+                    ),
+                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
+                    origin: origin.clone(),
+                });
+            };
+            Some(ir::Expr::Call {
+                base_qualifier: None,
+                target: Some(Box::new(target)),
+                callee_usr: String::new(),
+                callee_name: "contains".to_owned(),
+                args: vec![key.clone()],
+                ty: ir::Type::Bool,
+                origin: origin.clone(),
+            })
+        }
         // `*it` / `it->field` inside a loop `lower_iterator_for_loop`
         // recognized. Deliberately *not* using `target` (the generic
         // receiver lowering computed above, shared by every other arm):
@@ -9819,7 +10317,15 @@ unsafe fn lower_stdlib_method_call(
         // instance) would just fail the lookup and fall through unchanged.
         (_, "operator*" | "operator->")
             if unsafe { clang_sys::clang_Cursor_getNumArguments(call_cursor) } >= 1 =>
-        unsafe { lower_stdlib_dereference_call(call_cursor, &template_name, &callee_name, origin) },
+        unsafe {
+            lower_stdlib_dereference_call(
+                call_cursor,
+                &template_name,
+                &callee_name,
+                project_root,
+                origin,
+            )
+        },
         _ => Some(ir::Expr::UnsupportedTyped {
             reason: format!("unsupported std::{template_name}::{callee_name} call"),
             ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
@@ -9875,18 +10381,15 @@ unsafe fn stdlib_method_receiver(
 
 /// `X.begin()`/`X.cbegin()` (`want_begin`) or `X.end()`/`X.cend()`
 /// (`!want_begin`) — a zero-argument iterator-producing member call on a
-/// known sequence/set container. Returns the *lowered* receiver `X`, so
-/// `lower_find_contains_idiom` can require every `begin`/`end` receiver in
-/// the whole comparison to be the exact same value via `Expr`'s own
-/// `PartialEq`, rather than comparing raw cursor identity. `None` for
-/// anything else: a different member name, an owner this bridge doesn't
-/// map to a Dart collection, or a non-call expression.
+/// The receiver of a `begin`/`cbegin`/`end`/`cend`/`rbegin`/`crbegin`/`rend`/`crend`
+/// call on a known sequence/set/map/string container. Returns the lowered receiver
+/// and a boolean indicating whether it is a reverse iterator endpoint (`rbegin`/`rend`).
 unsafe fn container_begin_or_end_receiver(
     cursor: clang_sys::CXCursor,
     want_begin: bool,
     project_root: &Path,
     origin: &ir::Origin,
-) -> Option<ir::Expr> {
+) -> Option<(ir::Expr, bool)> {
     if unsafe { clang_sys::clang_getCursorKind(cursor) } != clang_sys::CXCursor_CallExpr {
         return None;
     }
@@ -9896,25 +10399,28 @@ unsafe fn container_begin_or_end_receiver(
     }
     let name =
         unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced)) };
-    let matches_name = if want_begin {
-        name == "begin" || name == "cbegin"
+    let (matches_name, is_reverse) = if want_begin {
+        if name == "begin" || name == "cbegin" {
+            (true, false)
+        } else if name == "rbegin" || name == "crbegin" {
+            (true, true)
+        } else {
+            (false, false)
+        }
     } else {
-        name == "end" || name == "cend"
+        if name == "end" || name == "cend" {
+            (true, false)
+        } else if name == "rend" || name == "crend" {
+            (true, true)
+        } else {
+            (false, false)
+        }
     };
     if !matches_name {
         return None;
     }
     let owner = unsafe { clang_sys::clang_getCursorSemanticParent(referenced) };
     let template_name = unsafe { stdlib_template_name(owner) }?;
-    // Every template name `lower_type`'s own `CXType_Record`/
-    // `CXType_Unexposed` branch already maps to `Type::List`/`Type::Set`
-    // (`"array"`/`"initializer_list"` → `List`, `"unordered_set"` → `Set`,
-    // confirmed by grepping that branch directly) belongs here too — this
-    // function only decides *which* containers are safe to treat as one
-    // receiver across `begin`/`end`, not how they're represented. `map`/
-    // `unordered_map` deliberately excluded: their iterator's `first`/
-    // `second` needs a `key`/`value` translation neither this idiom nor
-    // `lower_find_contains_idiom` (this function's other caller) attempts.
     if !matches!(
         template_name.as_str(),
         "vector"
@@ -9925,10 +10431,14 @@ unsafe fn container_begin_or_end_receiver(
             | "array"
             | "initializer_list"
             | "unordered_set"
+            | "map"
+            | "unordered_map"
+            | "basic_string"
     ) {
         return None;
     }
-    unsafe { stdlib_method_receiver(cursor, project_root, origin) }.ok()
+    let receiver = unsafe { stdlib_method_receiver(cursor, project_root, origin) }.ok()?;
+    Some((receiver, is_reverse))
 }
 
 /// Whether `a` and `b` are the same *receiver* expression — the same
@@ -10049,19 +10559,53 @@ unsafe fn lower_find_contains_idiom(
     {
         return None;
     }
-    if unsafe { clang_sys::clang_Cursor_getNumArguments(find_call_cursor) } != 3 {
+    let arg_count = unsafe { clang_sys::clang_Cursor_getNumArguments(find_call_cursor) };
+    if arg_count == 1 && find_name == "find" {
+        let (end_receiver_outer, _) = unsafe {
+            container_begin_or_end_receiver(outer_end_cursor, false, project_root, origin)
+        }?;
+        let key_cursor = unsafe { clang_sys::clang_Cursor_getArgument(find_call_cursor, 0) };
+        let find_receiver =
+            unsafe { stdlib_method_receiver(find_call_cursor, project_root, origin) }.ok()?;
+        if !same_receiver_ignoring_origin(&find_receiver, &end_receiver_outer) {
+            return None;
+        }
+        let key_expr = unsafe { lower_expr(key_cursor, project_root) };
+        let is_map = matches!(find_receiver.ty(), Some(ir::Type::Map(..)));
+        let method = if is_map { "containsKey" } else { "contains" };
+        let contains = ir::Expr::Call {
+            base_qualifier: None,
+            target: Some(Box::new(find_receiver)),
+            callee_usr: String::new(),
+            callee_name: method.to_owned(),
+            args: vec![key_expr],
+            ty: ir::Type::Bool,
+            origin: origin.clone(),
+        };
+        return Some(if is_negated {
+            contains
+        } else {
+            ir::Expr::Unary {
+                op: ir::UnaryOp::Not,
+                operand: Box::new(contains),
+                ty: ir::Type::Bool,
+                origin: origin.clone(),
+            }
+        });
+    }
+    if arg_count != 3 {
         return None;
     }
     let begin_cursor = unsafe { clang_sys::clang_Cursor_getArgument(find_call_cursor, 0) };
     let end_cursor_in_find = unsafe { clang_sys::clang_Cursor_getArgument(find_call_cursor, 1) };
     let value_cursor = unsafe { clang_sys::clang_Cursor_getArgument(find_call_cursor, 2) };
 
-    let begin_receiver =
+    let (begin_receiver, is_rev_begin) =
         unsafe { container_begin_or_end_receiver(begin_cursor, true, project_root, origin) }?;
-    let end_receiver_in_find = unsafe {
+    let (end_receiver_in_find, is_rev_end1) = unsafe {
         container_begin_or_end_receiver(end_cursor_in_find, false, project_root, origin)
     }?;
-    let end_receiver_outer =
+    let (end_receiver_outer, is_rev_end2) =
         unsafe { container_begin_or_end_receiver(outer_end_cursor, false, project_root, origin) }?;
     // Structural equality *ignoring `Origin`*: the same three-in-source-code
     // receiver (`dotLocs` appearing at `.cbegin()`, `.cend()`, and the outer
@@ -10071,7 +10615,9 @@ unsafe fn lower_find_contains_idiom(
     // different. Only the lvalue shapes a receiver can actually take here
     // are compared; anything else is conservatively "not equal" rather than
     // guessed.
-    if !same_receiver_ignoring_origin(&begin_receiver, &end_receiver_in_find)
+    if is_rev_begin != is_rev_end1
+        || is_rev_begin != is_rev_end2
+        || !same_receiver_ignoring_origin(&begin_receiver, &end_receiver_in_find)
         || !same_receiver_ignoring_origin(&begin_receiver, &end_receiver_outer)
     {
         return None;
@@ -10182,12 +10728,12 @@ unsafe fn lower_erase_remove_if_idiom(
         unsafe { clang_sys::clang_Cursor_getArgument(remove_if_cursor, 1) };
     let pred_cursor = unsafe { clang_sys::clang_Cursor_getArgument(remove_if_cursor, 2) };
 
-    let begin_receiver =
+    let (begin_receiver, _) =
         unsafe { container_begin_or_end_receiver(begin_cursor, true, project_root, origin) }?;
-    let end_receiver_in_remove_if = unsafe {
+    let (end_receiver_in_remove_if, _) = unsafe {
         container_begin_or_end_receiver(end_cursor_in_remove_if, false, project_root, origin)
     }?;
-    let end_receiver_outer =
+    let (end_receiver_outer, _) =
         unsafe { container_begin_or_end_receiver(outer_end_cursor, false, project_root, origin) }?;
     if !same_receiver_ignoring_origin(&begin_receiver, &end_receiver_in_remove_if)
         || !same_receiver_ignoring_origin(&begin_receiver, &end_receiver_outer)
@@ -10329,13 +10875,53 @@ unsafe fn lower_iterator_for_loop(
     let [it_init_cursor] = it_init_candidates.as_slice() else {
         return None;
     };
-    let begin_receiver =
+    let (begin_receiver, is_reverse_begin) =
         unsafe { container_begin_or_end_receiver(*it_init_cursor, true, project_root, origin) }?;
-    let elem_ty = match &begin_receiver {
-        ir::Expr::Ref { ty, .. } | ir::Expr::FieldAccess { ty, .. } => match ty {
-            ir::Type::List(elem) | ir::Type::Set(elem) => (**elem).clone(),
-            _ => return None,
-        },
+    let (elem_ty, iterable) = match begin_receiver.ty() {
+        Some(ir::Type::List(elem) | ir::Type::Set(elem)) => {
+            let elem = (**elem).clone();
+            let iterable = if is_reverse_begin {
+                ir::Expr::FieldAccess {
+                    target: Box::new(begin_receiver.clone()),
+                    field: "reversed".to_owned(),
+                    ty: ir::Type::List(Box::new(elem.clone())),
+                    origin: origin.clone(),
+                }
+            } else {
+                begin_receiver.clone()
+            };
+            (elem, iterable)
+        }
+        Some(ir::Type::Map(key_ty, value_ty)) => {
+            let elem = ir::Type::Pair(key_ty.clone(), value_ty.clone());
+            let entries = ir::Expr::FieldAccess {
+                target: Box::new(begin_receiver.clone()),
+                field: "entries".to_owned(),
+                ty: ir::Type::List(Box::new(elem.clone())),
+                origin: origin.clone(),
+            };
+            (elem, entries)
+        }
+        Some(ir::Type::Str) => {
+            let elem = ir::Type::Int;
+            let code_units = ir::Expr::FieldAccess {
+                target: Box::new(begin_receiver.clone()),
+                field: "codeUnits".to_owned(),
+                ty: ir::Type::List(Box::new(ir::Type::Int)),
+                origin: origin.clone(),
+            };
+            let iterable = if is_reverse_begin {
+                ir::Expr::FieldAccess {
+                    target: Box::new(code_units),
+                    field: "reversed".to_owned(),
+                    ty: ir::Type::List(Box::new(ir::Type::Int)),
+                    origin: origin.clone(),
+                }
+            } else {
+                code_units
+            };
+            (elem, iterable)
+        }
         _ => return None,
     };
 
@@ -10407,9 +10993,11 @@ unsafe fn lower_iterator_for_loop(
         return None;
     }
     let condition_rhs = unsafe { unwrap_transparent_value_cursor(condition_rhs) };
-    let end_receiver =
+    let (end_receiver, is_reverse_end) =
         unsafe { container_begin_or_end_receiver(condition_rhs, false, project_root, origin) }?;
-    if !same_receiver_ignoring_origin(&begin_receiver, &end_receiver) {
+    if is_reverse_begin != is_reverse_end
+        || !same_receiver_ignoring_origin(&begin_receiver, &end_receiver)
+    {
         return None;
     }
 
@@ -10463,7 +11051,7 @@ unsafe fn lower_iterator_for_loop(
         ty: elem_ty,
         is_final: true,
         write_back: false,
-        iterable: begin_receiver,
+        iterable,
         body,
         origin: origin.clone(),
     })
@@ -10539,32 +11127,53 @@ unsafe fn lower_find_iterator_guard_idiom(
     let find_name = unsafe {
         type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(find_referenced))
     };
-    if !matches!(find_name.as_str(), "find" | "find_if")
-        || unsafe {
-            clang_sys::clang_Location_isInSystemHeader(clang_sys::clang_getCursorLocation(
-                find_referenced,
-            ))
-        } == 0
-        || !unsafe { free_function_reachable_from_std(find_referenced) }
-        || unsafe { clang_sys::clang_Cursor_getNumArguments(find_call_cursor) } != 3
+    if unsafe {
+        clang_sys::clang_Location_isInSystemHeader(clang_sys::clang_getCursorLocation(
+            find_referenced,
+        ))
+    } == 0
     {
         return None;
     }
 
     let origin = stmt_origin(decl_cursor, project_root);
-    let begin_cursor = unsafe { clang_sys::clang_Cursor_getArgument(find_call_cursor, 0) };
-    let end_cursor_in_find = unsafe { clang_sys::clang_Cursor_getArgument(find_call_cursor, 1) };
-    let value_or_pred_cursor = unsafe { clang_sys::clang_Cursor_getArgument(find_call_cursor, 2) };
+    let num_find_args = unsafe { clang_sys::clang_Cursor_getNumArguments(find_call_cursor) };
 
-    let begin_receiver =
-        unsafe { container_begin_or_end_receiver(begin_cursor, true, project_root, &origin) }?;
-    let end_receiver_in_find = unsafe {
-        container_begin_or_end_receiver(end_cursor_in_find, false, project_root, &origin)
-    }?;
-    if !same_receiver_ignoring_origin(&begin_receiver, &end_receiver_in_find) {
+    let (begin_receiver, elem_ty, value_or_pred_cursor, is_map) = if num_find_args == 3
+        && matches!(find_name.as_str(), "find" | "find_if")
+        && unsafe { free_function_reachable_from_std(find_referenced) }
+    {
+        let begin_cursor = unsafe { clang_sys::clang_Cursor_getArgument(find_call_cursor, 0) };
+        let end_cursor_in_find =
+            unsafe { clang_sys::clang_Cursor_getArgument(find_call_cursor, 1) };
+        let value_or_pred_cursor =
+            unsafe { clang_sys::clang_Cursor_getArgument(find_call_cursor, 2) };
+
+        let (begin_receiver, _) =
+            unsafe { container_begin_or_end_receiver(begin_cursor, true, project_root, &origin) }?;
+        let (end_receiver_in_find, _) = unsafe {
+            container_begin_or_end_receiver(end_cursor_in_find, false, project_root, &origin)
+        }?;
+        if !same_receiver_ignoring_origin(&begin_receiver, &end_receiver_in_find) {
+            return None;
+        }
+        let elem_ty = container_element_type(&begin_receiver)?;
+        (begin_receiver, elem_ty, value_or_pred_cursor, false)
+    } else if num_find_args == 1 && find_name == "find" {
+        let value_or_pred_cursor =
+            unsafe { clang_sys::clang_Cursor_getArgument(find_call_cursor, 0) };
+        let begin_receiver =
+            unsafe { stdlib_method_receiver(find_call_cursor, project_root, &origin) }.ok()?;
+        let is_map = matches!(begin_receiver.ty(), Some(ir::Type::Map(..)));
+        let elem_ty = match begin_receiver.ty() {
+            Some(ir::Type::Map(_, v)) => (**v).clone(),
+            Some(ir::Type::Set(elem) | ir::Type::List(elem)) => (**elem).clone(),
+            _ => return None,
+        };
+        (begin_receiver, elem_ty, value_or_pred_cursor, is_map)
+    } else {
         return None;
-    }
-    let elem_ty = container_element_type(&begin_receiver)?;
+    };
 
     if unsafe { clang_sys::clang_getCursorKind(if_cursor) } != clang_sys::CXCursor_IfStmt {
         return None;
@@ -10627,7 +11236,7 @@ unsafe fn lower_find_iterator_guard_idiom(
         return None;
     }
     let condition_rhs = unsafe { unwrap_transparent_value_cursor(condition_rhs) };
-    let end_receiver_condition =
+    let (end_receiver_condition, _) =
         unsafe { container_begin_or_end_receiver(condition_rhs, false, project_root, &origin) }?;
     if !same_receiver_ignoring_origin(&begin_receiver, &end_receiver_condition) {
         return None;
@@ -10648,7 +11257,15 @@ unsafe fn lower_find_iterator_guard_idiom(
         ir::Type::Nullable(_) => elem_ty.clone(),
         _ => ir::Type::Nullable(Box::new(elem_ty.clone())),
     };
-    let init_expr = if find_name == "find" {
+    let init_expr = if is_map {
+        let value = unsafe { lower_expr(value_or_pred_cursor, project_root) };
+        ir::Expr::Index {
+            target: Box::new(begin_receiver.clone()),
+            index: Box::new(value),
+            ty: it_ty.clone(),
+            origin: origin.clone(),
+        }
+    } else if find_name == "find" {
         // `X.contains(v) ? v : null` — when found, `*it` and `v` are the
         // same value by construction (`std::find` found `v` itself), so no
         // helper is needed the way `find_if` needs one to locate *which*
@@ -11053,7 +11670,7 @@ unsafe fn lower_stdlib_algorithm_call(
     }
     let begin_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
     let end_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 1) };
-    let (Some(begin_receiver), Some(end_receiver)) = (
+    let (Some((begin_receiver, _)), Some((end_receiver, _))) = (
         unsafe { container_begin_or_end_receiver(begin_cursor, true, project_root, origin) },
         unsafe { container_begin_or_end_receiver(end_cursor, false, project_root, origin) },
     ) else {

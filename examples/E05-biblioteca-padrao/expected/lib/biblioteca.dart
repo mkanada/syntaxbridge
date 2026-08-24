@@ -29,3 +29,38 @@ int maiorValor(List<int> valores) {
   }
   return maior;
 }
+
+int somaComLista(List<int> valores) {
+  int soma = 0;
+  for (final int it in valores) {
+    soma = soma + it;
+  }
+  return soma;
+}
+
+int contaOcorrencias(List<bool> valores) {
+  int total = 0;
+  for (int i = 0; i < valores.length; i = i + 1) {
+    if (valores[i]) {
+      total = total + 1;
+    }
+  }
+  return total;
+}
+
+int ultimoElementoReverso(List<int> valores) {
+  int ultimo = 0;
+  for (final int it in valores.reversed) {
+    ultimo = it;
+    break;
+  }
+  return ultimo;
+}
+
+int valorOuPadrao(Map<String, int> mapa, String chave, int padrao) {
+  int? it = mapa[chave];
+  if (it != null) {
+    return it;
+  }
+  return padrao;
+}
