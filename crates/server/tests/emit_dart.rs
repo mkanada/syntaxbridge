@@ -1256,8 +1256,8 @@ fn a_null_check_conjunct_promotes_the_rest_of_the_and_chain_and_the_then_branch(
         op: BinaryOp::And,
         lhs: Box::new(Expr::Binary {
             op: BinaryOp::Ne,
-            lhs: Box::new(nullable_ref("chord", 4)),
-            rhs: Box::new(Expr::NullLiteral { origin: origin(4) }),
+            lhs: Box::new(Expr::NullLiteral { origin: origin(4) }),
+            rhs: Box::new(nullable_ref("chord", 4)),
             ty: Type::Bool,
             origin: origin(4),
         }),
@@ -1308,8 +1308,8 @@ fn a_null_check_conjunct_promotes_the_rest_of_the_and_chain_and_the_then_branch(
     let source = &files["lib/aritmetica.dart"];
 
     assert!(
-        source.contains("if (chord != null && chord.HasNotes())"),
-        "expected the second conjunct's '!' to be dropped once `chord != null` already proved it, got:\n{source}"
+        source.contains("if (null != chord && chord.HasNotes())"),
+        "expected the second conjunct's '!' to be dropped once `null != chord` already proved it, got:\n{source}"
     );
     assert!(
         source.contains("chord.OtherThing();"),
