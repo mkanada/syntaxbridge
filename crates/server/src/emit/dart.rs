@@ -51,6 +51,7 @@ const INDEX_OF_BYTE_HELPER_NAME: &str = "syntaxBridgeIndexOfByte";
 /// the same "named bridge, not an erased type" answer `SyntaxBridgePair`
 /// already gives `std::pair`.
 pub const LIST_CURSOR_TYPE_NAME: &str = "SyntaxBridgeListCursor";
+pub const BYTE_CURSOR_TYPE_NAME: &str = "SyntaxBridgeByteCursor";
 pub const OUTPUT_STREAM_TYPE_NAME: &str = "SyntaxBridgeOutputStream";
 pub const OUTPUT_STREAM_STRING_TYPE_NAME: &str = "SyntaxBridgeStringOutputStream";
 pub const OUTPUT_STREAM_STDOUT_TYPE_NAME: &str = "SyntaxBridgeStdoutStream";
@@ -252,6 +253,9 @@ pub fn emit_module_with_externals(
     let needs_list_cursor_support = files
         .values()
         .any(|source| source.contains(LIST_CURSOR_TYPE_NAME));
+    let needs_byte_cursor_support = files
+        .values()
+        .any(|source| source.contains(BYTE_CURSOR_TYPE_NAME));
     let needs_map_entry_pair_extension = files
         .values()
         .any(|source| source.contains(MAP_ENTRY_MARKER));
@@ -273,13 +277,22 @@ pub fn emit_module_with_externals(
         || needs_native_handle_support
         || needs_first_where_support
         || needs_list_cursor_support
+        || needs_byte_cursor_support
         || needs_map_entry_pair_extension
         || needs_string_byte_index_support
         || needs_stream_support
     {
         let mut support = String::new();
+        let mut header_imports = Vec::new();
         if needs_string_byte_index_support {
-            support.push_str("import 'dart:convert';\n\n");
+            header_imports.push("import 'dart:convert';");
+        }
+        if needs_byte_cursor_support {
+            header_imports.push("import 'dart:typed_data';");
+        }
+        if !header_imports.is_empty() {
+            support.push_str(&header_imports.join("\n"));
+            support.push_str("\n\n");
         }
         if needs_opaque_support {
             support.push_str(&emit_opaque_type());
@@ -308,6 +321,12 @@ pub fn emit_module_with_externals(
             }
             support.push_str(&emit_list_cursor_support());
         }
+        if needs_byte_cursor_support {
+            if !support.is_empty() && !support.ends_with("\n\n") {
+                support.push('\n');
+            }
+            support.push_str(&emit_byte_cursor_support());
+        }
         if needs_map_entry_pair_extension {
             if !support.is_empty() && !support.ends_with("\n\n") {
                 support.push('\n');
@@ -328,6 +347,7 @@ pub fn emit_module_with_externals(
         }
         files.insert(format!("lib/{SUPPORT_FILE_NAME}"), support);
     }
+
     files
 }
 
@@ -616,6 +636,7 @@ fn emit_file(
         || source.contains(NATIVE_HANDLE_TYPE_NAME)
         || source.contains(FIRST_WHERE_HELPER_NAME)
         || source.contains(LIST_CURSOR_TYPE_NAME)
+        || source.contains(BYTE_CURSOR_TYPE_NAME)
         || source.contains(MAP_ENTRY_MARKER)
         || source.contains(INDEX_OF_BYTES_HELPER_NAME)
         || source.contains(INDEX_OF_BYTE_HELPER_NAME)
@@ -782,6 +803,56 @@ fn emit_list_cursor_support() -> String {
          {INDENT}bool operator >({LIST_CURSOR_TYPE_NAME}<T> other) => _index > other._index;\n\
          {INDENT}bool operator >=({LIST_CURSOR_TYPE_NAME}<T> other) => _index >= other._index;\n\n\
          {INDENT}T operator [](int offset) => _items[_index + offset];\n\
+         {INDENT}void operator []=(int offset, T value) {{\n\
+         {INDENT}{INDENT}_items[_index + offset] = value;\n\
+         {INDENT}}}\n\
+         {INDENT}T get value => _items[_index];\n\
+         {INDENT}set value(T v) {{\n\
+         {INDENT}{INDENT}_items[_index] = v;\n\
+         {INDENT}}}\n\
+         }}\n"
+    )
+}
+
+/// `lower::cpp::Type::ByteCursor`'s Dart shape: a cursor over a `Uint8List`
+/// (`[]`, `[]=`, `value`, pointer arithmetic `+`/`-`, comparisons).
+fn emit_byte_cursor_support() -> String {
+    format!(
+        "final class {BYTE_CURSOR_TYPE_NAME} {{\n\
+         {INDENT}{BYTE_CURSOR_TYPE_NAME}(this._bytes, [this._offset = 0]);\n\n\
+         {INDENT}final Uint8List _bytes;\n\
+         {INDENT}int _offset;\n\n\
+         {INDENT}int operator [](int i) => _bytes[_offset + i];\n\
+         {INDENT}void operator []=(int i, int v) {{\n\
+         {INDENT}{INDENT}_bytes[_offset + i] = v;\n\
+         {INDENT}}}\n\
+         {INDENT}int get value => _bytes[_offset];\n\
+         {INDENT}set value(int v) {{\n\
+         {INDENT}{INDENT}_bytes[_offset] = v;\n\
+         {INDENT}}}\n\n\
+         {INDENT}{BYTE_CURSOR_TYPE_NAME} operator +(int n) =>\n\
+         {INDENT}{INDENT}{BYTE_CURSOR_TYPE_NAME}(_bytes, _offset + n);\n\n\
+         {INDENT}Object operator -(Object other) {{\n\
+         {INDENT}{INDENT}if (other is int) {{\n\
+         {INDENT}{INDENT}{INDENT}return {BYTE_CURSOR_TYPE_NAME}(_bytes, _offset - other);\n\
+         {INDENT}{INDENT}}}\n\
+         {INDENT}{INDENT}if (other is {BYTE_CURSOR_TYPE_NAME}) {{\n\
+         {INDENT}{INDENT}{INDENT}return _offset - other._offset;\n\
+         {INDENT}{INDENT}}}\n\
+         {INDENT}{INDENT}throw ArgumentError('Invalid operand for -: $other');\n\
+         {INDENT}}}\n\n\
+         {INDENT}int distanceTo({BYTE_CURSOR_TYPE_NAME} other) => other._offset - _offset;\n\n\
+         {INDENT}bool operator <({BYTE_CURSOR_TYPE_NAME} other) => _offset < other._offset;\n\
+         {INDENT}bool operator <=({BYTE_CURSOR_TYPE_NAME} other) => _offset <= other._offset;\n\
+         {INDENT}bool operator >({BYTE_CURSOR_TYPE_NAME} other) => _offset > other._offset;\n\
+         {INDENT}bool operator >=({BYTE_CURSOR_TYPE_NAME} other) => _offset >= other._offset;\n\n\
+         {INDENT}@override\n\
+         {INDENT}bool operator ==(Object other) =>\n\
+         {INDENT}{INDENT}other is {BYTE_CURSOR_TYPE_NAME} &&\n\
+         {INDENT}{INDENT}identical(_bytes, other._bytes) &&\n\
+         {INDENT}{INDENT}_offset == other._offset;\n\n\
+         {INDENT}@override\n\
+         {INDENT}int get hashCode => Object.hash(identityHashCode(_bytes), _offset);\n\
          }}\n"
     )
 }
@@ -1006,6 +1077,7 @@ fn collect_referenced_usrs_in_type<'a>(ty: &'a Type, out: &mut HashSet<&'a str>)
         | Type::Void
         | Type::Str
         | Type::Bytes
+        | Type::ByteCursor
         | Type::Object
         | Type::Unsupported(_) => {}
     }
@@ -1153,6 +1225,7 @@ fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str
         | Expr::NullLiteral { .. }
         | Expr::StringLiteral { .. }
         | Expr::Unsupported { .. } => {}
+        Expr::NamedArg { value, .. } => collect_referenced_usrs_in_expr(value, out),
         Expr::UnsupportedTyped { ty, .. } => collect_referenced_usrs_in_type(ty, out),
         Expr::Ref { ty, .. } | Expr::This { ty, .. } => collect_referenced_usrs_in_type(ty, out),
         Expr::Binary { lhs, rhs, ty, .. } => {
@@ -1648,6 +1721,7 @@ fn field_default_literal(ty: &Type, enums_by_usr: &HashMap<&str, &Enum>) -> Opti
         Type::Record { .. }
         | Type::Pair(_, _)
         | Type::ListCursor(_)
+        | Type::ByteCursor
         | Type::Callback { .. }
         | Type::Tuple(_)
         | Type::Void
@@ -1812,6 +1886,7 @@ fn expr_contains_this(expr: &Expr) -> bool {
         | Expr::StringLiteral { .. }
         | Expr::Unsupported { .. } => false,
         Expr::UnsupportedTyped { .. } => false,
+        Expr::NamedArg { value, .. } => expr_contains_this(value),
         Expr::Binary { lhs, rhs, .. } => expr_contains_this(lhs) || expr_contains_this(rhs),
         Expr::Conditional {
             condition,
@@ -2903,6 +2978,7 @@ fn expr_unsupported_type_spelling(expr: &Expr) -> Option<&str> {
         | Expr::StringLiteral { .. }
         | Expr::Unsupported { .. } => None,
         Expr::UnsupportedTyped { ty, .. } => unsupported_spelling(ty),
+        Expr::NamedArg { value, .. } => expr_unsupported_type_spelling(value),
         Expr::Ref { ty, .. } => unsupported_spelling(ty),
         Expr::Binary { ty, lhs, rhs, .. } => unsupported_spelling(ty)
             .or_else(|| expr_unsupported_type_spelling(lhs))
@@ -3079,6 +3155,7 @@ fn emit_type(ty: &Type) -> String {
             emit_type(second)
         ),
         Type::ListCursor(element) => format!("{LIST_CURSOR_TYPE_NAME}<{}>", emit_type(element)),
+        Type::ByteCursor => BYTE_CURSOR_TYPE_NAME.to_owned(),
         Type::Callback {
             return_type,
             params,
@@ -3145,7 +3222,11 @@ fn emit_stmt(
             }
             None => {
                 promoted.remove(name);
-                format!("{pad}late {} {name};\n", emit_type(ty))
+                if matches!(ty, Type::Nullable(_)) {
+                    format!("{pad}{} {name};\n", emit_type(ty))
+                } else {
+                    format!("{pad}late {} {name};\n", emit_type(ty))
+                }
             }
         },
         Stmt::Assign { name, value, .. } => {
@@ -4806,6 +4887,10 @@ fn emit_expr(
                 promoted.remove(name);
             }
             format!("({target_text} = {value_text})")
+        }
+        Expr::NamedArg { name, value } => {
+            let value_text = emit_expr(value, used_expr_helper, used_utf8_encode, promoted);
+            format!("{name}: {value_text}")
         }
         Expr::Tuple { values, .. } => format!(
             "({})",

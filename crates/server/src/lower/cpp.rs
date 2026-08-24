@@ -23,11 +23,12 @@
 //! `ir::Expr::Unsupported` rather than being silently dropped or panicking.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::os::raw::c_uint;
 use std::path::Path;
 
-use crate::emit::dart::LIST_CURSOR_TYPE_NAME;
+use crate::emit::dart::{BYTE_CURSOR_TYPE_NAME, LIST_CURSOR_TYPE_NAME};
 use crate::ir;
 use crate::mapping;
 use crate::type_catalog;
@@ -60,6 +61,7 @@ pub fn overload_type_suffix(ty: &ir::Type) -> String {
             overload_type_suffix(second)
         ),
         ir::Type::ListCursor(element) => format!("ListCursor{}", overload_type_suffix(element)),
+        ir::Type::ByteCursor => "ByteCursor".to_owned(),
         ir::Type::Callback {
             return_type,
             params,
@@ -430,6 +432,123 @@ fn pop_active_pointer_out_params(count: usize) {
         let new_len = stack.len().saturating_sub(count);
         stack.truncate(new_len);
     });
+}
+
+// Scoped registry of pointer-as-cursor names (e.g. `SyntaxBridgeByteCursor`)
+// active in the current function or method body — Task 12.
+thread_local! {
+    static ACTIVE_POINTER_CURSORS: RefCell<Vec<(String, ir::Type)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+fn active_pointer_cursor_type(name: &str) -> Option<ir::Type> {
+    ACTIVE_POINTER_CURSORS.with(|stack| {
+        stack
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, ty)| ty.clone())
+    })
+}
+
+fn push_active_pointer_cursor(name: String, ty: ir::Type) {
+    ACTIVE_POINTER_CURSORS.with(|stack| {
+        stack.borrow_mut().push((name, ty));
+    });
+}
+
+fn pop_active_pointer_cursors(count: usize) {
+    ACTIVE_POINTER_CURSORS.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        let new_len = stack.len().saturating_sub(count);
+        stack.truncate(new_len);
+    });
+}
+
+fn active_pointer_cursors_len() -> usize {
+    ACTIVE_POINTER_CURSORS.with(|stack| stack.borrow().len())
+}
+
+unsafe fn scan_cursor_usages(root: clang_sys::CXCursor, out_names: &mut HashSet<String>) {
+    struct VisitorData<'a> {
+        out_names: &'a mut HashSet<String>,
+    }
+
+    extern "C" fn visitor(
+        cursor: clang_sys::CXCursor,
+        parent: clang_sys::CXCursor,
+        client_data: clang_sys::CXClientData,
+    ) -> clang_sys::CXChildVisitResult {
+        let data = unsafe { &mut *(client_data as *mut VisitorData<'_>) };
+        let kind = unsafe { clang_sys::clang_getCursorKind(cursor) };
+        if kind == clang_sys::CXCursor_DeclRefExpr {
+            let referenced = unsafe { clang_sys::clang_getCursorReferenced(cursor) };
+            let ref_kind = unsafe { clang_sys::clang_getCursorKind(referenced) };
+            if ref_kind == clang_sys::CXCursor_VarDecl || ref_kind == clang_sys::CXCursor_ParmDecl {
+                let ref_type = unsafe { clang_sys::clang_getCursorType(referenced) };
+                if ref_type.kind == clang_sys::CXType_Pointer {
+                    let parent_kind = unsafe { clang_sys::clang_getCursorKind(parent) };
+                    let is_cursor_use = match parent_kind {
+                        clang_sys::CXCursor_UnaryOperator => {
+                            let op = unsafe { clang_sys::clang_getCursorUnaryOperatorKind(parent) };
+                            matches!(
+                                op,
+                                clang_sys::CXUnaryOperator_PostInc
+                                    | clang_sys::CXUnaryOperator_PreInc
+                                    | clang_sys::CXUnaryOperator_PostDec
+                                    | clang_sys::CXUnaryOperator_PreDec
+                            )
+                        }
+                        clang_sys::CXCursor_BinaryOperator
+                        | clang_sys::CXCursor_CompoundAssignOperator => {
+                            let op =
+                                unsafe { clang_sys::clang_getCursorBinaryOperatorKind(parent) };
+                            matches!(
+                                op,
+                                clang_sys::CXBinaryOperator_Add
+                                    | clang_sys::CXBinaryOperator_Sub
+                                    | clang_sys::CXBinaryOperator_AddAssign
+                                    | clang_sys::CXBinaryOperator_SubAssign
+                                    | clang_sys::CXBinaryOperator_LT
+                                    | clang_sys::CXBinaryOperator_LE
+                                    | clang_sys::CXBinaryOperator_GT
+                                    | clang_sys::CXBinaryOperator_GE
+                            )
+                        }
+                        clang_sys::CXCursor_ArraySubscriptExpr => {
+                            let children = unsafe { collect_children(parent) };
+                            children.first().is_some_and(|c| unsafe {
+                                clang_sys::clang_equalCursors(
+                                    unwrap_transparent_value_cursor(*c),
+                                    cursor,
+                                ) != 0
+                            })
+                        }
+                        _ => false,
+                    };
+                    if is_cursor_use {
+                        let name = dart_safe_identifier(&unsafe {
+                            type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(
+                                referenced,
+                            ))
+                        });
+                        data.out_names.insert(name);
+                    }
+                }
+            }
+        }
+        clang_sys::CXChildVisit_Recurse
+    }
+
+    let mut data = VisitorData { out_names };
+    unsafe {
+        clang_sys::clang_visitChildren(
+            root,
+            visitor,
+            &mut data as *mut VisitorData<'_> as clang_sys::CXClientData,
+        );
+    }
 }
 
 // The `usr` of the record whose method/constructor/destructor body is
@@ -1119,10 +1238,29 @@ pub fn lower_function(
     let body_cursor = unsafe { find_compound_stmt_child(cursor) };
     let pointer_out_params = unsafe { pointer_out_param_bindings(cursor) };
     push_active_pointer_out_params(&pointer_out_params);
+    let start_cursor_depth = active_pointer_cursors_len();
+    let mut cursor_names = HashSet::new();
+    if body_cursor.is_some() {
+        unsafe { scan_cursor_usages(cursor, &mut cursor_names) };
+    }
+    for param in &mut params {
+        let is_byte_buf = match &param.ty {
+            ir::Type::Bytes => true,
+            ir::Type::Nullable(inner) => **inner == ir::Type::Bytes,
+            _ => false,
+        };
+        if cursor_names.contains(&param.name) && is_byte_buf {
+            param.ty = ir::Type::ByteCursor;
+            push_active_pointer_cursor(param.name.clone(), ir::Type::ByteCursor);
+        }
+    }
+
     let mut body = match body_cursor {
         Some(compound) => unsafe { lower_compound_stmt(compound, project_root) },
         None => Vec::new(),
     };
+    pop_active_pointer_cursors(active_pointer_cursors_len().saturating_sub(start_cursor_depth));
+
     pop_active_pointer_out_params(pointer_out_params.len());
     body.splice(0..0, clone_prelude);
     neutralize_out_param_call_input_locals(&mut body);
@@ -1438,6 +1576,11 @@ pub const INPUT_STREAM_TYPE_NAME: &str = "SyntaxBridgeInputStream";
 pub const INPUT_STREAM_STRING_TYPE_NAME: &str = "SyntaxBridgeStringInputStream";
 pub const INPUT_STREAM_FILE_TYPE_NAME: &str = "SyntaxBridgeFileInputStream";
 
+pub const REGEX_USR: &str = "syntax-bridge:regex";
+pub const REGEX_TYPE_NAME: &str = "RegExp";
+pub const REGEX_MATCH_USR: &str = "syntax-bridge:regex-match";
+pub const REGEX_MATCH_TYPE_NAME: &str = "RegExpMatch";
+
 pub fn lower_method(
     cursor: clang_sys::CXCursor,
     usr: &str,
@@ -1510,10 +1653,29 @@ pub fn lower_method(
         let owner_usr =
             unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(owner)) };
         push_active_method_owner_usr(owner_usr);
+        let start_cursor_depth = active_pointer_cursors_len();
+        let mut cursor_names = HashSet::new();
+        if body_cursor.is_some() {
+            unsafe { scan_cursor_usages(cursor, &mut cursor_names) };
+        }
+        for param in &mut params {
+            let is_byte_buf = match &param.ty {
+                ir::Type::Bytes => true,
+                ir::Type::Nullable(inner) => **inner == ir::Type::Bytes,
+                _ => false,
+            };
+            if cursor_names.contains(&param.name) && is_byte_buf {
+                param.ty = ir::Type::ByteCursor;
+                push_active_pointer_cursor(param.name.clone(), ir::Type::ByteCursor);
+            }
+        }
+
         let mut body = match body_cursor {
             Some(compound) => unsafe { lower_compound_stmt(compound, project_root) },
             None => Vec::new(),
         };
+        pop_active_pointer_cursors(active_pointer_cursors_len().saturating_sub(start_cursor_depth));
+
         pop_active_method_owner_usr();
         pop_active_pointer_out_params(pointer_out_params.len());
         body.splice(0..0, clone_prelude);
@@ -2629,7 +2791,11 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
         // origin instead, which is exactly as much identity as
         // `possible_pointee_types` needs to report "just this one, no
         // subclasses to find" for them.
-        let shape = match &pointee_ty {
+        let unflattened_pointee = match &pointee_ty {
+            ir::Type::Nullable(inner) => inner.as_ref(),
+            other => other,
+        };
+        let shape = match unflattened_pointee {
             ir::Type::Record { usr, name } | ir::Type::Enum { usr, name } => {
                 mapping::PointeeShape::Known {
                     usr: usr.clone(),
@@ -2747,6 +2913,18 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
         // `Unexposed` sharing, unlike `Record`).
         clang_sys::CXType_Enum => {
             let decl = unsafe { clang_sys::clang_getTypeDeclaration(cx_type) };
+            let decl_spelling = unsafe {
+                type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(decl))
+            };
+            if decl_spelling == "syntax_option_type"
+                || decl_spelling == "_Syntax_option_type"
+                || decl_spelling == "match_flag_type"
+                || decl_spelling == "_Match_flag_type"
+                || decl_spelling.ends_with("syntax_option_type")
+                || decl_spelling.ends_with("match_flag_type")
+            {
+                return ir::Type::Int;
+            }
             let usr =
                 unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(decl)) };
             let name = unsafe { dart_enum_type_name(decl) };
@@ -2928,6 +3106,45 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
                     return ir::Type::ListCursor(Box::new(element));
                 }
                 Some("basic_string") => return ir::Type::Str,
+                Some("basic_regex") => {
+                    let char_ty =
+                        if unsafe { clang_sys::clang_Type_getNumTemplateArguments(cx_type) } >= 1 {
+                            lower_type(unsafe {
+                                clang_sys::clang_Type_getTemplateArgumentAsType(cx_type, 0)
+                            })
+                        } else {
+                            ir::Type::Int
+                        };
+                    if char_ty != ir::Type::Int {
+                        let spelling = unsafe {
+                            type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(
+                                cx_type,
+                            ))
+                        };
+                        return ir::Type::Unsupported(format!(
+                            "basic_regex character type (spelling: {spelling})"
+                        ));
+                    }
+                    return ir::Type::Record {
+                        usr: REGEX_USR.to_owned(),
+                        name: REGEX_TYPE_NAME.to_owned(),
+                    };
+                }
+                Some("match_results") => {
+                    return ir::Type::Nullable(Box::new(ir::Type::Record {
+                        usr: REGEX_MATCH_USR.to_owned(),
+                        name: REGEX_MATCH_TYPE_NAME.to_owned(),
+                    }));
+                }
+                Some("sub_match") => {
+                    return ir::Type::Nullable(Box::new(ir::Type::Str));
+                }
+                Some("regex_iterator") => {
+                    return ir::Type::List(Box::new(ir::Type::Record {
+                        usr: REGEX_MATCH_USR.to_owned(),
+                        name: REGEX_MATCH_TYPE_NAME.to_owned(),
+                    }));
+                }
                 Some("basic_ostream") | Some("basic_iostream") | Some("basic_ios") => {
                     return ir::Type::Record {
                         usr: OUTPUT_STREAM_USR.to_owned(),
@@ -3297,7 +3514,7 @@ fn is_known_byte_buffer_type(spelling: &str) -> bool {
             .unwrap_or(spelling.trim())
             .trim_end_matches(" const")
             .trim(),
-        "uint8_t" | "std::uint8_t" | "mz_uint8"
+        "uint8_t" | "std::uint8_t" | "mz_uint8" | "unsigned char" | "uint8"
     )
 }
 
@@ -6044,7 +6261,15 @@ unsafe fn lower_one_var_decl(
     // body resolves through the same function (`qualified_static_member_name`
     // → `dart_member_name`'s public branch), so the two can never disagree.
     let cx_type = unsafe { clang_sys::clang_getCursorType(*var_decl_cursor) };
-    let ty = lower_type(cx_type);
+    let mut ty = lower_type(cx_type);
+    if cx_type.kind == clang_sys::CXType_Pointer {
+        let pointee = unsafe { clang_sys::clang_getPointeeType(cx_type) };
+        let pointee_spelling =
+            unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(pointee)) };
+        if is_known_byte_buffer_type(&pointee_spelling) {
+            ty = ir::Type::ByteCursor;
+        }
+    }
     // F15/tarefa 15.8: `struct tm tm;` (real trigger: `zip_file.dart:1390`)
     // keeps `tm` the type and `tm` the local in separate C++ namespaces —
     // Dart has one shared namespace, so the local shadows the type the
@@ -6060,6 +6285,9 @@ unsafe fn lower_one_var_decl(
         }),
         &ty,
     );
+    if ty == ir::Type::ByteCursor {
+        push_active_pointer_cursor(name.clone(), ty.clone());
+    }
 
     // A record-typed `VarDecl` always has at least one child that isn't a
     // real initializer: `libclang` emits a leading `TypeRef` (pointing at
@@ -6136,7 +6364,30 @@ unsafe fn lower_one_var_decl(
             )
             .then(|| default_scalar_value(&ty, &origin))
         }),
-        [only_child] => Some(unsafe { lower_expr(*only_child, project_root) }),
+        [only_child] => {
+            let mut expr = unsafe { lower_expr(*only_child, project_root) };
+            if ty == ir::Type::ByteCursor && expr.ty() != Some(&ir::Type::ByteCursor) {
+                if matches!(expr.ty(), Some(ir::Type::Nullable(_))) {
+                    expr = ir::Expr::Convert {
+                        operand: Box::new(expr),
+                        ty: ir::Type::Bytes,
+                        origin: origin.clone(),
+                    };
+                }
+                expr = ir::Expr::Call {
+                    base_qualifier: None,
+                    target: None,
+                    callee_usr: String::new(),
+                    callee_name: BYTE_CURSOR_TYPE_NAME.to_owned(),
+                    args: vec![expr],
+                    ty: ir::Type::ByteCursor,
+                    origin: origin.clone(),
+                };
+            }
+
+            Some(expr)
+        }
+
         _ => Some(ir::Expr::UnsupportedTyped {
             reason: format!(
                 "VarDecl had {} initializer-shaped children, expected at most 1",
@@ -6307,6 +6558,7 @@ fn default_scalar_value(ty: &ir::Type, origin: &ir::Origin) -> ir::Expr {
         | ir::Type::Enum { .. }
         | ir::Type::Pair(_, _)
         | ir::Type::ListCursor(_)
+        | ir::Type::ByteCursor
         | ir::Type::Callback { .. }
         | ir::Type::Tuple(_)
         | ir::Type::Void
@@ -6345,6 +6597,28 @@ unsafe fn lower_assign_stmt(
         let name = unsafe {
             qualified_static_member_name(clang_sys::clang_getCursorReferenced(*lhs_cursor))
         };
+        let mut value = value;
+        if let Some(ir::Type::ByteCursor) = active_pointer_cursor_type(&name)
+            && value.ty() != Some(&ir::Type::ByteCursor)
+        {
+            if matches!(value.ty(), Some(ir::Type::Nullable(_))) {
+                value = ir::Expr::Convert {
+                    operand: Box::new(value),
+                    ty: ir::Type::Bytes,
+                    origin: origin.clone(),
+                };
+            }
+            value = ir::Expr::Call {
+                base_qualifier: None,
+                target: None,
+                callee_usr: String::new(),
+                callee_name: BYTE_CURSOR_TYPE_NAME.to_owned(),
+                args: vec![value],
+                ty: ir::Type::ByteCursor,
+                origin: origin.clone(),
+            };
+        }
+
         return ir::Stmt::Assign {
             name,
             value,
@@ -6379,6 +6653,14 @@ unsafe fn lower_assign_stmt(
             origin,
         };
     }
+    if let ir::Expr::FieldAccess { target, field, .. } = target {
+        return ir::Stmt::FieldAssign {
+            target: *target,
+            field,
+            value,
+            origin,
+        };
+    }
     // `*out = value` where `out` is a pointer-shaped out-param (round 19):
     // `lhs_kind` here is `CXCursor_UnaryOperator` (a dereference), not
     // `CXCursor_DeclRefExpr`, so the plain-variable branch above never
@@ -6393,6 +6675,7 @@ unsafe fn lower_assign_stmt(
             origin,
         };
     }
+
     ir::Stmt::Unsupported {
         reason: "assignment target is not a simple local variable or a field \
                   (index assignment not supported yet)"
@@ -7102,7 +7385,11 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
             };
         }
         let name = unsafe { qualified_static_member_name(referenced) };
-        let ty = lower_type(unsafe { clang_sys::clang_getCursorType(cursor) });
+        let ty = if let Some(cursor_ty) = active_pointer_cursor_type(&name) {
+            cursor_ty
+        } else {
+            lower_type(unsafe { clang_sys::clang_getCursorType(cursor) })
+        };
         return ir::Expr::Ref { name, ty, origin };
     }
 
@@ -7555,10 +7842,17 @@ unsafe fn lower_array_subscript_expr(
     let target_kind = unsafe { clang_sys::clang_getCursorKind(target_value_cursor) };
     let target = if target_kind == clang_sys::CXCursor_DeclRefExpr {
         let referenced = unsafe { clang_sys::clang_getCursorReferenced(target_value_cursor) };
-        let declared_type = lower_type(unsafe { clang_sys::clang_getCursorType(referenced) });
-        if matches!(declared_type, ir::Type::List(_) | ir::Type::Bytes) {
+        let mut declared_type = lower_type(unsafe { clang_sys::clang_getCursorType(referenced) });
+        let ref_name = unsafe { qualified_static_member_name(referenced) };
+        if let Some(cursor_ty) = active_pointer_cursor_type(&ref_name) {
+            declared_type = cursor_ty;
+        }
+        if matches!(
+            declared_type,
+            ir::Type::List(_) | ir::Type::Bytes | ir::Type::ByteCursor | ir::Type::ListCursor(_)
+        ) {
             ir::Expr::Ref {
-                name: unsafe { qualified_static_member_name(referenced) },
+                name: ref_name,
                 ty: declared_type,
                 origin: stmt_origin(target_value_cursor, project_root),
             }
@@ -7575,7 +7869,10 @@ unsafe fn lower_array_subscript_expr(
         // recovered directly instead, same as the `DeclRefExpr` case.
         let referenced = unsafe { clang_sys::clang_getCursorReferenced(target_value_cursor) };
         let declared_type = lower_type(unsafe { clang_sys::clang_getCursorType(referenced) });
-        if matches!(declared_type, ir::Type::List(_) | ir::Type::Bytes) {
+        if matches!(
+            declared_type,
+            ir::Type::List(_) | ir::Type::Bytes | ir::Type::ByteCursor | ir::Type::ListCursor(_)
+        ) {
             ir::Expr::FieldAccess {
                 target: Box::new(unsafe {
                     member_ref_receiver(target_value_cursor, project_root, &origin)
@@ -7612,16 +7909,35 @@ unsafe fn lower_array_subscript_expr(
     // is the inner `List<T>`'s own element type — one level removed from
     // the field's declared `List<List<T>>`, but still `List`/`Bytes` and
     // just as indexable.
+    let target_ty = target.ty().cloned();
     let is_indexable = matches!(
+        target_ty.as_ref(),
+        Some(
+            ir::Type::List(_)
+                | ir::Type::Bytes
+                | ir::Type::ByteCursor
+                | ir::Type::ListCursor(_)
+                | ir::Type::Nullable(_)
+        )
+    ) || matches!(
         target,
         ir::Expr::Ref {
-            ty: ir::Type::List(_) | ir::Type::Bytes,
+            ty: ir::Type::List(_)
+                | ir::Type::Bytes
+                | ir::Type::ByteCursor
+                | ir::Type::ListCursor(_),
             ..
         } | ir::Expr::FieldAccess {
-            ty: ir::Type::List(_) | ir::Type::Bytes,
+            ty: ir::Type::List(_)
+                | ir::Type::Bytes
+                | ir::Type::ByteCursor
+                | ir::Type::ListCursor(_),
             ..
         } | ir::Expr::Index {
-            ty: ir::Type::List(_) | ir::Type::Bytes,
+            ty: ir::Type::List(_)
+                | ir::Type::Bytes
+                | ir::Type::ByteCursor
+                | ir::Type::ListCursor(_),
             ..
         }
     );
@@ -7632,6 +7948,20 @@ unsafe fn lower_array_subscript_expr(
             origin,
         };
     }
+
+    let target = if matches!(target_ty.as_ref(), Some(ir::Type::Nullable(box_type)) if matches!(box_type.as_ref(), ir::Type::Bytes | ir::Type::ByteCursor | ir::Type::ListCursor(_) | ir::Type::List(_)))
+    {
+        ir::Expr::Convert {
+            operand: Box::new(target),
+            ty: match target_ty.unwrap() {
+                ir::Type::Nullable(inner) => *inner,
+                other => other,
+            },
+            origin: origin.clone(),
+        }
+    } else {
+        target
+    };
 
     ir::Expr::Index {
         target: Box::new(target),
@@ -7884,7 +8214,80 @@ unsafe fn lower_binary_expr(
 
     let lhs = unsafe { lower_binary_operand(*lhs_cursor, project_root) };
     let rhs = unsafe { lower_binary_operand(*rhs_cursor, project_root) };
-    let ty = lower_type(unsafe { clang_sys::clang_getCursorType(cursor) });
+    let lhs_ty = lhs.ty();
+    let rhs_ty = rhs.ty();
+    let is_lhs_cursor = matches!(lhs_ty.as_ref(), Some(ir::Type::ByteCursor));
+    let is_rhs_cursor = matches!(rhs_ty.as_ref(), Some(ir::Type::ByteCursor));
+    let is_lhs_list_cursor = matches!(lhs_ty.as_ref(), Some(ir::Type::ListCursor(_)));
+    let is_rhs_list_cursor = matches!(rhs_ty.as_ref(), Some(ir::Type::ListCursor(_)));
+
+    let ty = if op == ir::BinaryOp::Add {
+        if is_lhs_cursor || is_rhs_cursor {
+            ir::Type::ByteCursor
+        } else if is_lhs_list_cursor {
+            lhs_ty.cloned().unwrap()
+        } else if is_rhs_list_cursor {
+            rhs_ty.cloned().unwrap()
+        } else {
+            lower_type(unsafe { clang_sys::clang_getCursorType(cursor) })
+        }
+    } else if op == ir::BinaryOp::Sub {
+        if is_lhs_cursor && is_rhs_cursor {
+            ir::Type::Int
+        } else if is_lhs_cursor {
+            ir::Type::ByteCursor
+        } else if is_lhs_list_cursor && is_rhs_list_cursor {
+            ir::Type::Int
+        } else if is_lhs_list_cursor {
+            lhs_ty.cloned().unwrap()
+        } else {
+            lower_type(unsafe { clang_sys::clang_getCursorType(cursor) })
+        }
+    } else if matches!(
+        op,
+        ir::BinaryOp::Eq
+            | ir::BinaryOp::Ne
+            | ir::BinaryOp::Lt
+            | ir::BinaryOp::Le
+            | ir::BinaryOp::Gt
+            | ir::BinaryOp::Ge
+    ) {
+        ir::Type::Bool
+    } else {
+        lower_type(unsafe { clang_sys::clang_getCursorType(cursor) })
+    };
+
+    let (lhs, rhs) = if matches!(
+        op,
+        ir::BinaryOp::Lt | ir::BinaryOp::Le | ir::BinaryOp::Gt | ir::BinaryOp::Ge
+    ) && matches!(
+        lhs_ty.as_ref(),
+        Some(ir::Type::Nullable(inner)) if matches!(inner.as_ref(), ir::Type::Record { .. })
+    ) {
+        (
+            ir::Expr::Call {
+                base_qualifier: None,
+                target: None,
+                callee_usr: String::new(),
+                callee_name: "identityHashCode".to_owned(),
+                args: vec![lhs],
+                ty: ir::Type::Int,
+                origin: origin.clone(),
+            },
+            ir::Expr::Call {
+                base_qualifier: None,
+                target: None,
+                callee_usr: String::new(),
+                callee_name: "identityHashCode".to_owned(),
+                args: vec![rhs],
+                ty: ir::Type::Int,
+                origin: origin.clone(),
+            },
+        )
+    } else {
+        (lhs, rhs)
+    };
+
     ir::Expr::Binary {
         op,
         lhs: Box::new(lhs),
@@ -7966,6 +8369,74 @@ unsafe fn lower_unary_expr(
         let operand = unsafe { lower_expr(*operand_cursor, project_root) };
         let ty = lower_type(unsafe { clang_sys::clang_getCursorType(cursor) });
         let operand_ty = lower_type(unsafe { clang_sys::clang_getCursorType(*operand_cursor) });
+
+        if operator_kind == clang_sys::CXUnaryOperator_Deref {
+            let op_ty = operand.ty().cloned();
+            if matches!(op_ty.as_ref(), Some(ir::Type::ByteCursor))
+                || operand_ty == ir::Type::ByteCursor
+            {
+                return ir::Expr::FieldAccess {
+                    target: Box::new(operand),
+                    field: "value".to_owned(),
+                    ty: ir::Type::Int,
+                    origin,
+                };
+            }
+            if let Some(ir::Type::ListCursor(inner)) = op_ty {
+                return ir::Expr::FieldAccess {
+                    target: Box::new(operand),
+                    field: "value".to_owned(),
+                    ty: *inner,
+                    origin,
+                };
+            }
+
+            if matches!(operand.ty(), Some(ir::Type::Bytes)) {
+                return ir::Expr::Index {
+                    target: Box::new(operand),
+                    index: Box::new(ir::Expr::IntLiteral {
+                        value: 0,
+                        origin: origin.clone(),
+                    }),
+                    ty: ir::Type::Int,
+                    origin,
+                };
+            }
+        }
+
+        if operator_kind == clang_sys::CXUnaryOperator_AddrOf {
+            let unwrapped_op = unsafe { unwrap_transparent_value_cursor(*operand_cursor) };
+            if unsafe { clang_sys::clang_getCursorKind(unwrapped_op) }
+                == clang_sys::CXCursor_ArraySubscriptExpr
+            {
+                let sub_children = unsafe { collect_children(unwrapped_op) };
+                if let [base_cur, idx_cur] = sub_children.as_slice() {
+                    let base = unsafe { lower_expr(*base_cur, project_root) };
+                    let idx = unsafe { lower_expr(*idx_cur, project_root) };
+                    let base_ty = base.ty();
+                    if matches!(
+                        base_ty.as_ref(),
+                        Some(
+                            ir::Type::Bytes
+                                | ir::Type::List(_)
+                                | ir::Type::ByteCursor
+                                | ir::Type::ListCursor(_)
+                        )
+                    ) {
+                        return ir::Expr::Call {
+                            base_qualifier: None,
+                            target: None,
+                            callee_usr: String::new(),
+                            callee_name: BYTE_CURSOR_TYPE_NAME.to_owned(),
+                            args: vec![base, idx],
+                            ty: ir::Type::ByteCursor,
+                            origin,
+                        };
+                    }
+                }
+            }
+        }
+
         let represented_address = operator_kind == clang_sys::CXUnaryOperator_AddrOf
             && matches!(ty, ir::Type::Nullable(_));
         let represented_dereference = operator_kind == clang_sys::CXUnaryOperator_Deref
@@ -8039,12 +8510,89 @@ unsafe fn lower_unary_expr(
     } else {
         operand
     };
-    let ty = lower_type(unsafe { clang_sys::clang_getCursorType(cursor) });
+    let ty = if matches!(operand.ty(), Some(ir::Type::ByteCursor)) {
+        ir::Type::ByteCursor
+    } else if let Some(ir::Type::ListCursor(inner)) = operand.ty() {
+        ir::Type::ListCursor(inner.clone())
+    } else {
+        lower_type(unsafe { clang_sys::clang_getCursorType(cursor) })
+    };
+
     ir::Expr::Unary {
         op,
         operand: Box::new(operand),
         ty,
         origin,
+    }
+}
+
+enum RegexFlagResult {
+    Flags {
+        case_sensitive: bool,
+        multi_line: bool,
+    },
+    Unsupported(String),
+}
+
+unsafe fn parse_regex_syntax_flags(cursor: clang_sys::CXCursor) -> RegexFlagResult {
+    let mut names = Vec::new();
+    unsafe { collect_flag_names(cursor, &mut names) };
+
+    let mut case_sensitive = true;
+    let mut multi_line = false;
+
+    for name in names {
+        match name.as_str() {
+            "icase" => case_sensitive = false,
+            "multiline" => multi_line = true,
+            "ECMAScript" | "0" | "match_default" => {}
+            other => return RegexFlagResult::Unsupported(other.to_owned()),
+        }
+    }
+
+    RegexFlagResult::Flags {
+        case_sensitive,
+        multi_line,
+    }
+}
+
+unsafe fn collect_flag_names(cursor: clang_sys::CXCursor, names: &mut Vec<String>) {
+    let unwrapped = unsafe { unwrap_transparent_value_cursor(cursor) };
+    let kind = unsafe { clang_sys::clang_getCursorKind(unwrapped) };
+
+    if kind == clang_sys::CXCursor_BinaryOperator {
+        let children = unsafe { collect_children(unwrapped) };
+        for child in children {
+            unsafe { collect_flag_names(child, names) };
+        }
+        return;
+    }
+
+    if kind == clang_sys::CXCursor_DeclRefExpr {
+        let referenced = unsafe { clang_sys::clang_getCursorReferenced(unwrapped) };
+        if unsafe { clang_sys::clang_Cursor_isNull(referenced) } == 0 {
+            let spelling = unsafe {
+                type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced))
+            };
+            if !spelling.is_empty() {
+                names.push(spelling);
+                return;
+            }
+        }
+    }
+
+    if kind == clang_sys::CXCursor_IntegerLiteral {
+        let val = unsafe { evaluate_int_eval_result(unwrapped) }.unwrap_or(0);
+        if val != 0 {
+            names.push(val.to_string());
+        }
+        return;
+    }
+
+    let spelling =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(unwrapped)) };
+    if !spelling.is_empty() {
+        names.push(spelling);
     }
 }
 
@@ -8113,7 +8661,10 @@ unsafe fn is_default_construct_of_a_known_adapter_type(cursor: clang_sys::CXCurs
     let owner = unsafe { clang_sys::clang_getCursorSemanticParent(referenced) };
     matches!(
         unsafe { stdlib_template_name(owner) }.as_deref(),
-        Some("basic_string") | Some("basic_stringstream") | Some("basic_ostringstream")
+        Some("basic_string")
+            | Some("basic_stringstream")
+            | Some("basic_ostringstream")
+            | Some("match_results")
     )
 }
 
@@ -8300,6 +8851,85 @@ unsafe fn lower_call_expr(
                 value: String::new(),
                 origin,
             };
+        }
+        if owner_template_name.as_deref() == Some("basic_regex") {
+            let ty = ir::Type::Record {
+                usr: REGEX_USR.to_owned(),
+                name: REGEX_TYPE_NAME.to_owned(),
+            };
+            if arg_count == 0 {
+                return ir::Expr::Call {
+                    base_qualifier: None,
+                    target: None,
+                    callee_usr: String::new(),
+                    callee_name: REGEX_TYPE_NAME.to_owned(),
+                    args: vec![ir::Expr::StringLiteral {
+                        value: String::new(),
+                        origin: origin.clone(),
+                    }],
+                    ty,
+                    origin,
+                };
+            }
+            let pattern_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 0) };
+            let pattern_expr = unsafe { lower_expr(pattern_cursor, project_root) };
+            if arg_count == 1 {
+                return ir::Expr::Call {
+                    base_qualifier: None,
+                    target: None,
+                    callee_usr: String::new(),
+                    callee_name: REGEX_TYPE_NAME.to_owned(),
+                    args: vec![pattern_expr],
+                    ty,
+                    origin,
+                };
+            }
+            let flag_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 1) };
+            match unsafe { parse_regex_syntax_flags(flag_cursor) } {
+                RegexFlagResult::Unsupported(flag) => {
+                    return ir::Expr::UnsupportedTyped {
+                        reason: format!("unsupported regex flag '{flag}'"),
+                        ty,
+                        origin,
+                    };
+                }
+                RegexFlagResult::Flags {
+                    case_sensitive,
+                    multi_line,
+                } => {
+                    let mut args = vec![pattern_expr];
+                    if !case_sensitive {
+                        args.push(ir::Expr::NamedArg {
+                            name: "caseSensitive".to_owned(),
+                            value: Box::new(ir::Expr::BoolLiteral {
+                                value: false,
+                                origin: origin.clone(),
+                            }),
+                        });
+                    }
+                    if multi_line {
+                        args.push(ir::Expr::NamedArg {
+                            name: "multiLine".to_owned(),
+                            value: Box::new(ir::Expr::BoolLiteral {
+                                value: true,
+                                origin: origin.clone(),
+                            }),
+                        });
+                    }
+                    return ir::Expr::Call {
+                        base_qualifier: None,
+                        target: None,
+                        callee_usr: String::new(),
+                        callee_name: REGEX_TYPE_NAME.to_owned(),
+                        args,
+                        ty,
+                        origin,
+                    };
+                }
+            }
+        }
+        if owner_template_name.as_deref() == Some("match_results") {
+            return ir::Expr::NullLiteral { origin };
         }
         // A Dart nullable value directly models an engaged optional. The
         // constructor has no remaining runtime identity after the type
@@ -9449,10 +10079,13 @@ unsafe fn lower_stdlib_method_call(
         };
         let mut target = unsafe { lower_expr(*receiver_cursor, project_root) };
         let target_is_record = match target.ty() {
-            Some(ir::Type::Record { .. }) => true,
-            Some(ir::Type::Nullable(inner))
-                if matches!(inner.as_ref(), ir::Type::Record { .. }) =>
-            {
+            Some(ir::Type::Record { usr, .. }) => {
+                usr != OUTPUT_STREAM_USR
+                    && usr != INPUT_STREAM_USR
+                    && usr != REGEX_USR
+                    && usr != REGEX_MATCH_USR
+            }
+            Some(ir::Type::Nullable(inner)) if matches!(inner.as_ref(), ir::Type::Record { usr, .. } if usr != OUTPUT_STREAM_USR && usr != INPUT_STREAM_USR && usr != REGEX_USR && usr != REGEX_MATCH_USR) => {
                 true
             }
             _ => false,
@@ -9518,6 +10151,17 @@ unsafe fn lower_stdlib_method_call(
                 index: Box::new(index),
                 default_value: Box::new(default_scalar_value(&value_type, origin)),
                 ty: value_type,
+                origin: origin.clone(),
+            });
+        }
+        if template_name == "match_results" {
+            return Some(ir::Expr::Call {
+                base_qualifier: None,
+                target: Some(Box::new(target)),
+                callee_usr: String::new(),
+                callee_name: "group".to_owned(),
+                args: vec![index],
+                ty: ir::Type::Nullable(Box::new(ir::Type::Str)),
                 origin: origin.clone(),
             });
         }
@@ -9664,9 +10308,14 @@ unsafe fn lower_stdlib_method_call(
         }
     };
     let target_is_record = match target.ty() {
-        Some(ir::Type::Record { usr, .. }) => usr != OUTPUT_STREAM_USR && usr != INPUT_STREAM_USR,
+        Some(ir::Type::Record { usr, .. }) => {
+            usr != OUTPUT_STREAM_USR
+                && usr != INPUT_STREAM_USR
+                && usr != REGEX_USR
+                && usr != REGEX_MATCH_USR
+        }
         Some(ir::Type::Nullable(inner)) => {
-            matches!(inner.as_ref(), ir::Type::Record { usr, .. } if usr != OUTPUT_STREAM_USR && usr != INPUT_STREAM_USR)
+            matches!(inner.as_ref(), ir::Type::Record { usr, .. } if usr != OUTPUT_STREAM_USR && usr != INPUT_STREAM_USR && usr != REGEX_USR && usr != REGEX_MATCH_USR)
         }
         _ => false,
     };
@@ -9769,6 +10418,194 @@ unsafe fn lower_stdlib_method_call(
             origin: origin.clone(),
         }),
         ("map", "size") | ("set", "size") => Some(ir::Expr::FieldAccess {
+            target: Box::new(target),
+            field: "length".to_owned(),
+            ty: ir::Type::Int,
+            origin: origin.clone(),
+        }),
+        ("match_results", "size") => Some(ir::Expr::Binary {
+            op: ir::BinaryOp::Add,
+            lhs: Box::new(ir::Expr::FieldAccess {
+                target: Box::new(target),
+                field: "groupCount".to_owned(),
+                ty: ir::Type::Int,
+                origin: origin.clone(),
+            }),
+            rhs: Box::new(ir::Expr::IntLiteral {
+                value: 1,
+                origin: origin.clone(),
+            }),
+            ty: ir::Type::Int,
+            origin: origin.clone(),
+        }),
+        ("match_results", "empty") => Some(ir::Expr::Binary {
+            op: ir::BinaryOp::Eq,
+            lhs: Box::new(target),
+            rhs: Box::new(ir::Expr::NullLiteral {
+                origin: origin.clone(),
+            }),
+            ty: ir::Type::Bool,
+            origin: origin.clone(),
+        }),
+        ("match_results", "ready") => Some(ir::Expr::Binary {
+            op: ir::BinaryOp::Ne,
+            lhs: Box::new(target),
+            rhs: Box::new(ir::Expr::NullLiteral {
+                origin: origin.clone(),
+            }),
+            ty: ir::Type::Bool,
+            origin: origin.clone(),
+        }),
+        ("match_results", "str") => {
+            let args =
+                unsafe { lower_call_arguments(call_cursor, project_root) }.unwrap_or_default();
+            let index_expr = if let Some(arg) = args.into_iter().next() {
+                arg
+            } else {
+                ir::Expr::IntLiteral {
+                    value: 0,
+                    origin: origin.clone(),
+                }
+            };
+            Some(ir::Expr::Call {
+                base_qualifier: None,
+                target: Some(Box::new(target)),
+                callee_usr: String::new(),
+                callee_name: "group".to_owned(),
+                args: vec![index_expr],
+                ty: ir::Type::Nullable(Box::new(ir::Type::Str)),
+                origin: origin.clone(),
+            })
+        }
+        ("match_results", "position") => {
+            let args =
+                unsafe { lower_call_arguments(call_cursor, project_root) }.unwrap_or_default();
+            if args.is_empty()
+                || matches!(args.first(), Some(ir::Expr::IntLiteral { value: 0, .. }))
+            {
+                Some(ir::Expr::FieldAccess {
+                    target: Box::new(target),
+                    field: "start".to_owned(),
+                    ty: ir::Type::Int,
+                    origin: origin.clone(),
+                })
+            } else {
+                Some(ir::Expr::UnsupportedTyped {
+                    reason: "std::match_results::position(n) with n > 0 is not supported"
+                        .to_owned(),
+                    ty: ir::Type::Int,
+                    origin: origin.clone(),
+                })
+            }
+        }
+        ("match_results", "length") => {
+            let args =
+                unsafe { lower_call_arguments(call_cursor, project_root) }.unwrap_or_default();
+            if args.is_empty()
+                || matches!(args.first(), Some(ir::Expr::IntLiteral { value: 0, .. }))
+            {
+                Some(ir::Expr::Binary {
+                    op: ir::BinaryOp::Sub,
+                    lhs: Box::new(ir::Expr::FieldAccess {
+                        target: Box::new(target.clone()),
+                        field: "end".to_owned(),
+                        ty: ir::Type::Int,
+                        origin: origin.clone(),
+                    }),
+                    rhs: Box::new(ir::Expr::FieldAccess {
+                        target: Box::new(target),
+                        field: "start".to_owned(),
+                        ty: ir::Type::Int,
+                        origin: origin.clone(),
+                    }),
+                    ty: ir::Type::Int,
+                    origin: origin.clone(),
+                })
+            } else {
+                Some(ir::Expr::UnsupportedTyped {
+                    reason: "std::match_results::length(n) with n > 0 is not supported".to_owned(),
+                    ty: ir::Type::Int,
+                    origin: origin.clone(),
+                })
+            }
+        }
+        ("basic_regex", "assign") => {
+            let num_args = unsafe { clang_sys::clang_Cursor_getNumArguments(call_cursor) };
+            if num_args == 0 {
+                return Some(ir::Expr::UnsupportedTyped {
+                    reason: "std::basic_regex::assign requires at least 1 argument".to_owned(),
+                    ty: ir::Type::Record {
+                        usr: REGEX_USR.to_owned(),
+                        name: REGEX_TYPE_NAME.to_owned(),
+                    },
+                    origin: origin.clone(),
+                });
+            }
+            let pattern_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
+            let pattern_expr = unsafe { lower_expr(pattern_cursor, project_root) };
+            let mut call_args = vec![pattern_expr];
+            if num_args >= 2 {
+                let flag_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 1) };
+                match unsafe { parse_regex_syntax_flags(flag_cursor) } {
+                    RegexFlagResult::Unsupported(flag) => {
+                        return Some(ir::Expr::UnsupportedTyped {
+                            reason: format!("unsupported regex flag in assign: '{flag}'"),
+                            ty: ir::Type::Record {
+                                usr: REGEX_USR.to_owned(),
+                                name: REGEX_TYPE_NAME.to_owned(),
+                            },
+                            origin: origin.clone(),
+                        });
+                    }
+                    RegexFlagResult::Flags {
+                        case_sensitive,
+                        multi_line,
+                    } => {
+                        if !case_sensitive {
+                            call_args.push(ir::Expr::NamedArg {
+                                name: "caseSensitive".to_owned(),
+                                value: Box::new(ir::Expr::BoolLiteral {
+                                    value: false,
+                                    origin: origin.clone(),
+                                }),
+                            });
+                        }
+                        if multi_line {
+                            call_args.push(ir::Expr::NamedArg {
+                                name: "multiLine".to_owned(),
+                                value: Box::new(ir::Expr::BoolLiteral {
+                                    value: true,
+                                    origin: origin.clone(),
+                                }),
+                            });
+                        }
+                    }
+                }
+            }
+            let reg_call = ir::Expr::Call {
+                base_qualifier: None,
+                target: None,
+                callee_usr: String::new(),
+                callee_name: REGEX_TYPE_NAME.to_owned(),
+                args: call_args,
+                ty: ir::Type::Record {
+                    usr: REGEX_USR.to_owned(),
+                    name: REGEX_TYPE_NAME.to_owned(),
+                },
+                origin: origin.clone(),
+            };
+            Some(ir::Expr::Assign {
+                target: Box::new(target),
+                value: Box::new(reg_call),
+                ty: ir::Type::Record {
+                    usr: REGEX_USR.to_owned(),
+                    name: REGEX_TYPE_NAME.to_owned(),
+                },
+                origin: origin.clone(),
+            })
+        }
+        ("sub_match", "str") => Some(target),
+        ("sub_match", "length" | "size") => Some(ir::Expr::FieldAccess {
             target: Box::new(target),
             field: "length".to_owned(),
             ty: ir::Type::Int,
@@ -11711,6 +12548,9 @@ const BRIDGED_STDLIB_FREE_FUNCTION_NAMES: &[&str] = &[
     "stoll",
     "stod",
     "stof",
+    "regex_search",
+    "regex_replace",
+    "regex_match",
 ];
 
 /// Whether `referenced` (a resolved call target already confirmed to be a
@@ -12030,6 +12870,134 @@ unsafe fn lower_stdlib_free_function_call(
                 Some(unsupported())
             }
         }
+        "regex_search" => {
+            if arg_count < 2 {
+                return Some(unsupported());
+            }
+            let s_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
+            let second_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 1) };
+            let s_expr = unsafe { lower_expr(s_cursor, project_root) };
+            let second_ty = lower_type(unsafe { clang_sys::clang_getCursorType(second_cursor) });
+
+            let is_regex = match &second_ty {
+                ir::Type::Record { usr, .. } => usr == REGEX_USR,
+                _ => false,
+            };
+
+            if is_regex {
+                // regex_search(s, re) or regex_search(s, re, flags)
+                let re_expr = unsafe { lower_expr(second_cursor, project_root) };
+                if arg_count >= 3 {
+                    let flags_cursor =
+                        unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 2) };
+                    if let RegexFlagResult::Unsupported(flag) =
+                        unsafe { parse_regex_syntax_flags(flags_cursor) }
+                    {
+                        return Some(ir::Expr::UnsupportedTyped {
+                            reason: format!("unsupported regex match flag in regex_search: {flag}"),
+                            ty: ir::Type::Bool,
+                            origin: origin.clone(),
+                        });
+                    }
+                }
+                Some(ir::Expr::Call {
+                    base_qualifier: None,
+                    target: Some(Box::new(re_expr)),
+                    callee_usr,
+                    callee_name: "hasMatch".to_owned(),
+                    args: vec![s_expr],
+                    ty: ir::Type::Bool,
+                    origin: origin.clone(),
+                })
+            } else {
+                // regex_search(s, m, re) or regex_search(s, m, re, flags)
+                if arg_count < 3 {
+                    return Some(unsupported());
+                }
+                let m_cursor = second_cursor;
+                let re_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 2) };
+                let m_expr = unsafe { lower_expr(m_cursor, project_root) };
+                let re_expr = unsafe { lower_expr(re_cursor, project_root) };
+                if arg_count >= 4 {
+                    let flags_cursor =
+                        unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 3) };
+                    if let RegexFlagResult::Unsupported(flag) =
+                        unsafe { parse_regex_syntax_flags(flags_cursor) }
+                    {
+                        return Some(ir::Expr::UnsupportedTyped {
+                            reason: format!("unsupported regex match flag in regex_search: {flag}"),
+                            ty: ir::Type::Bool,
+                            origin: origin.clone(),
+                        });
+                    }
+                }
+                let match_type = ir::Type::Nullable(Box::new(ir::Type::Record {
+                    usr: REGEX_MATCH_USR.to_owned(),
+                    name: REGEX_MATCH_TYPE_NAME.to_owned(),
+                }));
+                let first_match_call = ir::Expr::Call {
+                    base_qualifier: None,
+                    target: Some(Box::new(re_expr)),
+                    callee_usr: String::new(),
+                    callee_name: "firstMatch".to_owned(),
+                    args: vec![s_expr],
+                    ty: match_type.clone(),
+                    origin: origin.clone(),
+                };
+                let assign = ir::Expr::Assign {
+                    target: Box::new(m_expr),
+                    value: Box::new(first_match_call),
+                    ty: match_type,
+                    origin: origin.clone(),
+                };
+                Some(ir::Expr::Binary {
+                    op: ir::BinaryOp::Ne,
+                    lhs: Box::new(assign),
+                    rhs: Box::new(ir::Expr::NullLiteral {
+                        origin: origin.clone(),
+                    }),
+                    ty: ir::Type::Bool,
+                    origin: origin.clone(),
+                })
+            }
+        }
+        "regex_replace" => {
+            if arg_count < 3 {
+                return Some(unsupported());
+            }
+            let s_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
+            let re_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 1) };
+            let rep_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 2) };
+            let s_expr = unsafe { lower_expr(s_cursor, project_root) };
+            let re_expr = unsafe { lower_expr(re_cursor, project_root) };
+            let rep_expr = unsafe { lower_expr(rep_cursor, project_root) };
+            if arg_count >= 4 {
+                let flags_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 3) };
+                if let RegexFlagResult::Unsupported(flag) =
+                    unsafe { parse_regex_syntax_flags(flags_cursor) }
+                {
+                    return Some(ir::Expr::UnsupportedTyped {
+                        reason: format!("unsupported regex flag in regex_replace: {flag}"),
+                        ty: ir::Type::Str,
+                        origin: origin.clone(),
+                    });
+                }
+            }
+            Some(ir::Expr::Call {
+                base_qualifier: None,
+                target: Some(Box::new(s_expr)),
+                callee_usr,
+                callee_name: "replaceAll".to_owned(),
+                args: vec![re_expr, rep_expr],
+                ty: ir::Type::Str,
+                origin: origin.clone(),
+            })
+        }
+        "regex_match" => Some(ir::Expr::UnsupportedTyped {
+            reason: "std::regex_match full-string matching is not supported".to_owned(),
+            ty: ir::Type::Bool,
+            origin: origin.clone(),
+        }),
         _ => None,
     }
 }
@@ -12232,7 +13200,11 @@ unsafe fn lower_stdlib_operator_call(
     let rhs_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 1) };
     let lhs_ty = lower_type(unsafe { clang_sys::clang_getCursorType(lhs_cursor) });
     let rhs_ty = lower_type(unsafe { clang_sys::clang_getCursorType(rhs_cursor) });
-    if lhs_ty != ir::Type::Str && rhs_ty != ir::Type::Str {
+    let is_str_or_nullable_str = |ty: &ir::Type| {
+        matches!(ty, ir::Type::Str)
+            || matches!(ty, ir::Type::Nullable(inner) if inner.as_ref() == &ir::Type::Str)
+    };
+    if !is_str_or_nullable_str(&lhs_ty) && !is_str_or_nullable_str(&rhs_ty) {
         return None;
     }
 

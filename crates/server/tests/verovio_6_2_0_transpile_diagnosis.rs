@@ -581,7 +581,8 @@ fn collect_type_bailouts(ty: &Type, inventory: &mut BailoutInventory) {
         | Type::Enum { .. }
         | Type::Str
         | Type::Object
-        | Type::Bytes => {}
+        | Type::Bytes
+        | Type::ByteCursor => {}
     }
 }
 
@@ -713,6 +714,9 @@ fn collect_expression_bailouts(expression: &Expr, inventory: &mut BailoutInvento
             if let Expr::UnsupportedTyped { ty, .. } = expression {
                 collect_type_bailouts(ty, inventory);
             }
+        }
+        Expr::NamedArg { value, .. } => {
+            collect_expression_bailouts(value, inventory);
         }
         Expr::IntLiteral { .. }
         | Expr::DoubleLiteral { .. }

@@ -80,6 +80,31 @@
       "funcao": "valorOuPadrao",
       "args": [{"a": 1, "b": 2}, "c", 42],
       "espera": 42
+    },
+    {
+      "funcao": "temNota",
+      "args": ["C#4"],
+      "espera": true
+    },
+    {
+      "funcao": "temNota",
+      "args": ["D3"],
+      "espera": false
+    },
+    {
+      "funcao": "temNota",
+      "args": ["sem nota"],
+      "espera": false
+    },
+    {
+      "funcao": "limpa",
+      "args": ["ola   mundo   aqui"],
+      "espera": "ola mundo aqui"
+    },
+    {
+      "funcao": "limpa",
+      "args": ["  espacos  no   inicio  e  fim  "],
+      "espera": " espacos no inicio e fim "
     }
   ]
 }

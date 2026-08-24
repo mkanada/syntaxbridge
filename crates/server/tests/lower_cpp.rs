@@ -5643,8 +5643,8 @@ int read_and_advance(const uint8_t* pSrc) {
     );
 
     assert!(
-        source.contains("(pSrc++).toInt()"),
-        "a postfix increment converted with .toInt() must be parenthesized, got:\n{source}"
+        source.contains("(pSrc++).value") || source.contains("(pSrc++).toInt()"),
+        "a postfix increment must be parenthesized, got:\n{source}"
     );
 }
 
@@ -8185,5 +8185,118 @@ int somaValores(const std::map<std::string, int> &m) {
         !source.contains("throw UnimplementedError(")
             && !source.contains("_syntaxBridgeUnsupported"),
         "expected real translation without bailouts, got:\n{source}"
+    );
+}
+
+#[test]
+fn t12_miniz_pointer_buffer_cursor_soma_lowers_cleanly() {
+    let source = lower_and_emit(
+        "lower-cpp-t12-miniz-soma",
+        r#"
+unsigned soma(const unsigned char *buf, int len) {
+    unsigned total = 0;
+    const unsigned char *p = buf;
+    while (len >= 4) {
+        total += p[0] + p[1] + p[2] + p[3];
+        p = p + 4;
+        len -= 4;
+    }
+    while (len--) { total += *p++; }
+    return total;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("throw UnimplementedError(")
+            && !source.contains("_syntaxBridgeUnsupported"),
+        "expected real translation without bailouts, got:\n{source}"
+    );
+    assert!(
+        source.contains("SyntaxBridgeByteCursor"),
+        "expected SyntaxBridgeByteCursor usage, got:\n{source}"
+    );
+}
+
+#[test]
+fn t12_indexed_write_buffer_zera_lowers_cleanly() {
+    let source = lower_and_emit(
+        "lower-cpp-t12-indexed-write-zera",
+        r#"
+void zera(unsigned char *buf, int len) {
+    for (int i = 0; i < len; i++) {
+        buf[i] = 0;
+    }
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("throw UnimplementedError(")
+            && !source.contains("_syntaxBridgeUnsupported"),
+        "expected real translation without bailouts, got:\n{source}"
+    );
+    assert!(
+        source.contains("buf![i] = 0;") || source.contains("buf[i] = 0;"),
+        "expected index assignment buf[i] = 0;, got:\n{source}"
+    );
+}
+
+#[test]
+fn t12_e10_ponteiros_full_file_lowers_cleanly() {
+    let source = lower_and_emit(
+        "lower-cpp-t12-e10-ponteiros",
+        r#"
+union ValorBruto {
+    int comoInteiro;
+    float comoFlutuante;
+};
+
+void trocar(int* a, int* b) {
+    int temp = *a;
+    *a = *b;
+    *b = temp;
+}
+
+float lerComoFlutuante(ValorBruto valor) {
+    return valor.comoFlutuante;
+}
+
+int somarSemPonteiro(int a, int b) {
+    return a + b;
+}
+
+unsigned soma(const unsigned char *buf, int len) {
+    unsigned total = 0;
+    const unsigned char *p = buf;
+    while (len >= 4) {
+        total += p[0] + p[1] + p[2] + p[3];
+        p = p + 4;
+        len -= 4;
+    }
+    while (len--) { total += *p++; }
+    return total;
+}
+
+void zera(unsigned char *buf, int len) {
+    for (int i = 0; i < len; i++) {
+        buf[i] = 0;
+    }
+}
+"#,
+    );
+
+    assert!(
+        source.contains("int soma(Uint8List? buf, int len)")
+            || source.contains("int soma(SyntaxBridgeByteCursor buf, int len)"),
+        "expected soma signature, got:\n{source}"
+    );
+    assert!(
+        source.contains("SyntaxBridgeByteCursor"),
+        "expected SyntaxBridgeByteCursor usage, got:\n{source}"
+    );
+    assert!(
+        source.contains("void zera(Uint8List? buf, int len)"),
+        "expected zera signature, got:\n{source}"
     );
 }

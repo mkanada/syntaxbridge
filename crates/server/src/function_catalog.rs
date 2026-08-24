@@ -1164,6 +1164,7 @@ fn rename_record_refs_in_type(ty: &mut ir::Type, renames: &HashMap<String, Strin
         | ir::Type::Void
         | ir::Type::Str
         | ir::Type::Bytes
+        | ir::Type::ByteCursor
         | ir::Type::Object
         | ir::Type::Enum { .. }
         | ir::Type::Unsupported(_) => {}
@@ -1492,6 +1493,7 @@ impl IrRefVisitor<'_> {
             | ir::Expr::StringLiteral { .. }
             | ir::Expr::Unsupported { .. } => {}
             ir::Expr::UnsupportedTyped { ty, .. } => self.visit_type(ty),
+            ir::Expr::NamedArg { value, .. } => self.visit_expr(value),
             ir::Expr::Ref { ty, .. } | ir::Expr::This { ty, .. } => {
                 self.visit_type(ty);
             }
@@ -1683,6 +1685,7 @@ impl IrRefVisitor<'_> {
             | ir::Type::Void
             | ir::Type::Str
             | ir::Type::Bytes
+            | ir::Type::ByteCursor
             | ir::Type::Object
             | ir::Type::Record { .. }
             | ir::Type::Enum { .. }
@@ -2475,6 +2478,7 @@ fn expr_references_name(expr: &ir::Expr, name: &str) -> bool {
         | ir::Expr::This { .. }
         | ir::Expr::Unsupported { .. }
         | ir::Expr::UnsupportedTyped { .. } => false,
+        ir::Expr::NamedArg { value, .. } => expr_references_name(value, name),
         ir::Expr::Binary { lhs, rhs, .. } => {
             expr_references_name(lhs, name) || expr_references_name(rhs, name)
         }
@@ -2684,6 +2688,9 @@ fn replace_this_with_ref_in_expr(expr: &mut ir::Expr, var_name: &str) {
         | ir::Expr::Ref { .. }
         | ir::Expr::Unsupported { .. }
         | ir::Expr::UnsupportedTyped { .. } => {}
+        ir::Expr::NamedArg { value, .. } => {
+            replace_this_with_ref_in_expr(value, var_name);
+        }
         ir::Expr::Binary { lhs, rhs, .. } => {
             replace_this_with_ref_in_expr(lhs, var_name);
             replace_this_with_ref_in_expr(rhs, var_name);
@@ -2924,6 +2931,9 @@ fn rename_calls_in_expr(expr: &mut ir::Expr, renames: &HashMap<String, String>) 
         | ir::Expr::This { .. }
         | ir::Expr::Unsupported { .. }
         | ir::Expr::UnsupportedTyped { .. } => {}
+        ir::Expr::NamedArg { value, .. } => {
+            rename_calls_in_expr(value, renames);
+        }
         ir::Expr::Binary { lhs, rhs, .. } => {
             rename_calls_in_expr(lhs, renames);
             rename_calls_in_expr(rhs, renames);

@@ -64,3 +64,17 @@ int valorOuPadrao(Map<String, int> mapa, String chave, int padrao) {
   }
   return padrao;
 }
+
+bool temNota(String s) {
+  RegExp re = RegExp('([A-G])([#b]?)([0-9])');
+  RegExpMatch? m;
+  if ((m = re.firstMatch(s)) != null) {
+    return m!.group(1) == 'C';
+  }
+  return false;
+}
+
+String limpa(String s) {
+  RegExp espacos = RegExp('\\s+');
+  return s.replaceAll(espacos, ' ');
+}

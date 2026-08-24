@@ -116,6 +116,11 @@ pub enum Type {
     /// same "named bridge, not an erased type" shape `Pair` already gives
     /// `std::pair`.
     ListCursor(Box<Type>),
+    /// A cursor over a contiguous byte buffer (`Uint8List` + offset) —
+    /// emitted as `SyntaxBridgeByteCursor`. Task 12
+    /// (`docs/prompts/2026-08-23-12-buffers-de-ponteiro-cru.md`)'s answer for
+    /// raw pointer arithmetic and indexation over buffers.
+    ByteCursor,
     /// A C/C++ function pointer whose parameter and return types are all
     /// represented in this IR. Emitted as a typed Dart closure
     /// (`ReturnType Function(Args...)`); ABI callbacks that need native
@@ -524,6 +529,12 @@ pub enum Expr {
         values: Vec<Expr>,
         origin: Origin,
     },
+    /// A named argument in a call or constructor (`name: value`), such as
+    /// Dart's `RegExp(pattern, caseSensitive: false, multiLine: true)` (T13).
+    NamedArg {
+        name: String,
+        value: Box<Expr>,
+    },
     Unsupported {
         reason: String,
         origin: Origin,
@@ -571,6 +582,7 @@ impl Expr {
             | Self::Tuple { origin, .. }
             | Self::Unsupported { origin, .. }
             | Self::UnsupportedTyped { origin, .. } => origin,
+            Self::NamedArg { value, .. } => value.origin(),
         }
     }
 
@@ -595,6 +607,7 @@ impl Expr {
 
     pub fn ty(&self) -> Option<&Type> {
         match self {
+            Self::NamedArg { value, .. } => value.ty(),
             Self::Ref { ty, .. }
             | Self::Binary { ty, .. }
             | Self::Conditional { ty, .. }

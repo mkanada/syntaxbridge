@@ -2924,3 +2924,72 @@ fn a_copy_constructor_deep_copies_records_and_mutable_collections() {
          the C++ pointer copy would, got:\n{source}"
     );
 }
+
+#[test]
+fn byte_cursor_emits_as_syntax_bridge_byte_cursor_and_includes_support_file() {
+    let processa = Function {
+        name: "processa".to_owned(),
+        usr: "c:@F@processa#".to_owned(),
+        params: vec![Param {
+            name: "cursor".to_owned(),
+            ty: Type::ByteCursor,
+            default_value: None,
+        }],
+        return_type: Type::Int,
+        body: vec![Stmt::Return {
+            value: Some(Expr::Index {
+                target: Box::new(Expr::Ref {
+                    name: "cursor".to_owned(),
+                    ty: Type::ByteCursor,
+                    origin: origin(3),
+                }),
+                index: Box::new(Expr::IntLiteral {
+                    value: 2,
+                    origin: origin(3),
+                }),
+                ty: Type::Int,
+                origin: origin(3),
+            }),
+            origin: origin(3),
+        }],
+        origin: origin(2),
+    };
+    let module = Module {
+        records: Vec::new(),
+        functions: vec![processa],
+        enums: Vec::new(),
+    };
+
+    let files = emit_module(&module);
+    assert!(
+        files.contains_key("lib/syntax_bridge_support.dart"),
+        "expected syntax_bridge_support.dart to be generated"
+    );
+    let support = &files["lib/syntax_bridge_support.dart"];
+    assert!(
+        support.contains("final class SyntaxBridgeByteCursor {"),
+        "expected SyntaxBridgeByteCursor class in support file, got:\n{support}"
+    );
+    assert!(
+        support.contains("int operator [](int i) => _bytes[_offset + i];"),
+        "expected index operator in SyntaxBridgeByteCursor, got:\n{support}"
+    );
+    assert!(
+        support.contains("void operator []=(int i, int v) {"),
+        "expected index assignment operator in SyntaxBridgeByteCursor, got:\n{support}"
+    );
+
+    let source = &files["lib/aritmetica.dart"];
+    assert!(
+        source.contains("import 'syntax_bridge_support.dart';"),
+        "expected support import in source file, got:\n{source}"
+    );
+    assert!(
+        source.contains("int processa(SyntaxBridgeByteCursor cursor) {"),
+        "expected SyntaxBridgeByteCursor parameter, got:\n{source}"
+    );
+    assert!(
+        source.contains("return cursor[2];"),
+        "expected index expression, got:\n{source}"
+    );
+}

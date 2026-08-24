@@ -1,4 +1,5 @@
 #include "biblioteca.hpp"
+#include <regex>
 
 std::string saudacao(const std::string& nome) {
     return "Ola, " + nome;
@@ -63,5 +64,19 @@ int valorOuPadrao(const std::map<std::string, int>& mapa, const std::string& cha
         return it->second;
     }
     return padrao;
+}
+
+bool temNota(const std::string& s) {
+    std::regex re("([A-G])([#b]?)([0-9])");
+    std::smatch m;
+    if (std::regex_search(s, m, re)) {
+        return m[1] == "C";
+    }
+    return false;
+}
+
+std::string limpa(const std::string& s) {
+    std::regex espacos("\\s+");
+    return std::regex_replace(s, espacos, " ");
 }
 

@@ -14,3 +14,5 @@ int somaComLista(const std::list<int>& valores);
 int contaOcorrencias(const std::vector<bool>& valores);
 int ultimoElementoReverso(const std::vector<int>& valores);
 int valorOuPadrao(const std::map<std::string, int>& mapa, const std::string& chave, int padrao);
+bool temNota(const std::string& s);
+std::string limpa(const std::string& s);
