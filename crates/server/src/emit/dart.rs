@@ -51,6 +51,14 @@ const INDEX_OF_BYTE_HELPER_NAME: &str = "syntaxBridgeIndexOfByte";
 /// the same "named bridge, not an erased type" answer `SyntaxBridgePair`
 /// already gives `std::pair`.
 const LIST_CURSOR_TYPE_NAME: &str = "SyntaxBridgeListCursor";
+pub const OUTPUT_STREAM_TYPE_NAME: &str = "SyntaxBridgeOutputStream";
+pub const OUTPUT_STREAM_STRING_TYPE_NAME: &str = "SyntaxBridgeStringOutputStream";
+pub const OUTPUT_STREAM_STDOUT_TYPE_NAME: &str = "SyntaxBridgeStdoutStream";
+pub const OUTPUT_STREAM_STDERR_TYPE_NAME: &str = "SyntaxBridgeStderrStream";
+pub const OUTPUT_STREAM_FILE_TYPE_NAME: &str = "SyntaxBridgeFileOutputStream";
+pub const INPUT_STREAM_TYPE_NAME: &str = "SyntaxBridgeInputStream";
+pub const INPUT_STREAM_STRING_TYPE_NAME: &str = "SyntaxBridgeStringInputStream";
+pub const INPUT_STREAM_FILE_TYPE_NAME: &str = "SyntaxBridgeFileInputStream";
 const SUPPORT_FILE_NAME: &str = "syntax_bridge_support.dart";
 
 /// Groups `module`'s records and functions by the C++ source file they came
@@ -250,6 +258,16 @@ pub fn emit_module_with_externals(
     let needs_string_byte_index_support = files.values().any(|source| {
         source.contains(INDEX_OF_BYTES_HELPER_NAME) || source.contains(INDEX_OF_BYTE_HELPER_NAME)
     });
+    let needs_stream_support = files.values().any(|source| {
+        source.contains(OUTPUT_STREAM_TYPE_NAME)
+            || source.contains(OUTPUT_STREAM_STRING_TYPE_NAME)
+            || source.contains(OUTPUT_STREAM_STDOUT_TYPE_NAME)
+            || source.contains(OUTPUT_STREAM_STDERR_TYPE_NAME)
+            || source.contains(OUTPUT_STREAM_FILE_TYPE_NAME)
+            || source.contains(INPUT_STREAM_TYPE_NAME)
+            || source.contains(INPUT_STREAM_STRING_TYPE_NAME)
+            || source.contains(INPUT_STREAM_FILE_TYPE_NAME)
+    });
     if needs_opaque_support
         || needs_pair_support
         || needs_native_handle_support
@@ -257,6 +275,7 @@ pub fn emit_module_with_externals(
         || needs_list_cursor_support
         || needs_map_entry_pair_extension
         || needs_string_byte_index_support
+        || needs_stream_support
     {
         let mut support = String::new();
         if needs_string_byte_index_support {
@@ -300,6 +319,12 @@ pub fn emit_module_with_externals(
                 support.push('\n');
             }
             support.push_str(&emit_string_byte_index_support());
+        }
+        if needs_stream_support {
+            if !support.is_empty() && !support.ends_with("\n\n") {
+                support.push('\n');
+            }
+            support.push_str(&emit_stream_support());
         }
         files.insert(format!("lib/{SUPPORT_FILE_NAME}"), support);
     }
@@ -594,6 +619,14 @@ fn emit_file(
         || source.contains(MAP_ENTRY_MARKER)
         || source.contains(INDEX_OF_BYTES_HELPER_NAME)
         || source.contains(INDEX_OF_BYTE_HELPER_NAME)
+        || source.contains(OUTPUT_STREAM_TYPE_NAME)
+        || source.contains(OUTPUT_STREAM_STRING_TYPE_NAME)
+        || source.contains(OUTPUT_STREAM_STDOUT_TYPE_NAME)
+        || source.contains(OUTPUT_STREAM_STDERR_TYPE_NAME)
+        || source.contains(OUTPUT_STREAM_FILE_TYPE_NAME)
+        || source.contains(INPUT_STREAM_TYPE_NAME)
+        || source.contains(INPUT_STREAM_STRING_TYPE_NAME)
+        || source.contains(INPUT_STREAM_FILE_TYPE_NAME)
     {
         import_lines.push(format!("import '{SUPPORT_FILE_NAME}';"));
     }
@@ -751,6 +784,108 @@ fn emit_native_handle_support() -> String {
          /// identity (`==` is the default `Object` identity check).\n\
          final class {NATIVE_HANDLE_TYPE_NAME} {{\n\
          {INDENT}const {NATIVE_HANDLE_TYPE_NAME}();\n\
+         }}\n"
+    )
+}
+
+fn emit_stream_support() -> String {
+    format!(
+        "abstract class {OUTPUT_STREAM_TYPE_NAME} {{\n\
+         {INDENT}{OUTPUT_STREAM_TYPE_NAME} write(Object? obj);\n\
+         {INDENT}{OUTPUT_STREAM_TYPE_NAME} writeln([Object? obj = '']);\n\
+         {INDENT}void flush();\n\
+         }}\n\n\
+         class {OUTPUT_STREAM_STRING_TYPE_NAME} extends {OUTPUT_STREAM_TYPE_NAME} {{\n\
+         {INDENT}final StringBuffer _buffer = StringBuffer();\n\n\
+         {INDENT}@override\n\
+         {INDENT}{OUTPUT_STREAM_TYPE_NAME} write(Object? obj) {{\n\
+         {INDENT}{INDENT}if (obj != null) {{\n\
+         {INDENT}{INDENT}{INDENT}_buffer.write(obj);\n\
+         {INDENT}{INDENT}}}\n\
+         {INDENT}{INDENT}return this;\n\
+         {INDENT}}}\n\n\
+         {INDENT}@override\n\
+         {INDENT}{OUTPUT_STREAM_TYPE_NAME} writeln([Object? obj = '']) {{\n\
+         {INDENT}{INDENT}_buffer.writeln(obj ?? '');\n\
+         {INDENT}{INDENT}return this;\n\
+         {INDENT}}}\n\n\
+         {INDENT}@override\n\
+         {INDENT}void flush() {{}}\n\n\
+         {INDENT}String str() => _buffer.toString();\n\n\
+         {INDENT}@override\n\
+         {INDENT}String toString() => _buffer.toString();\n\
+         }}\n\n\
+         class {OUTPUT_STREAM_STDOUT_TYPE_NAME} extends {OUTPUT_STREAM_TYPE_NAME} {{\n\
+         {INDENT}@override\n\
+         {INDENT}{OUTPUT_STREAM_TYPE_NAME} write(Object? obj) {{\n\
+         {INDENT}{INDENT}if (obj != null) {{\n\
+         {INDENT}{INDENT}{INDENT}print(obj);\n\
+         {INDENT}{INDENT}}}\n\
+         {INDENT}{INDENT}return this;\n\
+         {INDENT}}}\n\n\
+         {INDENT}@override\n\
+         {INDENT}{OUTPUT_STREAM_TYPE_NAME} writeln([Object? obj = '']) {{\n\
+         {INDENT}{INDENT}print(obj ?? '');\n\
+         {INDENT}{INDENT}return this;\n\
+         {INDENT}}}\n\n\
+         {INDENT}@override\n\
+         {INDENT}void flush() {{}}\n\
+         }}\n\n\
+         class {OUTPUT_STREAM_STDERR_TYPE_NAME} extends {OUTPUT_STREAM_TYPE_NAME} {{\n\
+         {INDENT}@override\n\
+         {INDENT}{OUTPUT_STREAM_TYPE_NAME} write(Object? obj) {{\n\
+         {INDENT}{INDENT}if (obj != null) {{\n\
+         {INDENT}{INDENT}{INDENT}print(obj);\n\
+         {INDENT}{INDENT}}}\n\
+         {INDENT}{INDENT}return this;\n\
+         {INDENT}}}\n\n\
+         {INDENT}@override\n\
+         {INDENT}{OUTPUT_STREAM_TYPE_NAME} writeln([Object? obj = '']) {{\n\
+         {INDENT}{INDENT}print(obj ?? '');\n\
+         {INDENT}{INDENT}return this;\n\
+         {INDENT}}}\n\n\
+         {INDENT}@override\n\
+         {INDENT}void flush() {{}}\n\
+         }}\n\n\
+         class {OUTPUT_STREAM_FILE_TYPE_NAME} extends {OUTPUT_STREAM_STRING_TYPE_NAME} {{\n\
+         {INDENT}final String? path;\n\
+         {INDENT}{OUTPUT_STREAM_FILE_TYPE_NAME}([this.path]);\n\
+         }}\n\n\
+         abstract class {INPUT_STREAM_TYPE_NAME} {{\n\
+         {INDENT}String? readLine();\n\
+         {INDENT}int readByte();\n\
+         {INDENT}bool get eof;\n\
+         }}\n\n\
+         class {INPUT_STREAM_STRING_TYPE_NAME} extends {INPUT_STREAM_TYPE_NAME} {{\n\
+         {INDENT}final String _content;\n\
+         {INDENT}int _offset = 0;\n\n\
+         {INDENT}{INPUT_STREAM_STRING_TYPE_NAME}(this._content);\n\n\
+         {INDENT}@override\n\
+         {INDENT}String? readLine() {{\n\
+         {INDENT}{INDENT}if (_offset >= _content.length) return null;\n\
+         {INDENT}{INDENT}int nextNewline = _content.indexOf('\\n', _offset);\n\
+         {INDENT}{INDENT}if (nextNewline == -1) {{\n\
+         {INDENT}{INDENT}{INDENT}final line = _content.substring(_offset);\n\
+         {INDENT}{INDENT}{INDENT}_offset = _content.length;\n\
+         {INDENT}{INDENT}{INDENT}return line;\n\
+         {INDENT}{INDENT}}}\n\
+         {INDENT}{INDENT}final line = _content.substring(_offset, nextNewline);\n\
+         {INDENT}{INDENT}_offset = nextNewline + 1;\n\
+         {INDENT}{INDENT}return line.endsWith('\\r') ? line.substring(0, line.length - 1) : line;\n\
+         {INDENT}}}\n\n\
+         {INDENT}@override\n\
+         {INDENT}int readByte() {{\n\
+         {INDENT}{INDENT}if (_offset >= _content.length) return -1;\n\
+         {INDENT}{INDENT}final byte = _content.codeUnitAt(_offset);\n\
+         {INDENT}{INDENT}_offset++;\n\
+         {INDENT}{INDENT}return byte;\n\
+         {INDENT}}}\n\n\
+         {INDENT}@override\n\
+         {INDENT}bool get eof => _offset >= _content.length;\n\
+         }}\n\n\
+         class {INPUT_STREAM_FILE_TYPE_NAME} extends {INPUT_STREAM_STRING_TYPE_NAME} {{\n\
+         {INDENT}final String? path;\n\
+         {INDENT}{INPUT_STREAM_FILE_TYPE_NAME}([this.path, String content = '']) : super(content);\n\
          }}\n"
     )
 }
@@ -1342,6 +1477,15 @@ fn emit_record(
             "static ",
             &field.ty,
             &field.name,
+            enums_by_usr,
+        ));
+    }
+    if let Some(base_ty) = &record.library_base {
+        let field_name = crate::lower::cpp::library_base_field_name(base_ty);
+        source.push_str(&emit_field_declaration(
+            "",
+            base_ty,
+            field_name,
             enums_by_usr,
         ));
     }
@@ -2310,6 +2454,17 @@ fn emit_copy_constructor(
     };
     for field in &record.fields {
         emit_own_field(field);
+    }
+    if let Some(base_ty) = &record.library_base {
+        let field_name = crate::lower::cpp::library_base_field_name(base_ty);
+        let value = match base_ty {
+            Type::List(_) => format!("List.of(other.{})", field_name),
+            Type::Set(_) => format!("Set.of(other.{})", field_name),
+            Type::Map(_, _) => format!("Map.of(other.{})", field_name),
+            Type::Bytes => format!("Uint8List.fromList(other.{})", field_name),
+            _ => format!("other.{}", field_name),
+        };
+        own_inits.push(format!("{} = {value}", field_name));
     }
     let mut emit_mixin_field = |field: &crate::ir::Field| {
         let value = match &field.ty {
@@ -4419,13 +4574,21 @@ fn emit_expr(
                 .join(", ");
             format!("{receiver_prefix}{callee_name}({args_text})")
         }
-        Expr::FieldAccess { target, field, .. } => match target.as_ref() {
+        Expr::FieldAccess {
+            target, field, ty, ..
+        } => match target.as_ref() {
             Expr::This { .. } => field.clone(),
             _ => {
                 let target_text =
                     emit_receiver(target, used_expr_helper, used_utf8_encode, promoted);
-                let bang = receiver_bang(target, promoted);
-                format!("{target_text}{bang}.{field}")
+                if matches!(ty, Type::Nullable(_))
+                    && matches!(expr_ty(target), Some(Type::Nullable(_)))
+                {
+                    format!("{target_text}?.{field}")
+                } else {
+                    let bang = receiver_bang(target, promoted);
+                    format!("{target_text}{bang}.{field}")
+                }
             }
         },
         Expr::RecordConstruct {

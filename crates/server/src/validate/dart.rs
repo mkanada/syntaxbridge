@@ -342,6 +342,7 @@ mod tests {
                 methods: Vec::new(),
                 base_class: None,
                 mixins: Vec::new(),
+                library_base: None,
                 destructor: None,
                 origin: origin("/proj/aritmetica.cpp", 5),
             }],
@@ -415,6 +416,7 @@ mod tests {
                 usr: "c:@S@Ponto".to_owned(),
                 name: "Ponto".to_owned(),
             }],
+            library_base: None,
             destructor: None,
             origin: origin("/proj/aritmetica.cpp", 9),
         };

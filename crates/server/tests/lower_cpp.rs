@@ -5467,16 +5467,17 @@ std::string join(const std::vector<std::string>& values) {
     );
 
     assert!(
-        source.contains("String ss = '';"),
-        "expected the stringstream to start as an empty Dart String, got:\n{source}"
+        source.contains("SyntaxBridgeStringOutputStream ss = SyntaxBridgeStringOutputStream();"),
+        "expected the stringstream to start as SyntaxBridgeStringOutputStream, got:\n{source}"
     );
     assert!(
-        source.contains("ss = ss + ', ';") && source.contains("ss = ss + '\"' + value + '\"';"),
-        "expected each insertion chain to reassign ss by concatenation, got:\n{source}"
+        source.contains("ss.write(', ');")
+            && source.contains("ss.write('\"').write(value).write('\"');"),
+        "expected each insertion chain to call .write(), got:\n{source}"
     );
     assert!(
-        source.contains("return ss;"),
-        "expected ss.str() to read back the accumulated string directly, got:\n{source}"
+        source.contains("return ss.str();"),
+        "expected ss.str() to call .str(), got:\n{source}"
     );
     assert!(
         !source.contains("Unsupported") && !source.contains("dynamic"),
@@ -5484,8 +5485,7 @@ std::string join(const std::vector<std::string>& values) {
     );
 }
 
-/// A numeric insertion into a stringstream needs `.toString()`, the same
-/// way the `std::cout` chain already converts a non-`Str` operand.
+/// A numeric insertion into a stringstream calls `.write(count)`.
 #[test]
 fn a_stringstream_converts_non_string_operands_with_to_string() {
     let source = lower_and_emit(
@@ -5503,8 +5503,8 @@ std::string describe(int count) {
     );
 
     assert!(
-        source.contains("ss = ss + 'count=' + count.toString();"),
-        "expected the int operand to be converted with toString(), got:\n{source}"
+        source.contains("ss.write('count=').write(count);"),
+        "expected write chain with int operand, got:\n{source}"
     );
     assert!(
         !source.contains("Unsupported") && !source.contains("dynamic"),

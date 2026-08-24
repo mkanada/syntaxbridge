@@ -73,6 +73,7 @@ fn validate_route_reuses_persisted_ir_and_reports_origins() {
         methods: Vec::new(),
         base_class: None,
         mixins: Vec::new(),
+        library_base: None,
         destructor: None,
         origin: origin.clone(),
     };

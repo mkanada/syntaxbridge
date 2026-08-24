@@ -1012,6 +1012,11 @@ pub struct Record {
     /// changes the field defaults and constructor emission for the
     /// referenced record.
     pub mixins: Vec<BaseClass>,
+    /// Base class from standard library / built-in types (e.g. `std::string`,
+    /// `std::vector<T>`) that cannot be extended in Dart directly (`extends`/
+    /// `with`), represented via composition with a stable base field.
+    #[serde(default)]
+    pub library_base: Option<Type>,
     /// A *real* destructor's body — `None` for no user-declared destructor,
     /// an empty/`= default` one (no teardown logic of its own, same
     /// distinction E06 already draws for deciding whether to lower a

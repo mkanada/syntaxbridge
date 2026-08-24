@@ -458,6 +458,7 @@ fn a_package_with_externally_mocked_callables_passes_dart_analyze_and_dart_forma
         methods: Vec::new(),
         base_class: None,
         mixins: Vec::new(),
+        library_base: None,
         destructor: None,
         origin: origin_at(1),
     };
@@ -527,6 +528,7 @@ fn a_package_with_externally_mocked_callables_passes_dart_analyze_and_dart_forma
         }],
         base_class: None,
         mixins: Vec::new(),
+        library_base: None,
         destructor: None,
         origin: origin_at(12),
     };

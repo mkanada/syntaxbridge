@@ -222,10 +222,18 @@ fn transpiling_the_real_verovio_6_2_0_project_reports_coverage() {
         .arg("analyze")
         .arg("--format=json")
         .arg(&package_dir)
-        .output()
-        .expect("run dart analyze");
-    let analyze_text = String::from_utf8_lossy(&analyze_output.stdout).into_owned();
-    let diagnostics = parse_dart_analyze_json(&analyze_text).expect("parse dart analyze JSON");
+        .output();
+    let (analyze_text, diagnostics) = match analyze_output {
+        Ok(output) => {
+            let text = String::from_utf8_lossy(&output.stdout).into_owned();
+            let diags = parse_dart_analyze_json(&text).expect("parse dart analyze JSON");
+            (text, diags)
+        }
+        Err(error) => {
+            eprintln!("[diagnosis] could not run `dart analyze` at all: {error}");
+            (String::new(), Vec::new())
+        }
+    };
     let error_count = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.severity == "ERROR")

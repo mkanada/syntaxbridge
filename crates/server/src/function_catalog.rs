@@ -2075,6 +2075,7 @@ fn build_mixin_impl(record: &ir::Record) -> (ir::Record, Vec<ir::Method>) {
             usr: record.usr.clone(),
             name: record.name.clone(),
         }],
+        library_base: None,
         destructor: None,
         origin: impl_origin.clone(),
     };
@@ -4235,6 +4236,7 @@ mod merge_tests {
             methods: Vec::new(),
             base_class: None,
             mixins: Vec::new(),
+            library_base: None,
             destructor: None,
             origin: origin(1),
         };
@@ -4413,6 +4415,7 @@ mod mixin_form_tests {
             methods: Vec::new(),
             base_class: None,
             mixins: Vec::new(),
+            library_base: None,
             destructor: None,
             origin: origin(1),
         }

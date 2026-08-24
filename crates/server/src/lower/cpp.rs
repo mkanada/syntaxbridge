@@ -962,6 +962,18 @@ const CONVERSION_TO_STR_METHOD_NAME: &str = "toStr";
 /// is the single source of truth for both).
 const CONVERSION_TO_BOOL_METHOD_NAME: &str = "toBool";
 
+/// The stable Dart field name generated for a record's composed library base type.
+pub fn library_base_field_name(ty: &ir::Type) -> &'static str {
+    match ty {
+        ir::Type::Str => "syntaxBridgeStringBase",
+        ir::Type::List(_) => "syntaxBridgeListBase",
+        ir::Type::Set(_) => "syntaxBridgeSetBase",
+        ir::Type::Map(_, _) => "syntaxBridgeMapBase",
+        ir::Type::Bytes => "syntaxBridgeBytesBase",
+        _ => "syntaxBridgeLibraryBase",
+    }
+}
+
 /// The Dart method name a C++ conversion operator's target type earns, if
 /// any — `None` for any target this module hasn't verified a name/semantics
 /// for yet, which callers must treat as an explicit bailout rather than a
@@ -974,8 +986,37 @@ fn conversion_operator_dart_method_name(target_type: &ir::Type) -> Option<&'stat
     match target_type {
         ir::Type::Str => Some(CONVERSION_TO_STR_METHOD_NAME),
         ir::Type::Bool => Some(CONVERSION_TO_BOOL_METHOD_NAME),
+        ir::Type::Int => Some("toInt"),
+        ir::Type::Double => Some("toDouble"),
+        ir::Type::Bytes => Some("toBytes"),
         _ => None,
     }
+}
+
+/// Recognizes the safe-bool idiom (`operator unspecified_bool_type() const`),
+/// where a conversion operator returns a callback, function pointer, or type
+/// named with `bool`/`safe_bool` to allow boolean context testing without
+/// allowing unintended scalar arithmetic conversions.
+unsafe fn is_safe_bool_conversion(cursor: clang_sys::CXCursor) -> bool {
+    if unsafe { clang_sys::clang_getCursorKind(cursor) } != clang_sys::CXCursor_ConversionFunction {
+        return false;
+    }
+    let result_type = unsafe { clang_sys::clang_getCursorResultType(cursor) };
+    let type_spelling =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getTypeSpelling(result_type)) };
+    let lowered = lower_type(result_type);
+    if lowered == ir::Type::Bool {
+        return false;
+    }
+    if type_spelling.to_lowercase().contains("bool") {
+        return true;
+    }
+    if let ir::Type::Callback { return_type, .. } = &lowered
+        && **return_type == ir::Type::Void
+    {
+        return true;
+    }
+    false
 }
 
 /// The `usr`/`name` `lower_type` gives a `void*`/`const void*` pointer's
@@ -986,6 +1027,18 @@ fn conversion_operator_dart_method_name(target_type: &ir::Type) -> Option<&'stat
 /// `emit::dart::NATIVE_HANDLE_TYPE_NAME` must read the same literal name.
 const NATIVE_HANDLE_USR: &str = "syntax-bridge:native-handle";
 const NATIVE_HANDLE_TYPE_NAME: &str = "SyntaxBridgeNativeHandle";
+
+pub const OUTPUT_STREAM_USR: &str = "syntax-bridge:output-stream";
+pub const OUTPUT_STREAM_TYPE_NAME: &str = "SyntaxBridgeOutputStream";
+pub const OUTPUT_STREAM_STRING_TYPE_NAME: &str = "SyntaxBridgeStringOutputStream";
+pub const OUTPUT_STREAM_STDOUT_TYPE_NAME: &str = "SyntaxBridgeStdoutStream";
+pub const OUTPUT_STREAM_STDERR_TYPE_NAME: &str = "SyntaxBridgeStderrStream";
+pub const OUTPUT_STREAM_FILE_TYPE_NAME: &str = "SyntaxBridgeFileOutputStream";
+
+pub const INPUT_STREAM_USR: &str = "syntax-bridge:input-stream";
+pub const INPUT_STREAM_TYPE_NAME: &str = "SyntaxBridgeInputStream";
+pub const INPUT_STREAM_STRING_TYPE_NAME: &str = "SyntaxBridgeStringInputStream";
+pub const INPUT_STREAM_FILE_TYPE_NAME: &str = "SyntaxBridgeFileInputStream";
 
 pub fn lower_method(
     cursor: clang_sys::CXCursor,
@@ -1003,13 +1056,16 @@ pub fn lower_method(
     // below; only the name needs its own path.
     let is_conversion_operator =
         unsafe { clang_sys::clang_getCursorKind(cursor) } == clang_sys::CXCursor_ConversionFunction;
-    let conversion_name = is_conversion_operator
-        .then(|| {
-            conversion_operator_dart_method_name(&lower_type(unsafe {
-                clang_sys::clang_getCursorResultType(cursor)
-            }))
-        })
-        .flatten();
+    let is_safe_bool = is_conversion_operator && unsafe { is_safe_bool_conversion(cursor) };
+    let conversion_name = if is_safe_bool {
+        Some(CONVERSION_TO_BOOL_METHOD_NAME)
+    } else if is_conversion_operator {
+        conversion_operator_dart_method_name(&lower_type(unsafe {
+            clang_sys::clang_getCursorResultType(cursor)
+        }))
+    } else {
+        None
+    };
     if is_conversion_operator && conversion_name.is_none() {
         return None;
     }
@@ -1026,7 +1082,11 @@ pub fn lower_method(
     let (file, line, column) = type_catalog::cursor_site(cursor, project_root)?;
     let origin = ir::Origin { file, line, column };
 
-    let mut return_type = lower_type(unsafe { clang_sys::clang_getCursorResultType(cursor) });
+    let mut return_type = if is_safe_bool {
+        ir::Type::Bool
+    } else {
+        lower_type(unsafe { clang_sys::clang_getCursorResultType(cursor) })
+    };
     let (mut params, clone_prelude) =
         unsafe { collect_params_with_clone_prelude(cursor, &origin, project_root) };
     // A pure virtual method (`virtual T f() = 0;`) has no body cursor at
@@ -1364,6 +1424,7 @@ pub fn lower_record(cursor: clang_sys::CXCursor, project_root: &Path) -> Option<
     } else {
         (None, bases)
     };
+    let library_base = unsafe { library_base_of(cursor) };
 
     Some(ir::Record {
         name,
@@ -1381,6 +1442,7 @@ pub fn lower_record(cursor: clang_sys::CXCursor, project_root: &Path) -> Option<
         methods: Vec::new(),
         base_class,
         mixins,
+        library_base,
         // Filled in later, the same way constructors/methods are — see the
         // comment just above.
         destructor: None,
@@ -1671,6 +1733,56 @@ unsafe fn base_classes_of(cursor: clang_sys::CXCursor) -> Vec<ir::BaseClass> {
             }
         })
         .collect()
+}
+
+/// Identifies a base class that is a library type (e.g. `std::string`, `std::vector<T>`)
+/// rather than a declared `ir::Type::Record` or `ir::Type::Enum`.
+unsafe fn library_base_of(cursor: clang_sys::CXCursor) -> Option<ir::Type> {
+    let mut library_bases = Vec::new();
+    for base_specifier in unsafe { collect_children(cursor) } {
+        if unsafe { clang_sys::clang_getCursorKind(base_specifier) }
+            != clang_sys::CXCursor_CXXBaseSpecifier
+        {
+            continue;
+        }
+        let base_type = unsafe { clang_sys::clang_getCursorType(base_specifier) };
+        let lowered = lower_type(base_type);
+        match lowered {
+            ir::Type::Record { .. } | ir::Type::Enum { .. } | ir::Type::Unsupported(_) => {}
+            other => {
+                library_bases.push(other);
+            }
+        }
+    }
+    if library_bases.len() == 1 {
+        library_bases.pop()
+    } else {
+        None
+    }
+}
+
+/// Returns the library base type (direct or inherited) of a record declaration, if any.
+unsafe fn record_library_base(record_decl: clang_sys::CXCursor) -> Option<ir::Type> {
+    let definition = unsafe { clang_sys::clang_getCursorDefinition(record_decl) };
+    let cursor = if unsafe { clang_sys::clang_Cursor_isNull(definition) } != 0 {
+        record_decl
+    } else {
+        definition
+    };
+    if let Some(direct) = unsafe { library_base_of(cursor) } {
+        return Some(direct);
+    }
+    for child in unsafe { collect_children(cursor) } {
+        if unsafe { clang_sys::clang_getCursorKind(child) } == clang_sys::CXCursor_CXXBaseSpecifier
+        {
+            let base_type = unsafe { clang_sys::clang_getCursorType(child) };
+            let base_decl = unsafe { clang_sys::clang_getTypeDeclaration(base_type) };
+            if let Some(inherited) = unsafe { record_library_base(base_decl) } {
+                return Some(inherited);
+            }
+        }
+    }
+    None
 }
 
 /// Whether the record declared at `record_decl` transitively derives from
@@ -2334,20 +2446,42 @@ fn lower_type(cx_type: clang_sys::CXType) -> ir::Type {
             let stdlib_name = unsafe { stdlib_template_name(decl) };
             match stdlib_name.as_deref() {
                 Some("basic_string") => return ir::Type::Str,
-                // `std::stringstream`/`std::ostringstream` — the read+write
-                // and write-only accumulator streams (round 19, real
-                // trigger `options.cpp`'s `OptionArray::GetStr`: `ss <<
-                // "\"" << value << "\""; ... return ss.str();`). Modeled
-                // directly as `Type::Str` rather than a distinct type:
-                // every operation this bridge supports on one (`<<`
-                // insertion as a statement, `.str()`) reduces to plain
-                // string concatenation/identity, so giving the variable
-                // itself `Type::Str` reuses the entire existing string
-                // machinery (default value, assignment, emission) instead
-                // of inventing a parallel one. `basic_istringstream`
-                // (read/extraction via `>>`, a different idiom entirely)
-                // deliberately excluded — no fixture needs it yet.
-                Some("basic_stringstream") | Some("basic_ostringstream") => return ir::Type::Str,
+                Some("basic_ostream") | Some("basic_iostream") | Some("basic_ios") => {
+                    return ir::Type::Record {
+                        usr: OUTPUT_STREAM_USR.to_owned(),
+                        name: OUTPUT_STREAM_TYPE_NAME.to_owned(),
+                    };
+                }
+                Some("basic_ostringstream") | Some("basic_stringstream") => {
+                    return ir::Type::Record {
+                        usr: OUTPUT_STREAM_USR.to_owned(),
+                        name: OUTPUT_STREAM_STRING_TYPE_NAME.to_owned(),
+                    };
+                }
+                Some("basic_ofstream") => {
+                    return ir::Type::Record {
+                        usr: OUTPUT_STREAM_USR.to_owned(),
+                        name: OUTPUT_STREAM_FILE_TYPE_NAME.to_owned(),
+                    };
+                }
+                Some("basic_istream") => {
+                    return ir::Type::Record {
+                        usr: INPUT_STREAM_USR.to_owned(),
+                        name: INPUT_STREAM_TYPE_NAME.to_owned(),
+                    };
+                }
+                Some("basic_istringstream") => {
+                    return ir::Type::Record {
+                        usr: INPUT_STREAM_USR.to_owned(),
+                        name: INPUT_STREAM_STRING_TYPE_NAME.to_owned(),
+                    };
+                }
+                Some("basic_ifstream") => {
+                    return ir::Type::Record {
+                        usr: INPUT_STREAM_USR.to_owned(),
+                        name: INPUT_STREAM_FILE_TYPE_NAME.to_owned(),
+                    };
+                }
                 // `std::list<T>`, `std::deque<T>`, `std::array<T, N>` and
                 // `std::initializer_list<T>` preserve the same value shape
                 // Dart exposes as `List<T>`. Their iteration and allocation
@@ -4491,19 +4625,6 @@ unsafe fn lower_stmt(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::St
         };
     }
 
-    // `ss << a << b;` (round 19) — a `std::stringstream` accumulation used
-    // as its own statement. Checked directly on `cursor`, not through
-    // `method_call_cursor_under_wrappers`: the chain's outermost
-    // `operator<<` can resolve to a free function (a literal insertion,
-    // same as the `std::cout` chain's own note on this), not only a
-    // `CXXMethod`, and `lower_stringstream_insertion_stmt` already does its
-    // own cursor-kind/receiver-chain validation.
-    if let Some(statement) =
-        unsafe { lower_stringstream_insertion_stmt(cursor, project_root, &origin) }
-    {
-        return statement;
-    }
-
     // An overloaded assignment is represented as a CallExpr, not the
     // BinaryOperator shape handled above. For immutable Dart-backed values
     // such as `String`, C++ copy assignment has the same value semantics as
@@ -5101,7 +5222,25 @@ unsafe fn lower_stdlib_assignment_stmt(
     let target = unsafe { lower_expr(target, project_root) };
     let value = unsafe { lower_expr(value_cursor, project_root) };
     let value = match (template_name.as_str(), callee_name.as_str()) {
-        ("basic_string", "operator=") => value,
+        ("basic_string", "operator=") => {
+            if matches!(value, ir::Expr::StringLiteral { .. }) || value.ty() == Some(&ir::Type::Str)
+            {
+                value
+            } else {
+                let val_ty = lower_type(unsafe { clang_sys::clang_getCursorType(value_cursor) });
+                if matches!(val_ty, ir::Type::Nullable(inner) if inner.as_ref() == &ir::Type::Str)
+                    || matches!(value.ty(), Some(ir::Type::Nullable(inner)) if inner.as_ref() == &ir::Type::Str)
+                {
+                    ir::Expr::Convert {
+                        operand: Box::new(value),
+                        ty: ir::Type::Str,
+                        origin: origin.clone(),
+                    }
+                } else {
+                    value
+                }
+            }
+        }
         ("basic_string", "operator+=") => {
             let val_ty = lower_type(unsafe { clang_sys::clang_getCursorType(value_cursor) });
             let rhs = if val_ty == ir::Type::Int {
@@ -6112,6 +6251,21 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
                     ty: ir::Type::Bool,
                     origin,
                 }
+            } else if matches!(&child_ty, ir::Type::Nullable(inner_ty) if inner_ty.as_ref() == &outer_ty)
+            {
+                // A nullable value (`const char*` as `String?`, or a nullable object reference)
+                // implicitly converted to a non-nullable target (`std::string` as `String`, etc.) —
+                // materialize the explicit non-null assertion boundary `Expr::Convert`.
+                if matches!(inner, ir::Expr::StringLiteral { .. }) || inner.ty() == Some(&outer_ty)
+                {
+                    inner
+                } else {
+                    ir::Expr::Convert {
+                        operand: Box::new(inner),
+                        ty: outer_ty,
+                        origin,
+                    }
+                }
             } else if outer_ty == ir::Type::Void {
                 // `(void)fmt;` (E13's `LogDebug` stub) — C++'s idiom for
                 // "evaluate this and deliberately discard the result",
@@ -6227,6 +6381,106 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
                     ty: outer_ty,
                     origin,
                 }
+            } else if outer_ty == ir::Type::Bool {
+                // Safe bool idiom or conversion operator to bool in condition/boolean position
+                if inner.ty() == Some(&ir::Type::Bool) {
+                    inner
+                } else {
+                    ir::Expr::Call {
+                        base_qualifier: None,
+                        target: Some(Box::new(inner)),
+                        callee_usr: String::new(),
+                        callee_name: CONVERSION_TO_BOOL_METHOD_NAME.to_owned(),
+                        args: Vec::new(),
+                        ty: ir::Type::Bool,
+                        origin,
+                    }
+                }
+            } else if matches!(child_ty, ir::Type::Record { .. })
+                && let Some(lib_base) = unsafe {
+                    let child_type = clang_sys::clang_getCursorType(child_cursor);
+                    let child_decl = clang_sys::clang_getTypeDeclaration(child_type);
+                    record_library_base(child_decl)
+                }
+                && lib_base == outer_ty
+            {
+                ir::Expr::FieldAccess {
+                    target: Box::new(inner),
+                    field: library_base_field_name(&lib_base).to_owned(),
+                    ty: outer_ty,
+                    origin,
+                }
+            } else if let (ir::Type::Nullable(child_record), ir::Type::Nullable(target_base)) =
+                (&child_ty, &outer_ty)
+                && matches!(child_record.as_ref(), ir::Type::Record { .. })
+                && let Some(lib_base) = unsafe {
+                    let child_type = clang_sys::clang_getCursorType(child_cursor);
+                    let pointee = clang_sys::clang_getPointeeType(child_type);
+                    let target_ty = if pointee.kind != clang_sys::CXType_Invalid {
+                        pointee
+                    } else {
+                        child_type
+                    };
+                    let child_decl = clang_sys::clang_getTypeDeclaration(target_ty);
+                    record_library_base(child_decl)
+                }
+                && &lib_base == target_base.as_ref()
+            {
+                ir::Expr::FieldAccess {
+                    target: Box::new(inner),
+                    field: library_base_field_name(&lib_base).to_owned(),
+                    ty: outer_ty,
+                    origin,
+                }
+            } else if let (ir::Type::Nullable(child_record), target_base) = (&child_ty, &outer_ty)
+                && matches!(child_record.as_ref(), ir::Type::Record { .. })
+                && let Some(lib_base) = unsafe {
+                    let child_type = clang_sys::clang_getCursorType(child_cursor);
+                    let pointee = clang_sys::clang_getPointeeType(child_type);
+                    let target_ty = if pointee.kind != clang_sys::CXType_Invalid {
+                        pointee
+                    } else {
+                        child_type
+                    };
+                    let child_decl = clang_sys::clang_getTypeDeclaration(target_ty);
+                    record_library_base(child_decl)
+                }
+                && &lib_base == target_base
+            {
+                ir::Expr::FieldAccess {
+                    target: Box::new(inner),
+                    field: library_base_field_name(&lib_base).to_owned(),
+                    ty: outer_ty,
+                    origin,
+                }
+            } else if child_ty == ir::Type::Int && matches!(outer_ty, ir::Type::Callback { .. }) {
+                // Integer constant 0 / 1 converted to safe_bool / dummy function pointer
+                if matches!(inner, ir::Expr::IntLiteral { value: 0, .. }) {
+                    ir::Expr::NullLiteral { origin }
+                } else if matches!(inner, ir::Expr::IntLiteral { value: 1, .. }) {
+                    ir::Expr::BoolLiteral {
+                        value: true,
+                        origin,
+                    }
+                } else {
+                    inner
+                }
+            } else if matches!(child_ty, ir::Type::Record { .. })
+                && let Some(method_name) = conversion_operator_dart_method_name(&outer_ty)
+            {
+                if inner.ty() == Some(&outer_ty) {
+                    inner
+                } else {
+                    ir::Expr::Call {
+                        base_qualifier: None,
+                        target: Some(Box::new(inner)),
+                        callee_usr: String::new(),
+                        callee_name: method_name.to_owned(),
+                        args: Vec::new(),
+                        ty: outer_ty,
+                        origin,
+                    }
+                }
             } else {
                 ir::Expr::UnsupportedTyped {
                     reason: format!(
@@ -6282,6 +6536,31 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
                 let value = unsafe { clang_sys::clang_getEnumConstantDeclValue(referenced) };
                 return ir::Expr::IntLiteral { value, origin };
             }
+        }
+        if let Some(stream) = unsafe { known_ostream_global(cursor) } {
+            let type_name = match stream {
+                KnownOstream::Cout => OUTPUT_STREAM_STDOUT_TYPE_NAME,
+                KnownOstream::Cerr => OUTPUT_STREAM_STDERR_TYPE_NAME,
+            };
+            return ir::Expr::ConstructorCall {
+                type_name: type_name.to_owned(),
+                type_usr: OUTPUT_STREAM_USR.to_owned(),
+                constructor_index: 0,
+                args: Vec::new(),
+                origin,
+            };
+        }
+        if unsafe { is_known_istream_global(cursor) } {
+            return ir::Expr::ConstructorCall {
+                type_name: INPUT_STREAM_STRING_TYPE_NAME.to_owned(),
+                type_usr: INPUT_STREAM_USR.to_owned(),
+                constructor_index: 0,
+                args: vec![ir::Expr::StringLiteral {
+                    value: String::new(),
+                    origin: origin.clone(),
+                }],
+                origin,
+            };
         }
         let name = unsafe { qualified_static_member_name(referenced) };
         let ty = lower_type(unsafe { clang_sys::clang_getCursorType(cursor) });
@@ -7419,7 +7698,23 @@ unsafe fn lower_call_expr(
         // information `Type::Str` needs to represent.
         if arg_count >= 1 && owner_template_name.as_deref() == Some("basic_string") {
             let arg_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 0) };
-            return unsafe { lower_expr(arg_cursor, project_root) };
+            let arg_expr = unsafe { lower_expr(arg_cursor, project_root) };
+            if matches!(arg_expr, ir::Expr::StringLiteral { .. })
+                || arg_expr.ty() == Some(&ir::Type::Str)
+            {
+                return arg_expr;
+            }
+            let arg_ty = lower_type(unsafe { clang_sys::clang_getCursorType(arg_cursor) });
+            if matches!(arg_expr.ty(), Some(ir::Type::Nullable(inner)) if inner.as_ref() == &ir::Type::Str)
+                || matches!(arg_ty, ir::Type::Nullable(inner) if inner.as_ref() == &ir::Type::Str)
+            {
+                return ir::Expr::Convert {
+                    operand: Box::new(arg_expr),
+                    ty: ir::Type::Str,
+                    origin,
+                };
+            }
+            return arg_expr;
         }
         // `std::string()` (F6/tarefa 07: real Verovio trigger —
         // `jsonxx.cc`'s `const std::string &attr = std::string()` default
@@ -7447,6 +7742,77 @@ unsafe fn lower_call_expr(
             }
             let arg_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 0) };
             return unsafe { lower_expr(arg_cursor, project_root) };
+        }
+        if matches!(
+            owner_template_name.as_deref(),
+            Some("basic_ostringstream") | Some("basic_stringstream")
+        ) {
+            let args = if arg_count >= 1 {
+                let arg_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 0) };
+                let arg_ty = lower_type(unsafe { clang_sys::clang_getCursorType(arg_cursor) });
+                if arg_ty == ir::Type::Str {
+                    vec![unsafe { lower_expr(arg_cursor, project_root) }]
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+            return ir::Expr::ConstructorCall {
+                type_name: OUTPUT_STREAM_STRING_TYPE_NAME.to_owned(),
+                type_usr: OUTPUT_STREAM_USR.to_owned(),
+                constructor_index: 0,
+                args,
+                origin,
+            };
+        }
+        if owner_template_name.as_deref() == Some("basic_ofstream") {
+            let args = if arg_count >= 1 {
+                let arg_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 0) };
+                vec![unsafe { lower_expr(arg_cursor, project_root) }]
+            } else {
+                Vec::new()
+            };
+            return ir::Expr::ConstructorCall {
+                type_name: OUTPUT_STREAM_FILE_TYPE_NAME.to_owned(),
+                type_usr: OUTPUT_STREAM_USR.to_owned(),
+                constructor_index: 0,
+                args,
+                origin,
+            };
+        }
+        if owner_template_name.as_deref() == Some("basic_istringstream") {
+            let args = if arg_count >= 1 {
+                let arg_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 0) };
+                vec![unsafe { lower_expr(arg_cursor, project_root) }]
+            } else {
+                vec![ir::Expr::StringLiteral {
+                    value: String::new(),
+                    origin: origin.clone(),
+                }]
+            };
+            return ir::Expr::ConstructorCall {
+                type_name: INPUT_STREAM_STRING_TYPE_NAME.to_owned(),
+                type_usr: INPUT_STREAM_USR.to_owned(),
+                constructor_index: 0,
+                args,
+                origin,
+            };
+        }
+        if owner_template_name.as_deref() == Some("basic_ifstream") {
+            let args = if arg_count >= 1 {
+                let arg_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 0) };
+                vec![unsafe { lower_expr(arg_cursor, project_root) }]
+            } else {
+                Vec::new()
+            };
+            return ir::Expr::ConstructorCall {
+                type_name: INPUT_STREAM_FILE_TYPE_NAME.to_owned(),
+                type_usr: INPUT_STREAM_USR.to_owned(),
+                constructor_index: 0,
+                args,
+                origin,
+            };
         }
         // `std::vector<int> v = {1, 2, 3}` invokes `vector`'s
         // `initializer_list` constructor — a real `CXXConstructExpr`, same
@@ -7618,8 +7984,13 @@ unsafe fn lower_call_expr(
     // type, another record) stays an honest, explicit bailout rather than
     // guessing a Dart name or semantics this hasn't been verified for.
     if referenced_kind == clang_sys::CXCursor_ConversionFunction {
-        let target_type = lower_type(unsafe { clang_sys::clang_getCursorResultType(referenced) });
-        if conversion_operator_dart_method_name(&target_type).is_some() {
+        let is_safe_bool = unsafe { is_safe_bool_conversion(referenced) };
+        let target_type = if is_safe_bool {
+            ir::Type::Bool
+        } else {
+            lower_type(unsafe { clang_sys::clang_getCursorResultType(referenced) })
+        };
+        if is_safe_bool || conversion_operator_dart_method_name(&target_type).is_some() {
             return unsafe { lower_method_call(cursor, referenced, project_root, origin) };
         }
         return ir::Expr::UnsupportedTyped {
@@ -7783,6 +8154,49 @@ unsafe fn lower_call_expr(
             ty,
             origin,
         };
+    }
+
+    if callee_name == "operator<<"
+        && unsafe { clang_sys::clang_Cursor_getNumArguments(cursor) } == 2
+    {
+        let receiver_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 0) };
+        let value_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 1) };
+        let receiver_ty = lower_type(unsafe { clang_sys::clang_getCursorType(receiver_cursor) });
+        if matches!(&receiver_ty, ir::Type::Record { usr, .. } if usr == OUTPUT_STREAM_USR) {
+            let target = unsafe { lower_expr(receiver_cursor, project_root) };
+            if unsafe { is_std_endl(value_cursor) } {
+                return ir::Expr::Call {
+                    base_qualifier: None,
+                    target: Some(Box::new(target)),
+                    callee_usr: String::new(),
+                    callee_name: "writeln".to_owned(),
+                    args: Vec::new(),
+                    ty: receiver_ty,
+                    origin,
+                };
+            }
+            if unsafe { is_std_flush(value_cursor) } {
+                return ir::Expr::Call {
+                    base_qualifier: None,
+                    target: Some(Box::new(target)),
+                    callee_usr: String::new(),
+                    callee_name: "flush".to_owned(),
+                    args: Vec::new(),
+                    ty: receiver_ty,
+                    origin,
+                };
+            }
+            let value_expr = unsafe { lower_expr(value_cursor, project_root) };
+            return ir::Expr::Call {
+                base_qualifier: None,
+                target: Some(Box::new(target)),
+                callee_usr: String::new(),
+                callee_name: "write".to_owned(),
+                args: vec![value_expr],
+                ty: receiver_ty,
+                origin,
+            };
+        }
     }
 
     // Every free operator overload this function actually knows how to
@@ -8080,6 +8494,38 @@ unsafe fn is_std_endl(cursor: clang_sys::CXCursor) -> bool {
         } != 0
 }
 
+unsafe fn is_std_flush(cursor: clang_sys::CXCursor) -> bool {
+    let value_cursor = unsafe { unwrap_transparent_value_cursor(cursor) };
+    if unsafe { clang_sys::clang_getCursorKind(value_cursor) } != clang_sys::CXCursor_DeclRefExpr {
+        return false;
+    }
+    let referenced = unsafe { clang_sys::clang_getCursorReferenced(value_cursor) };
+    let name =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced)) };
+    name == "flush"
+        && unsafe {
+            clang_sys::clang_Location_isInSystemHeader(clang_sys::clang_getCursorLocation(
+                referenced,
+            ))
+        } != 0
+}
+
+unsafe fn is_known_istream_global(cursor: clang_sys::CXCursor) -> bool {
+    if unsafe { clang_sys::clang_getCursorKind(cursor) } != clang_sys::CXCursor_DeclRefExpr {
+        return false;
+    }
+    let referenced = unsafe { clang_sys::clang_getCursorReferenced(cursor) };
+    let is_std = unsafe {
+        clang_sys::clang_Location_isInSystemHeader(clang_sys::clang_getCursorLocation(referenced))
+    } != 0;
+    if !is_std {
+        return false;
+    }
+    let name =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced)) };
+    name == "cin"
+}
+
 /// Walks a chain of `std::cout << a << b << ...` insertions — left-
 /// associative in the AST (`((cout << a) << b) << ...`, confirmed via
 /// `clang -Xclang -ast-dump`, the same operator-syntax shape `operator[]`'s
@@ -8172,167 +8618,6 @@ unsafe fn lower_ostream_insertion_chain(
     };
     pieces.push(piece);
     Some((stream, pieces))
-}
-
-/// Whether `cursor` is a `DeclRefExpr` to a local `std::stringstream`/
-/// `std::ostringstream` variable — the base case
-/// `lower_stringstream_insertion_chain` bottoms out at, mirroring
-/// `known_ostream_global`'s role for the `std::cout`/`std::cerr` chain.
-/// Checked against the variable's own *declared* clang type
-/// (`stdlib_template_name_of_type`), not `lower_type`'s result: a
-/// stringstream variable already lowers to `Type::Str` (this bridge models
-/// it *as* the accumulated string directly), which would be
-/// indistinguishable from an ordinary `std::string` local otherwise.
-unsafe fn stringstream_variable_name(cursor: clang_sys::CXCursor) -> Option<String> {
-    // `ss`, as the receiver of `operator<<`, is always reached through an
-    // implicit `DerivedToBase` cast (`basic_iostream` → `basic_ostream`,
-    // confirmed via `-ast-dump`: `operator<<` takes `basic_ostream&`, and
-    // `stringstream`'s own inheritance chain is `basic_stringstream` →
-    // `basic_iostream` → `basic_ostream`) — unlike `std::cout`/`std::cerr`,
-    // whose global objects genuinely *are* `basic_ostream` already, no cast
-    // needed. `unwrap_transparent_value_cursor` strips it before the
-    // `DeclRefExpr` check below, the same wrapper class this module
-    // already unwraps in half a dozen other spots.
-    let cursor = unsafe { unwrap_transparent_value_cursor(cursor) };
-    if unsafe { clang_sys::clang_getCursorKind(cursor) } != clang_sys::CXCursor_DeclRefExpr {
-        return None;
-    }
-    let referenced = unsafe { clang_sys::clang_getCursorReferenced(cursor) };
-    if unsafe { clang_sys::clang_Cursor_isNull(referenced) } != 0 {
-        return None;
-    }
-    // `std::stringstream` is itself a typedef for `basic_stringstream<char>`
-    // (the same shape `std::string`/`basic_string<char>` has, and the same
-    // trap `lower_ostream_insertion_chain`'s own `call_type` already
-    // canonicalizes for): `clang_getTypeDeclaration` on the typedef itself
-    // resolves to the `TypedefDecl`, which `stdlib_template_name` correctly
-    // reports as "not a template specialization" — so this needs the
-    // canonical type first, or every real `std::stringstream` variable
-    // would silently never match.
-    let declared_type =
-        unsafe { clang_sys::clang_getCanonicalType(clang_sys::clang_getCursorType(referenced)) };
-    match unsafe { stdlib_template_name_of_type(declared_type) }.as_deref() {
-        Some("basic_stringstream") | Some("basic_ostringstream") => {}
-        _ => return None,
-    }
-    Some(dart_safe_identifier(&unsafe {
-        type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced))
-    }))
-}
-
-/// `ss << a << b << ...;` — the `std::stringstream`/`std::ostringstream`
-/// accumulator idiom (round 19, real trigger `options.cpp`'s
-/// `OptionArray::GetStr`: `ss << "\"" << value << "\"";` inside a loop,
-/// then `return ss.str();`). Structurally the *same* left-associative
-/// chain `lower_ostream_insertion_chain` already walks for `std::cout`/
-/// `std::cerr` (same operator-syntax shape, same
-/// `stdlib_template_name_of_type(call_type) == "basic_ostream"` check —
-/// `basic_stringstream` inherits `basic_ostream`'s `operator<<`, so a
-/// chain ending at either resolves through the exact same overloads) —
-/// duplicated rather than sharing one function with
-/// `lower_ostream_insertion_chain`, since the two differ in exactly the
-/// one thing a shared helper would need a parameter for anyway (the base
-/// case: a known global stream object vs. a local variable's own name) and
-/// in what they do with the result (`print`/`stderr.writeln` vs. a
-/// self-reassignment). No `std::endl`/manipulator requirement here, unlike
-/// the `std::cout` chain: a stringstream accumulates across many separate
-/// statements, not one terminal flush, so this fires for *every* insertion
-/// chain into a recognized stringstream variable, used as its own
-/// statement.
-unsafe fn lower_stringstream_insertion_chain(
-    cursor: clang_sys::CXCursor,
-    project_root: &Path,
-    origin: &ir::Origin,
-) -> Option<(String, Vec<ir::Expr>)> {
-    if let Some(name) = unsafe { stringstream_variable_name(cursor) } {
-        return Some((name, Vec::new()));
-    }
-    if unsafe { clang_sys::clang_getCursorKind(cursor) } != clang_sys::CXCursor_CallExpr {
-        return None;
-    }
-    let referenced = unsafe { clang_sys::clang_getCursorReferenced(cursor) };
-    if unsafe { clang_sys::clang_Cursor_isNull(referenced) } != 0 {
-        return None;
-    }
-    let spelling =
-        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced)) };
-    if spelling != "operator<<" {
-        return None;
-    }
-    let call_type =
-        unsafe { clang_sys::clang_getCanonicalType(clang_sys::clang_getCursorType(cursor)) };
-    if unsafe { stdlib_template_name_of_type(call_type) }.as_deref() != Some("basic_ostream") {
-        return None;
-    }
-    if unsafe { clang_sys::clang_Cursor_getNumArguments(cursor) } != 2 {
-        return None;
-    }
-    let receiver_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 0) };
-    let value_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 1) };
-    let (name, mut pieces) =
-        unsafe { lower_stringstream_insertion_chain(receiver_cursor, project_root, origin) }?;
-    let value = unsafe { lower_expr(value_cursor, project_root) };
-    let piece = if matches!(value, ir::Expr::StringLiteral { .. }) {
-        value
-    } else {
-        match lower_type(unsafe { clang_sys::clang_getCursorType(value_cursor) }) {
-            ir::Type::Str => value,
-            ir::Type::Int | ir::Type::Double => ir::Expr::Call {
-                base_qualifier: None,
-                target: Some(Box::new(value)),
-                callee_usr: String::new(),
-                callee_name: "toString".to_owned(),
-                args: Vec::new(),
-                ty: ir::Type::Str,
-                origin: origin.clone(),
-            },
-            _ => return None,
-        }
-    };
-    pieces.push(piece);
-    Some((name, pieces))
-}
-
-/// `ss << a << b;` used as its own statement — builds
-/// `ss = ss + a.toString() + b.toString();`, preserving whatever `ss`
-/// already held (the same reduce-with-`Add` `lower_ostream_insertion_chain`
-/// already uses for `print`'s message, just starting the fold from `ss`
-/// itself instead of the first piece, since this appends rather than
-/// replaces). `None` for anything `lower_stringstream_insertion_chain`
-/// itself doesn't recognize, so the caller falls through to the ordinary
-/// bailout unchanged.
-unsafe fn lower_stringstream_insertion_stmt(
-    cursor: clang_sys::CXCursor,
-    project_root: &Path,
-    origin: &ir::Origin,
-) -> Option<ir::Stmt> {
-    if unsafe { clang_sys::clang_getCursorKind(cursor) } != clang_sys::CXCursor_CallExpr {
-        return None;
-    }
-    let (name, pieces) =
-        unsafe { lower_stringstream_insertion_chain(cursor, project_root, origin) }?;
-    if pieces.is_empty() {
-        return None;
-    }
-    let value = pieces.into_iter().fold(
-        ir::Expr::Ref {
-            name: name.clone(),
-            ty: ir::Type::Str,
-            origin: origin.clone(),
-        },
-        |acc, piece| ir::Expr::Binary {
-            op: ir::BinaryOp::Add,
-            lhs: Box::new(acc),
-            rhs: Box::new(piece),
-            ty: ir::Type::Str,
-            origin: origin.clone(),
-        },
-    );
-    Some(ir::Stmt::Assign {
-        name,
-        value,
-        origin: origin.clone(),
-    })
 }
 
 /// `*it` / `it->field` inside a loop `lower_iterator_for_loop` recognized,
@@ -8471,7 +8756,41 @@ unsafe fn lower_stdlib_method_call(
                 origin: origin.clone(),
             });
         };
-        let target = unsafe { lower_expr(*receiver_cursor, project_root) };
+        let mut target = unsafe { lower_expr(*receiver_cursor, project_root) };
+        let target_is_record = match target.ty() {
+            Some(ir::Type::Record { .. }) => true,
+            Some(ir::Type::Nullable(inner))
+                if matches!(inner.as_ref(), ir::Type::Record { .. }) =>
+            {
+                true
+            }
+            _ => false,
+        };
+        if target_is_record {
+            let (field_name, field_ty) = match template_name.as_str() {
+                "basic_string" => ("syntaxBridgeStringBase", ir::Type::Str),
+                "vector" | "deque" => (
+                    "syntaxBridgeListBase",
+                    ir::Type::List(Box::new(ir::Type::Int)),
+                ),
+                "map" => (
+                    "syntaxBridgeMapBase",
+                    ir::Type::Map(Box::new(ir::Type::Int), Box::new(ir::Type::Int)),
+                ),
+                _ => ("syntaxBridgeLibraryBase", ir::Type::Void),
+            };
+            let ty = if matches!(target.ty(), Some(ir::Type::Nullable(_))) {
+                ir::Type::Nullable(Box::new(field_ty))
+            } else {
+                field_ty
+            };
+            target = ir::Expr::FieldAccess {
+                target: Box::new(target),
+                field: field_name.to_owned(),
+                ty,
+                origin: origin.clone(),
+            };
+        }
         let index = unsafe { lower_expr(*index_cursor, project_root) };
         if template_name == "basic_string" {
             return Some(ir::Expr::StringByteAt {
@@ -8598,6 +8917,43 @@ unsafe fn lower_stdlib_method_call(
                 },
             });
         }
+        let target = unsafe { lower_expr(receiver_cursor, project_root) };
+        let stream_ty = ir::Type::Record {
+            usr: OUTPUT_STREAM_USR.to_owned(),
+            name: OUTPUT_STREAM_TYPE_NAME.to_owned(),
+        };
+        if unsafe { is_std_endl(value_cursor) } {
+            return Some(ir::Expr::Call {
+                base_qualifier: None,
+                target: Some(Box::new(target)),
+                callee_usr: String::new(),
+                callee_name: "writeln".to_owned(),
+                args: Vec::new(),
+                ty: stream_ty,
+                origin: origin.clone(),
+            });
+        }
+        if unsafe { is_std_flush(value_cursor) } {
+            return Some(ir::Expr::Call {
+                base_qualifier: None,
+                target: Some(Box::new(target)),
+                callee_usr: String::new(),
+                callee_name: "flush".to_owned(),
+                args: Vec::new(),
+                ty: stream_ty,
+                origin: origin.clone(),
+            });
+        }
+        let value_expr = unsafe { lower_expr(value_cursor, project_root) };
+        return Some(ir::Expr::Call {
+            base_qualifier: None,
+            target: Some(Box::new(target)),
+            callee_usr: String::new(),
+            callee_name: "write".to_owned(),
+            args: vec![value_expr],
+            ty: stream_ty,
+            origin: origin.clone(),
+        });
     }
 
     // A normal dot call owns a `MemberRefExpr` for its callee. Overloaded
@@ -8606,7 +8962,7 @@ unsafe fn lower_stdlib_method_call(
     // Verovio corpus). Normalize both shapes *before* method dispatch: a
     // method that we do not yet bridge must still report its own name, not a
     // fragile incidental detail of libclang's child ordering.
-    let target = match unsafe { stdlib_method_receiver(call_cursor, project_root, origin) } {
+    let mut target = match unsafe { stdlib_method_receiver(call_cursor, project_root, origin) } {
         Ok(target) => target,
         Err(reason) => {
             return Some(ir::Expr::UnsupportedTyped {
@@ -8616,18 +8972,99 @@ unsafe fn lower_stdlib_method_call(
             });
         }
     };
+    let target_is_record = match target.ty() {
+        Some(ir::Type::Record { .. }) => true,
+        Some(ir::Type::Nullable(inner)) if matches!(inner.as_ref(), ir::Type::Record { .. }) => {
+            true
+        }
+        _ => false,
+    };
+    if target_is_record {
+        let (field_name, field_ty) = match template_name.as_str() {
+            "basic_string" => ("syntaxBridgeStringBase", ir::Type::Str),
+            "vector" | "list" | "deque" | "stack" => (
+                "syntaxBridgeListBase",
+                ir::Type::List(Box::new(ir::Type::Int)),
+            ),
+            "set" | "unordered_set" => (
+                "syntaxBridgeSetBase",
+                ir::Type::Set(Box::new(ir::Type::Int)),
+            ),
+            "map" | "unordered_map" => (
+                "syntaxBridgeMapBase",
+                ir::Type::Map(Box::new(ir::Type::Int), Box::new(ir::Type::Int)),
+            ),
+            _ => ("syntaxBridgeLibraryBase", ir::Type::Void),
+        };
+        let ty = if matches!(target.ty(), Some(ir::Type::Nullable(_))) {
+            ir::Type::Nullable(Box::new(field_ty))
+        } else {
+            field_ty
+        };
+        target = ir::Expr::FieldAccess {
+            target: Box::new(target),
+            field: field_name.to_owned(),
+            ty,
+            origin: origin.clone(),
+        };
+    }
 
     match (template_name.as_str(), callee_name.as_str()) {
-        // `ss.str()` — the stringstream variable already *is* `Type::Str`
-        // (round 19: `lower_type`'s `basic_stringstream`/
-        // `basic_ostringstream` case), so reading it back is identity, the
-        // zero-argument form only (`ss.str(newValue)`, a rarer resetting
-        // overload no fixture needs, falls through to the generic bailout
-        // below unchanged).
         ("basic_stringstream" | "basic_ostringstream", "str")
             if unsafe { clang_sys::clang_Cursor_getNumArguments(call_cursor) } == 0 =>
         {
-            Some(target)
+            Some(ir::Expr::Call {
+                base_qualifier: None,
+                target: Some(Box::new(target)),
+                callee_usr: String::new(),
+                callee_name: "str".to_owned(),
+                args: Vec::new(),
+                ty: ir::Type::Str,
+                origin: origin.clone(),
+            })
+        }
+        (
+            "basic_ostream"
+            | "basic_ofstream"
+            | "basic_ostringstream"
+            | "basic_stringstream"
+            | "basic_iostream"
+            | "basic_ios",
+            "flush",
+        ) => Some(ir::Expr::Call {
+            base_qualifier: None,
+            target: Some(Box::new(target)),
+            callee_usr: String::new(),
+            callee_name: "flush".to_owned(),
+            args: Vec::new(),
+            ty: ir::Type::Void,
+            origin: origin.clone(),
+        }),
+        (
+            "basic_istream"
+            | "basic_ifstream"
+            | "basic_istringstream"
+            | "basic_iostream"
+            | "basic_ios",
+            "eof",
+        ) => Some(ir::Expr::FieldAccess {
+            target: Box::new(target),
+            field: "eof".to_owned(),
+            ty: ir::Type::Bool,
+            origin: origin.clone(),
+        }),
+        ("basic_istream" | "basic_ifstream" | "basic_istringstream" | "basic_iostream", "get")
+            if unsafe { clang_sys::clang_Cursor_getNumArguments(call_cursor) } == 0 =>
+        {
+            Some(ir::Expr::Call {
+                base_qualifier: None,
+                target: Some(Box::new(target)),
+                callee_usr: String::new(),
+                callee_name: "readByte".to_owned(),
+                args: Vec::new(),
+                ty: ir::Type::Int,
+                origin: origin.clone(),
+            })
         }
         ("basic_string", "size") | ("basic_string", "length") => Some(ir::Expr::StringByteLength {
             target: Box::new(target),
@@ -8844,6 +9281,42 @@ unsafe fn lower_stdlib_method_call(
                 callee_name: "compareTo".to_owned(),
                 args: vec![other],
                 ty: ir::Type::Int,
+                origin: origin.clone(),
+            })
+        }
+        (
+            "basic_string",
+            "operator==" | "operator!=" | "operator<" | "operator<=" | "operator>" | "operator>=",
+        ) => {
+            let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
+            let (lhs, rhs) = match args.as_slice() {
+                [rhs] => (target, rhs.clone()),
+                [lhs, rhs] => (lhs.clone(), rhs.clone()),
+                _ => {
+                    return Some(ir::Expr::UnsupportedTyped {
+                        reason: format!(
+                            "std::basic_string::{callee_name} had {} arguments, expected 1 or 2",
+                            args.len()
+                        ),
+                        ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
+                        origin: origin.clone(),
+                    });
+                }
+            };
+            let op = match callee_name.as_str() {
+                "operator==" => ir::BinaryOp::Eq,
+                "operator!=" => ir::BinaryOp::Ne,
+                "operator<" => ir::BinaryOp::Lt,
+                "operator<=" => ir::BinaryOp::Le,
+                "operator>" => ir::BinaryOp::Gt,
+                "operator>=" => ir::BinaryOp::Ge,
+                _ => unreachable!(),
+            };
+            Some(ir::Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                ty: ir::Type::Bool,
                 origin: origin.clone(),
             })
         }
@@ -10923,10 +11396,15 @@ unsafe fn lower_method_call(
     } else if unsafe { clang_sys::clang_getCursorKind(referenced) }
         == clang_sys::CXCursor_ConversionFunction
     {
-        let target_type = lower_type(unsafe { clang_sys::clang_getCursorResultType(referenced) });
-        conversion_operator_dart_method_name(&target_type)
-            .map(str::to_owned)
-            .unwrap_or(raw_callee_name)
+        if unsafe { is_safe_bool_conversion(referenced) } {
+            CONVERSION_TO_BOOL_METHOD_NAME.to_owned()
+        } else {
+            let target_type =
+                lower_type(unsafe { clang_sys::clang_getCursorResultType(referenced) });
+            conversion_operator_dart_method_name(&target_type)
+                .map(str::to_owned)
+                .unwrap_or(raw_callee_name)
+        }
     } else {
         raw_callee_name
     };
@@ -11012,7 +11490,14 @@ unsafe fn lower_method_call(
         }
     };
     let args = unsafe { regroup_variadic_call_args(args, referenced, &origin) };
-    let ty = lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) });
+    let ty = if unsafe { clang_sys::clang_getCursorKind(referenced) }
+        == clang_sys::CXCursor_ConversionFunction
+        && unsafe { is_safe_bool_conversion(referenced) }
+    {
+        ir::Type::Bool
+    } else {
+        lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) })
+    };
 
     ir::Expr::Call {
         base_qualifier,

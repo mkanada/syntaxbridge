@@ -609,6 +609,7 @@ fn a_record_with_an_unsupported_field_type_has_a_throwing_constructor() {
         methods: Vec::new(),
         base_class: None,
         mixins: Vec::new(),
+        library_base: None,
         destructor: None,
         origin: origin(1),
     };
@@ -686,6 +687,7 @@ fn syntax_bridge_opaque_is_declared_once_in_the_shared_support_file() {
         }],
         base_class: None,
         mixins: Vec::new(),
+        library_base: None,
         destructor: None,
         origin: base_origin,
     };
@@ -709,6 +711,7 @@ fn syntax_bridge_opaque_is_declared_once_in_the_shared_support_file() {
         }],
         base_class: Some(base(&base_record.usr, &base_record.name)),
         mixins: Vec::new(),
+        library_base: None,
         destructor: None,
         origin: derived_origin,
     };
@@ -886,6 +889,7 @@ fn field_and_method_access_through_a_nullable_pointer_gets_a_non_null_assertion(
         methods: Vec::new(),
         base_class: None,
         mixins: Vec::new(),
+        library_base: None,
         destructor: None,
         origin: origin(2),
     };
@@ -969,6 +973,7 @@ fn field_and_method_access_through_a_nullable_pointer_gets_a_non_null_assertion(
         ],
         base_class: None,
         mixins: Vec::new(),
+        library_base: None,
         destructor: None,
         origin: origin(3),
     };
@@ -1152,6 +1157,7 @@ fn a_field_access_never_promotes_even_when_read_twice_in_the_same_body() {
         methods: Vec::new(),
         base_class: None,
         mixins: Vec::new(),
+        library_base: None,
         destructor: None,
         origin: origin(2),
     };
@@ -1201,6 +1207,7 @@ fn a_field_access_never_promotes_even_when_read_twice_in_the_same_body() {
         }],
         base_class: None,
         mixins: Vec::new(),
+        library_base: None,
         destructor: None,
         origin: origin(3),
     };
@@ -1894,6 +1901,7 @@ fn a_field_without_a_sound_zero_literal_is_late_not_a_fabricated_zero() {
         methods: vec![],
         base_class: None,
         mixins: Vec::new(),
+        library_base: None,
         destructor: None,
         origin: origin(2),
     };
@@ -1946,6 +1954,7 @@ fn a_field_without_a_sound_zero_literal_is_late_not_a_fabricated_zero() {
         methods: vec![],
         base_class: None,
         mixins: Vec::new(),
+        library_base: None,
         destructor: None,
         origin: origin(3),
     };
@@ -2032,6 +2041,7 @@ fn mixin_record(name: &str, base_class: Option<BaseClass>, mixins: Vec<BaseClass
         methods: Vec::new(),
         base_class,
         mixins,
+        library_base: None,
         destructor: None,
         origin: origin(1),
     }
@@ -2277,6 +2287,7 @@ fn a_type_only_mentioned_before_a_bodys_bailout_statement_is_not_imported() {
         methods: Vec::new(),
         base_class: None,
         mixins: Vec::new(),
+        library_base: None,
         destructor: None,
         origin: origin_in("/project/input-source/src/beam.cpp", 1),
     };
@@ -2315,6 +2326,7 @@ fn a_type_only_mentioned_before_a_bodys_bailout_statement_is_not_imported() {
         methods: vec![visit_method],
         base_class: None,
         mixins: Vec::new(),
+        library_base: None,
         destructor: None,
         origin: origin_in("/project/input-source/src/calc.cpp", 1),
     };
@@ -2461,6 +2473,7 @@ fn an_externally_marked_method_mocks_its_return_value() {
         methods: vec![method],
         base_class: None,
         mixins: Vec::new(),
+        library_base: None,
         destructor: None,
         origin: origin(1),
     };
@@ -2512,6 +2525,7 @@ fn an_externally_marked_constructor_has_an_empty_mocked_body() {
         methods: Vec::new(),
         base_class: None,
         mixins: Vec::new(),
+        library_base: None,
         destructor: None,
         origin: origin(1),
     };
@@ -2593,6 +2607,7 @@ fn an_externally_marked_function_returning_a_record_mocks_a_constructor_call() {
         methods: Vec::new(),
         base_class: None,
         mixins: Vec::new(),
+        library_base: None,
         destructor: None,
         origin: origin(1),
     };
@@ -2667,6 +2682,7 @@ fn a_record_copy_goes_through_the_records_named_copy_constructor() {
         methods: Vec::new(),
         base_class: None,
         mixins: Vec::new(),
+        library_base: None,
         destructor: None,
         origin: origin(2),
     };
@@ -2753,6 +2769,7 @@ fn a_non_copyable_record_copy_becomes_an_honest_statement_bailout() {
         // Used as a mixin by another record → emitted as `mixin`, no
         // constructor allowed.
         mixins: Vec::new(),
+        library_base: None,
         destructor: None,
         origin: origin(1),
     };
@@ -2769,6 +2786,7 @@ fn a_non_copyable_record_copy_becomes_an_honest_statement_bailout() {
             usr: "c:@S@Comum".to_owned(),
             name: "Comum".to_owned(),
         }],
+        library_base: None,
         destructor: None,
         origin: origin(2),
     };
@@ -2837,6 +2855,7 @@ fn a_copy_constructor_deep_copies_records_and_mutable_collections() {
         methods: Vec::new(),
         base_class: None,
         mixins: Vec::new(),
+        library_base: None,
         destructor: None,
         origin: origin(1),
     };
@@ -2873,6 +2892,7 @@ fn a_copy_constructor_deep_copies_records_and_mutable_collections() {
         methods: Vec::new(),
         base_class: None,
         mixins: Vec::new(),
+        library_base: None,
         destructor: None,
         origin: origin(2),
     };

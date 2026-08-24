@@ -2461,6 +2461,7 @@ mod tests {
             methods: Vec::new(),
             base_class: None,
             mixins: Vec::new(),
+            library_base: None,
             destructor: None,
             origin: sample_ir_origin(),
         }

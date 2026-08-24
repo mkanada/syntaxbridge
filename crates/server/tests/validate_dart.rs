@@ -65,6 +65,7 @@ fn a_deliberate_analyzer_error_resolves_back_to_the_c_plus_plus_declaration_it_c
             methods: Vec::new(),
             base_class: None,
             mixins: Vec::new(),
+            library_base: None,
             destructor: None,
             origin: origin("/workspace/src/aritmetica.cpp", 5),
         }],
