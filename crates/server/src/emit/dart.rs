@@ -1227,9 +1227,15 @@ fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str
         | Expr::Unsupported { .. } => {}
         Expr::NamedArg { value, .. } => collect_referenced_usrs_in_expr(value, out),
         Expr::UnsupportedTyped { ty, .. } => collect_referenced_usrs_in_type(ty, out),
-        Expr::Ref { ty, .. } | Expr::This { ty, .. } => collect_referenced_usrs_in_type(ty, out),
-        Expr::Binary { lhs, rhs, ty, .. } => {
-            collect_referenced_usrs_in_type(ty, out);
+        // A plain reference's result type is metadata and is not printed.
+        // Enum constants are the exception: their `name` is emitted as
+        // `EnumType.value`, so the enum declaration's library is required.
+        Expr::Ref {
+            ty: ty @ Type::Enum { .. },
+            ..
+        } => collect_referenced_usrs_in_type(ty, out),
+        Expr::Ref { .. } | Expr::This { .. } => {},
+        Expr::Binary { lhs, rhs, .. } => {
             collect_referenced_usrs_in_expr(lhs, out);
             collect_referenced_usrs_in_expr(rhs, out);
         }
@@ -1237,27 +1243,22 @@ fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str
             condition,
             then_expr,
             else_expr,
-            ty,
             ..
         } => {
-            collect_referenced_usrs_in_type(ty, out);
             collect_referenced_usrs_in_expr(condition, out);
             collect_referenced_usrs_in_expr(then_expr, out);
             collect_referenced_usrs_in_expr(else_expr, out);
         }
-        Expr::Unary { operand, ty, .. } | Expr::Convert { operand, ty, .. } => {
-            collect_referenced_usrs_in_type(ty, out);
+        Expr::Unary { operand, .. } | Expr::Convert { operand, .. } => {
             collect_referenced_usrs_in_expr(operand, out);
         }
         Expr::Call {
             target,
             callee_usr,
             args,
-            ty,
             ..
         } => {
             out.insert(callee_usr.as_str());
-            collect_referenced_usrs_in_type(ty, out);
             if let Some(target) = target {
                 collect_referenced_usrs_in_expr(target, out);
             }
@@ -1265,8 +1266,7 @@ fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str
                 collect_referenced_usrs_in_expr(arg, out);
             }
         }
-        Expr::FieldAccess { target, ty, .. } => {
-            collect_referenced_usrs_in_type(ty, out);
+        Expr::FieldAccess { target, .. } => {
             collect_referenced_usrs_in_expr(target, out);
         }
         Expr::RecordConstruct {
@@ -1289,10 +1289,7 @@ fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str
                 collect_referenced_usrs_in_expr(arg, out);
             }
         }
-        Expr::Index {
-            target, index, ty, ..
-        } => {
-            collect_referenced_usrs_in_type(ty, out);
+        Expr::Index { target, index, .. } => {
             collect_referenced_usrs_in_expr(target, out);
             collect_referenced_usrs_in_expr(index, out);
         }
@@ -1300,18 +1297,13 @@ fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str
             target,
             index,
             default_value,
-            ty,
             ..
         } => {
-            collect_referenced_usrs_in_type(ty, out);
             collect_referenced_usrs_in_expr(target, out);
             collect_referenced_usrs_in_expr(index, out);
             collect_referenced_usrs_in_expr(default_value, out);
         }
-        Expr::StringByteAt {
-            target, index, ty, ..
-        } => {
-            collect_referenced_usrs_in_type(ty, out);
+        Expr::StringByteAt { target, index, .. } => {
             collect_referenced_usrs_in_expr(target, out);
             collect_referenced_usrs_in_expr(index, out);
         }
@@ -1358,10 +1350,7 @@ fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str
             collect_referenced_usrs_in_type(ty, out);
             collect_referenced_usrs_in_expr(operand, out);
         }
-        Expr::Assign {
-            target, value, ty, ..
-        } => {
-            collect_referenced_usrs_in_type(ty, out);
+        Expr::Assign { target, value, .. } => {
             collect_referenced_usrs_in_expr(target, out);
             collect_referenced_usrs_in_expr(value, out);
         }

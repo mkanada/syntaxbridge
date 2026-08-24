@@ -2350,6 +2350,70 @@ fn a_type_only_mentioned_before_a_bodys_bailout_statement_is_not_imported() {
     );
 }
 
+/// Expression result types guide lowering/emission but are not necessarily
+/// spelled in Dart. A call prints only its callee and arguments; importing
+/// the file of `Call::ty` therefore creates an `unused_import` when that is
+/// the expression's only link to the foreign record.
+#[test]
+fn a_type_used_only_as_unprinted_expression_metadata_is_not_imported() {
+    fn origin_in(file: &str) -> Origin {
+        Origin {
+            file: file.to_owned(),
+            line: 1,
+            column: 1,
+        }
+    }
+
+    let glyph = Record {
+        name: "Glyph".to_owned(),
+        usr: "c:@S@Glyph".to_owned(),
+        namespace: String::new(),
+        fields: Vec::new(),
+        static_fields: Vec::new(),
+        constructors: Vec::new(),
+        methods: Vec::new(),
+        base_class: None,
+        mixins: Vec::new(),
+        library_base: None,
+        destructor: None,
+        origin: origin_in("/project/input-source/src/glyph.cpp"),
+    };
+    let inspect = Function {
+        name: "inspect".to_owned(),
+        usr: "c:@F@inspect#".to_owned(),
+        params: Vec::new(),
+        return_type: Type::Void,
+        body: vec![Stmt::ExprStmt {
+            expr: Expr::Call {
+                target: None,
+                base_qualifier: None,
+                callee_usr: String::new(),
+                callee_name: "opaqueValue".to_owned(),
+                args: Vec::new(),
+                ty: Type::Record {
+                    usr: glyph.usr.clone(),
+                    name: glyph.name.clone(),
+                },
+                origin: origin_in("/project/input-source/src/inspect.cpp"),
+            },
+            origin: origin_in("/project/input-source/src/inspect.cpp"),
+        }],
+        origin: origin_in("/project/input-source/src/inspect.cpp"),
+    };
+    let files = emit_module(&Module {
+        records: vec![glyph],
+        functions: vec![inspect],
+        enums: Vec::new(),
+    });
+    let source = &files["lib/inspect.dart"];
+
+    assert!(source.contains("opaqueValue();"), "got:\n{source}");
+    assert!(
+        !source.contains("import 'glyph.dart';"),
+        "`Glyph` is not printed in this file, so its import is unused, got:\n{source}"
+    );
+}
+
 /// `docs/plans/lista-de-externos.md` decision 1: "mock = valor plausível,
 /// execução segue" — a free function whose usr is in the effective external
 /// set gets a `return` of a plausible default for its type, never a
