@@ -579,6 +579,21 @@ local:
 
 Prompt: `docs/prompts/2026-08-23-14-limpeza-de-emissao.md`
 
+#### Medicoes da execucao de T14
+
+**Tarefa 14.7 (`unused_field`, 2026-08-24).** O diagnostico executado no
+Flatpak, no commit `8a71d0e`, encontrou 55 avisos em 19 arquivos, e nao os 717
+da estimativa que originou o prompt. A inspecao cruzada das declaracoes Dart
+com o Verovio 6.2.0 nao encontrou o caso (a): nao ha leitura explicita de um
+campo privado gerado por uma subclasse em outra biblioteca Dart. Os campos
+amostrados continuam usados no C++ (`m_currentMeasure`, `m_isOtherLayer`,
+`m_classIds` e os campos de `SetScoreDefFunctor`), mas seus leitores estao em
+metodos que ainda contem bailouts ou nao sobreviveram integralmente ao
+lowering. Portanto, o residuo e predominantemente o caso (b), nao campo morto
+do modelo nem regressao de visibilidade. Nenhum campo foi removido e o aviso
+nao foi silenciado; ele deve cair conforme os corpos consumidores forem
+materializados.
+
 ## 5. O que "funcionar" quer dizer, e o que ainda não existe para medir isso
 
 Nenhuma das tarefas acima prova que o Dart emitido **faz a mesma coisa** que o
