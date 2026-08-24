@@ -244,6 +244,39 @@ int f(int a, int b) {
     );
 }
 
+/// The same C++ numeric boundary conversion applies outside local
+/// declarations: constructor field initializers, call arguments and return
+/// values all require an explicit Dart conversion too.
+#[test]
+fn numeric_boundary_conversions_cover_fields_arguments_and_returns() {
+    let source = lower_and_emit(
+        "lower-cpp-numeric-boundaries",
+        r#"
+struct Bucket {
+    int count;
+    Bucket(double value) : count(value * 0.5) {}
+};
+
+int takes_int(int value) { return value; }
+int forwards(double argument) { return takes_int(argument * 0.5); }
+int returns_int(double result) { return result * 0.5; }
+"#,
+    );
+
+    assert!(
+        source.contains("count = (value * 0.5).toInt()"),
+        "expected field-initializer narrowing, got:\n{source}"
+    );
+    assert!(
+        source.contains("takes_int((argument * 0.5).toInt())"),
+        "expected call-argument narrowing, got:\n{source}"
+    );
+    assert!(
+        source.contains("return (result * 0.5).toInt();"),
+        "expected return-boundary narrowing, got:\n{source}"
+    );
+}
+
 #[test]
 fn mixed_arithmetic_negative_factors_converts_at_boundary() {
     let source = lower_and_emit(
