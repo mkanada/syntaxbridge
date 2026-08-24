@@ -5429,6 +5429,122 @@ int use_it(Resources &resources, int code) {
     );
 }
 
+/// F8/tarefa 10 (round 22): out-param caller locals declared in an outer
+/// block and used in a nested block (such as an `if/else` branch, real
+/// trigger `adjustclefchangesfunctor.cpp`'s `int nextLeft, nextRight; if
+/// (graceAligner) { nextLeft = ...; } else {
+/// nextAlignment->GetLeftRight(..., nextLeft, nextRight); }`) must not be
+/// left as bare `late int` declarations without initial values.
+#[test]
+fn a_neutral_default_applies_to_out_param_locals_used_inside_a_nested_branch() {
+    let source = lower_and_emit(
+        "lower-cpp-out-param-nested-branch",
+        r#"
+struct Alvo {
+    void limites(int n, int &esq, int &dir) const {
+        esq = n;
+        dir = n + 1;
+    }
+};
+
+int usa(const Alvo &a, bool cedo) {
+    int esq, dir;
+    if (cedo) {
+        esq = 0;
+    } else {
+        a.limites(1, esq, dir);
+    }
+    return esq + dir;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("late int"),
+        "locals used in bridged calls inside nested branches must get a neutral default \
+         instead of `late`, got:\n{source}"
+    );
+    assert!(
+        source.contains("int esq = 0;") && source.contains("int dir = 0;"),
+        "expected neutral zero default values for out-param locals, got:\n{source}"
+    );
+    assert!(
+        source.contains("(esq, dir) = a.limites(1, esq, dir);"),
+        "expected tuple destructuring at call site, got:\n{source}"
+    );
+}
+
+/// A local without an initializer that is plainly assigned before any bridged
+/// out-param use remains `late`, since it is definitely assigned before any read.
+#[test]
+fn a_local_definitely_assigned_before_bridged_call_stays_late() {
+    let source = lower_and_emit(
+        "lower-cpp-out-param-assigned-first-stays-late",
+        r#"
+struct Alvo {
+    void limites(int n, int &esq, int &dir) const {
+        esq = n;
+        dir = n + 1;
+    }
+};
+
+int usa(const Alvo &a) {
+    int esq;
+    int dir;
+    esq = 10;
+    dir = 20;
+    a.limites(1, esq, dir);
+    return esq + dir;
+}
+"#,
+    );
+
+    assert!(
+        source.contains("late int esq;") && source.contains("late int dir;"),
+        "expected definitely assigned locals before bridged call to remain `late`, got:\n{source}"
+    );
+}
+
+/// Out-param locals used inside deeply nested control flow (e.g. `for` inside `if`)
+/// must also receive neutral default values.
+#[test]
+fn a_neutral_default_applies_to_out_param_locals_inside_deeply_nested_loops() {
+    let source = lower_and_emit(
+        "lower-cpp-out-param-deeply-nested",
+        r#"
+struct Alvo {
+    void limites(int n, int &esq, int &dir) const {
+        esq = n;
+        dir = n + 1;
+    }
+};
+
+int usa(const Alvo &a, bool cond, int count) {
+    int esq, dir;
+    if (cond) {
+        for (int i = 0; i < count; i++) {
+            a.limites(i, esq, dir);
+        }
+    }
+    return esq + dir;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("late int"),
+        "deeply nested out-param locals must get a neutral default instead of `late`, got:\n{source}"
+    );
+    assert!(
+        source.contains("int esq = 0;") && source.contains("int dir = 0;"),
+        "expected neutral zero default values, got:\n{source}"
+    );
+    assert!(
+        source.contains("(esq, dir) = a.limites(i, esq, dir);"),
+        "expected tuple destructuring at call site, got:\n{source}"
+    );
+}
+
 /// `std::stringstream`/`std::ostringstream` accumulation (round 19, real
 /// trigger `options.cpp`'s `OptionArray::GetStr`): `ss << a << b;` used as
 /// its own statement, across several separate insertions (including inside

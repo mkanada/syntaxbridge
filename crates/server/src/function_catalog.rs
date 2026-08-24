@@ -405,8 +405,26 @@ pub(crate) fn finish_function_catalog(partials: Vec<FunctionCatalogPartial>) -> 
                 }
                 Some(&index) => {
                     if ir_function_is_prototype[&function.usr] && !is_prototype {
+                        let mut function = function;
+                        for (i, p) in function.params.iter_mut().enumerate() {
+                            if p.default_value.is_none()
+                                && let Some(orig_p) = ir_functions[index].params.get(i)
+                                && orig_p.default_value.is_some()
+                            {
+                                p.default_value = orig_p.default_value.clone();
+                            }
+                        }
                         ir_functions[index] = function;
                         ir_function_is_prototype.insert(ir_functions[index].usr.clone(), false);
+                    } else if !ir_function_is_prototype[&function.usr] && is_prototype {
+                        for (i, p) in ir_functions[index].params.iter_mut().enumerate() {
+                            if p.default_value.is_none()
+                                && let Some(incoming_p) = function.params.get(i)
+                                && incoming_p.default_value.is_some()
+                            {
+                                p.default_value = incoming_p.default_value.clone();
+                            }
+                        }
                     }
                 }
             }
@@ -559,7 +577,25 @@ fn merge_methods(existing: &mut Vec<ir::Method>, incoming: Vec<ir::Method>) {
             }
             Some(&index) => {
                 if existing[index].body.is_none() && method.body.is_some() {
+                    let mut method = method;
+                    for (i, p) in method.params.iter_mut().enumerate() {
+                        if p.default_value.is_none()
+                            && let Some(orig_p) = existing[index].params.get(i)
+                            && orig_p.default_value.is_some()
+                        {
+                            p.default_value = orig_p.default_value.clone();
+                        }
+                    }
                     existing[index] = method;
+                } else if existing[index].body.is_some() && method.body.is_none() {
+                    for (i, p) in existing[index].params.iter_mut().enumerate() {
+                        if p.default_value.is_none()
+                            && let Some(incoming_p) = method.params.get(i)
+                            && incoming_p.default_value.is_some()
+                        {
+                            p.default_value = incoming_p.default_value.clone();
+                        }
+                    }
                 } else if existing[index].body.is_some()
                     && method.body.is_some()
                     && existing[index].body != method.body
@@ -582,25 +618,30 @@ fn merge_methods(existing: &mut Vec<ir::Method>, incoming: Vec<ir::Method>) {
 /// prefer away from — a `usr` present in only one partial is simply
 /// appended, and a `usr` present in both is expected to carry the same body.
 fn merge_constructors(existing: &mut Vec<ir::Constructor>, incoming: Vec<ir::Constructor>) {
-    let mut seen: HashSet<String> = existing
-        .iter()
-        .map(|constructor| constructor.usr.clone())
-        .collect();
-
     for constructor in incoming {
-        if seen.insert(constructor.usr.clone()) {
-            existing.push(constructor);
-        } else if let Some(existing_constructor) = existing
-            .iter()
+        if let Some(existing_constructor) = existing
+            .iter_mut()
             .find(|candidate| candidate.usr == constructor.usr)
-            && (existing_constructor.body != constructor.body
-                || existing_constructor.inits != constructor.inits)
         {
-            log_function_catalog(format_args!(
-                "finish_function_catalog: constructor {} has a different body/inits \
-                 in two compilation units — kept the first partial's body/inits",
-                constructor.usr
-            ));
+            for (i, p) in constructor.params.iter().enumerate() {
+                if let Some(orig_p) = existing_constructor.params.get_mut(i)
+                    && orig_p.default_value.is_none()
+                    && p.default_value.is_some()
+                {
+                    orig_p.default_value = p.default_value.clone();
+                }
+            }
+            if existing_constructor.body != constructor.body
+                || existing_constructor.inits != constructor.inits
+            {
+                log_function_catalog(format_args!(
+                    "finish_function_catalog: constructor {} has a different body/inits \
+                     in two compilation units — kept the first partial's body/inits",
+                    constructor.usr
+                ));
+            }
+        } else {
+            existing.push(constructor);
         }
     }
 }

@@ -710,6 +710,296 @@ fn replace_return_with_out_param_tuple(
 /// — already gets a real value before any risky read, so `late` was
 /// already fine; stop without patching) — anything else in between (an
 /// unrelated declaration, an unrelated call, ...) is simply skipped over.
+/// Returns whether `expr` contains an assignment directly writing to local variable `name`.
+fn expr_assigns_to_var(expr: &ir::Expr, name: &str) -> bool {
+    match expr {
+        ir::Expr::Assign { target, .. } => {
+            matches!(target.as_ref(), ir::Expr::Ref { name: target_name, .. } if target_name == name)
+        }
+        _ => false,
+    }
+}
+
+/// Returns whether `stmt` unconditionally assigns to local variable `name` along all
+/// continuing execution paths (or unconditionally diverges via return/throw).
+fn stmt_definitely_assigns_var(stmt: &ir::Stmt, name: &str) -> bool {
+    match stmt {
+        ir::Stmt::Assign {
+            name: assigned_name,
+            ..
+        } if assigned_name == name => true,
+        ir::Stmt::ExprAssign {
+            target:
+                ir::Expr::Ref {
+                    name: target_name, ..
+                },
+            ..
+        } if target_name == name => true,
+        ir::Stmt::ExprStmt { expr, .. } => expr_assigns_to_var(expr, name),
+        ir::Stmt::TupleAssign { targets, .. } => targets.iter().any(
+            |target| matches!(target, ir::Expr::Ref { name: target_name, .. } if target_name == name),
+        ),
+        ir::Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            !else_branch.is_empty()
+                && block_definitely_assigns_var(then_branch, name)
+                && block_definitely_assigns_var(else_branch, name)
+        }
+        ir::Stmt::DoWhile { body, .. } => block_definitely_assigns_var(body, name),
+        ir::Stmt::TryFinally {
+            try_body,
+            finally_body,
+            ..
+        } => {
+            block_definitely_assigns_var(finally_body, name)
+                || block_definitely_assigns_var(try_body, name)
+        }
+        ir::Stmt::TryCatch {
+            try_body,
+            catch_body,
+            ..
+        } => {
+            block_definitely_assigns_var(try_body, name)
+                && block_definitely_assigns_var(catch_body, name)
+        }
+        ir::Stmt::Switch {
+            cases,
+            default: Some(default),
+            ..
+        } => {
+            !cases.is_empty()
+                && cases
+                    .iter()
+                    .all(|c| block_definitely_assigns_var(&c.body, name))
+                && block_definitely_assigns_var(default, name)
+        }
+        ir::Stmt::Return { .. } | ir::Stmt::Throw { .. } => true,
+        _ => false,
+    }
+}
+
+fn block_definitely_assigns_var(stmts: &[ir::Stmt], name: &str) -> bool {
+    stmts
+        .iter()
+        .any(|stmt| stmt_definitely_assigns_var(stmt, name))
+}
+
+/// Scans forward from a variable's declaration scope for an out-param bridged
+/// `TupleAssign` that reads `name` as an argument without `name` having been
+/// definitely assigned first.
+///
+/// Returns `(found_unassigned_tuple_use, definitely_assigned_after)`.
+fn scan_for_unassigned_tuple_use(
+    stmts: &[ir::Stmt],
+    name: &str,
+    mut assigned: bool,
+) -> (bool, bool) {
+    for stmt in stmts {
+        match stmt {
+            ir::Stmt::VarDecl {
+                name: decl_name, ..
+            } if decl_name == name => {
+                // Shadowing: inner scope hides outer local.
+                return (false, assigned);
+            }
+            ir::Stmt::TupleAssign { targets, value, .. } => {
+                let is_call_input = match value {
+                    ir::Expr::Call { args, .. } => args.iter().any(
+                        |arg| matches!(arg, ir::Expr::Ref { name: arg_name, .. } if arg_name == name),
+                    ),
+                    _ => false,
+                };
+                let is_destructure_target = targets.iter().any(
+                    |target| matches!(target, ir::Expr::Ref { name: target_name, .. } if target_name == name),
+                );
+                if is_call_input && is_destructure_target && !assigned {
+                    return (true, true);
+                }
+                if is_destructure_target {
+                    assigned = true;
+                }
+            }
+            ir::Stmt::Assign {
+                name: assigned_name,
+                ..
+            } if assigned_name == name => {
+                assigned = true;
+            }
+            ir::Stmt::ExprAssign {
+                target: ir::Expr::Ref {
+                    name: target_name, ..
+                },
+                ..
+            } if target_name == name => {
+                assigned = true;
+            }
+            ir::Stmt::ExprStmt { expr, .. } if expr_assigns_to_var(expr, name) => {
+                assigned = true;
+            }
+            ir::Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                let (then_found, then_assigned) =
+                    scan_for_unassigned_tuple_use(then_branch, name, assigned);
+                if then_found {
+                    return (true, assigned);
+                }
+                let (else_found, else_assigned) =
+                    scan_for_unassigned_tuple_use(else_branch, name, assigned);
+                if else_found {
+                    return (true, assigned);
+                }
+                if !else_branch.is_empty() && then_assigned && else_assigned {
+                    assigned = true;
+                }
+            }
+            ir::Stmt::While { body, .. } | ir::Stmt::ForEach { body, .. } => {
+                let (body_found, _) = scan_for_unassigned_tuple_use(body, name, assigned);
+                if body_found {
+                    return (true, assigned);
+                }
+            }
+            ir::Stmt::DoWhile { body, .. } => {
+                let (body_found, body_assigned) =
+                    scan_for_unassigned_tuple_use(body, name, assigned);
+                if body_found {
+                    return (true, assigned);
+                }
+                if body_assigned {
+                    assigned = true;
+                }
+            }
+            ir::Stmt::For {
+                init,
+                increment,
+                body,
+                ..
+            } => {
+                let mut for_assigned = assigned;
+                if let Some(init_stmt) = init
+                    && stmt_definitely_assigns_var(init_stmt, name)
+                {
+                    for_assigned = true;
+                }
+                let (body_found, _) = scan_for_unassigned_tuple_use(body, name, for_assigned);
+                if body_found {
+                    return (true, assigned);
+                }
+                if let Some(inc_stmt) = increment {
+                    let (inc_found, _) = scan_for_unassigned_tuple_use(
+                        std::slice::from_ref(inc_stmt),
+                        name,
+                        for_assigned,
+                    );
+                    if inc_found {
+                        return (true, assigned);
+                    }
+                }
+                if for_assigned {
+                    assigned = true;
+                }
+            }
+            ir::Stmt::TryCatch {
+                try_body,
+                catch_body,
+                ..
+            } => {
+                let (try_found, try_assigned) =
+                    scan_for_unassigned_tuple_use(try_body, name, assigned);
+                if try_found {
+                    return (true, assigned);
+                }
+                let (catch_found, catch_assigned) =
+                    scan_for_unassigned_tuple_use(catch_body, name, assigned);
+                if catch_found {
+                    return (true, assigned);
+                }
+                if try_assigned && catch_assigned {
+                    assigned = true;
+                }
+            }
+            ir::Stmt::TryFinally {
+                try_body,
+                finally_body,
+                ..
+            } => {
+                let (try_found, try_assigned) =
+                    scan_for_unassigned_tuple_use(try_body, name, assigned);
+                if try_found {
+                    return (true, assigned);
+                }
+                let (finally_found, finally_assigned) =
+                    scan_for_unassigned_tuple_use(finally_body, name, try_assigned);
+                if finally_found {
+                    return (true, assigned);
+                }
+                if finally_assigned || try_assigned {
+                    assigned = true;
+                }
+            }
+            ir::Stmt::Switch { cases, default, .. } => {
+                let mut all_cases_assigned = true;
+                for case in cases {
+                    let (case_found, case_assigned) =
+                        scan_for_unassigned_tuple_use(&case.body, name, assigned);
+                    if case_found {
+                        return (true, assigned);
+                    }
+                    if !case_assigned {
+                        all_cases_assigned = false;
+                    }
+                }
+                let default_assigned = if let Some(default_body) = default {
+                    let (def_found, def_assigned) =
+                        scan_for_unassigned_tuple_use(default_body, name, assigned);
+                    if def_found {
+                        return (true, assigned);
+                    }
+                    def_assigned
+                } else {
+                    false
+                };
+                if default.is_some() && all_cases_assigned && default_assigned {
+                    assigned = true;
+                }
+            }
+            ir::Stmt::Return { .. } | ir::Stmt::Throw { .. } => {
+                return (false, true);
+            }
+            _ => {}
+        }
+    }
+    (false, assigned)
+}
+
+/// F8/tarefa 10's last gap: a caller-side local declared with no C++
+/// initializer (`int x;`), later reused by an out-param-bridged call as
+/// *both* an input argument and a destructuring target (`GetBoundingBox(x,
+/// y, w, h)` / `(x, y, w, h) = ...` — the same reuse `lower_stmt`'s own
+/// `Stmt::TupleAssign` construction always does, correct for a callee that
+/// genuinely reads-and-modifies its out-param, like `Fraction::
+/// ReduceStatic`'s `num = num / 2`). `emit::dart` turns a no-initializer
+/// `VarDecl` into `late T name;`, deferring initialization to first use —
+/// correct for a local truly untouched until a later statement, but wrong
+/// here: the call reads each local's value (as an argument) before its own
+/// destructuring assignment ever writes to it, a real read of a still-
+/// unassigned `late` local (`definitely_unassigned_late_local_variable`,
+/// real trigger `Doc::GetGlyphHeight`'s `int x; int y; int w; int h;
+/// Resources resources = GetResources(); Glyph *glyph =
+/// resources.GetGlyph(code); ...GetBoundingBox(x, y, w, h);` — note the
+/// unrelated declarations sitting *between* the out-param locals and the
+/// call, ruling out an adjacency-only scan). A neutral default value
+/// (`default_scalar_value`, the same stand-in `default_field_value`
+/// already gives an uninitialized field) is exactly as safe as whatever
+/// indeterminate value C++ itself would have left there. Scans forward
+/// from each no-initializer declaration across statements and nested
+/// blocks (if/loops/try/switch) for any reachable unassigned `TupleAssign`
+/// use. If an unconditional assignment dominates the use, `late` is preserved.
 fn neutralize_out_param_call_input_locals(stmts: &mut [ir::Stmt]) {
     for decl_index in 0..stmts.len() {
         let ir::Stmt::VarDecl {
@@ -719,39 +1009,7 @@ fn neutralize_out_param_call_input_locals(stmts: &mut [ir::Stmt]) {
             continue;
         };
         let name = name.clone();
-        let mut qualifies = false;
-        for peek in &stmts[decl_index + 1..] {
-            match peek {
-                ir::Stmt::Assign {
-                    name: assigned_name,
-                    ..
-                } if *assigned_name == name => break,
-                ir::Stmt::ExprAssign {
-                    target:
-                        ir::Expr::Ref {
-                            name: target_name, ..
-                        },
-                    ..
-                } if *target_name == name => break,
-                ir::Stmt::TupleAssign {
-                    targets,
-                    value: ir::Expr::Call { args, .. },
-                    ..
-                } => {
-                    let is_call_input = args.iter().any(
-                        |arg| matches!(arg, ir::Expr::Ref { name: arg_name, .. } if *arg_name == name),
-                    );
-                    let is_destructure_target = targets.iter().any(
-                        |target| matches!(target, ir::Expr::Ref { name: target_name, .. } if *target_name == name),
-                    );
-                    if is_call_input && is_destructure_target {
-                        qualifies = true;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
+        let (qualifies, _) = scan_for_unassigned_tuple_use(&stmts[decl_index + 1..], &name, false);
         if qualifies {
             let ir::Stmt::VarDecl {
                 ty, init, origin, ..
@@ -780,7 +1038,22 @@ fn recurse_neutralize_out_param_call_input_locals(stmt: &mut ir::Stmt) {
         ir::Stmt::While { body, .. } | ir::Stmt::DoWhile { body, .. } => {
             neutralize_out_param_call_input_locals(body)
         }
-        ir::Stmt::For { body, .. } => neutralize_out_param_call_input_locals(body),
+        ir::Stmt::For { init, body, .. } => {
+            if let Some(init_stmt) = init
+                && let ir::Stmt::VarDecl {
+                    name,
+                    ty,
+                    init: var_init @ None,
+                    origin,
+                } = init_stmt.as_mut()
+            {
+                let (qualifies, _) = scan_for_unassigned_tuple_use(body, name, false);
+                if qualifies {
+                    *var_init = Some(default_scalar_value(ty, origin));
+                }
+            }
+            neutralize_out_param_call_input_locals(body);
+        }
         ir::Stmt::ForEach { body, .. } => neutralize_out_param_call_input_locals(body),
         ir::Stmt::TryCatch {
             try_body,
@@ -3379,6 +3652,19 @@ unsafe fn collect_params_with_clone_prelude(
         .filter(|child| unsafe { clang_sys::clang_getCursorKind(*child) } == clang_sys::CXCursor_ParmDecl)
         .collect();
 
+    let canonical = unsafe { clang_sys::clang_getCanonicalCursor(cursor) };
+    let canonical_param_cursors: Vec<clang_sys::CXCursor> =
+        if unsafe { clang_sys::clang_equalCursors(cursor, canonical) } == 0 {
+            unsafe { collect_children(canonical) }
+                .into_iter()
+                .filter(|child| unsafe {
+                    clang_sys::clang_getCursorKind(*child) == clang_sys::CXCursor_ParmDecl
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
     for param_cursor in param_cursors.iter().copied() {
         // A C++ parameter may legally have no name (common in an interface
         // signature that never uses it, e.g. `bool F(int, bool named)`) —
@@ -3460,15 +3746,15 @@ unsafe fn collect_params_with_clone_prelude(
         // the non-type template argument `3` as another ParmVarDecl child,
         // indistinguishable by cursor kind from a real default expression.
         // A default argument is the only one of the two whose parameter
-        // spelling contains `=`. Only looked up for a scalar/`Str`
-        // parameter: a `Record`-typed default would interact with the
-        // by-value clone prelude above in a way no fixture forces yet, so it
-        // stays unimplemented rather than guessed at.
-        let default_value = if matches!(ty, ir::Type::Record { .. })
-            || !unsafe { parameter_has_explicit_default(param_cursor) }
-        {
+        // spelling contains `=`.
+        //
+        // In C++, default arguments live on the declaration (header), and out-of-line
+        // definitions repeat the signature without `= default` (T11). When `cursor`
+        // is an out-of-line definition, `canonical_param_cursors` (from `canonical`)
+        // preserves the declaration's default argument expression.
+        let default_value = if matches!(ty, ir::Type::Record { .. }) {
             None
-        } else {
+        } else if unsafe { parameter_has_explicit_default(param_cursor) } {
             unsafe { collect_children(param_cursor) }
                 .into_iter()
                 .find(|child| {
@@ -3482,6 +3768,24 @@ unsafe fn collect_params_with_clone_prelude(
                 .map(|default_cursor| unsafe {
                     default_argument_value(default_cursor, &ty, project_root, origin)
                 })
+        } else if let Some(canon_param_cursor) = canonical_param_cursors.get(params.len())
+            && unsafe { parameter_has_explicit_default(*canon_param_cursor) }
+        {
+            unsafe { collect_children(*canon_param_cursor) }
+                .into_iter()
+                .find(|child| {
+                    !matches!(
+                        unsafe { clang_sys::clang_getCursorKind(*child) },
+                        clang_sys::CXCursor_TypeRef
+                            | clang_sys::CXCursor_NamespaceRef
+                            | clang_sys::CXCursor_TemplateRef
+                    )
+                })
+                .map(|default_cursor| unsafe {
+                    default_argument_value(default_cursor, &ty, project_root, origin)
+                })
+        } else {
+            None
         };
 
         params.push(ir::Param {
@@ -11394,8 +11698,20 @@ unsafe fn free_function_reachable_from_std(decl: clang_sys::CXCursor) -> bool {
 /// mocks a symbol Metade A already translates for real — that would emit
 /// an unused, dead mock function alongside the real call and risk `dart
 /// analyze`'s `unused_element`.
-const BRIDGED_STDLIB_FREE_FUNCTION_NAMES: &[&str] =
-    &["gcd", "max", "min", "abs", "to_string", "make_pair", "swap"];
+const BRIDGED_STDLIB_FREE_FUNCTION_NAMES: &[&str] = &[
+    "gcd",
+    "max",
+    "min",
+    "abs",
+    "to_string",
+    "make_pair",
+    "swap",
+    "stoi",
+    "stol",
+    "stoll",
+    "stod",
+    "stof",
+];
 
 /// Whether `referenced` (a resolved call target already confirmed to be a
 /// `CXCursor_FunctionDecl`) is one of Metade A's curated `std::` adapters —
@@ -11411,6 +11727,38 @@ pub(crate) unsafe fn is_bridged_stdlib_free_function(referenced: clang_sys::CXCu
             ))
         } != 0
         && unsafe { free_function_reachable_from_std(referenced) }
+}
+
+unsafe fn is_null_or_default_pointer_arg(
+    arg_cursor: clang_sys::CXCursor,
+    lowered: &ir::Expr,
+) -> bool {
+    if matches!(
+        lowered,
+        ir::Expr::NullLiteral { .. } | ir::Expr::IntLiteral { value: 0, .. }
+    ) {
+        return true;
+    }
+    let kind = unsafe { clang_sys::clang_getCursorKind(arg_cursor) };
+    if kind == clang_sys::CXCursor_UnexposedExpr
+        && unsafe { collect_children(arg_cursor) }.is_empty()
+    {
+        return true;
+    }
+    false
+}
+
+unsafe fn is_default_or_base_10_arg(arg_cursor: clang_sys::CXCursor, lowered: &ir::Expr) -> bool {
+    if matches!(lowered, ir::Expr::IntLiteral { value: 10, .. }) {
+        return true;
+    }
+    let kind = unsafe { clang_sys::clang_getCursorKind(arg_cursor) };
+    if kind == clang_sys::CXCursor_UnexposedExpr
+        && unsafe { collect_children(arg_cursor) }.is_empty()
+    {
+        return true;
+    }
+    false
 }
 
 /// `std` free functions with a direct, unconditional Dart equivalent — no
@@ -11584,6 +11932,103 @@ unsafe fn lower_stdlib_free_function_call(
                 ty: ir::Type::Pair(first_ty, second_ty),
                 origin: origin.clone(),
             })
+        }
+        // `std::stoi(s)`/`std::stol(s)`/`std::stoll(s)` — Dart's `int.parse(s)`
+        // directly parses string representations into integers (T11/Metade B).
+        // If a non-null `size_t* idx` pointer is passed, it bails out honestly
+        // since Dart's `int.parse` cannot update a position pointer.
+        "stoi" | "stol" | "stoll" => {
+            if arg_count == 1 {
+                let arg_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
+                let arg = unsafe { lower_expr(arg_cursor, project_root) };
+                Some(ir::Expr::Call {
+                    base_qualifier: None,
+                    target: None,
+                    callee_usr,
+                    callee_name: "int.parse".to_owned(),
+                    args: vec![arg],
+                    ty: ir::Type::Int,
+                    origin: origin.clone(),
+                })
+            } else if arg_count == 2 {
+                let s_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
+                let idx_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 1) };
+                let s = unsafe { lower_expr(s_cursor, project_root) };
+                let idx = unsafe { lower_expr(idx_cursor, project_root) };
+                if unsafe { is_null_or_default_pointer_arg(idx_cursor, &idx) } {
+                    Some(ir::Expr::Call {
+                        base_qualifier: None,
+                        target: None,
+                        callee_usr,
+                        callee_name: "int.parse".to_owned(),
+                        args: vec![s],
+                        ty: ir::Type::Int,
+                        origin: origin.clone(),
+                    })
+                } else {
+                    Some(unsupported())
+                }
+            } else if arg_count == 3 {
+                let s_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
+                let idx_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 1) };
+                let base_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 2) };
+                let s = unsafe { lower_expr(s_cursor, project_root) };
+                let idx = unsafe { lower_expr(idx_cursor, project_root) };
+                let base = unsafe { lower_expr(base_cursor, project_root) };
+                if unsafe { is_null_or_default_pointer_arg(idx_cursor, &idx) }
+                    && unsafe { is_default_or_base_10_arg(base_cursor, &base) }
+                {
+                    Some(ir::Expr::Call {
+                        base_qualifier: None,
+                        target: None,
+                        callee_usr,
+                        callee_name: "int.parse".to_owned(),
+                        args: vec![s],
+                        ty: ir::Type::Int,
+                        origin: origin.clone(),
+                    })
+                } else {
+                    Some(unsupported())
+                }
+            } else {
+                Some(unsupported())
+            }
+        }
+        // `std::stod(s)`/`std::stof(s)` — Dart's `double.parse(s)` (T11/Metade B).
+        "stod" | "stof" => {
+            if arg_count == 1 {
+                let arg_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
+                let arg = unsafe { lower_expr(arg_cursor, project_root) };
+                Some(ir::Expr::Call {
+                    base_qualifier: None,
+                    target: None,
+                    callee_usr,
+                    callee_name: "double.parse".to_owned(),
+                    args: vec![arg],
+                    ty: ir::Type::Double,
+                    origin: origin.clone(),
+                })
+            } else if arg_count == 2 {
+                let s_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
+                let idx_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 1) };
+                let s = unsafe { lower_expr(s_cursor, project_root) };
+                let idx = unsafe { lower_expr(idx_cursor, project_root) };
+                if unsafe { is_null_or_default_pointer_arg(idx_cursor, &idx) } {
+                    Some(ir::Expr::Call {
+                        base_qualifier: None,
+                        target: None,
+                        callee_usr,
+                        callee_name: "double.parse".to_owned(),
+                        args: vec![s],
+                        ty: ir::Type::Double,
+                        origin: origin.clone(),
+                    })
+                } else {
+                    Some(unsupported())
+                }
+            } else {
+                Some(unsupported())
+            }
         }
         _ => None,
     }
