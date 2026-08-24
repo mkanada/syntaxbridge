@@ -3074,6 +3074,34 @@ int scoped() {
     );
 }
 
+/// Dart reports both a literal `if (false)` and statements following an
+/// unconditional block terminator as `dead_code`. Neither carries runtime
+/// behavior from C++: the false branch cannot execute and control cannot
+/// pass a return.
+#[test]
+fn statically_unreachable_statements_are_not_emitted() {
+    let source = lower_and_emit(
+        "lower-cpp-dead-code",
+        r#"
+void side_effect();
+
+int answer() {
+    if (false) {
+        side_effect();
+    }
+    return 42;
+    side_effect();
+    return 0;
+}
+"#,
+    );
+
+    assert!(!source.contains("if (false)"), "got:\n{source}");
+    assert_eq!(source.matches("side_effect();").count(), 0, "got:\n{source}");
+    assert!(source.contains("return 42;"), "got:\n{source}");
+    assert!(!source.contains("return 0;"), "got:\n{source}");
+}
+
 /// `int a = 1, b = 2;` — one `DeclStmt` cursor with multiple `VarDecl`
 /// children, C++'s comma-separated multi-declarator form. `DeclStmt had N
 /// declarators, expected exactly 1` was the single largest statement-level

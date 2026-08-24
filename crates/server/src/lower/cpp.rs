@@ -4488,6 +4488,10 @@ unsafe fn lower_compound_stmt(cursor: clang_sys::CXCursor, project_root: &Path) 
         result.extend(unsafe { lower_stmt_into(children[index], project_root) });
         index += 1;
     }
+    // A compound block cannot reach anything after an unconditional jump.
+    // Keep this normalization at the IR boundary so every emitter and
+    // analysis sees the same reachable statement list, not just Dart.
+    truncate_after_case_terminator(&mut result);
     result
 }
 
@@ -4561,7 +4565,23 @@ unsafe fn lower_stmt_into(cursor: clang_sys::CXCursor, project_root: &Path) -> V
             return statements;
         }
     }
-    vec![unsafe { lower_stmt(cursor, project_root) }]
+    let stmt = unsafe { lower_stmt(cursor, project_root) };
+    match stmt {
+        // Preprocessor constants often leave literal conditions in the
+        // libclang AST (`if (false)`). Select the only reachable branch
+        // before emission; Dart otherwise reports the preserved dead arm.
+        ir::Stmt::If {
+            condition: ir::Expr::BoolLiteral { value: true, .. },
+            then_branch,
+            ..
+        } => then_branch,
+        ir::Stmt::If {
+            condition: ir::Expr::BoolLiteral { value: false, .. },
+            else_branch,
+            ..
+        } => else_branch,
+        other => vec![other],
+    }
 }
 
 /// `std::swap(a, b);` (F6/tarefa 07, Metade A's "outros" bucket) — Dart has
