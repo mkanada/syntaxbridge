@@ -15,6 +15,22 @@
       "funcao": "testarDobroString",
       "args": [],
       "espera": "oi (dobrado)"
+    },
+    {
+      "funcao": "testarCaixaString",
+      "args": [],
+      "espera": "valor:teste"
+    },
+    {
+      "funcao": "testarCaixaInt",
+      "args": [],
+      "espera": 5
+    },
+    {
+      "funcao": "testarCaixaTem",
+      "args": [],
+      "espera": true
     }
   ]
 }
+

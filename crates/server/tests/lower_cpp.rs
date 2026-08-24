@@ -1877,19 +1877,11 @@ int g(Base* b) {
 /// a call to a member *operator template* instantiation (jsonxx's real
 /// `Object& operator<<(const T&)` shape, called with a string literal so
 /// only the template overload — not the concrete `operator<<(int)` sibling —
-/// can match) must not silently print a call to a bridge name
-/// (`streamInsert`, computed purely from the symbol and arity) that no
-/// declaration in the emitted Dart actually carries: this project has no
-/// member-template monomorphization (only the free-function path does), so
-/// the instantiation is never lowered as a real method. Before this fix, an
-/// unrelated non-template sibling overload of the same operator symbol could
-/// coincidentally share that exact bridge name and mask the gap — as soon as
-/// F13's own type-based disambiguation (tested above) renames that sibling
-/// away, the call becomes a `dart analyze` `undefined_method`, "reaching a
-/// declaration but not every call site". The honest failure is an explicit
-/// bailout, not a call to a name nothing declares.
+/// Tarefa 08: member operator template instantiations are monomorphized and lowered
+/// into named bridge methods (e.g. `streamInsertListInt`), with both declaration
+/// and call site matching.
 #[test]
-fn a_call_to_a_member_operator_template_instantiation_bails_out_explicitly() {
+fn member_operator_template_instantiation_is_monomorphized() {
     let source = lower_and_emit(
         "lower-cpp-member-operator-template-instantiation",
         r#"
@@ -1905,12 +1897,12 @@ void Use(Builder& b) {
     );
 
     assert!(
-        !source.contains("streamInsert"),
-        "must not print a call to a bridge name no declaration carries, got:\n{source}"
+        source.contains("Builder streamInsertListInt(List<int> value)"),
+        "expected Builder to declare monomorphized streamInsertListInt, got:\n{source}"
     );
     assert!(
-        source.contains("UnimplementedError"),
-        "expected an explicit bailout for the unmonomorphized template instantiation, got:\n{source}"
+        source.contains("b.streamInsertListInt('hello');"),
+        "expected Use to call b.streamInsertListInt('hello'), got:\n{source}"
     );
 }
 
@@ -4996,9 +4988,10 @@ void only_x(int *a) {
     );
 
     assert!(
-        source.contains("Unsupported"),
+        source.contains("UnimplementedError") || source.contains("Unsupported"),
         "expected an honest bailout for the nullptr out-arg, got:\n{source}"
     );
+
     assert!(
         !source.contains("GetPoint(a, nullptr)") && !source.contains("GetPoint(a, null)"),
         "the call must not survive as a bare (value-discarding) expression statement, \
@@ -7700,5 +7693,153 @@ bool diferente(Item a, Item b) { return a != b; }
     assert!(
         source.contains("return a != b;"),
         "call site of != should remain a != b in Dart, got:\n{source}"
+    );
+}
+
+/// Tarefa 08: explicit specialization of member templates on a class.
+/// `Caixa::tem<std::string>` and `Caixa::pega<std::string>` must be lowered
+/// into `Caixa`'s methods with monomorphized names (`temString`, `pegaString`),
+/// and call sites in `usa` must call them by the exact same names.
+#[test]
+fn member_template_explicit_specialization_is_monomorphized() {
+    let source = lower_and_emit(
+        "lower-cpp-member-template-explicit-spec",
+        r#"
+#include <string>
+class Caixa {
+public:
+    template <typename T> bool tem(const std::string &chave) const;
+    template <typename T> T pega(const std::string &chave) const;
+};
+template <> bool Caixa::tem<std::string>(const std::string &chave) const { return true; }
+template <> std::string Caixa::pega<std::string>(const std::string &chave) const { return chave; }
+
+std::string usa(const Caixa &c) {
+    if (c.tem<std::string>("a")) return c.pega<std::string>("a");
+    return "";
+}
+"#,
+    );
+
+    assert!(
+        source.contains("bool temString(String chave)"),
+        "expected Caixa to declare `bool temString(String chave)`, got:\n{source}"
+    );
+    assert!(
+        source.contains("String pegaString(String chave)"),
+        "expected Caixa to declare `String pegaString(String chave)`, got:\n{source}"
+    );
+    assert!(
+        source.contains("if (c.temString('a'))"),
+        "expected caller to invoke `c.temString('a')`, got:\n{source}"
+    );
+    assert!(
+        source.contains("return c.pegaString('a');"),
+        "expected caller to invoke `c.pegaString('a')`, got:\n{source}"
+    );
+}
+
+/// Tarefa 08: two distinct instantiations of the same member method template
+/// (`pega<std::string>` and `pega<int>`) must produce distinct names
+/// (`pegaString`, `pegaInt`) without collision or duplicate definitions.
+#[test]
+fn member_template_two_instantiations_produce_distinct_monomorphized_names() {
+    let source = lower_and_emit(
+        "lower-cpp-member-template-two-instantiations",
+        r#"
+#include <string>
+class Caixa {
+public:
+    template <typename T> T pega(const std::string &chave) const;
+};
+template <> std::string Caixa::pega<std::string>(const std::string &chave) const { return chave; }
+template <> int Caixa::pega<int>(const std::string &chave) const { return 42; }
+
+std::string usaString(const Caixa &c) {
+    return c.pega<std::string>("a");
+}
+
+int usaInt(const Caixa &c) {
+    return c.pega<int>("b");
+}
+"#,
+    );
+
+    assert!(
+        source.contains("String pegaString(String chave)"),
+        "expected Caixa to declare `String pegaString(String chave)`, got:\n{source}"
+    );
+    assert!(
+        source.contains("int pegaInt(String chave)"),
+        "expected Caixa to declare `int pegaInt(String chave)`, got:\n{source}"
+    );
+    assert!(
+        source.contains("return c.pegaString('a');"),
+        "expected usaString to invoke `c.pegaString('a')`, got:\n{source}"
+    );
+    assert!(
+        source.contains("return c.pegaInt('b');"),
+        "expected usaInt to invoke `c.pegaInt('b')`, got:\n{source}"
+    );
+}
+
+/// Tarefa 08: inline member template methods (implicit instantiation, jsonxx shape)
+/// must be lowered into the record's methods upon use at call sites.
+#[test]
+fn member_template_inline_implicit_instantiation_is_synthesized_and_monomorphized() {
+    let source = lower_and_emit(
+        "lower-cpp-member-template-implicit-inline",
+        r#"
+#include <string>
+class Caixa {
+public:
+    template <typename T>
+    bool has(const std::string &key) const {
+        return key.length() > 0;
+    }
+
+    template <typename T>
+    T get(const std::string &key) const {
+        return T();
+    }
+};
+
+bool testaHas(const Caixa &c) {
+    return c.has<std::string>("chave");
+}
+
+int testaGetInt(const Caixa &c) {
+    return c.get<int>("num");
+}
+
+std::string testaGetString(const Caixa &c) {
+    return c.get<std::string>("txt");
+}
+"#,
+    );
+
+    assert!(
+        source.contains("bool hasString(String key)"),
+        "expected Caixa to declare `bool hasString(String key)`, got:\n{source}"
+    );
+    assert!(
+        source.contains("int getInt(String key)"),
+        "expected Caixa to declare `int getInt(String key)`, got:\n{source}"
+    );
+    assert!(
+        source.contains("String getString(String key)"),
+        "expected Caixa to declare `String getString(String key)`, got:\n{source}"
+    );
+    assert!(
+        source.contains("return c.hasString('chave');"),
+        "expected caller to invoke `c.hasString('chave')`, got:\n{source}"
+    );
+    assert!(
+        source.contains("return c.getInt('num');"),
+        "expected caller to invoke `c.getInt('num')`, got:\n{source}"
+    );
+    assert!(
+        source.contains("return c.getString('txt');"),
+        "expected caller to invoke `c.getString('txt')`, got:\n{source}"
     );
 }

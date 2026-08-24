@@ -3410,6 +3410,15 @@ extern "C" fn visit_cursor(
             describe_function(cursor, declaration_kind, state.project_root)
     {
         declaration.has_definition = is_definition;
+        let specialized_template = unsafe { clang_sys::clang_getSpecializedCursorTemplate(cursor) };
+        if unsafe { clang_sys::clang_Cursor_isNull(specialized_template) } == 0 {
+            let base_name = unsafe {
+                type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(
+                    specialized_template,
+                ))
+            };
+            declaration.name = lower::cpp::monomorphized_template_name(&base_name, cursor);
+        }
         let caller_usr = declaration.usr.clone();
         let declared_kind = declaration.kind;
         let owning_class_usr = declaration.owning_class_usr.clone();
@@ -3532,6 +3541,8 @@ extern "C" fn visit_cursor(
                 call_seen: &mut *state.call_seen,
                 ir_functions: &mut *state.ir_functions,
                 ir_function_is_prototype: &mut *state.ir_function_is_prototype,
+                ir_records: &mut *state.ir_records,
+                ir_member_seen: &mut *state.ir_member_seen,
                 ir_seen: &mut *state.ir_seen,
                 declarations: &mut *state.declarations,
                 declaration_seen: &mut *state.seen,
@@ -3571,6 +3582,8 @@ struct CallVisitorState<'a> {
     /// `false` here: a monomorphized function is synthesized from a real
     /// template instantiation, never a prototype-only stand-in.
     ir_function_is_prototype: &'a mut Vec<bool>,
+    ir_records: &'a mut Vec<ir::Record>,
+    ir_member_seen: &'a mut HashSet<String>,
     ir_seen: &'a mut HashSet<String>,
     /// F6/tarefa 07, Metade B: the same catalog `VisitorState.declarations`
     /// holds, reborrowed so `record_call` can catalog a system-header free
@@ -3796,6 +3809,41 @@ fn record_call(cursor: clang_sys::CXCursor, state: &mut CallVisitorState<'_>) {
                         lower::cpp::monomorphized_template_name(&base_name, referenced);
                     state.ir_functions.push(function_ir);
                     state.ir_function_is_prototype.push(false);
+                }
+            }
+            if is_template_instantiation
+                && (referenced_kind == clang_sys::CXCursor_CXXMethod
+                    || referenced_kind == clang_sys::CXCursor_ConversionFunction)
+            {
+                let instantiation_usr = unsafe {
+                    type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(referenced))
+                };
+                if !instantiation_usr.is_empty()
+                    && state.ir_member_seen.insert(instantiation_usr.clone())
+                {
+                    let owner = unsafe { clang_sys::clang_getCursorSemanticParent(referenced) };
+                    let owner_usr = unsafe {
+                        type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(owner))
+                    };
+                    if let Some(mut method_ir) =
+                        lower::cpp::lower_method(referenced, &instantiation_usr, state.project_root)
+                    {
+                        let base_name = unsafe {
+                            type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(
+                                template,
+                            ))
+                        };
+                        method_ir.name = lower::cpp::monomorphized_template_name_with_call(
+                            &base_name,
+                            referenced,
+                            Some(cursor),
+                        );
+                        if let Some(record) =
+                            state.ir_records.iter_mut().find(|r| r.usr == owner_usr)
+                        {
+                            record.methods.push(method_ir);
+                        }
+                    }
                 }
             }
 

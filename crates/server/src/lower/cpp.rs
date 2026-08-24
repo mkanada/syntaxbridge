@@ -117,31 +117,155 @@ fn pascal_case_alnum_segments(text: &str) -> String {
 }
 
 /// The deterministic Dart-side name for a call/declaration that resolves to
-/// *any* instantiation of a function template (E08) — `cursor` is the
-/// concrete instantiation itself (an implicit instantiation's synthesized
-/// decl, or a full explicit specialization's own written decl; both report
-/// concrete, non-template-dependent parameter types, confirmed empirically
-/// against `clang_getCursorType` on each). Appends `overload_type_suffix`
-/// of every parameter's *concrete* type to `base_name` — the same scheme
-/// E07 uses for a renamed overload, and for the same reason: Dart has
-/// neither C++ template instantiation nor (usable, for this project's
-/// scope) generic type parameters with the operator-based constraints a
-/// template body like `valor + valor` implicitly relies on, so each
-/// concrete instantiation becomes its own named Dart function instead.
-/// Called independently at both the declaration this resolves to
-/// (`function_catalog::record_call`'s synthesis, or the top-level
-/// `FreeFunction` path for an explicit specialization) and every call site
-/// referencing it (`lower_call_expr`) — deterministic from `cursor` alone,
-/// so the two can never disagree about the name.
+/// *any* instantiation of a function or method template (E08 / Tarefa 08) —
+/// `cursor` is the concrete instantiation itself (an implicit instantiation's
+/// synthesized decl, or a full explicit specialization's own written decl;
+/// both report concrete, non-template-dependent parameter types, confirmed
+/// empirically against `clang_getCursorType` and template arguments against
+/// `clang_Cursor_getNumTemplateArguments`/`clang_Cursor_getTemplateArgumentType`).
+/// Appends `overload_type_suffix` of template type arguments (or template-dependent
+/// return type / parameters, or TypeRef children at call site/specialization)
+/// to `base_name` — deterministic from `cursor` alone, so declaration and call
+/// site can never disagree about the name.
 pub fn monomorphized_template_name(base_name: &str, cursor: clang_sys::CXCursor) -> String {
-    let mut name = base_name.to_owned();
-    for param_cursor in unsafe { collect_children(cursor) } {
-        if unsafe { clang_sys::clang_getCursorKind(param_cursor) } != clang_sys::CXCursor_ParmDecl {
-            continue;
+    monomorphized_template_name_with_call(base_name, cursor, None)
+}
+
+pub fn monomorphized_template_name_with_call(
+    base_name: &str,
+    cursor: clang_sys::CXCursor,
+    call_cursor: Option<clang_sys::CXCursor>,
+) -> String {
+    let mut name = if base_name.starts_with("operator") {
+        let num_args = unsafe { clang_sys::clang_Cursor_getNumArguments(cursor) };
+        let arity = if num_args > 0 { num_args as usize } else { 1 };
+        dart_operator_bridge_name(base_name, arity).to_owned()
+    } else {
+        base_name.to_owned()
+    };
+
+    let mut suffix = String::new();
+
+    let num_template_args = unsafe { clang_sys::clang_Cursor_getNumTemplateArguments(cursor) };
+    if num_template_args > 0 {
+        for i in 0..num_template_args as c_uint {
+            let kind = unsafe { clang_sys::clang_Cursor_getTemplateArgumentKind(cursor, i) };
+            if kind == clang_sys::CXTemplateArgumentKind_Type {
+                let cx_type = unsafe { clang_sys::clang_Cursor_getTemplateArgumentType(cursor, i) };
+                let ty = lower_type(cx_type);
+                suffix.push_str(&overload_type_suffix(&ty));
+            } else if kind == clang_sys::CXTemplateArgumentKind_Integral {
+                let val = unsafe { clang_sys::clang_Cursor_getTemplateArgumentValue(cursor, i) };
+                suffix.push_str(&format!("Val{val}"));
+            }
         }
-        let ty = lower_type(unsafe { clang_sys::clang_getCursorType(param_cursor) });
-        name.push_str(&overload_type_suffix(&ty));
     }
+
+    let specialized_template = unsafe { clang_sys::clang_getSpecializedCursorTemplate(cursor) };
+    let has_specialized = unsafe { clang_sys::clang_Cursor_isNull(specialized_template) } == 0;
+
+    if suffix.is_empty() && has_specialized {
+        let prim_res =
+            lower_type(unsafe { clang_sys::clang_getCursorResultType(specialized_template) });
+        let inst_res = lower_type(unsafe { clang_sys::clang_getCursorResultType(cursor) });
+        if matches!(prim_res, ir::Type::Unsupported(_))
+            && !matches!(inst_res, ir::Type::Unsupported(_))
+        {
+            suffix.push_str(&overload_type_suffix(&inst_res));
+        }
+    }
+
+    if suffix.is_empty() && has_specialized {
+        let prim_params: Vec<_> = unsafe { collect_children(specialized_template) }
+            .into_iter()
+            .filter(
+                |c| unsafe { clang_sys::clang_getCursorKind(*c) } == clang_sys::CXCursor_ParmDecl,
+            )
+            .collect();
+        let inst_params: Vec<_> = unsafe { collect_children(cursor) }
+            .into_iter()
+            .filter(
+                |c| unsafe { clang_sys::clang_getCursorKind(*c) } == clang_sys::CXCursor_ParmDecl,
+            )
+            .collect();
+        for (prim, inst) in prim_params.iter().zip(inst_params.iter()) {
+            let prim_ty = lower_type(unsafe { clang_sys::clang_getCursorType(*prim) });
+            let inst_ty = lower_type(unsafe { clang_sys::clang_getCursorType(*inst) });
+            if matches!(prim_ty, ir::Type::Unsupported(_))
+                && !matches!(inst_ty, ir::Type::Unsupported(_))
+            {
+                suffix.push_str(&overload_type_suffix(&inst_ty));
+            }
+        }
+    }
+
+    if suffix.is_empty() {
+        let owner = unsafe { clang_sys::clang_getCursorSemanticParent(cursor) };
+        let owner_name = if unsafe { clang_sys::clang_Cursor_isNull(owner) } == 0 {
+            unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(owner)) }
+        } else {
+            String::new()
+        };
+        for child in unsafe { collect_children(cursor) } {
+            if unsafe { clang_sys::clang_getCursorKind(child) } == clang_sys::CXCursor_TypeRef {
+                let spelling = unsafe {
+                    type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(child))
+                };
+                if !owner_name.is_empty()
+                    && (spelling == owner_name
+                        || spelling == format!("class {owner_name}")
+                        || spelling == format!("struct {owner_name}"))
+                {
+                    continue;
+                }
+                let ty = lower_type(unsafe { clang_sys::clang_getCursorType(child) });
+                if !matches!(ty, ir::Type::Unsupported(ref s) if s.is_empty()) {
+                    suffix.push_str(&overload_type_suffix(&ty));
+                    break;
+                }
+            }
+        }
+    }
+
+    if suffix.is_empty()
+        && let Some(call) = call_cursor
+    {
+        for child in unsafe { collect_children(call) } {
+            for sub in unsafe { collect_children(child) } {
+                if unsafe { clang_sys::clang_getCursorKind(sub) } == clang_sys::CXCursor_TypeRef {
+                    let ty = lower_type(unsafe { clang_sys::clang_getCursorType(sub) });
+                    if !matches!(ty, ir::Type::Unsupported(ref s) if s.is_empty()) {
+                        suffix.push_str(&overload_type_suffix(&ty));
+                        break;
+                    }
+                }
+            }
+            if !suffix.is_empty() {
+                break;
+            }
+        }
+    }
+
+    if suffix.is_empty() {
+        for param_cursor in unsafe { collect_children(cursor) } {
+            if unsafe { clang_sys::clang_getCursorKind(param_cursor) }
+                != clang_sys::CXCursor_ParmDecl
+            {
+                continue;
+            }
+            let ty = lower_type(unsafe { clang_sys::clang_getCursorType(param_cursor) });
+            suffix.push_str(&overload_type_suffix(&ty));
+        }
+    }
+
+    if suffix.is_empty() {
+        let ret_type = lower_type(unsafe { clang_sys::clang_getCursorResultType(cursor) });
+        if ret_type != ir::Type::Void {
+            suffix.push_str(&overload_type_suffix(&ret_type));
+        }
+    }
+
+    name.push_str(&suffix);
     name
 }
 
@@ -1070,7 +1194,15 @@ pub fn lower_method(
         return None;
     }
 
-    let name = if let Some(conversion_name) = conversion_name {
+    let specialized_template = unsafe { clang_sys::clang_getSpecializedCursorTemplate(cursor) };
+    let name = if unsafe { clang_sys::clang_Cursor_isNull(specialized_template) } == 0 {
+        let base_name = unsafe {
+            type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(
+                specialized_template,
+            ))
+        };
+        monomorphized_template_name(&base_name, cursor)
+    } else if let Some(conversion_name) = conversion_name {
         conversion_name.to_owned()
     } else {
         unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(cursor)) }
@@ -8973,12 +9105,13 @@ unsafe fn lower_stdlib_method_call(
         }
     };
     let target_is_record = match target.ty() {
-        Some(ir::Type::Record { .. }) => true,
-        Some(ir::Type::Nullable(inner)) if matches!(inner.as_ref(), ir::Type::Record { .. }) => {
-            true
+        Some(ir::Type::Record { usr, .. }) => usr != OUTPUT_STREAM_USR && usr != INPUT_STREAM_USR,
+        Some(ir::Type::Nullable(inner)) => {
+            matches!(inner.as_ref(), ir::Type::Record { usr, .. } if usr != OUTPUT_STREAM_USR && usr != INPUT_STREAM_USR)
         }
         _ => false,
     };
+
     if target_is_record {
         let (field_name, field_ty) = match template_name.as_str() {
             "basic_string" => ("syntaxBridgeStringBase", ir::Type::Str),
@@ -11326,21 +11459,8 @@ unsafe fn lower_method_call(
         if unsafe { clang_sys::clang_getCursorKind(*first_child) }
             == clang_sys::CXCursor_MemberRefExpr
         {
-            // `Base::foo()`/`this->Base::foo()` (F12/tarefa 09) — only a
-            // qualified call on an *implicit* `this` receiver has a Dart
-            // `super.` equivalent at all; `obj.Base::foo()` on an explicit,
-            // different object has none (Dart has no way to pick a specific
-            // ancestor implementation through an arbitrary reference), so
-            // this stays disqualified even though `member_ref_qualifier_base`
-            // still reports the same `TypeRef`. A qualifier naming *this
-            // very record* (a non-virtual self-qualified call, still
-            // genuinely recursive the same way in Dart as in C++) is left
-            // alone exactly like an unqualified call; only a qualifier
-            // naming a *different* record, on the implicit receiver, is a
-            // real base-qualified call, whose dispatch `super.`/a bailout
-            // has to capture — see `Expr::Call::base_qualifier`'s own doc
-            // comment.
             let receiver = unsafe { member_ref_receiver(*first_child, project_root, &origin) };
+
             let qualifier = unsafe { member_ref_qualifier_base(*first_child) };
             let base_qualifier = qualifier.filter(|base| {
                 matches!(receiver, ir::Expr::This { .. })
@@ -11391,7 +11511,21 @@ unsafe fn lower_method_call(
     // identifier) spelling is kept as a fallback rather than panicking, in
     // the defensive case some other future call path reaches this function
     // directly with a target type this module still doesn't name.
-    let callee_name = if raw_callee_name == "operator()" {
+    let specialized_template = unsafe { clang_sys::clang_getSpecializedCursorTemplate(referenced) };
+    let is_user_template_instantiation = unsafe {
+        clang_sys::clang_Cursor_isNull(specialized_template) == 0
+            && clang_sys::clang_Location_isInSystemHeader(clang_sys::clang_getCursorLocation(
+                referenced,
+            )) == 0
+    };
+    let callee_name = if is_user_template_instantiation {
+        let base_name = unsafe {
+            type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(
+                specialized_template,
+            ))
+        };
+        monomorphized_template_name_with_call(&base_name, referenced, Some(call_cursor))
+    } else if raw_callee_name == "operator()" {
         "call".to_owned()
     } else if unsafe { clang_sys::clang_getCursorKind(referenced) }
         == clang_sys::CXCursor_ConversionFunction
@@ -11408,6 +11542,7 @@ unsafe fn lower_method_call(
     } else {
         raw_callee_name
     };
+
     if callee_name.starts_with("operator") {
         // F13/tarefa 12 (`docs/prompts/2026-08-21-12-overloads-const-e-colisoes-de-nome.md`):
         // a call to a member *operator template* instantiation
