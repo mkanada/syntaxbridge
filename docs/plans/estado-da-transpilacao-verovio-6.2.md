@@ -594,6 +594,19 @@ do modelo nem regressao de visibilidade. Nenhum campo foi removido e o aviso
 nao foi silenciado; ele deve cair conforme os corpos consumidores forem
 materializados.
 
+**Tarefa 14.8 (`goto`/rotulo, 2026-08-24).** A fonte do Verovio 6.2.0 contem
+13 `goto` textuais nos dois focos do diagnostico. Em `zip_file.hpp`, 11 saltos
+sao para frente (um para `common_exit` e dez para `handle_failure`); em
+`pugixml.cpp`, os dois saltos, para `LOC_ATTRIBUTES` e `LOC_TAG`, sao para
+tras. Assim, 11/13 (84,6%) pertencem ao subconjunto potencialmente traduzivel
+e 2/13 (15,4%) exigem reestruturacao de fluxo. Os 64 bailouts de `GotoStmt` e
+10 de `LabelStmt` contam expansoes e unidades de compilacao, nao 74 comandos
+distintos na fonte. A implementacao do subconjunto para frente nao e uma
+correcao local: requer representar blocos rotulados no IR, resolver o alvo e
+provar que o salto nao atravessa um escopo. Por isso ela fica registrada como
+tarefa propria; os dois saltos para tras continuam explicitamente fora desse
+subconjunto.
+
 ## 5. O que "funcionar" quer dizer, e o que ainda não existe para medir isso
 
 Nenhuma das tarefas acima prova que o Dart emitido **faz a mesma coisa** que o
