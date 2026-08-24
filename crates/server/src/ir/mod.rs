@@ -502,10 +502,12 @@ pub enum Expr {
     },
     /// `std::basic_string::find(needle)` — searches the UTF-8 bytes rather
     /// than Dart `String` UTF-16 code units, retaining C++'s offset domain
-    /// and `-1` not-found sentinel through `List<int>.indexOf`.
+    /// and `-1` not-found sentinel through `syntaxBridgeIndexOfBytes`/`syntaxBridgeIndexOfByte`.
     StringByteIndexOf {
         target: Box<Expr>,
         needle: Box<Expr>,
+        #[serde(default)]
+        from: Option<Box<Expr>>,
         origin: Origin,
     },
     StringByteAt {

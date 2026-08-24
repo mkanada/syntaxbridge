@@ -43,6 +43,8 @@ const MAP_ENTRY_MARKER: &str = "MapEntry<";
 /// instead, the same "adaptador nomeado" answer `SyntaxBridgePair` already
 /// gives `std::make_pair`.
 const FIRST_WHERE_HELPER_NAME: &str = "syntaxBridgeFirstWhere";
+const INDEX_OF_BYTES_HELPER_NAME: &str = "syntaxBridgeIndexOfBytes";
+const INDEX_OF_BYTE_HELPER_NAME: &str = "syntaxBridgeIndexOfByte";
 /// `lower::cpp::Type::ListCursor`'s own Dart shape — a named adapter for a
 /// long-lived `std::vector<T>::iterator`/`std::string::iterator` (a field,
 /// or a local outliving the one recognized guard-and-deref/for-each idiom),
@@ -245,46 +247,59 @@ pub fn emit_module_with_externals(
     let needs_map_entry_pair_extension = files
         .values()
         .any(|source| source.contains(MAP_ENTRY_MARKER));
+    let needs_string_byte_index_support = files.values().any(|source| {
+        source.contains(INDEX_OF_BYTES_HELPER_NAME) || source.contains(INDEX_OF_BYTE_HELPER_NAME)
+    });
     if needs_opaque_support
         || needs_pair_support
         || needs_native_handle_support
         || needs_first_where_support
         || needs_list_cursor_support
         || needs_map_entry_pair_extension
+        || needs_string_byte_index_support
     {
         let mut support = String::new();
+        if needs_string_byte_index_support {
+            support.push_str("import 'dart:convert';\n\n");
+        }
         if needs_opaque_support {
             support.push_str(&emit_opaque_type());
         }
         if needs_pair_support {
-            if !support.is_empty() {
+            if !support.is_empty() && !support.ends_with("\n\n") {
                 support.push('\n');
             }
             support.push_str(&emit_pair_support());
         }
         if needs_native_handle_support {
-            if !support.is_empty() {
+            if !support.is_empty() && !support.ends_with("\n\n") {
                 support.push('\n');
             }
             support.push_str(&emit_native_handle_support());
         }
         if needs_first_where_support {
-            if !support.is_empty() {
+            if !support.is_empty() && !support.ends_with("\n\n") {
                 support.push('\n');
             }
             support.push_str(&emit_first_where_support());
         }
         if needs_list_cursor_support {
-            if !support.is_empty() {
+            if !support.is_empty() && !support.ends_with("\n\n") {
                 support.push('\n');
             }
             support.push_str(&emit_list_cursor_support());
         }
         if needs_map_entry_pair_extension {
-            if !support.is_empty() {
+            if !support.is_empty() && !support.ends_with("\n\n") {
                 support.push('\n');
             }
             support.push_str(&emit_map_entry_pair_extension());
+        }
+        if needs_string_byte_index_support {
+            if !support.is_empty() && !support.ends_with("\n\n") {
+                support.push('\n');
+            }
+            support.push_str(&emit_string_byte_index_support());
         }
         files.insert(format!("lib/{SUPPORT_FILE_NAME}"), support);
     }
@@ -577,6 +592,8 @@ fn emit_file(
         || source.contains(FIRST_WHERE_HELPER_NAME)
         || source.contains(LIST_CURSOR_TYPE_NAME)
         || source.contains(MAP_ENTRY_MARKER)
+        || source.contains(INDEX_OF_BYTES_HELPER_NAME)
+        || source.contains(INDEX_OF_BYTE_HELPER_NAME)
     {
         import_lines.push(format!("import '{SUPPORT_FILE_NAME}';"));
     }
@@ -665,6 +682,32 @@ fn emit_first_where_support() -> String {
          {INDENT}{INDENT}if (test(item)) return item;\n\
          {INDENT}}}\n\
          {INDENT}return null;\n\
+         }}\n"
+    )
+}
+
+/// UTF-8 byte search helpers for `std::basic_string::find` (T4).
+fn emit_string_byte_index_support() -> String {
+    format!(
+        "int {INDEX_OF_BYTES_HELPER_NAME}(String haystack, String needle, [int from = 0]) {{\n\
+         {INDENT}if (from < 0) from = 0;\n\
+         {INDENT}final hBytes = utf8.encode(haystack);\n\
+         {INDENT}final nBytes = utf8.encode(needle);\n\
+         {INDENT}if (nBytes.isEmpty) return from <= hBytes.length ? from : -1;\n\
+         {INDENT}if (from + nBytes.length > hBytes.length) return -1;\n\
+         {INDENT}outer:\n\
+         {INDENT}for (int i = from; i <= hBytes.length - nBytes.length; i++) {{\n\
+         {INDENT}{INDENT}for (int j = 0; j < nBytes.length; j++) {{\n\
+         {INDENT}{INDENT}{INDENT}if (hBytes[i + j] != nBytes[j]) continue outer;\n\
+         {INDENT}{INDENT}}}\n\
+         {INDENT}{INDENT}return i;\n\
+         {INDENT}}}\n\
+         {INDENT}return -1;\n\
+         }}\n\n\
+         int {INDEX_OF_BYTE_HELPER_NAME}(String haystack, int byte, [int from = 0]) {{\n\
+         {INDENT}if (from < 0) from = 0;\n\
+         {INDENT}final hBytes = utf8.encode(haystack);\n\
+         {INDENT}return hBytes.indexOf(byte, from);\n\
          }}\n"
     )
 }
@@ -1046,9 +1089,17 @@ fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str
             collect_referenced_usrs_in_expr(index, out);
         }
         Expr::StringByteLength { target, .. } => collect_referenced_usrs_in_expr(target, out),
-        Expr::StringByteIndexOf { target, needle, .. } => {
+        Expr::StringByteIndexOf {
+            target,
+            needle,
+            from,
+            ..
+        } => {
             collect_referenced_usrs_in_expr(target, out);
             collect_referenced_usrs_in_expr(needle, out);
+            if let Some(from) = from {
+                collect_referenced_usrs_in_expr(from, out);
+            }
         }
         Expr::Tuple { values, .. } => {
             for value in values {
@@ -1633,8 +1684,15 @@ fn expr_contains_this(expr: &Expr) -> bool {
                 || expr_contains_this(default_value)
         }
         Expr::StringByteLength { target, .. } => expr_contains_this(target),
-        Expr::StringByteIndexOf { target, needle, .. } => {
-            expr_contains_this(target) || expr_contains_this(needle)
+        Expr::StringByteIndexOf {
+            target,
+            needle,
+            from,
+            ..
+        } => {
+            expr_contains_this(target)
+                || expr_contains_this(needle)
+                || from.as_ref().is_some_and(|f| expr_contains_this(f))
         }
         Expr::StringByteAt { target, index, .. } => {
             expr_contains_this(target) || expr_contains_this(index)
@@ -2725,8 +2783,17 @@ fn expr_unsupported_type_spelling(expr: &Expr) -> Option<&str> {
             .or_else(|| expr_unsupported_type_spelling(index))
             .or_else(|| expr_unsupported_type_spelling(default_value)),
         Expr::StringByteLength { target, .. } => expr_unsupported_type_spelling(target),
-        Expr::StringByteIndexOf { target, needle, .. } => expr_unsupported_type_spelling(target)
-            .or_else(|| expr_unsupported_type_spelling(needle)),
+        Expr::StringByteIndexOf {
+            target,
+            needle,
+            from,
+            ..
+        } => expr_unsupported_type_spelling(target)
+            .or_else(|| expr_unsupported_type_spelling(needle))
+            .or_else(|| {
+                from.as_ref()
+                    .and_then(|f| expr_unsupported_type_spelling(f))
+            }),
         Expr::StringByteAt {
             target, index, ty, ..
         } => unsupported_spelling(ty)
@@ -4446,13 +4513,29 @@ fn emit_expr(
                 emit_expr(target, used_expr_helper, used_utf8_encode, promoted)
             )
         }
-        Expr::StringByteIndexOf { target, needle, .. } => {
-            *used_utf8_encode = true;
-            format!(
-                "utf8.encode({}).indexOf(utf8.encode({}))",
-                emit_expr(target, used_expr_helper, used_utf8_encode, promoted),
-                emit_expr(needle, used_expr_helper, used_utf8_encode, promoted)
-            )
+        Expr::StringByteIndexOf {
+            target,
+            needle,
+            from,
+            ..
+        } => {
+            let target_text = emit_expr(target, used_expr_helper, used_utf8_encode, promoted);
+            let needle_text = emit_expr(needle, used_expr_helper, used_utf8_encode, promoted);
+            let from_suffix = match from {
+                Some(from_expr) => {
+                    let from_text =
+                        emit_expr(from_expr, used_expr_helper, used_utf8_encode, promoted);
+                    format!(", {from_text}")
+                }
+                None => String::new(),
+            };
+            let is_byte = matches!(expr_ty(needle), Some(Type::Int))
+                || matches!(needle.as_ref(), Expr::IntLiteral { .. });
+            if is_byte {
+                format!("{INDEX_OF_BYTE_HELPER_NAME}({target_text}, {needle_text}{from_suffix})")
+            } else {
+                format!("{INDEX_OF_BYTES_HELPER_NAME}({target_text}, {needle_text}{from_suffix})")
+            }
         }
         Expr::StringByteAt { target, index, .. } => {
             *used_utf8_encode = true;

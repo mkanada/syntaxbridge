@@ -2554,7 +2554,7 @@ int read(const std::vector<int>& values) {
 
     assert!(
         source.contains("return text.isEmpty;")
-            && source.contains("return utf8.encode(text).indexOf(utf8.encode('x'));")
+            && source.contains("return syntaxBridgeIndexOfBytes(text, 'x');")
             && source.contains("values.add(value);")
             && source.contains("values.clear();")
             && source.contains("return values[0];"),

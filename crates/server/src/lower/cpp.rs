@@ -4733,13 +4733,27 @@ unsafe fn lower_stdlib_mutating_string_stmt(
             value: String::new(),
             origin: origin.clone(),
         },
-        "append" if args.len() == 1 => ir::Expr::Binary {
-            op: ir::BinaryOp::Add,
-            lhs: Box::new(target.clone()),
-            rhs: Box::new(args.into_iter().next().expect("one append argument")),
-            ty: ir::Type::Str,
-            origin: origin.clone(),
-        },
+        "append" if args.len() == 1 => {
+            let mut arg = args.into_iter().next().expect("one append argument");
+            if arg.ty() == Some(&ir::Type::Int) {
+                arg = ir::Expr::Call {
+                    base_qualifier: None,
+                    target: None,
+                    callee_usr: String::new(),
+                    callee_name: "String.fromCharCode".to_owned(),
+                    args: vec![arg],
+                    ty: ir::Type::Str,
+                    origin: origin.clone(),
+                };
+            }
+            ir::Expr::Binary {
+                op: ir::BinaryOp::Add,
+                lhs: Box::new(target.clone()),
+                rhs: Box::new(arg),
+                ty: ir::Type::Str,
+                origin: origin.clone(),
+            }
+        }
         // `std::basic_string::push_back(char)` — real triggers found by
         // grepping the extracted Verovio source directly
         // (`toolkit.cpp`'s `option_str.push_back(option->GetShortOption())`,
@@ -5088,13 +5102,29 @@ unsafe fn lower_stdlib_assignment_stmt(
     let value = unsafe { lower_expr(value_cursor, project_root) };
     let value = match (template_name.as_str(), callee_name.as_str()) {
         ("basic_string", "operator=") => value,
-        ("basic_string", "operator+=") => ir::Expr::Binary {
-            op: ir::BinaryOp::Add,
-            lhs: Box::new(target.clone()),
-            rhs: Box::new(value),
-            ty: ir::Type::Str,
-            origin: origin.clone(),
-        },
+        ("basic_string", "operator+=") => {
+            let val_ty = lower_type(unsafe { clang_sys::clang_getCursorType(value_cursor) });
+            let rhs = if val_ty == ir::Type::Int {
+                ir::Expr::Call {
+                    base_qualifier: None,
+                    target: None,
+                    callee_usr: String::new(),
+                    callee_name: "String.fromCharCode".to_owned(),
+                    args: vec![value],
+                    ty: ir::Type::Str,
+                    origin: origin.clone(),
+                }
+            } else {
+                value
+            };
+            ir::Expr::Binary {
+                op: ir::BinaryOp::Add,
+                lhs: Box::new(target.clone()),
+                rhs: Box::new(rhs),
+                ty: ir::Type::Str,
+                origin: origin.clone(),
+            }
+        }
         ("optional", "operator=") => value,
         ("vector" | "list" | "deque", "operator=") => ir::Expr::Call {
             base_qualifier: None,
@@ -6220,6 +6250,17 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
 
     if kind == clang_sys::CXCursor_DeclRefExpr {
         let referenced = unsafe { clang_sys::clang_getCursorReferenced(cursor) };
+        if unsafe { clang_sys::clang_getCursorKind(referenced) } == clang_sys::CXCursor_VarDecl {
+            let spelling = unsafe {
+                type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced))
+            };
+            if spelling == "npos" {
+                let owner = unsafe { clang_sys::clang_getCursorSemanticParent(referenced) };
+                if unsafe { stdlib_template_name(owner) }.as_deref() == Some("basic_string") {
+                    return ir::Expr::IntLiteral { value: -1, origin };
+                }
+            }
+        }
         // An anonymous `enum { SMUFL_0020_space = 0x0020, ... }` (a common
         // C idiom for a group of named integer constants, not a real type
         // — confirmed as the real Verovio shape by grepping the source,
@@ -6248,7 +6289,19 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
     }
 
     if kind == clang_sys::CXCursor_MemberRefExpr {
-        let field = unsafe { dart_member_name(clang_sys::clang_getCursorReferenced(cursor)) };
+        let referenced = unsafe { clang_sys::clang_getCursorReferenced(cursor) };
+        if unsafe { clang_sys::clang_getCursorKind(referenced) } == clang_sys::CXCursor_VarDecl {
+            let spelling = unsafe {
+                type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced))
+            };
+            if spelling == "npos" {
+                let owner = unsafe { clang_sys::clang_getCursorSemanticParent(referenced) };
+                if unsafe { stdlib_template_name(owner) }.as_deref() == Some("basic_string") {
+                    return ir::Expr::IntLiteral { value: -1, origin };
+                }
+            }
+        }
+        let field = unsafe { dart_member_name(referenced) };
         let target = unsafe { member_ref_receiver(cursor, project_root, &origin) };
         let ty = lower_type(unsafe { clang_sys::clang_getCursorType(cursor) });
         return ir::Expr::FieldAccess {
@@ -8357,6 +8410,14 @@ unsafe fn lower_stdlib_dereference_call(
     }
 }
 
+fn is_npos_expr(expr: &ir::Expr) -> bool {
+    match expr {
+        ir::Expr::IntLiteral { value: -1, .. } => true,
+        ir::Expr::Ref { name, .. } => name == "-1" || name.ends_with("npos"),
+        _ => false,
+    }
+}
+
 unsafe fn lower_stdlib_method_call(
     call_cursor: clang_sys::CXCursor,
     referenced: clang_sys::CXCursor,
@@ -8710,19 +8771,24 @@ unsafe fn lower_stdlib_method_call(
         ("basic_string", "c_str") => Some(target),
         ("basic_string", "find") => {
             let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
-            let [needle] = args.as_slice() else {
-                return Some(ir::Expr::UnsupportedTyped {
-                    reason: format!(
-                        "std::basic_string::find had {} arguments, expected exactly 1",
-                        args.len()
-                    ),
-                    ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
-                    origin: origin.clone(),
-                });
+            let (needle, from) = match args.as_slice() {
+                [needle] => (needle.clone(), None),
+                [needle, from] => (needle.clone(), Some(Box::new(from.clone()))),
+                _ => {
+                    return Some(ir::Expr::UnsupportedTyped {
+                        reason: format!(
+                            "std::basic_string::find had {} arguments, expected 1 or 2",
+                            args.len()
+                        ),
+                        ty: lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) }),
+                        origin: origin.clone(),
+                    });
+                }
             };
             Some(ir::Expr::StringByteIndexOf {
                 target: Box::new(target),
-                needle: Box::new(needle.clone()),
+                needle: Box::new(needle),
+                from,
                 origin: origin.clone(),
             })
         }
@@ -8785,6 +8851,7 @@ unsafe fn lower_stdlib_method_call(
             let args = unsafe { lower_call_arguments(call_cursor, project_root) }?;
             let substring_args = match args.as_slice() {
                 [start] => vec![start.clone()],
+                [start, count] if is_npos_expr(count) => vec![start.clone()],
                 [start, count] => vec![
                     start.clone(),
                     ir::Expr::Binary {
@@ -10501,8 +10568,31 @@ unsafe fn lower_stdlib_operator_call(
         return None;
     }
 
-    let lhs = unsafe { lower_expr(lhs_cursor, project_root) };
-    let rhs = unsafe { lower_expr(rhs_cursor, project_root) };
+    let mut lhs = unsafe { lower_expr(lhs_cursor, project_root) };
+    let mut rhs = unsafe { lower_expr(rhs_cursor, project_root) };
+    if op == ir::BinaryOp::Add {
+        if lhs_ty == ir::Type::Int && rhs_ty == ir::Type::Str {
+            lhs = ir::Expr::Call {
+                base_qualifier: None,
+                target: None,
+                callee_usr: String::new(),
+                callee_name: "String.fromCharCode".to_owned(),
+                args: vec![lhs],
+                ty: ir::Type::Str,
+                origin: origin.clone(),
+            };
+        } else if rhs_ty == ir::Type::Int && lhs_ty == ir::Type::Str {
+            rhs = ir::Expr::Call {
+                base_qualifier: None,
+                target: None,
+                callee_usr: String::new(),
+                callee_name: "String.fromCharCode".to_owned(),
+                args: vec![rhs],
+                ty: ir::Type::Str,
+                origin: origin.clone(),
+            };
+        }
+    }
     let ty = lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) });
     Some(ir::Expr::Binary {
         op,

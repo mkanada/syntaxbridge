@@ -1545,9 +1545,17 @@ impl IrRefVisitor<'_> {
                 self.visit_expr(default_value);
             }
             ir::Expr::StringByteLength { target, .. } => self.visit_expr(target),
-            ir::Expr::StringByteIndexOf { target, needle, .. } => {
+            ir::Expr::StringByteIndexOf {
+                target,
+                needle,
+                from,
+                ..
+            } => {
                 self.visit_expr(target);
                 self.visit_expr(needle);
+                if let Some(from) = from {
+                    self.visit_expr(from);
+                }
             }
             ir::Expr::StringByteAt {
                 target, index, ty, ..
@@ -2450,8 +2458,15 @@ fn expr_references_name(expr: &ir::Expr, name: &str) -> bool {
         ir::Expr::FieldAccess { target, .. } | ir::Expr::StringByteLength { target, .. } => {
             expr_references_name(target, name)
         }
-        ir::Expr::StringByteIndexOf { target, needle, .. } => {
-            expr_references_name(target, name) || expr_references_name(needle, name)
+        ir::Expr::StringByteIndexOf {
+            target,
+            needle,
+            from,
+            ..
+        } => {
+            expr_references_name(target, name)
+                || expr_references_name(needle, name)
+                || from.as_ref().is_some_and(|f| expr_references_name(f, name))
         }
         ir::Expr::StringByteAt { target, index, .. } => {
             expr_references_name(target, name) || expr_references_name(index, name)
@@ -2655,9 +2670,17 @@ fn replace_this_with_ref_in_expr(expr: &mut ir::Expr, var_name: &str) {
         ir::Expr::FieldAccess { target, .. } | ir::Expr::StringByteLength { target, .. } => {
             replace_this_with_ref_in_expr(target, var_name);
         }
-        ir::Expr::StringByteIndexOf { target, needle, .. } => {
+        ir::Expr::StringByteIndexOf {
+            target,
+            needle,
+            from,
+            ..
+        } => {
             replace_this_with_ref_in_expr(target, var_name);
             replace_this_with_ref_in_expr(needle, var_name);
+            if let Some(from) = from {
+                replace_this_with_ref_in_expr(from, var_name);
+            }
         }
         ir::Expr::StringByteAt { target, index, .. } => {
             replace_this_with_ref_in_expr(target, var_name);
@@ -2896,9 +2919,17 @@ fn rename_calls_in_expr(expr: &mut ir::Expr, renames: &HashMap<String, String>) 
         ir::Expr::FieldAccess { target, .. } | ir::Expr::StringByteLength { target, .. } => {
             rename_calls_in_expr(target, renames);
         }
-        ir::Expr::StringByteIndexOf { target, needle, .. } => {
+        ir::Expr::StringByteIndexOf {
+            target,
+            needle,
+            from,
+            ..
+        } => {
             rename_calls_in_expr(target, renames);
             rename_calls_in_expr(needle, renames);
+            if let Some(from) = from {
+                rename_calls_in_expr(from, renames);
+            }
         }
         ir::Expr::StringByteAt { target, index, .. } => {
             rename_calls_in_expr(target, renames);
