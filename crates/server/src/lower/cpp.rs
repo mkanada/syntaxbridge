@@ -7612,12 +7612,7 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
         if let ir::Type::List(element_ty) = &ty {
             let items = unsafe { collect_children(cursor) }
                 .into_iter()
-                .map(|child| {
-                    preserve_expected_bailout_type(
-                        unsafe { lower_expr(child, project_root) },
-                        element_ty,
-                    )
-                })
+                .map(|child| unsafe { lower_initializer_element(child, element_ty, project_root) })
                 .collect();
             return ir::Expr::ListLiteral { items, ty, origin };
         }
@@ -8212,6 +8207,87 @@ fn preserve_expected_bailout_type(expr: ir::Expr, expected: &ir::Type) -> ir::Ex
             origin,
         },
         other => other,
+    }
+}
+
+/// Lowers one brace-initializer slot using the destination type supplied by
+/// its enclosing container. Libclang assigns `void` to nested
+/// `InitListExpr` cursors, so that surrounding type is the only reliable way
+/// to distinguish a nested list from a `pair`/tuple construction.
+unsafe fn lower_initializer_element(
+    cursor: clang_sys::CXCursor,
+    expected: &ir::Type,
+    project_root: &Path,
+) -> ir::Expr {
+    let cursor = unsafe { unwrap_transparent_value_cursor(cursor) };
+    if unsafe { clang_sys::clang_getCursorKind(cursor) } != clang_sys::CXCursor_InitListExpr {
+        return preserve_expected_bailout_type(
+            unsafe { lower_expr(cursor, project_root) },
+            expected,
+        );
+    }
+
+    let origin = stmt_origin(cursor, project_root);
+    let children = unsafe { collect_children(cursor) };
+    match expected {
+        ir::Type::List(element_ty) => ir::Expr::ListLiteral {
+            items: children
+                .into_iter()
+                .map(|child| unsafe { lower_initializer_element(child, element_ty, project_root) })
+                .collect(),
+            ty: expected.clone(),
+            origin,
+        },
+        ir::Type::Pair(first_ty, second_ty) => {
+            let [first_cursor, second_cursor] = children.as_slice() else {
+                return ir::Expr::UnsupportedTyped {
+                    reason: format!(
+                        "pair initializer had {} elements, expected 2",
+                        children.len()
+                    ),
+                    ty: expected.clone(),
+                    origin,
+                };
+            };
+            ir::Expr::Call {
+                base_qualifier: None,
+                target: None,
+                callee_usr: String::new(),
+                callee_name: "SyntaxBridgePair".to_owned(),
+                args: vec![
+                    unsafe { lower_initializer_element(*first_cursor, first_ty, project_root) },
+                    unsafe { lower_initializer_element(*second_cursor, second_ty, project_root) },
+                ],
+                ty: expected.clone(),
+                origin,
+            }
+        }
+        ir::Type::Tuple(element_types) if element_types.len() == children.len() => {
+            ir::Expr::Tuple {
+                values: children
+                    .into_iter()
+                    .zip(element_types)
+                    .map(|(child, element_ty)| unsafe {
+                        lower_initializer_element(child, element_ty, project_root)
+                    })
+                    .collect(),
+                origin,
+            }
+        }
+        ir::Type::Tuple(element_types) => ir::Expr::UnsupportedTyped {
+            reason: format!(
+                "tuple initializer had {} elements, expected {}",
+                children.len(),
+                element_types.len()
+            ),
+            ty: expected.clone(),
+            origin,
+        },
+        _ => ir::Expr::UnsupportedTyped {
+            reason: format!("nested initializer has no construction rule for {expected:?}"),
+            ty: expected.clone(),
+            origin,
+        },
     }
 }
 

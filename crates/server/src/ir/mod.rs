@@ -279,9 +279,11 @@ pub enum Expr {
     /// A brace-enclosed initializer list (`{1, 2, 3}`) lowered to a Dart
     /// list literal — only when `ty` (`clang_getCursorType` on the
     /// `InitListExpr` cursor, already resolved by `lower::cpp`) is
-    /// `Type::List`; every other destination (aggregate struct, `Set`,
-    /// fixed C array) stays a bailout rather than guessing a Dart literal
-    /// shape from an unverified type. `Type::Map` gets its own
+    /// `Type::List`; nested initializers are resolved recursively against the
+    /// outer element type, including named `Pair` and Dart-record `Tuple`
+    /// constructions. Every other destination (aggregate struct, `Set`, fixed
+    /// C array) stays a bailout rather than guessing a Dart literal shape from
+    /// an unverified type. `Type::Map` gets its own
     /// `Expr::MapLiteral` below instead, since a `std::map`'s brace
     /// initializer doesn't share this variant's flat "one value per
     /// element" shape. See `lower::cpp::lower_expr`'s

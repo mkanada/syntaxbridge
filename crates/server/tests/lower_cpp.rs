@@ -3509,14 +3509,13 @@ std::vector<int> f() {
     assert!(!source.contains("cursor kind 119"), "got:\n{source}");
 }
 
-/// An unsupported brace element still has the container's precise element
-/// type. In particular, libclang reports a nested `InitListExpr` as `void`;
-/// emitting that raw cursor type makes Dart reject the bailout in a typed
-/// `List<SyntaxBridgePair<...>>` with `use_of_void_result`.
+/// A nested brace element is lowered against the outer container's element
+/// type. Libclang reports the nested initializer as `void`, while the outer
+/// vector proves that it constructs a `std::pair`.
 #[test]
-fn an_unsupported_nested_initializer_preserves_the_list_element_type() {
+fn a_nested_pair_initializer_constructs_the_declared_pair_type() {
     let source = lower_and_emit(
-        "lower-cpp-typed-nested-init-list-bailout",
+        "lower-cpp-typed-nested-init-list",
         r#"
 #include <string>
 #include <utility>
@@ -3529,12 +3528,28 @@ std::vector<std::pair<std::string, std::string>> pairs() {
     );
 
     assert!(
-        source.contains("_syntaxBridgeUnsupported<SyntaxBridgePair<String, String>>('"),
-        "expected the bailout to retain the list element type, got:\n{source}"
+        source.contains("<SyntaxBridgePair<String, String>>[SyntaxBridgePair('a', 'b')]")
+            && !source.contains("cursor kind 119"),
+        "expected a real pair construction instead of a nested initializer bailout, got:\n{source}"
     );
+}
+
+#[test]
+fn a_nested_vector_initializer_recurses_against_the_element_type() {
+    let source = lower_and_emit(
+        "lower-cpp-nested-vector-init-list",
+        r#"
+#include <vector>
+std::vector<std::vector<int>> rows() {
+    return {{1, 2}, {3, 4}};
+}
+"#,
+    );
+
     assert!(
-        !source.contains("_syntaxBridgeUnsupported<void>"),
-        "a value-position bailout must never be typed void, got:\n{source}"
+        source.contains("<List<int>>[<int>[1, 2], <int>[3, 4]]")
+            && !source.contains("cursor kind 119"),
+        "expected recursively typed Dart list literals, got:\n{source}"
     );
 }
 
