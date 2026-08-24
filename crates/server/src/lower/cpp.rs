@@ -7585,10 +7585,15 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
         // `Set`/`Map` and fixed C arrays resolve to a different `ty` here
         // and stay an explicit bailout below rather than guessing a Dart
         // literal shape from an unverified type.
-        if let ir::Type::List(_) = &ty {
+        if let ir::Type::List(element_ty) = &ty {
             let items = unsafe { collect_children(cursor) }
                 .into_iter()
-                .map(|child| unsafe { lower_expr(child, project_root) })
+                .map(|child| {
+                    preserve_expected_bailout_type(
+                        unsafe { lower_expr(child, project_root) },
+                        element_ty,
+                    )
+                })
                 .collect();
             return ir::Expr::ListLiteral { items, ty, origin };
         }
@@ -8010,6 +8015,7 @@ unsafe fn unwrap_transparent_value_cursor(mut cursor: clang_sys::CXCursor) -> cl
 unsafe fn map_literal_entries(
     init_list_cursor: clang_sys::CXCursor,
     key_ty: &ir::Type,
+    value_ty: &ir::Type,
     project_root: &Path,
 ) -> Option<Vec<(ir::Expr, ir::Expr)>> {
     unsafe { collect_children(init_list_cursor) }
@@ -8024,12 +8030,37 @@ unsafe fn map_literal_entries(
             let [key_cursor, value_cursor] = pair_children.as_slice() else {
                 return None;
             };
-            let key =
-                coerce_map_literal_key(unsafe { lower_expr(*key_cursor, project_root) }, key_ty);
-            let value = unsafe { lower_expr(*value_cursor, project_root) };
+            let key = preserve_expected_bailout_type(
+                coerce_map_literal_key(unsafe { lower_expr(*key_cursor, project_root) }, key_ty),
+                key_ty,
+            );
+            let value = preserve_expected_bailout_type(
+                unsafe { lower_expr(*value_cursor, project_root) },
+                value_ty,
+            );
             Some((key, value))
         })
         .collect()
+}
+
+/// `libclang` gives some unsupported value expressions — notably a nested
+/// `CXCursor_InitListExpr` — the cursor type `void`. In a typed literal the
+/// surrounding element/key/value slot is stronger information: preserve it
+/// on the bailout so Dart sees a value of the required static type instead
+/// of `_syntaxBridgeUnsupported<void>(...)` in value position.
+fn preserve_expected_bailout_type(expr: ir::Expr, expected: &ir::Type) -> ir::Expr {
+    match expr {
+        ir::Expr::UnsupportedTyped {
+            reason,
+            ty: ir::Type::Void,
+            origin,
+        } => ir::Expr::UnsupportedTyped {
+            reason,
+            ty: expected.clone(),
+            origin,
+        },
+        other => other,
+    }
 }
 
 /// A map literal's declared key type (`ir::Type::Map`'s first component)
@@ -9068,14 +9099,15 @@ unsafe fn lower_call_expr(
                 Some("map") | Some("unordered_map")
             )
             && let ty = lower_type(unsafe { clang_sys::clang_getCursorType(cursor) })
-            && let ir::Type::Map(key_ty, _) = &ty
+            && let ir::Type::Map(key_ty, value_ty) = &ty
         {
             let arg_cursor = unsafe { clang_sys::clang_Cursor_getArgument(cursor, 0) };
             let init_list_cursor = unsafe { unwrap_transparent_value_cursor(arg_cursor) };
             if unsafe { clang_sys::clang_getCursorKind(init_list_cursor) }
                 == clang_sys::CXCursor_InitListExpr
-                && let Some(entries) =
-                    unsafe { map_literal_entries(init_list_cursor, key_ty, project_root) }
+                && let Some(entries) = unsafe {
+                    map_literal_entries(init_list_cursor, key_ty, value_ty, project_root)
+                }
             {
                 return ir::Expr::MapLiteral {
                     entries,

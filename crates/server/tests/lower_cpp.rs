@@ -3444,6 +3444,37 @@ std::vector<int> f() {
     assert!(!source.contains("cursor kind 119"), "got:\n{source}");
 }
 
+/// An unsupported brace element still has the container's precise element
+/// type. In particular, libclang reports a nested `InitListExpr` as `void`;
+/// emitting that raw cursor type makes Dart reject the bailout in a typed
+/// `List<SyntaxBridgePair<...>>` with `use_of_void_result`.
+#[test]
+fn an_unsupported_nested_initializer_preserves_the_list_element_type() {
+    let source = lower_and_emit(
+        "lower-cpp-typed-nested-init-list-bailout",
+        r#"
+#include <string>
+#include <utility>
+#include <vector>
+
+std::vector<std::pair<std::string, std::string>> pairs() {
+    return {{"a", "b"}};
+}
+"#,
+    );
+
+    assert!(
+        source.contains(
+            "_syntaxBridgeUnsupported<SyntaxBridgePair<String, String>>('"
+        ),
+        "expected the bailout to retain the list element type, got:\n{source}"
+    );
+    assert!(
+        !source.contains("_syntaxBridgeUnsupported<void>"),
+        "a value-position bailout must never be typed void, got:\n{source}"
+    );
+}
+
 /// Real trigger: `midifunctor.cpp`/`iocmme.cpp`'s static const lookup
 /// tables, `static const std::map<int, data_DURATION> durationEq{ { a, b },
 /// ... };`. Unlike `std::vector`'s flat initializer list, each of
