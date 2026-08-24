@@ -2626,3 +2626,281 @@ fn an_externally_marked_function_returning_a_record_mocks_a_constructor_call() {
     );
     assert!(!source.contains("throw"), "got:\n{source}");
 }
+
+/// T2 (`docs/prompts/2026-08-23-02-copia-por-valor-sem-construtor-posicional.md`):
+/// `Expr::RecordCopy` — the by-value copy role, separated from
+/// `RecordConstruct`'s aggregate role. A record with its own constructors
+/// declares a single, stable copy form — the named copy constructor
+/// `T.syntaxBridgeCopyOf(T other)` — and every copy site (the by-value
+/// parameter prelude included) goes through it. The constructor lives inside
+/// the class, so it reads private (`_`-prefixed) fields legally from whatever
+/// file the copy site is in.
+#[test]
+fn a_record_copy_goes_through_the_records_named_copy_constructor() {
+    let fracao_ty = || Type::Record {
+        usr: "c:@S@Fracao".to_owned(),
+        name: "Fracao".to_owned(),
+    };
+    let record = Record {
+        name: "Fracao".to_owned(),
+        usr: "c:@S@Fracao".to_owned(),
+        namespace: String::new(),
+        fields: vec![
+            Field {
+                name: "_n".to_owned(),
+                ty: Type::Int,
+            },
+            Field {
+                name: "_d".to_owned(),
+                ty: Type::Int,
+            },
+        ],
+        static_fields: Vec::new(),
+        constructors: vec![Constructor {
+            usr: "c:@S@Fracao@F@Fracao#".to_owned(),
+            constructor_index: 0,
+            params: Vec::new(),
+            inits: Vec::new(),
+            body: Vec::new(),
+            origin: origin(3),
+        }],
+        methods: Vec::new(),
+        base_class: None,
+        mixins: Vec::new(),
+        destructor: None,
+        origin: origin(2),
+    };
+    let usa = Function {
+        name: "usa".to_owned(),
+        usr: "c:@F@usa#S@Fracao#".to_owned(),
+        params: vec![Param {
+            name: "f".to_owned(),
+            ty: fracao_ty(),
+            default_value: None,
+        }],
+        return_type: Type::Void,
+        body: vec![
+            Stmt::Assign {
+                name: "f".to_owned(),
+                value: Expr::RecordCopy {
+                    target: Box::new(Expr::Ref {
+                        name: "f".to_owned(),
+                        ty: fracao_ty(),
+                        origin: origin(5),
+                    }),
+                    type_usr: "c:@S@Fracao".to_owned(),
+                    type_name: "Fracao".to_owned(),
+                    origin: origin(5),
+                },
+                origin: origin(5),
+            },
+            Stmt::Return {
+                value: None,
+                origin: origin(6),
+            },
+        ],
+        origin: origin(4),
+    };
+    let module = Module {
+        records: vec![record],
+        functions: vec![usa],
+        enums: Vec::new(),
+    };
+
+    let files = emit_module(&module);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert!(
+        source.contains("Fracao.syntaxBridgeCopyOf(Fracao other)"),
+        "the record must declare its named copy constructor, got:\n{source}"
+    );
+    assert!(
+        source.contains("_n = other._n") && source.contains("_d = other._d"),
+        "the copy constructor must copy every field from inside the class, got:\n{source}"
+    );
+    assert!(
+        source.contains("f = Fracao.syntaxBridgeCopyOf(f);"),
+        "the by-value parameter prelude must call the named copy constructor, got:\n{source}"
+    );
+    assert!(
+        !source.contains("Fracao(f._n, f._d)"),
+        "no positional-constructor copy may remain, got:\n{source}"
+    );
+}
+
+/// T2, non-copyable records: a record emitted as a Dart `mixin` cannot
+/// declare any constructor, the named copy constructor included. A copy of
+/// such a record becomes an honest statement bailout at the copy's own
+/// position — never a silent partial copy.
+#[test]
+fn a_non_copyable_record_copy_becomes_an_honest_statement_bailout() {
+    let comum_ty = || Type::Record {
+        usr: "c:@S@Comum".to_owned(),
+        name: "Comum".to_owned(),
+    };
+    let comum = Record {
+        name: "Comum".to_owned(),
+        usr: "c:@S@Comum".to_owned(),
+        namespace: String::new(),
+        fields: vec![Field {
+            name: "base".to_owned(),
+            ty: Type::Int,
+        }],
+        static_fields: Vec::new(),
+        constructors: Vec::new(),
+        methods: Vec::new(),
+        base_class: None,
+        // Used as a mixin by another record → emitted as `mixin`, no
+        // constructor allowed.
+        mixins: Vec::new(),
+        destructor: None,
+        origin: origin(1),
+    };
+    let outra = Record {
+        name: "Outra".to_owned(),
+        usr: "c:@S@Outra".to_owned(),
+        namespace: String::new(),
+        fields: Vec::new(),
+        static_fields: Vec::new(),
+        constructors: Vec::new(),
+        methods: Vec::new(),
+        base_class: None,
+        mixins: vec![BaseClass {
+            usr: "c:@S@Comum".to_owned(),
+            name: "Comum".to_owned(),
+        }],
+        destructor: None,
+        origin: origin(2),
+    };
+    let copia = Function {
+        name: "copia".to_owned(),
+        usr: "c:@F@copia#S@Comum#".to_owned(),
+        params: vec![Param {
+            name: "c".to_owned(),
+            ty: comum_ty(),
+            default_value: None,
+        }],
+        return_type: Type::Void,
+        body: vec![Stmt::Assign {
+            name: "c".to_owned(),
+            value: Expr::RecordCopy {
+                target: Box::new(Expr::Ref {
+                    name: "c".to_owned(),
+                    ty: comum_ty(),
+                    origin: origin(4),
+                }),
+                type_usr: "c:@S@Comum".to_owned(),
+                type_name: "Comum".to_owned(),
+                origin: origin(4),
+            },
+            origin: origin(4),
+        }],
+        origin: origin(3),
+    };
+    let module = Module {
+        records: vec![comum, outra],
+        functions: vec![copia],
+        enums: Vec::new(),
+    };
+
+    let files = emit_module(&module);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert!(
+        !source.contains("Comum.syntaxBridgeCopyOf"),
+        "a record emitted as a mixin cannot declare the copy constructor, got:\n{source}"
+    );
+    assert!(
+        source.contains("throw UnimplementedError(") && source.contains("não copiável"),
+        "the copy must bail out honestly, saying why, got:\n{source}"
+    );
+}
+
+/// T2's copy semantics rule: deep-copy fields whose type is a copyable
+/// record (through that record's own copy constructor) and mutable
+/// collections (`List.of`/`Set.of`/`Map.of`); everything else — scalars,
+/// `String`, nullable pointers — is assigned as-is, mirroring what is
+/// observable in C++ (an immutable Dart `String` cannot alias; a pointer
+/// field in C++ aliases too).
+#[test]
+fn a_copy_constructor_deep_copies_records_and_mutable_collections() {
+    let interna = Record {
+        name: "Interna".to_owned(),
+        usr: "c:@S@Interna".to_owned(),
+        namespace: String::new(),
+        fields: vec![Field {
+            name: "valor".to_owned(),
+            ty: Type::Int,
+        }],
+        static_fields: Vec::new(),
+        constructors: Vec::new(),
+        methods: Vec::new(),
+        base_class: None,
+        mixins: Vec::new(),
+        destructor: None,
+        origin: origin(1),
+    };
+    let cesto = Record {
+        name: "Cesto".to_owned(),
+        usr: "c:@S@Cesto".to_owned(),
+        namespace: String::new(),
+        fields: vec![
+            Field {
+                name: "interna".to_owned(),
+                ty: Type::Record {
+                    usr: "c:@S@Interna".to_owned(),
+                    name: "Interna".to_owned(),
+                },
+            },
+            Field {
+                name: "valores".to_owned(),
+                ty: Type::List(Box::new(Type::Int)),
+            },
+            Field {
+                name: "rotulo".to_owned(),
+                ty: Type::Str,
+            },
+            Field {
+                name: "proximo".to_owned(),
+                ty: Type::Nullable(Box::new(Type::Record {
+                    usr: "c:@S@Cesto".to_owned(),
+                    name: "Cesto".to_owned(),
+                })),
+            },
+        ],
+        static_fields: Vec::new(),
+        constructors: Vec::new(),
+        methods: Vec::new(),
+        base_class: None,
+        mixins: Vec::new(),
+        destructor: None,
+        origin: origin(2),
+    };
+    let module = Module {
+        records: vec![interna, cesto],
+        functions: Vec::new(),
+        enums: Vec::new(),
+    };
+
+    let files = emit_module(&module);
+    let source = &files["lib/aritmetica.dart"];
+
+    assert!(
+        source.contains("interna = Interna.syntaxBridgeCopyOf(other.interna)"),
+        "a copyable-record field is deep-copied through its own copy \
+         constructor, got:\n{source}"
+    );
+    assert!(
+        source.contains("valores = List.of(other.valores)"),
+        "a mutable collection field is copied, not aliased, got:\n{source}"
+    );
+    assert!(
+        source.contains("rotulo = other.rotulo"),
+        "an immutable String field is assigned as-is, got:\n{source}"
+    );
+    assert!(
+        source.contains("proximo = other.proximo"),
+        "a nullable (pointer) field is assigned as-is, aliasing exactly like \
+         the C++ pointer copy would, got:\n{source}"
+    );
+}

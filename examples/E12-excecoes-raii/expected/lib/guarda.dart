@@ -4,6 +4,8 @@ class Guarda {
   Guarda() {
     Guarda.contadorAberto = Guarda.contadorAberto + 1;
   }
+
+  Guarda.syntaxBridgeCopyOf(Guarda other) {}
 }
 
 int contadorAtual() {

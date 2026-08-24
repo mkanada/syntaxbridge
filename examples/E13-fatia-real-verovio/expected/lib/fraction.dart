@@ -14,6 +14,10 @@ class Fraction {
     Reduce();
   }
 
+  Fraction.syntaxBridgeCopyOf(Fraction other)
+    : _m_numerator = other._m_numerator,
+      _m_denominator = other._m_denominator {}
+
   int GetNumerator() {
     return _m_numerator;
   }

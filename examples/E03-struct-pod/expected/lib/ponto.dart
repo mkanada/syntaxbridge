@@ -3,6 +3,8 @@ class Ponto {
   double y;
 
   Ponto(this.x, this.y);
+
+  Ponto.syntaxBridgeCopyOf(Ponto other) : x = other.x, y = other.y {}
 }
 
 Ponto criar_ponto(double x, double y) {
@@ -13,12 +15,12 @@ Ponto criar_ponto(double x, double y) {
 }
 
 double soma_coordenadas(Ponto p) {
-  p = Ponto(p.x, p.y);
+  p = Ponto.syntaxBridgeCopyOf(p);
   return p.x + p.y;
 }
 
 void mover(Ponto p, double dx, double dy) {
-  p = Ponto(p.x, p.y);
+  p = Ponto.syntaxBridgeCopyOf(p);
   p.x = p.x + dx;
   p.y = p.y + dy;
 }

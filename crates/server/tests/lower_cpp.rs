@@ -1207,8 +1207,9 @@ void copy_values(std::vector<int>& destination, const std::vector<int>& source) 
 }
 
 /// An implicitly generated C++ record assignment copies values. Dart record
-/// instances are references, so the lowering must construct a new record from
-/// the source fields instead of assigning the source object directly.
+/// instances are references, so the lowering must copy through the record's
+/// own named copy constructor (T2) instead of assigning the source object
+/// directly.
 #[test]
 fn a_defaulted_record_assignment_constructs_a_value_copy() {
     let source = lower_and_emit(
@@ -1226,8 +1227,13 @@ void copy_coordinate(Coordinate& destination, const Coordinate& source) {
     );
 
     assert!(
-        source.contains("destination = Coordinate(source.x, source.y);"),
-        "defaulted record assignment must construct a distinct Dart value, got:\n{source}"
+        source.contains("destination = Coordinate.syntaxBridgeCopyOf(source);"),
+        "defaulted record assignment must copy through the record's own \
+         named copy constructor, got:\n{source}"
+    );
+    assert!(
+        source.contains("x = other.x") && source.contains("y = other.y"),
+        "the copy constructor must copy every field, got:\n{source}"
     );
     assert!(
         !source.contains("unsupported operator method call: operator="),
@@ -1255,8 +1261,14 @@ void copy_bucket(Bucket& destination, const Bucket& source) {
     );
 
     assert!(
-        source.contains("destination = Bucket(List.of(source.values));"),
-        "record vector fields must keep C++ copy semantics, got:\n{source}"
+        source.contains("destination = Bucket.syntaxBridgeCopyOf(source);"),
+        "the assignment copy goes through the record's named copy \
+         constructor, got:\n{source}"
+    );
+    assert!(
+        source.contains("values = List.of(other.values)"),
+        "record vector fields must keep C++ copy semantics, inside the \
+         record's own copy constructor, got:\n{source}"
     );
 }
 
@@ -2053,7 +2065,7 @@ void sincroniza(Ponto& a, const Ponto& b) {
         "a live-object right-hand side must never route through the assignFrom bridge, got:\n{source}"
     );
     assert!(
-        source.contains("a = Ponto(b.x, b.y);"),
+        source.contains("a = Ponto.syntaxBridgeCopyOf(b);"),
         "a live-object copy assignment must construct a distinct Dart value, got:\n{source}"
     );
 }
@@ -3386,7 +3398,7 @@ public:
     );
 
     assert!(
-        !source.contains("super."),
+        !source.contains("super.g()") && !source.contains("super.f()"),
         "an unqualified/virtual call must never emit `super.`, got:\n{source}"
     );
     assert!(
@@ -4075,8 +4087,9 @@ public:
     );
 
     assert!(
-        source.contains("return Abbr(this.m_x);"),
-        "expected a field-by-field clone from `this`, got:\n{source}"
+        source.contains("return Abbr.syntaxBridgeCopyOf(this);"),
+        "expected the Clone() copy-construction to go through the record's \
+         named copy constructor, got:\n{source}"
     );
     assert!(!source.contains("CXX new child"), "got:\n{source}");
 }
@@ -7283,4 +7296,409 @@ int main() {
         "expected the parameterless Dart entry point, got:\n{source}"
     );
     assert!(!source.contains("return 0;"), "got:\n{source}");
+}
+
+/// T2 (`docs/prompts/2026-08-23-02-copia-por-valor-sem-construtor-posicional.md`):
+/// the exact Verovio shape — a record with its **own** constructors, passed by
+/// value. The old copy prelude rebuilt the value field-by-field as
+/// `Fracao(f._n, f._d)`, a call to a positional constructor that only exists
+/// for records *without* own constructors; for this record it matched no
+/// constructor at all (`extra_positional_arguments`), and it read the private
+/// fields from whatever file the function lives in. The copy now goes through
+/// a named copy constructor declared by the record itself, which exists
+/// regardless of the record's own constructors and reads its private fields
+/// legally because it lives inside the class.
+#[test]
+fn a_by_value_record_parameter_with_own_constructors_copies_through_a_named_copy_constructor() {
+    let source = lower_and_emit(
+        "lower-cpp-by-value-own-ctors",
+        r#"
+class Fracao {
+public:
+    Fracao() : _n(0), _d(1) {}
+    Fracao(int n, int d) : _n(n), _d(d) {}
+    int numerador() const { return _n; }
+private:
+    int _n;
+    int _d;
+};
+
+void usa(Fracao f) {
+    f = Fracao(1, 2);
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("Fracao(f.__n, f.__d)"),
+        "the copy prelude must not call a positional constructor the record \
+         never declared, got:\n{source}"
+    );
+    assert!(
+        source.contains("Fracao.syntaxBridgeCopyOf(Fracao other)"),
+        "the record must declare its own named copy constructor, got:\n{source}"
+    );
+    assert!(
+        source.contains("f = Fracao.syntaxBridgeCopyOf(f);"),
+        "the by-value parameter must be copied through the record's own \
+         named copy constructor, got:\n{source}"
+    );
+    assert!(
+        source.contains("__n = other.__n") && source.contains("__d = other.__d"),
+        "the copy constructor copies every field, reading the private ones \
+         from inside the class, got:\n{source}"
+    );
+    assert!(
+        !source.contains("f.__n") && !source.contains("f.__d"),
+        "no field of the record may be read from outside its own class, got:\n{source}"
+    );
+}
+
+/// T2's second damage, independently: a record consumed by a function defined
+/// in *another* compilation unit. The old prelude read `f._n` from that other
+/// unit's Dart file — private in Dart means library-private, so the read is an
+/// `undefined_getter` no matter how the constructor call matched. The named
+/// copy constructor keeps every field read inside the record's own file.
+#[test]
+fn a_by_value_record_from_another_tu_is_copied_without_reading_its_private_fields() {
+    let workspace =
+        TempWorkspace::new("lower-cpp-copy-privacy").expect("create temporary workspace");
+    fs::create_dir_all(workspace.path()).expect("create project dir");
+    fs::write(
+        workspace.path().join("fracao.hpp"),
+        r#"
+class Fracao {
+public:
+    Fracao();
+    Fracao(int n, int d);
+    int numerador() const;
+private:
+    int _n;
+    int _d;
+};
+"#,
+    )
+    .expect("write header");
+    fs::write(
+        workspace.path().join("fracao.cpp"),
+        r#"
+#include "fracao.hpp"
+
+Fracao::Fracao() : _n(0), _d(1) {}
+Fracao::Fracao(int n, int d) : _n(n), _d(d) {}
+int Fracao::numerador() const { return _n; }
+"#,
+    )
+    .expect("write record source");
+    fs::write(
+        workspace.path().join("consumidora.cpp"),
+        r#"
+#include "fracao.hpp"
+
+int soma_numerador(Fracao f) {
+    return f.numerador();
+}
+"#,
+    )
+    .expect("write consumer source");
+    let units = ["fracao.cpp", "consumidora.cpp"]
+        .into_iter()
+        .map(|name| CompilationUnit {
+            directory: workspace.path().display().to_string(),
+            file: workspace.path().join(name).display().to_string(),
+            command: None,
+            arguments: vec!["clang++".to_owned(), "-std=c++17".to_owned()],
+        })
+        .collect::<Vec<_>>();
+    let catalog = function_catalog::extract_function_catalog(&units, workspace.path(), None)
+        .expect("extract function catalog");
+    let module = syntax_bridge_server::ir::Module {
+        functions: catalog.ir_functions.clone(),
+        records: catalog.ir_records.clone(),
+        enums: catalog.ir_enums.clone(),
+    };
+    let files = syntax_bridge_server::emit::dart::emit_module(&module);
+
+    let consumer = &files["lib/consumidora.dart"];
+    assert!(
+        consumer.contains("f = Fracao.syntaxBridgeCopyOf(f);"),
+        "the cross-TU consumer must copy through the record's own named copy \
+         constructor, got:\n{consumer}"
+    );
+    assert!(
+        !consumer.contains("._n") && !consumer.contains("._d"),
+        "a private field must never be read from another unit's Dart file, got:\n{consumer}"
+    );
+    let record_file = &files["lib/fracao.dart"];
+    assert!(
+        record_file.contains("Fracao.syntaxBridgeCopyOf(Fracao other)"),
+        "the record's own file declares the copy constructor, got:\n{record_file}"
+    );
+}
+
+/// T2, non-copyable records: a record that ends up emitted as a Dart `mixin`
+/// (used as a base alongside another base, E09's multiple-inheritance shape)
+/// cannot declare any constructor — the named copy constructor included. A
+/// by-value parameter of such a record must become an honest bailout at the
+/// copy's own position, never a silent partial copy.
+#[test]
+fn a_by_value_mixin_record_parameter_bails_out_instead_of_partially_copying() {
+    let source = lower_and_emit(
+        "lower-cpp-by-value-mixin-record",
+        r#"
+class Comum {
+public:
+    int base;
+};
+
+class Trait {
+public:
+    int extra;
+};
+
+class Composta : public Comum, public Trait {};
+
+void copia(Comum c) {
+    c.base = 1;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("Comum.syntaxBridgeCopyOf"),
+        "a record emitted as a mixin cannot declare the copy constructor, got:\n{source}"
+    );
+    assert!(
+        source.contains("c = _syntaxBridgeUnsupported<Comum>("),
+        "the copy itself must become the typed throwing bailout, at the \
+         prelude's own position, got:\n{source}"
+    );
+    assert!(
+        source.contains("não copiável"),
+        "the bailout must say, honestly, why the copy cannot happen, got:\n{source}"
+    );
+    // The *class* that applies the mixins is a different story: its mixins'
+    // public fields are reachable from inside it, so it stays copyable —
+    // this is exactly the Abbr/EditorialElement split in the real corpus,
+    // where the blocker is the base's *private* fields, not mixin-hood.
+    assert!(
+        source.contains("Composta.syntaxBridgeCopyOf(Composta other)"),
+        "a class applying public-field mixins keeps its own copy constructor, got:\n{source}"
+    );
+}
+
+/// T2, the copy-assignment path: `a = b` between records with own
+/// constructors went through the same positional-constructor call. It now
+/// shares the one copy form with the parameter prelude.
+#[test]
+fn a_record_copy_assignment_with_own_constructors_uses_the_named_copy_constructor() {
+    let source = lower_and_emit(
+        "lower-cpp-op-assign-own-ctors",
+        r#"
+class Par {
+public:
+    Par() : _a(0), _b(0) {}
+    Par(int a, int b) : _a(a), _b(b) {}
+private:
+    int _a;
+    int _b;
+};
+
+void copia(Par& destino, const Par& fonte) {
+    destino = fonte;
+}
+"#,
+    );
+
+    assert!(
+        !source.contains("Par(fonte._a, fonte._b)"),
+        "the assignment copy must not call a positional constructor the record \
+         never declared, got:\n{source}"
+    );
+    assert!(
+        source.contains("destino = Par.syntaxBridgeCopyOf(fonte);"),
+        "the assignment copy must go through the record's named copy \
+         constructor, got:\n{source}"
+    );
+}
+
+/// T2, the `new T(*this)` path (Verovio's `Clone()` idiom): a
+/// copy-construction allocation also goes through the named copy constructor.
+#[test]
+fn a_copy_construction_allocation_uses_the_named_copy_constructor() {
+    let source = lower_and_emit(
+        "lower-cpp-new-copy-own-ctors",
+        r#"
+class Par {
+public:
+    Par() : _a(0), _b(0) {}
+    Par(int a, int b) : _a(a), _b(b) {}
+    Par* Clone() const { return new Par(*this); }
+private:
+    int _a;
+    int _b;
+};
+"#,
+    );
+
+    assert!(
+        !source.contains("Par(this._a, this._b)"),
+        "the allocation copy must not call a positional constructor the record \
+         never declared, got:\n{source}"
+    );
+    assert!(
+        source.contains("Par.syntaxBridgeCopyOf(this)"),
+        "the allocation copy must go through the record's named copy \
+         constructor, got:\n{source}"
+    );
+}
+
+/// Tarefa 03 (Metade A): `a[i]` on a user-defined record must lower to
+/// `ir::Expr::Index` (emitted as `a[i]`) and `a[i] = v` to indexed assignment,
+/// instead of falling back to `unsupportedOperator`.
+#[test]
+fn record_subscript_operator_lowers_to_index_expression_and_index_assignment() {
+    let source = lower_and_emit(
+        "lower-cpp-record-subscript",
+        r#"
+#include <vector>
+class Linhas {
+public:
+    int& operator[](int i) { return _v[i]; }
+    int soma() const { return 0; }
+private:
+    std::vector<int> _v;
+};
+int primeiro(Linhas &l) { return l[0]; }
+void define_primeiro(Linhas &l) { l[0] = 42; }
+"#,
+    );
+
+    assert!(
+        !source.contains("unsupportedOperator"),
+        "subscript operator on a record must not lower to unsupportedOperator, got:\n{source}"
+    );
+    assert!(
+        source.contains("l![0]") || source.contains("l[0]"),
+        "expected index access in Dart output, got:\n{source}"
+    );
+    assert!(
+        source.contains("l![0] = 42;") || source.contains("l[0] = 42;"),
+        "expected index assignment in Dart output, got:\n{source}"
+    );
+}
+
+/// Tarefa 03 (Metade A / B): `Num operator-() const;` called as `-a` lowers to
+/// `ir::Expr::Unary` (emitted as `-a`), not `unsupportedOperator`.
+#[test]
+fn record_unary_minus_operator_lowers_to_unary_expression() {
+    let source = lower_and_emit(
+        "lower-cpp-record-unary-minus",
+        r#"
+class Num {
+public:
+    Num() : _val(0) {}
+    Num(int v) : _val(v) {}
+    Num operator-() const { return Num(-_val); }
+private:
+    int _val;
+};
+Num inverte(Num a) { return -a; }
+"#,
+    );
+
+    assert!(
+        !source.contains("unsupportedOperator"),
+        "unary minus on a record must not lower to unsupportedOperator, got:\n{source}"
+    );
+    assert!(
+        source.contains("operator -()") || source.contains("operator - ()"),
+        "expected Dart unary operator - declaration, got:\n{source}"
+    );
+    assert!(
+        source.contains("-a"),
+        "expected unary minus call in Dart output, got:\n{source}"
+    );
+}
+
+/// Tarefa 03 (Metade B): when an operator has multiple overloads on a class,
+/// exactly one becomes the native Dart `operator <symbol>`, while others become
+/// named bridge methods (`addInt`, etc.), and call sites dispatch accordingly.
+#[test]
+fn operator_overloads_keep_one_native_and_rename_others_to_disambiguated_methods() {
+    let source = lower_and_emit(
+        "lower-cpp-operator-overload-disambiguation",
+        r#"
+class Num {
+public:
+    Num() : _val(0) {}
+    Num(int v) : _val(v) {}
+    Num operator+(const Num &o) const { return Num(_val + o._val); }
+    Num operator+(int v) const { return Num(_val + v); }
+private:
+    int _val;
+};
+Num soma_num(Num a, Num b) { return a + b; }
+Num soma_int(Num a) { return a + 1; }
+"#,
+    );
+
+    assert!(
+        !source.contains("unsupportedOperator"),
+        "operator overloads must not become unsupportedOperator, got:\n{source}"
+    );
+    assert!(
+        source.contains("Num operator +(Num? o)") || source.contains("Num operator +(Num o)"),
+        "expected native operator + declaration, got:\n{source}"
+    );
+    assert!(
+        source.contains("Num addInt(int v)"),
+        "expected named addInt declaration for the int overload, got:\n{source}"
+    );
+    assert!(
+        source.contains("return a + b;"),
+        "expected native operator call for same-type operands, got:\n{source}"
+    );
+    assert!(
+        source.contains("return a.addInt(1);"),
+        "expected named method call for int operand, got:\n{source}"
+    );
+}
+
+/// Tarefa 03 (Metade B): `operator!=` is derived automatically from `==` in Dart,
+/// so it must not generate a declaration that collides with `unsupportedOperator` or `==`.
+#[test]
+fn operator_not_equals_does_not_generate_duplicate_declaration() {
+    let source = lower_and_emit(
+        "lower-cpp-operator-ne-no-decl",
+        r#"
+class Item {
+public:
+    Item() : _id(0) {}
+    Item(int id) : _id(id) {}
+    bool operator==(const Item &o) const { return _id == o._id; }
+    bool operator!=(const Item &o) const { return _id != o._id; }
+private:
+    int _id;
+};
+bool diferente(Item a, Item b) { return a != b; }
+"#,
+    );
+
+    assert!(
+        !source.contains("unsupportedOperator"),
+        "operator!= must not become unsupportedOperator, got:\n{source}"
+    );
+    assert!(
+        !source.contains("operator !="),
+        "operator!= must not be declared in Dart, got:\n{source}"
+    );
+    assert!(
+        source.contains("bool operator ==(Object"),
+        "expected operator == in Dart, got:\n{source}"
+    );
+    assert!(
+        source.contains("return a != b;"),
+        "call site of != should remain a != b in Dart, got:\n{source}"
+    );
 }

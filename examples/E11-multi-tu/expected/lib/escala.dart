@@ -1,7 +1,7 @@
 import 'comum.dart';
 
 Ponto3D escalar(Ponto3D p, double fator) {
-  p = Ponto3D(p.x, p.y, p.z);
+  p = Ponto3D.syntaxBridgeCopyOf(p);
   Ponto3D resultado = Ponto3D(0, 0, 0);
   resultado.x = p.x * fator;
   resultado.y = p.y * fator;

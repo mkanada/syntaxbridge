@@ -621,6 +621,9 @@ fn collect_expression_bailouts(expression: &Expr, inventory: &mut BailoutInvento
                 collect_expression_bailouts(value, inventory);
             }
         }
+        Expr::RecordCopy { target, .. } => {
+            collect_expression_bailouts(target, inventory);
+        }
         Expr::ConstructorCall { args, .. } => {
             for argument in args {
                 collect_expression_bailouts(argument, inventory);

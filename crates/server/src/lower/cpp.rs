@@ -1019,7 +1019,7 @@ pub fn lower_method(
     } else {
         unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(cursor)) }
     };
-    if name.is_empty() {
+    if name.is_empty() || name == "operator!=" {
         return None;
     }
 
@@ -1162,11 +1162,11 @@ pub fn lower_constructor(
 }
 
 /// Collects a constructor's member-initializer list (`: x(a), Base(v)`) as
-/// `ir::ConstructorInit`s. Confirmado empiricamente, não assumido: `MemberRef`
-/// + expressão para `Field`, `TypeRef` + `CallExpr`/`CXXConstructExpr` para
-/// `Base`, antes do `CompoundStmt`, só quando `isWritten()` (probe
-/// `probe_ctor_init` 2026-08-23). O nome do campo passa por
-/// `dart_member_name` para nunca discordar da declaração.
+/// `ir::ConstructorInit`s. Confirmado empiricamente, não assumido:
+/// `MemberRef` + expressão para `Field`, `TypeRef` +
+/// `CallExpr`/`CXXConstructExpr` para `Base`, antes do `CompoundStmt`, só
+/// quando `isWritten()` (probe `probe_ctor_init` 2026-08-23). O nome do
+/// campo passa por `dart_member_name` para nunca discordar da declaração.
 unsafe fn collect_constructor_inits(
     cursor: clang_sys::CXCursor,
     project_root: &Path,
@@ -1201,7 +1201,9 @@ unsafe fn collect_constructor_inits(
                 let type_ref_cursor = children[index];
                 let referenced = unsafe { clang_sys::clang_getCursorReferenced(type_ref_cursor) };
                 let ref_usr = if unsafe { clang_sys::clang_Cursor_isNull(referenced) } == 0 {
-                    unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(referenced)) }
+                    unsafe {
+                        type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(referenced))
+                    }
                 } else {
                     String::new()
                 };
@@ -1221,8 +1223,11 @@ unsafe fn collect_constructor_inits(
             let name = if unsafe { clang_sys::clang_Cursor_isNull(referenced) } == 0 {
                 unsafe { dart_member_name(referenced) }
             } else {
-                let cpp_name =
-                    unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(field_cursor)) };
+                let cpp_name = unsafe {
+                    type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(
+                        field_cursor,
+                    ))
+                };
                 dart_safe_identifier(&cpp_name)
             };
             let value_cursor = children[index + 1];
@@ -1239,18 +1244,22 @@ unsafe fn collect_constructor_inits(
             let type_ref_cursor = children[index];
             let referenced = unsafe { clang_sys::clang_getCursorReferenced(type_ref_cursor) };
             let (usr, name) = if unsafe { clang_sys::clang_Cursor_isNull(referenced) } == 0 {
-                let usr =
-                    unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(referenced)) };
-                let name =
-                    unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced)) };
+                let usr = unsafe {
+                    type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(referenced))
+                };
+                let name = unsafe {
+                    type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced))
+                };
                 (usr, name)
             } else {
                 let ty = unsafe { clang_sys::clang_getCursorType(type_ref_cursor) };
                 let decl = unsafe { clang_sys::clang_getTypeDeclaration(ty) };
-                let usr =
-                    unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(decl)) };
-                let name =
-                    unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(decl)) };
+                let usr = unsafe {
+                    type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(decl))
+                };
+                let name = unsafe {
+                    type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(decl))
+                };
                 (usr, name)
             };
             if usr.is_empty() || name.is_empty() {
@@ -2980,12 +2989,15 @@ fn normalized_parameter_name(name: &str) -> String {
 }
 
 /// Collects parameters and, for every by-value `Record`-typed one, an
-/// implicit self-clone statement (`p = Ponto(p.x, p.y);`) — E03's armadilha
-/// (see this module's docs and `examples/E03-struct-pod/NOTES.md`). Works
-/// straight off each `ParmDecl`'s `CXType` (not the already-lowered
-/// `ir::Type`), since building the clone's field list needs the record's
-/// declaration cursor, which `clang_getTypeDeclaration` only gives from a
-/// `CXType`.
+/// implicit self-copy statement (`p = Ponto.syntaxBridgeCopyOf(p);`) — E03's
+/// armadilha (see this module's docs and `examples/E03-struct-pod/NOTES.md`),
+/// T2's copy form: the copy goes through the record's own named copy
+/// constructor instead of a positional-constructor call, so a record with
+/// own constructors is copied correctly and its private fields are read
+/// only from inside the record's own class. Works straight off each
+/// `ParmDecl`'s `CXType` (not the already-lowered `ir::Type`), since telling
+/// a by-value parameter from a by-reference one needs the type as written
+/// (`lower_type` erases `const T&` down to the same `Type::Record`).
 unsafe fn collect_params_with_clone_prelude(
     cursor: clang_sys::CXCursor,
     origin: &ir::Origin,
@@ -3037,30 +3049,25 @@ unsafe fn collect_params_with_clone_prelude(
         // written, before `lower_type` erases the distinction.
         let is_by_value = cx_type.kind != clang_sys::CXType_LValueReference;
         if is_by_value && let ir::Type::Record { usr, name } = &ty {
-            let decl = unsafe { clang_sys::clang_getTypeDeclaration(cx_type) };
-            let fields = unsafe { record_fields_of(decl) };
-            let field_values = fields
-                .into_iter()
-                .map(|field| {
-                    let access = ir::Expr::FieldAccess {
-                        target: Box::new(ir::Expr::Ref {
-                            name: param_name.clone(),
-                            ty: ty.clone(),
-                            origin: origin.clone(),
-                        }),
-                        field: field.name.clone(),
-                        ty: field.ty,
-                        origin: origin.clone(),
-                    };
-                    (field.name, access)
-                })
-                .collect();
+            // T2 (`docs/prompts/2026-08-23-02-copia-por-valor-sem-construtor-posicional.md`):
+            // the copy-on-entry clone is a `RecordCopy` naming the source —
+            // the *record's own* named copy constructor (`Fracao.syntaxBridgeCopyOf`)
+            // decides how the value is rebuilt, so this no longer presumes a
+            // positional constructor (which only exists for records without
+            // own constructors — the bug behind ~2.000 Verovio
+            // `extra_positional_arguments`) and no longer reads the record's
+            // fields from whatever file this function lives in (Dart privacy
+            // is per-library: `HumNum._top` read from `iohumdrum.dart`).
             prelude.push(ir::Stmt::Assign {
                 name: param_name.clone(),
-                value: ir::Expr::RecordConstruct {
+                value: ir::Expr::RecordCopy {
+                    target: Box::new(ir::Expr::Ref {
+                        name: param_name.clone(),
+                        ty: ty.clone(),
+                        origin: origin.clone(),
+                    }),
                     type_usr: usr.clone(),
                     type_name: name.clone(),
-                    fields: field_values,
                     origin: origin.clone(),
                 },
                 origin: origin.clone(),
@@ -5024,51 +5031,24 @@ unsafe fn lower_defaulted_record_assignment_stmt(
         });
     }
     let source = unsafe { lower_expr(source_cursor, project_root) };
-    let fields = unsafe { record_fields_of(owner) }
-        .into_iter()
-        .map(|field| {
-            let value = ir::Expr::FieldAccess {
-                target: Box::new(source.clone()),
-                field: field.name.clone(),
-                ty: field.ty.clone(),
-                origin: origin.clone(),
-            };
-            (field.name, clone_value_expr(value, &field.ty, origin))
-        })
-        .collect();
-
+    // T2: the implicit `operator=` copy shares the one copy form with the
+    // by-value parameter prelude — `T.syntaxBridgeCopyOf(source)`. The old
+    // field-by-field `RecordConstruct` here reimplemented the copy (and,
+    // through `clone_value_expr`, the collection deep-copies) at every
+    // assignment site, reading private fields from the wrong library and
+    // calling a positional constructor only records without own
+    // constructors have. The record's own copy constructor now owns those
+    // semantics exactly once.
     Some(ir::Stmt::ExprAssign {
         target,
-        value: ir::Expr::RecordConstruct {
+        value: ir::Expr::RecordCopy {
+            target: Box::new(source),
             type_usr: usr,
             type_name: name,
-            fields,
             origin: origin.clone(),
         },
         origin: origin.clone(),
     })
-}
-
-fn clone_value_expr(value: ir::Expr, ty: &ir::Type, origin: &ir::Origin) -> ir::Expr {
-    let callee_name = match ty {
-        ir::Type::List(_) => Some("List.of"),
-        ir::Type::Set(_) => Some("Set.of"),
-        ir::Type::Map(_, _) => Some("Map.of"),
-        ir::Type::Bytes => Some("Uint8List.fromList"),
-        _ => None,
-    };
-    match callee_name {
-        Some(callee_name) => ir::Expr::Call {
-            base_qualifier: None,
-            target: None,
-            callee_usr: String::new(),
-            callee_name: callee_name.to_owned(),
-            args: vec![value],
-            ty: ty.clone(),
-            origin: origin.clone(),
-        },
-        None => value,
-    }
 }
 
 unsafe fn lower_stdlib_assignment_stmt(
@@ -6206,8 +6186,8 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
                 // own type) — passing it where a `const uint8_t*`/`Uint8List?`
                 // parameter is expected needs this bridge, the same
                 // "compiles and is right" reasoning as `List.of`/
-                // `Uint8List.fromList` already applied to copy-construction
-                // in `clone_value_expr` just above.
+                // `Uint8List.fromList` a record's own copy constructor
+                // applies to a collection-typed field (T2).
                 ir::Expr::Call {
                     base_qualifier: None,
                     target: None,
@@ -6646,11 +6626,11 @@ unsafe fn lower_new_expr(
     // to — never a `ConstructorCall`/`RecordConstruct`. Recognized via
     // `clang_CXXConstructor_isCopyConstructor`/`isMoveConstructor` on the
     // *resolved* constructor rather than guessed from `construction`'s own
-    // shape, then rebuilt as a field-by-field `RecordConstruct` reading
-    // every field off the copy source — the same construction
-    // `collect_params_with_clone_prelude` already builds for a by-value
-    // parameter's own copy-on-entry clone (E03), just keyed to an arbitrary
-    // receiver expression instead of a parameter name.
+    // shape, then lowered as a `RecordCopy` of that source expression —
+    // the same one copy form `collect_params_with_clone_prelude` and the
+    // implicit `operator=` path already use (T2), instead of rebuilding a
+    // positional-constructor call that only records without own
+    // constructors can answer.
     let referenced = unsafe { clang_sys::clang_getCursorReferenced(*construction_cursor) };
     if unsafe { clang_sys::clang_Cursor_isNull(referenced) } == 0
         && unsafe { clang_sys::clang_getCursorKind(referenced) } == clang_sys::CXCursor_Constructor
@@ -6658,26 +6638,10 @@ unsafe fn lower_new_expr(
         && let ir::Type::Nullable(record_type) = &allocation_type
         && let ir::Type::Record { usr, name } = record_type.as_ref()
     {
-        let pointee_cx_type =
-            unsafe { clang_sys::clang_getPointeeType(clang_sys::clang_getCursorType(cursor)) };
-        let decl = unsafe { clang_sys::clang_getTypeDeclaration(pointee_cx_type) };
-        let fields = unsafe { record_fields_of(decl) };
-        let field_values = fields
-            .into_iter()
-            .map(|field| {
-                let access = ir::Expr::FieldAccess {
-                    target: Box::new(construction.clone()),
-                    field: field.name.clone(),
-                    ty: field.ty,
-                    origin: origin.clone(),
-                };
-                (field.name, access)
-            })
-            .collect();
-        return ir::Expr::RecordConstruct {
+        return ir::Expr::RecordCopy {
+            target: Box::new(construction),
             type_usr: usr.clone(),
             type_name: name.clone(),
-            fields: field_values,
             origin,
         };
     }
@@ -7573,9 +7537,9 @@ unsafe fn lower_call_expr(
         let callee_name = unsafe {
             type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(referenced))
         };
-        if let Some(operator_expr) =
-            unsafe { lower_record_operator_call(cursor, &callee_name, project_root, &origin) }
-        {
+        if let Some(operator_expr) = unsafe {
+            lower_record_operator_call(cursor, referenced, &callee_name, project_root, &origin)
+        } {
             return operator_expr;
         }
         return unsafe { lower_method_call(cursor, referenced, project_root, origin) };
@@ -7900,6 +7864,20 @@ pub(crate) fn dart_operator_bridge_name(operator_name: &str, arity: usize) -> &'
         .strip_prefix("operator")
         .unwrap_or(operator_name);
     match symbol {
+        "+" => "add",
+        "-" if arity == 0 => "negate",
+        "-" => "subtract",
+        "*" => "multiply",
+        "/" => "divide",
+        "<" => "lessThan",
+        "<=" => "lessThanOrEqual",
+        ">" => "greaterThan",
+        ">=" => "greaterThanOrEqual",
+        "==" => "equals",
+        "!=" => "notEquals",
+        "[]" => "get",
+        "[]=" => "set",
+        "()" => "call",
         "<<" => "streamInsert",
         ">>" => "streamExtract",
         "->" => "arrow",
@@ -10535,19 +10513,141 @@ unsafe fn lower_stdlib_operator_call(
     })
 }
 
+pub(crate) fn is_direct_dart_operator(method_name: &str, arity: usize) -> bool {
+    let symbol = method_name.strip_prefix("operator").unwrap_or(method_name);
+    match symbol {
+        "+" | "*" | "/" | "<" | "<=" | ">" | ">=" | "==" | "!=" | "[]" => arity == 1,
+        "-" => arity == 0 || arity == 1,
+        "[]=" => arity == 2,
+        _ => false,
+    }
+}
+
+fn unwrap_nullable_type(ty: &ir::Type) -> &ir::Type {
+    match ty {
+        ir::Type::Nullable(inner) => inner.as_ref(),
+        other => other,
+    }
+}
+
+pub(crate) fn types_match_for_record_operator(param_ty: &ir::Type, owner_type: &ir::Type) -> bool {
+    let param = unwrap_nullable_type(param_ty);
+    let owner = unwrap_nullable_type(owner_type);
+    match (param, owner) {
+        (ir::Type::Record { usr: u1, name: n1 }, ir::Type::Record { usr: u2, name: n2 }) => {
+            u1 == u2 || n1 == n2
+        }
+        _ => param == owner,
+    }
+}
+
+pub(crate) unsafe fn is_native_record_operator(
+    referenced: clang_sys::CXCursor,
+    callee_name: &str,
+) -> bool {
+    let target_param_count =
+        unsafe { clang_sys::clang_Cursor_getNumArguments(referenced) } as usize;
+    if !is_direct_dart_operator(callee_name, target_param_count) {
+        return false;
+    }
+
+    let owner = unsafe { clang_sys::clang_getCursorSemanticParent(referenced) };
+    if unsafe { clang_sys::clang_Cursor_isNull(owner) } != 0 {
+        return true;
+    }
+    let target_usr =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(referenced)) };
+    let owner_type = lower_type(unsafe { clang_sys::clang_getCursorType(owner) });
+
+    let mut same_symbol_methods = Vec::new();
+    for child in unsafe { collect_children(owner) } {
+        if unsafe { clang_sys::clang_getCursorKind(child) } != clang_sys::CXCursor_CXXMethod {
+            continue;
+        }
+        let child_name =
+            unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorSpelling(child)) };
+        if child_name == callee_name {
+            same_symbol_methods.push(child);
+        }
+    }
+
+    if same_symbol_methods.len() <= 1 {
+        return true;
+    }
+
+    let same_arity_methods: Vec<clang_sys::CXCursor> = same_symbol_methods
+        .into_iter()
+        .filter(|&m| unsafe { clang_sys::clang_Cursor_getNumArguments(m) } as usize == target_param_count)
+        .collect();
+
+    if same_arity_methods.len() <= 1 {
+        return true;
+    }
+
+    let mut native_cursor = same_arity_methods[0];
+    for &candidate in &same_arity_methods {
+        if target_param_count >= 1 {
+            let param_cursor = unsafe { clang_sys::clang_Cursor_getArgument(candidate, 0) };
+            let param_ty = lower_type(unsafe { clang_sys::clang_getCursorType(param_cursor) });
+            if types_match_for_record_operator(&param_ty, &owner_type) {
+                native_cursor = candidate;
+                break;
+            }
+        }
+    }
+
+    let native_usr =
+        unsafe { type_catalog::cxstring_to_string(clang_sys::clang_getCursorUSR(native_cursor)) };
+    native_usr == target_usr
+}
+
 /// A user `Record`'s own operator method, called with C++'s infix syntax
-/// (`a + b`) — `lower_stdlib_operator_call`'s counterpart for a `CXXMethod`
+/// (`a + b`, `a[i]`, `-a`) — `lower_stdlib_operator_call`'s counterpart for a `CXXMethod`
 /// operator instead of a free-function one (`std::string`'s `operator+`
-/// there is non-member/ADL, so it's never reached via this path). `None`
-/// for any operator outside Dart's own overloadable set (`mapping::
-/// DART_OPERATOR_SYMBOLS`) — matching `lower_method_call`'s existing
-/// bail-out for those (`operador-sem-equivalente-direto`, not built yet).
+/// there is non-member/ADL, so it's never reached via this path).
 unsafe fn lower_record_operator_call(
     call_cursor: clang_sys::CXCursor,
+    referenced: clang_sys::CXCursor,
     callee_name: &str,
     project_root: &Path,
     origin: &ir::Origin,
 ) -> Option<ir::Expr> {
+    if !callee_name.starts_with("operator") {
+        return None;
+    }
+    let is_native = unsafe { is_native_record_operator(referenced, callee_name) };
+    if !is_native {
+        return None;
+    }
+
+    let arg_count = unsafe { clang_sys::clang_Cursor_getNumArguments(call_cursor) };
+
+    if callee_name == "operator[]" && arg_count == 2 {
+        let lhs_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
+        let rhs_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 1) };
+        let lhs = unsafe { lower_expr(lhs_cursor, project_root) };
+        let rhs = unsafe { lower_expr(rhs_cursor, project_root) };
+        let ty = lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) });
+        return Some(ir::Expr::Index {
+            target: Box::new(lhs),
+            index: Box::new(rhs),
+            ty,
+            origin: origin.clone(),
+        });
+    }
+
+    if callee_name == "operator-" && arg_count == 1 {
+        let operand_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 0) };
+        let operand = unsafe { lower_expr(operand_cursor, project_root) };
+        let ty = lower_type(unsafe { clang_sys::clang_getCursorType(call_cursor) });
+        return Some(ir::Expr::Unary {
+            op: ir::UnaryOp::Neg,
+            operand: Box::new(operand),
+            ty,
+            origin: origin.clone(),
+        });
+    }
+
     let op = match callee_name {
         "operator+" => ir::BinaryOp::Add,
         "operator-" => ir::BinaryOp::Sub,
@@ -10562,7 +10662,6 @@ unsafe fn lower_record_operator_call(
         _ => return None,
     };
 
-    let arg_count = unsafe { clang_sys::clang_Cursor_getNumArguments(call_cursor) };
     if arg_count != 2 {
         return None;
     }

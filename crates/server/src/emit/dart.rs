@@ -77,6 +77,14 @@ pub fn emit_module_with_externals(
     module: &Module,
     external_usrs: &HashSet<&str>,
 ) -> BTreeMap<String, String> {
+    // T2 (`docs/prompts/2026-08-23-02-copia-por-valor-sem-construtor-posicional.md`):
+    // a copy of a record that cannot declare the named copy constructor
+    // (`T.syntaxBridgeCopyOf`) becomes an honest typed bailout before any
+    // file is printed, so neither `emit_expr` nor the import walk can ever
+    // see a copy with no constructor to call.
+    let module = rewrite_non_copyable_record_copies(module);
+    let module = &module;
+
     // E09: gathered across the *whole* module, not per-file — a mixin and
     // the class that uses it could in principle land in different files
     // (multi-TU dedup is E11's own armadilha, not reopened here), and
@@ -99,6 +107,19 @@ pub fn emit_module_with_externals(
         .iter()
         .map(|record| (record.usr.as_str(), record))
         .collect();
+
+    // T2: each record's copy verdict (a blocker string, or `None` for
+    // copyable), module-wide — the same scope `mixin_usrs` needs, for the
+    // same reason: a record's base chain decides its copyability, and the
+    // base can live in another file.
+    let mut copy_reasons: HashMap<&str, Option<String>> = HashMap::new();
+    {
+        let mut visiting: HashSet<&str> = HashSet::new();
+        for record in &module.records {
+            let blocker = record_copy_blocker(record, &records_by_usr, &mixin_usrs, &mut visiting);
+            copy_reasons.insert(record.usr.as_str(), blocker);
+        }
+    }
 
     // E11: which file *declares* each top-level record/function — the other
     // half of what a file needs to know before it can print its own
@@ -202,6 +223,7 @@ pub fn emit_module_with_externals(
                     &records_by_usr,
                     &usr_to_stem,
                     &enums_by_usr,
+                    &copy_reasons,
                     &mock,
                 ),
             )
@@ -458,6 +480,7 @@ fn emit_file(
     records_by_usr: &HashMap<&str, &Record>,
     usr_to_stem: &HashMap<&str, String>,
     enums_by_usr: &HashMap<&str, &Enum>,
+    copy_reasons: &HashMap<&str, Option<String>>,
     mock: &MockContext<'_>,
 ) -> String {
     let mut used_expr_helper = false;
@@ -481,6 +504,7 @@ fn emit_file(
             &mut used_expr_helper,
             &mut used_utf8_encode,
             enums_by_usr,
+            copy_reasons,
             mock,
         ));
     }
@@ -983,6 +1007,12 @@ fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str
                 collect_referenced_usrs_in_expr(value, out);
             }
         }
+        Expr::RecordCopy {
+            target, type_usr, ..
+        } => {
+            out.insert(type_usr.as_str());
+            collect_referenced_usrs_in_expr(target, out);
+        }
         Expr::ConstructorCall { type_usr, args, .. } => {
             out.insert(type_usr.as_str());
             for arg in args {
@@ -1109,10 +1139,7 @@ fn emit_enum(enum_decl: &Enum) -> String {
 /// user-declared constructor of its own) becomes a Dart class with every
 /// field declared `final`... except E03's own armadilha rules that out:
 /// `mover` mutates its (by-value-copied) parameter's fields in place, so
-/// fields need to stay mutable. A positional constructor
-/// (`Ponto(this.x, this.y);`) doubles as the copy constructor `lower::cpp`
-/// needs for by-value parameter semantics (`RecordConstruct` emits a call to
-/// this same constructor).
+/// fields need to stay mutable.
 ///
 /// A record with its own declared constructor(s) (E04) instead emits each
 /// one for real (`emit_constructor`, sorted by `constructor_index` — see
@@ -1122,6 +1149,15 @@ fn emit_enum(enum_decl: &Enum) -> String {
 /// own field initialization, so the E03 synthetic positional constructor
 /// would either be redundant or, worse, a second and inconsistent way to
 /// construct the same class.
+///
+/// T2: every *copyable* record — with or without own constructors —
+/// additionally declares the one stable copy form, the named copy
+/// constructor `T.syntaxBridgeCopyOf(T other)`
+/// (`emit_copy_constructor`), which `Expr::RecordCopy` call sites funnel
+/// into. That constructor is exactly why the copy no longer rides the
+/// synthetic positional constructor: the two roles used to share it, and a
+/// record with own constructors had no positional constructor at all for
+/// the copy to call (~2.000 Verovio `extra_positional_arguments`).
 #[allow(clippy::too_many_arguments)]
 fn emit_record(
     record: &Record,
@@ -1130,6 +1166,7 @@ fn emit_record(
     used_expr_helper: &mut bool,
     used_utf8_encode: &mut bool,
     enums_by_usr: &HashMap<&str, &Enum>,
+    copy_reasons: &HashMap<&str, Option<String>>,
     mock: &MockContext<'_>,
 ) -> String {
     // A record that is globally a `mixin` (`is_mixin`) but has a
@@ -1156,13 +1193,12 @@ fn emit_record(
     // `mixin` declaration (Dart's `mixin` keyword has no `abstract` variant
     // — a mixin can't be instantiated at all, so nothing to mark abstract),
     // so skipped entirely for that case.
-    let abstract_keyword = if !effective_is_mixin
-        && record.methods.iter().any(|method| method.body.is_none())
-    {
-        "abstract "
-    } else {
-        ""
-    };
+    let abstract_keyword =
+        if !effective_is_mixin && record.methods.iter().any(|method| method.body.is_none()) {
+            "abstract "
+        } else {
+            ""
+        };
     // Dart forbids both `extends` and `with` on a `mixin` declaration — only
     // `on` (a superclass *constraint*, not composition) is legal there. A
     // record that's itself used as a mixin elsewhere (`is_mixin`) therefore
@@ -1305,6 +1341,22 @@ fn emit_record(
                 used_utf8_encode,
             ));
         }
+    }
+
+    // T2: the one stable copy form, declared by every record that can
+    // declare constructors at all (`copy_reasons` carries the blocker for
+    // the ones that can't — a `mixin`, an uncopiable base chain — whose
+    // copy sites were already rewritten into honest bailouts before
+    // emission). Same branch for records with and without own
+    // constructors: the copy never rides a constructor the record happens
+    // to have, it has one of its own.
+    if !effective_is_mixin
+        && copy_reasons
+            .get(record.usr.as_str())
+            .is_some_and(Option::is_none)
+    {
+        source.push('\n');
+        source.push_str(&emit_copy_constructor(record, records_by_usr, copy_reasons));
     }
 
     for method in &record.methods {
@@ -1552,27 +1604,41 @@ fn expr_contains_this(expr: &Expr) -> bool {
             then_expr,
             else_expr,
             ..
-        } => expr_contains_this(condition) || expr_contains_this(then_expr) || expr_contains_this(else_expr),
+        } => {
+            expr_contains_this(condition)
+                || expr_contains_this(then_expr)
+                || expr_contains_this(else_expr)
+        }
         Expr::Unary { operand, .. } => expr_contains_this(operand),
         Expr::Convert { operand, .. } => expr_contains_this(operand),
         Expr::Call { target, args, .. } => {
-            target.as_ref().is_some_and(|t| expr_contains_this(t)) || args.iter().any(expr_contains_this)
+            target.as_ref().is_some_and(|t| expr_contains_this(t))
+                || args.iter().any(expr_contains_this)
         }
         Expr::FieldAccess { target, .. } => expr_contains_this(target),
         Expr::RecordConstruct { fields, .. } => fields.iter().any(|(_, v)| expr_contains_this(v)),
+        Expr::RecordCopy { target, .. } => expr_contains_this(target),
         Expr::ConstructorCall { args, .. } => args.iter().any(expr_contains_this),
-        Expr::Index { target, index, .. } => expr_contains_this(target) || expr_contains_this(index),
+        Expr::Index { target, index, .. } => {
+            expr_contains_this(target) || expr_contains_this(index)
+        }
         Expr::MapIndexOrInsert {
             target,
             index,
             default_value,
             ..
-        } => expr_contains_this(target) || expr_contains_this(index) || expr_contains_this(default_value),
+        } => {
+            expr_contains_this(target)
+                || expr_contains_this(index)
+                || expr_contains_this(default_value)
+        }
         Expr::StringByteLength { target, .. } => expr_contains_this(target),
         Expr::StringByteIndexOf { target, needle, .. } => {
             expr_contains_this(target) || expr_contains_this(needle)
         }
-        Expr::StringByteAt { target, index, .. } => expr_contains_this(target) || expr_contains_this(index),
+        Expr::StringByteAt { target, index, .. } => {
+            expr_contains_this(target) || expr_contains_this(index)
+        }
         Expr::Tuple { values, .. } => values.iter().any(expr_contains_this),
         Expr::ListLiteral { items, .. } => items.iter().any(expr_contains_this),
         Expr::MapLiteral { entries, .. } => entries
@@ -1580,7 +1646,9 @@ fn expr_contains_this(expr: &Expr) -> bool {
             .any(|(k, v)| expr_contains_this(k) || expr_contains_this(v)),
         Expr::Is { operand, .. } => expr_contains_this(operand),
         Expr::As { operand, .. } => expr_contains_this(operand),
-        Expr::Assign { target, value, .. } => expr_contains_this(target) || expr_contains_this(value),
+        Expr::Assign { target, value, .. } => {
+            expr_contains_this(target) || expr_contains_this(value)
+        }
     }
 }
 
@@ -1650,13 +1718,25 @@ fn emit_constructor(
 
     let mut init_parts: Vec<String> = Vec::new();
     for (name, value) in &field_inits_for_list {
-        let val_text = emit_expr(value, used_expr_helper, used_utf8_encode, &mut Promoted::new());
+        let val_text = emit_expr(
+            value,
+            used_expr_helper,
+            used_utf8_encode,
+            &mut Promoted::new(),
+        );
         init_parts.push(format!("{name} = {val_text}"));
     }
     if let Some((_, _, args)) = base_init {
         let args_text = args
             .iter()
-            .map(|arg| emit_expr(arg, used_expr_helper, used_utf8_encode, &mut Promoted::new()))
+            .map(|arg| {
+                emit_expr(
+                    arg,
+                    used_expr_helper,
+                    used_utf8_encode,
+                    &mut Promoted::new(),
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
         init_parts.push(format!("super({args_text})"));
@@ -2014,6 +2094,290 @@ fn first_unsupported_field_reason(record: &Record) -> Option<String> {
         })
 }
 
+/// T2 (`docs/prompts/2026-08-23-02-copia-por-valor-sem-construtor-posicional.md`):
+/// why a record cannot be value-copied, or `None` when it can. A copyable
+/// record declares the one stable copy form — the named copy constructor
+/// `T.syntaxBridgeCopyOf(T other)` (`emit_record`) — that every copy site
+/// (by-value parameter prelude, implicit `operator=`, copy-construction
+/// `new T(src)`) funnels into. A record is *not* copyable when:
+///
+/// - it is emitted as a Dart `mixin` (`mixin_usrs` membership, minus the
+///   `emit_record` fallback that forces a mixin-with-constructor-initializers
+///   back to `class`) — a `mixin` declaration cannot have any constructor;
+/// - its `extends` base is unknown to the module (nothing to copy its
+///   fields from or through) or is itself not copyable — the copy
+///   constructor's `super.syntaxBridgeCopyOf(other)` needs the base to own
+///   one too;
+/// - any mixin applied through its `with` clause (the transitively expanded
+///   chain, minus members already covered by the `extends` chain, whose
+///   fields `super` copies) is unknown to the module or declares a private
+///   (`_`-prefixed) field: Dart privacy is per-library, so the applying
+///   class — always another file — can neither read nor write it, and a
+///   copy that silently skipped it would be exactly the partial copy T2
+///   forbids.
+///
+/// Field *types* never block copying (unlike the zero-value path): the copy
+/// constructor assigns from `other`, so a field with no sound default
+/// (`late`) or an opaque bridge type is copied as soundly as any other.
+pub(crate) fn record_copy_blocker<'a>(
+    record: &'a Record,
+    records_by_usr: &HashMap<&str, &'a Record>,
+    mixin_usrs: &HashSet<&str>,
+    visiting: &mut HashSet<&'a str>,
+) -> Option<String> {
+    if !visiting.insert(record.usr.as_str()) {
+        // A base cycle (impossible in valid C++, this is just a defensive
+        // stop) says nothing about copyability — treat it as copyable and
+        // let the outer levels compose their own verdict.
+        return None;
+    }
+    let verdict = record_copy_blocker_inner(record, records_by_usr, mixin_usrs, visiting);
+    visiting.remove(record.usr.as_str());
+    verdict
+}
+
+fn record_copy_blocker_inner<'a>(
+    record: &'a Record,
+    records_by_usr: &HashMap<&str, &'a Record>,
+    mixin_usrs: &HashSet<&str>,
+    visiting: &mut HashSet<&'a str>,
+) -> Option<String> {
+    // Same formula `emit_record` uses to pick `mixin` vs `class`: a mixin
+    // whose constructor would need `super`/initializer emission falls back
+    // to `class`, and only a record actually emitted as `mixin` is barred
+    // from declaring constructors.
+    let has_ctor_inits = record
+        .constructors
+        .iter()
+        .any(|ctor| !ctor.inits.is_empty());
+    if mixin_usrs.contains(record.usr.as_str()) && !has_ctor_inits {
+        return Some("emitido como mixin, não pode declarar construtor de cópia".to_owned());
+    }
+    if let Some(base) = &record.base_class {
+        let Some(base_record) = records_by_usr.get(base.usr.as_str()) else {
+            return Some(format!(
+                "a base `{}` não está no módulo, não há como copiar seus campos",
+                base.name
+            ));
+        };
+        if let Some(blocker) =
+            record_copy_blocker(base_record, records_by_usr, mixin_usrs, visiting)
+        {
+            return Some(format!("a base `{}` não é copiável: {blocker}", base.name));
+        }
+    }
+    // Fields reachable through the `with` clause but *not* through the
+    // `extends` chain (those are `super.syntaxBridgeCopyOf`'s job — walking
+    // them here would both double-copy them and, worse, wrongly block on
+    // the base's private fields, which the super copy handles legally).
+    let mut extends_chain: HashSet<&str> = HashSet::new();
+    let mut cursor = record.base_class.as_ref();
+    while let Some(base) = cursor {
+        if !extends_chain.insert(base.usr.as_str()) {
+            break;
+        }
+        cursor = records_by_usr
+            .get(base.usr.as_str())
+            .and_then(|base_record| base_record.base_class.as_ref());
+    }
+    for mixin in expand_mixin_chain(&record.mixins, records_by_usr) {
+        if extends_chain.contains(mixin.usr.as_str()) {
+            continue;
+        }
+        let Some(mixin_record) = records_by_usr.get(mixin.usr.as_str()) else {
+            return Some(format!(
+                "o mixin `{}` não está no módulo, seus campos não podem ser copiados",
+                mixin.name
+            ));
+        };
+        if let Some(field) = mixin_record
+            .fields
+            .iter()
+            .find(|field| field.name.starts_with('_'))
+        {
+            return Some(format!(
+                "o mixin `{}` declara o campo privado `{}`, que outra biblioteca Dart \
+                 não pode ler",
+                mixin.name, field.name
+            ));
+        }
+    }
+    None
+}
+
+/// The `T.syntaxBridgeCopyOf(T other)` declaration every copyable record
+/// gets (T2): a generative named constructor that rebuilds the value field
+/// by field — the record's *own* fields, the public fields of every `with`
+/// mixin (their private ones made the record non-copyable already), and the
+/// `extends` chain through `super.syntaxBridgeCopyOf(other)`, so a derived
+/// copy copies its base subobject exactly like C++ does. Copy semantics per
+/// field: a copyable record is deep-copied through its own copy
+/// constructor; a mutable collection (`List`/`Set`/`Map`/`Bytes`) is copied
+/// (`List.of`/`Set.of`/`Map.of`/`Uint8List.fromList`, the same bridges the
+/// old implicit-`operator=` lowering spelled at every assignment site);
+/// everything else — scalars, the immutable `String`, nullable pointers —
+/// is assigned as-is, which is observably the same value C++'s own member
+/// copy produces (a C++ pointer field aliases too).
+fn emit_copy_constructor(
+    record: &Record,
+    records_by_usr: &HashMap<&str, &Record>,
+    copy_reasons: &HashMap<&str, Option<String>>,
+) -> String {
+    // T2's own `not_initialized_non_nullable_instance_field` regression
+    // (first hit on E11 `Comum.x` — `int x;` before `emit_record` added the
+    // copy constructor): Dart's flow analysis needs a non-nullable field
+    // either `late`/default-initialized or definitely assigned via the
+    // constructor's initializer list — assignment in the body is not
+    // enough. Own fields satisfy it here through a field initializer
+    // (`x = other.x` — implicitly `this.x = ...`); mixin-inherited fields
+    // cannot be initialized that way and stay in the body, which is fine
+    // because every field a `mixin` actually declares is `late` or
+    // default-initialized (`emit_record`'s `effective_is_mixin` path).
+    let mut own_inits: Vec<String> = Vec::new();
+    let mut mixin_body = String::new();
+    let mut emit_own_field = |field: &crate::ir::Field| {
+        let value = match &field.ty {
+            Type::Record { usr, name }
+                if copy_reasons.get(usr.as_str()).is_some_and(Option::is_none) =>
+            {
+                format!("{name}.syntaxBridgeCopyOf(other.{})", field.name)
+            }
+            Type::List(_) => format!("List.of(other.{})", field.name),
+            Type::Set(_) => format!("Set.of(other.{})", field.name),
+            Type::Map(_, _) => format!("Map.of(other.{})", field.name),
+            Type::Bytes => format!("Uint8List.fromList(other.{})", field.name),
+            _ => format!("other.{}", field.name),
+        };
+        own_inits.push(format!("{} = {value}", field.name));
+    };
+    for field in &record.fields {
+        emit_own_field(field);
+    }
+    let mut emit_mixin_field = |field: &crate::ir::Field| {
+        let value = match &field.ty {
+            Type::Record { usr, name }
+                if copy_reasons.get(usr.as_str()).is_some_and(Option::is_none) =>
+            {
+                format!("{name}.syntaxBridgeCopyOf(other.{})", field.name)
+            }
+            Type::List(_) => format!("List.of(other.{})", field.name),
+            Type::Set(_) => format!("Set.of(other.{})", field.name),
+            Type::Map(_, _) => format!("Map.of(other.{})", field.name),
+            Type::Bytes => format!("Uint8List.fromList(other.{})", field.name),
+            _ => format!("other.{}", field.name),
+        };
+        mixin_body.push_str(&format!("{INDENT}{INDENT}{} = {value};\n", field.name));
+    };
+    let mut extends_chain: HashSet<&str> = HashSet::new();
+    let mut cursor = record.base_class.as_ref();
+    while let Some(base) = cursor {
+        if !extends_chain.insert(base.usr.as_str()) {
+            break;
+        }
+        cursor = records_by_usr
+            .get(base.usr.as_str())
+            .and_then(|base_record| base_record.base_class.as_ref());
+    }
+    for mixin in expand_mixin_chain(&record.mixins, records_by_usr) {
+        if extends_chain.contains(mixin.usr.as_str()) {
+            continue;
+        }
+        if let Some(mixin_record) = records_by_usr.get(mixin.usr.as_str()) {
+            for field in &mixin_record.fields {
+                emit_mixin_field(field);
+            }
+        }
+    }
+    let mut init_parts: Vec<String> = Vec::new();
+    init_parts.extend(own_inits);
+    if record.base_class.is_some() {
+        init_parts.push("super.syntaxBridgeCopyOf(other)".to_owned());
+    }
+    let initializer = if init_parts.is_empty() {
+        String::new()
+    } else {
+        format!(" : {}", init_parts.join(", "))
+    };
+    format!(
+        "{INDENT}{}.syntaxBridgeCopyOf({} other){initializer} {{\n{mixin_body}{INDENT}}}\n",
+        record.name, record.name
+    )
+}
+
+/// T2: replaces every `Expr::RecordCopy` of a record that cannot declare the
+/// named copy constructor with an honest typed bailout at the copy's own
+/// position — never a silent partial copy. Emission borrows the module it
+/// prints, so the rewrite works on one clone (the same shape the extraction
+/// pipeline already uses when it hands IR between stages) and returns it as
+/// the module everything downstream prints. Statement-position copies (the
+/// by-value parameter prelude, an implicit `operator=`) render as the typed
+/// throwing expression they become — the body below them is unreachable
+/// after the throw, and the parameter/local keeps its declared static type
+/// (no `dynamic`).
+fn rewrite_non_copyable_record_copies(module: &Module) -> Module {
+    let records_by_usr: HashMap<&str, &Record> = module
+        .records
+        .iter()
+        .map(|record| (record.usr.as_str(), record))
+        .collect();
+    let mixin_usrs = mixin_usrs(&module.records);
+    let mut copy_reasons: HashMap<&str, Option<String>> = HashMap::new();
+    let mut visiting: HashSet<&str> = HashSet::new();
+    for record in &module.records {
+        let blocker = record_copy_blocker(record, &records_by_usr, &mixin_usrs, &mut visiting);
+        copy_reasons.insert(record.usr.as_str(), blocker);
+    }
+
+    let mut rewritten = module.clone();
+    let rewrite_bodies = |record: &mut Record| {
+        for constructor in &mut record.constructors {
+            rewrite_stmts_for_blocked_copy(&mut constructor.body, &copy_reasons);
+        }
+        for method in &mut record.methods {
+            if let Some(body) = &mut method.body {
+                rewrite_stmts_for_blocked_copy(body, &copy_reasons);
+            }
+        }
+    };
+    for record in &mut rewritten.records {
+        rewrite_bodies(record);
+    }
+    for function in &mut rewritten.functions {
+        rewrite_stmts_for_blocked_copy(&mut function.body, &copy_reasons);
+    }
+    rewritten
+}
+
+fn rewrite_stmts_for_blocked_copy(
+    stmts: &mut [Stmt],
+    copy_reasons: &HashMap<&str, Option<String>>,
+) {
+    let mut visitor = crate::function_catalog::IrRefVisitor {
+        on_type: &mut |_| {},
+        on_record_construct: &mut |_, _, _| {},
+        on_expr: &mut |expr: &mut Expr| {
+            if let Expr::RecordCopy {
+                type_usr,
+                type_name,
+                origin,
+                ..
+            } = expr
+                && let Some(Some(blocker)) = copy_reasons.get(type_usr.as_str())
+            {
+                *expr = Expr::UnsupportedTyped {
+                    reason: format!("cópia por valor de {type_name} não copiável: {blocker}"),
+                    ty: Type::Record {
+                        usr: type_usr.clone(),
+                        name: type_name.clone(),
+                    },
+                    origin: origin.clone(),
+                };
+            }
+        },
+    };
+    visitor.visit_stmts(stmts);
+}
+
 fn emit_function(
     function: &Function,
     mock: &MockContext<'_>,
@@ -2338,6 +2702,7 @@ fn expr_unsupported_type_spelling(expr: &Expr) -> Option<&str> {
         Expr::RecordConstruct { fields, .. } => fields
             .iter()
             .find_map(|(_name, value)| expr_unsupported_type_spelling(value)),
+        Expr::RecordCopy { target, .. } => expr_unsupported_type_spelling(target),
         // A `ConstructorCall`'s own type is always its (already-checked)
         // owning record's type, never itself `Unsupported` — only its
         // arguments can be. `This` carries a placeholder `Void` type (see
@@ -4007,6 +4372,21 @@ fn emit_expr(
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("{type_name}({args_text})")
+        }
+        // T2 (`docs/prompts/2026-08-23-02-copia-por-valor-sem-construtor-posicional.md`):
+        // the by-value copy role. Every copy site funnels into the one
+        // stable copy form the record declares for itself —
+        // `T.syntaxBridgeCopyOf` (see `emit_record`) — instead of
+        // improvising a positional-constructor call that only exists for
+        // records *without* own constructors. `rewrite_non_copyable_record_copies`
+        // has already replaced every copy of a record that cannot declare
+        // that constructor with a typed bailout, so reaching here always
+        // means the named constructor exists.
+        Expr::RecordCopy {
+            target, type_name, ..
+        } => {
+            let target_text = emit_expr(target, used_expr_helper, used_utf8_encode, promoted);
+            format!("{type_name}.syntaxBridgeCopyOf({target_text})")
         }
         Expr::ConstructorCall {
             type_name,

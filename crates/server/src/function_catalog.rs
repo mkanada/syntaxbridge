@@ -703,63 +703,72 @@ fn apply_overload_renames(
             }
             continue;
         }
-        // F13/tarefa 12: a bridge name for an operator that has no direct
-        // Dart equivalent (`operator<<` -> `streamInsert`,
-        // `lower::cpp::dart_operator_bridge_name`) is computed purely from
-        // the operator symbol and arity — every `operator<<` in a file
-        // collided under the same name until this branch existed, the
-        // family's own achado (b). Disambiguated by the (Dart-mapped)
-        // operand types, same `dart_overload_name` suffix scheme as an
-        // ordinary overload, applied to the bridge name instead of the raw
-        // C++ name — computed once here and picked up everywhere
-        // `dart_operator_bridge_name` is called (`emit::dart`'s declaration
-        // emission, `lower::cpp`'s call lowering) through the same usr-keyed
-        // `apply_renames` every other id above already relies on.
-        //
-        // `NATIVE_BINARY_OPERATORS` (`operator==`/`operator()` too) are
-        // excluded: their call sites never go through that shared
-        // `callee_usr`-keyed `Call` mechanism at all.
-        // `lower::cpp::lower_record_operator_call` lowers `a + b`/`a == b`/…
-        // straight to `ir::Expr::Binary` — no `callee_usr`, so
-        // `apply_renames`'s call-site rewrite can't reach it — and
-        // `emit::dart::emit_method` dispatches `operator==`/`operator()` on
-        // their *literal* C++ name unconditionally (Dart `==`/callable-object
-        // sugar), never consulting `dart_operator_bridge_name` either.
-        // Renaming any of these away from their literal name would desync
-        // the declaration from that call-site/emission assumption with no
-        // corresponding fix on the other side — confirmed the hard way, as a
-        // `dart analyze` `undefined_operator` regression on the real Verovio
-        // 6.2.0 corpus, not anticipated up front. A colliding group of these
-        // stays unrenamed, same as before this fix — a real gap, but a
-        // pre-existing one this task doesn't reach (it would need
-        // `lower_record_operator_call` itself to know about the collision,
-        // not just this post-hoc renaming pass).
-        const NATIVE_BINARY_OPERATORS: &[&str] = &[
-            "operator==",
-            "operator()",
-            "operator+",
-            "operator-",
-            "operator*",
-            "operator/",
-            "operator!=",
-            "operator<",
-            "operator<=",
-            "operator>",
-            "operator>=",
-        ];
-        if name.starts_with("operator") && !NATIVE_BINARY_OPERATORS.contains(&name.as_str()) {
-            if option.id == "operador-sem-equivalente-direto" {
+        // Tarefa 03 (Metade B): For operator overloads, at most one overload
+        // per record keeps the native Dart operator syntax (the one matching the
+        // receiver's type, or the first in declaration order); all other overloads
+        // become named bridge methods disambiguated by parameter type.
+        if name.starts_with("operator") {
+            if let Some(owning_usr) = owning_class_usr {
+                let owning_record = ir_records.iter().find(|r| &r.usr == owning_usr);
+                let mut by_arity: BTreeMap<usize, Vec<&FunctionDeclaration>> = BTreeMap::new();
                 for declaration in group {
-                    let params = ir_functions_by_usr
+                    let param_count = ir_methods_by_usr
                         .get(declaration.usr.as_str())
-                        .or_else(|| ir_methods_by_usr.get(declaration.usr.as_str()))
-                        .copied();
+                        .map(|p| p.len())
+                        .unwrap_or(0);
+                    by_arity.entry(param_count).or_default().push(declaration);
+                }
+
+                for (arity, bucket) in by_arity {
+                    let is_direct = lower::cpp::is_direct_dart_operator(name, arity);
+                    if bucket.len() == 1 && is_direct {
+                        continue;
+                    }
+                    let native_decl = if is_direct {
+                        let mut native = bucket[0];
+                        if let Some(record) = owning_record {
+                            for &decl in &bucket {
+                                if let Some(params) = ir_methods_by_usr.get(decl.usr.as_str())
+                                    && let Some(first_param) = params.first()
+                                    && lower::cpp::types_match_for_record_operator(
+                                        &first_param.ty,
+                                        &ir::Type::Record {
+                                            usr: record.usr.clone(),
+                                            name: record.name.clone(),
+                                        },
+                                    )
+                                {
+                                    native = decl;
+                                    break;
+                                }
+                            }
+                        }
+                        Some(native)
+                    } else {
+                        None
+                    };
+
+                    for declaration in bucket {
+                        if let Some(native) = native_decl
+                            && declaration.usr == native.usr
+                        {
+                            continue;
+                        }
+                        let params = ir_methods_by_usr
+                            .get(declaration.usr.as_str())
+                            .copied()
+                            .unwrap_or(&[]);
+                        let base = lower::cpp::dart_operator_bridge_name(name, arity);
+                        let new_name = format!("{base}{}", dart_overload_name("", params));
+                        renames.insert(declaration.usr.clone(), new_name);
+                    }
+                }
+            } else {
+                for declaration in group {
+                    let params = ir_functions_by_usr.get(declaration.usr.as_str()).copied();
                     if let Some(params) = params {
                         let base = lower::cpp::dart_operator_bridge_name(name, params.len());
-                        let mut new_name = format!("{base}{}", dart_overload_name("", params));
-                        if mapping::signature_is_const(&declaration.signature) {
-                            new_name.push_str("Const");
-                        }
+                        let new_name = format!("{base}{}", dart_overload_name("", params));
                         renames.insert(declaration.usr.clone(), new_name);
                     }
                 }
@@ -1151,7 +1160,22 @@ fn rename_record_refs_in_expr(expr: &mut ir::Expr, renames: &HashMap<String, Str
                 *type_name = new_name.clone();
             }
         },
-        on_expr: &mut |_| {},
+        // A `RecordCopy` names its Dart class out-of-band too, but the
+        // visitor intentionally keeps it away from `on_record_construct`
+        // (not a construction site) — renamed here instead, so a
+        // disambiguated record's copy sites keep naming the same class
+        // every other reference does.
+        on_expr: &mut |expr: &mut ir::Expr| {
+            if let ir::Expr::RecordCopy {
+                type_usr,
+                type_name,
+                ..
+            } = expr
+                && let Some(new_name) = renames.get(type_usr)
+            {
+                *type_name = new_name.clone();
+            }
+        },
     }
     .visit_expr(expr);
 }
@@ -1277,16 +1301,19 @@ fn reject_in_stmts(stmts: &mut [ir::Stmt], reject: &mut dyn FnMut(&mut ir::Type)
 /// walk would be a second place that has to stay exhaustive as `ir::Stmt`
 /// and `ir::Expr` grow — and a pass that silently skips a variant produces
 /// exactly the half-rewritten IR these passes exist to prevent.
-struct IrRefVisitor<'a> {
-    on_type: &'a mut dyn FnMut(&mut ir::Type),
+/// `emit::dart`'s T2 non-copyable-`RecordCopy` rewrite borrows this same
+/// visitor (its `on_expr` post-order hook), rather than growing a third
+/// exhaustive walk of its own.
+pub(crate) struct IrRefVisitor<'a> {
+    pub(crate) on_type: &'a mut dyn FnMut(&mut ir::Type),
     /// `Option<&mut usize>` is `None` for a `RecordConstruct` (no ordinal to
     /// rewrite) and `Some` for a `ConstructorCall`'s `constructor_index`.
-    on_record_construct: &'a mut dyn FnMut(&str, &mut String, Option<&mut usize>),
-    on_expr: &'a mut dyn FnMut(&mut ir::Expr),
+    pub(crate) on_record_construct: &'a mut dyn FnMut(&str, &mut String, Option<&mut usize>),
+    pub(crate) on_expr: &'a mut dyn FnMut(&mut ir::Expr),
 }
 
 impl IrRefVisitor<'_> {
-    fn visit_stmts(&mut self, stmts: &mut [ir::Stmt]) {
+    pub(crate) fn visit_stmts(&mut self, stmts: &mut [ir::Stmt]) {
         for stmt in stmts {
             self.visit_stmt(stmt);
         }
@@ -1473,6 +1500,18 @@ impl IrRefVisitor<'_> {
                 for (_name, value) in fields {
                     self.visit_expr(value);
                 }
+            }
+            ir::Expr::RecordCopy { target, .. } => {
+                // Deliberately NOT routed through `on_record_construct`:
+                // that hook means "a construction site names its Dart class"
+                // (mixin-forms' `collect_constructed_usrs`/factory rewrite
+                // act on it), and a copy is not a construction — a by-value
+                // parameter of a mixin record must reach T2's honest
+                // bailout, not synthesize a factory whose arguments could
+                // never express the copy's source. The one pass that DOES
+                // need to see the copy's out-of-band name (record name
+                // disambiguation) handles it through `on_expr` instead.
+                self.visit_expr(target);
             }
             ir::Expr::ConstructorCall {
                 type_usr,
@@ -2420,6 +2459,7 @@ fn expr_references_name(expr: &ir::Expr, name: &str) -> bool {
         ir::Expr::RecordConstruct { fields, .. } => fields
             .iter()
             .any(|(_name, value)| expr_references_name(value, name)),
+        ir::Expr::RecordCopy { target, .. } => expr_references_name(target, name),
         ir::Expr::ConstructorCall { args, .. } => {
             args.iter().any(|arg| expr_references_name(arg, name))
         }
@@ -2627,6 +2667,9 @@ fn replace_this_with_ref_in_expr(expr: &mut ir::Expr, var_name: &str) {
             for (_name, value) in fields {
                 replace_this_with_ref_in_expr(value, var_name);
             }
+        }
+        ir::Expr::RecordCopy { target, .. } => {
+            replace_this_with_ref_in_expr(target, var_name);
         }
         ir::Expr::ConstructorCall { args, .. } => {
             for arg in args {
@@ -2865,6 +2908,9 @@ fn rename_calls_in_expr(expr: &mut ir::Expr, renames: &HashMap<String, String>) 
             for (_name, value) in fields {
                 rename_calls_in_expr(value, renames);
             }
+        }
+        ir::Expr::RecordCopy { target, .. } => {
+            rename_calls_in_expr(target, renames);
         }
         ir::Expr::ConstructorCall { args, .. } => {
             for arg in args {
@@ -4257,7 +4303,7 @@ mod merge_tests {
                 constructor_index: 0,
                 params: Vec::new(),
                 inits: Vec::new(),
-            body: Vec::new(),
+                body: Vec::new(),
                 origin: origin(3),
             });
         });

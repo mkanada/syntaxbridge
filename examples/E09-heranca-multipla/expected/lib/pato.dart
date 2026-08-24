@@ -25,6 +25,11 @@ mixin Nadador {
 class PatoDaguaVoador with Voador, Nadador {
   PatoDaguaVoador();
 
+  PatoDaguaVoador.syntaxBridgeCopyOf(PatoDaguaVoador other) {
+    altitude = other.altitude;
+    profundidade = other.profundidade;
+  }
+
   String mover() {
     return 'voa e nada';
   }

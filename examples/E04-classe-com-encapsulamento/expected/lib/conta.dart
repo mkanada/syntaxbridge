@@ -12,6 +12,9 @@ class ContaBancaria {
     ContaBancaria._totalContas = ContaBancaria._totalContas + 1;
   }
 
+  ContaBancaria.syntaxBridgeCopyOf(ContaBancaria other)
+    : _saldo = other._saldo {}
+
   void depositar(double valor) {
     _saldo = _saldo + valor;
   }

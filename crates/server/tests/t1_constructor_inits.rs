@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use syntax_bridge_server::function_catalog;
 use syntax_bridge_server::ingest::CompilationUnit;
-use syntax_bridge_server::ir::{ConstructorInit, Expr, Stmt, Type};
+use syntax_bridge_server::ir::{ConstructorInit, Expr};
 
 fn write_fixture(project_root: &Path, source: &str, file_name: &str) -> CompilationUnit {
     fs::create_dir_all(project_root).expect("create project dir");
@@ -90,7 +90,12 @@ int usa() { Ponto p(3, 4); return p.x + p.y; }
         .expect("Ponto record");
     assert_eq!(ponto.constructors.len(), 1, "expected one constructor");
     let ctor = &ponto.constructors[0];
-    assert_eq!(ctor.inits.len(), 2, "expected two inits, got {:?}", ctor.inits);
+    assert_eq!(
+        ctor.inits.len(),
+        2,
+        "expected two inits, got {:?}",
+        ctor.inits
+    );
     match &ctor.inits[0] {
         ConstructorInit::Field { name, value } => {
             assert_eq!(name, "x");
@@ -114,7 +119,9 @@ int usa() { Ponto p(3, 4); return p.x + p.y; }
 
     let dart = lower_and_emit("t1-field-emit", source);
     assert!(
-        dart.contains(": x = a, y = b") || dart.contains(": x = a,y = b") || dart.contains("x = a, y = b"),
+        dart.contains(": x = a, y = b")
+            || dart.contains(": x = a,y = b")
+            || dart.contains("x = a, y = b"),
         "expected Dart initializer list ': x = a, y = b', got:\n{dart}"
     );
     assert!(
@@ -147,11 +154,21 @@ struct Derivada : Base {
     assert_eq!(derivada.constructors.len(), 1);
     let ctor = &derivada.constructors[0];
     // Should have Base + Field
-    assert_eq!(ctor.inits.len(), 2, "expected Base and Field, got {:?}", ctor.inits);
-    let has_base = ctor.inits.iter().any(|init| matches!(init, ConstructorInit::Base { name, .. } if name == "Base"));
+    assert_eq!(
+        ctor.inits.len(),
+        2,
+        "expected Base and Field, got {:?}",
+        ctor.inits
+    );
+    let has_base = ctor
+        .inits
+        .iter()
+        .any(|init| matches!(init, ConstructorInit::Base { name, .. } if name == "Base"));
     assert!(has_base, "expected Base init, got {:?}", ctor.inits);
     assert!(
-        ctor.inits.iter().any(|init| matches!(init, ConstructorInit::Field { name, .. } if name == "w")),
+        ctor.inits
+            .iter()
+            .any(|init| matches!(init, ConstructorInit::Field { name, .. } if name == "w")),
         "expected Field w"
     );
 
@@ -161,10 +178,13 @@ struct Derivada : Base {
         "expected ': super(v)' in Dart, got:\n{dart}"
     );
     // super should be last
-    if let Some(pos_super) = dart.find("super(") {
-        if let Some(pos_w) = dart.find("w = w_") {
-            assert!(pos_w < pos_super, "field init should come before super, got:\n{dart}");
-        }
+    if let Some(pos_super) = dart.find("super(")
+        && let Some(pos_w) = dart.find("w = w_")
+    {
+        assert!(
+            pos_w < pos_super,
+            "field init should come before super, got:\n{dart}"
+        );
     }
 }
 
@@ -194,7 +214,11 @@ struct Ponto {
             assert_eq!(name, "y");
             // value should be FieldAccess with This
             let contains_this = format!("{:?}", value).contains("This");
-            assert!(contains_this, "expected y(x) to reference this, got {:?}", value);
+            assert!(
+                contains_this,
+                "expected y(x) to reference this, got {:?}",
+                value
+            );
         }
         other => panic!("expected Field y, got {:?}", other),
     }
@@ -214,14 +238,14 @@ struct Ponto {
     );
     // Ensure initializer does not contain y = x with this reference in the initializer part before '{'
     // We check that after ':' and before '{', there is no 'y ='
-    if let Some(colon) = dart.find(':') {
-        if let Some(brace) = dart[colon..].find('{') {
-            let init_part = &dart[colon..colon+brace];
-            // init_part should contain x but not y (since y moved)
-            assert!(
-                init_part.contains("x = a") && !init_part.contains("y ="),
-                "y init should not be in initializer list, init_part={init_part}, full:\n{dart}"
-            );
-        }
+    if let Some(colon) = dart.find(':')
+        && let Some(brace) = dart[colon..].find('{')
+    {
+        let init_part = &dart[colon..colon + brace];
+        // init_part should contain x but not y (since y moved)
+        assert!(
+            init_part.contains("x = a") && !init_part.contains("y ="),
+            "y init should not be in initializer list, init_part={init_part}, full:\n{dart}"
+        );
     }
 }

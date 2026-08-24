@@ -405,15 +405,39 @@ pub enum Expr {
         origin: Origin,
     },
     /// Constructing a record value from its field values, in declaration
-    /// order — used both for an explicit aggregate construction in the
-    /// source and for the implicit copy `lower::cpp` inserts at the top of
-    /// a function for every by-value `Record` parameter (E03's armadilha:
-    /// C++ copies a struct passed by value, Dart passes the reference —
-    /// see `examples/E03-struct-pod/NOTES.md`).
+    /// order — the *aggregate* role only: an explicit (or default/zero
+    /// value) construction in the source. The *copy* role (a by-value
+    /// parameter's copy-on-entry clone, an implicit `operator=` copy, a
+    /// copy-construction `new T(src)`) is [`Expr::RecordCopy`] — the two
+    /// were one variant until T2
+    /// (`docs/prompts/2026-08-23-02-copia-por-valor-sem-construtor-posicional.md`)
+    /// and the shared shape is exactly what let E04's constructor changes
+    /// break E03's copy without anything noticing.
     RecordConstruct {
         type_usr: String,
         type_name: String,
         fields: Vec<(String, Expr)>,
+        origin: Origin,
+    },
+    /// A by-value *copy* of a record value — C++ copies, Dart passes the
+    /// reference (E03's armadilha, T2's fix). `target` is the expression
+    /// being copied (usually the `Ref` of the parameter being cloned, the
+    /// source of an implicit `operator=`, or `this` in Verovio's
+    /// `Clone()` idiom). Emitted as a call to the record's own named copy
+    /// constructor (`T.syntaxBridgeCopyOf(target)`), which
+    /// `emit::dart::emit_record` declares for every copyable record: it
+    /// lives inside the class, so it reads private (`_`-prefixed) fields
+    /// legally from whatever file the copy site is in — the exact read the
+    /// old copy-as-`RecordConstruct` performed at the call site, from
+    /// whichever library the function lived in (`HumNum._top` read from
+    /// `iohumdrum.dart`). A record that cannot declare that constructor
+    /// (emitted as a `mixin`, an uncopiable base chain, an incomplete
+    /// field shape) gets an honest bailout at the copy's own position
+    /// instead — never a silent partial copy.
+    RecordCopy {
+        target: Box<Expr>,
+        type_usr: String,
+        type_name: String,
         origin: Origin,
     },
     /// A call to one of a record's own (non-copy, non-move) constructors —
@@ -534,6 +558,7 @@ impl Expr {
             | Self::Call { origin, .. }
             | Self::FieldAccess { origin, .. }
             | Self::RecordConstruct { origin, .. }
+            | Self::RecordCopy { origin, .. }
             | Self::ConstructorCall { origin, .. }
             | Self::This { origin, .. }
             | Self::Index { origin, .. }
@@ -590,6 +615,7 @@ impl Expr {
             | Self::NullLiteral { .. }
             | Self::StringLiteral { .. }
             | Self::RecordConstruct { .. }
+            | Self::RecordCopy { .. }
             | Self::ConstructorCall { .. }
             | Self::StringByteLength { .. }
             | Self::StringByteIndexOf { .. }
@@ -899,7 +925,11 @@ pub enum ConstructorInit {
     /// `args`. `usr` is the join key back to the base `Record`; `name` rides
     /// along so emission doesn't need the whole `Module` in scope, mirroring
     /// `Type::Record`/`BaseClass`.
-    Base { usr: String, name: String, args: Vec<Expr> },
+    Base {
+        usr: String,
+        name: String,
+        args: Vec<Expr>,
+    },
 }
 
 /// One of a record's own constructors, in declaration order — see
