@@ -266,6 +266,16 @@ pub enum Expr {
         ty: Type,
         origin: Origin,
     },
+    /// A C++ lambda whose captures use the ordinary lexical forms (`[]`,
+    /// `[&]`, `[=]`, or explicit names). Dart closures capture lexical
+    /// bindings directly; exotic init-captures remain typed bailouts in the
+    /// C++ adapter.
+    Lambda {
+        params: Vec<Param>,
+        body: Vec<Stmt>,
+        ty: Type,
+        origin: Origin,
+    },
     /// A brace-enclosed initializer list (`{1, 2, 3}`) lowered to a Dart
     /// list literal — only when `ty` (`clang_getCursorType` on the
     /// `InitListExpr` cursor, already resolved by `lower::cpp`) is
@@ -562,6 +572,7 @@ impl Expr {
             | Self::Binary { origin, .. }
             | Self::Conditional { origin, .. }
             | Self::Unary { origin, .. }
+            | Self::Lambda { origin, .. }
             | Self::ListLiteral { origin, .. }
             | Self::MapLiteral { origin, .. }
             | Self::Is { origin, .. }
@@ -612,6 +623,7 @@ impl Expr {
             | Self::Binary { ty, .. }
             | Self::Conditional { ty, .. }
             | Self::Unary { ty, .. }
+            | Self::Lambda { ty, .. }
             | Self::ListLiteral { ty, .. }
             | Self::MapLiteral { ty, .. }
             | Self::Assign { ty, .. }

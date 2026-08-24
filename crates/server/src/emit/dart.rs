@@ -1234,7 +1234,7 @@ fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str
             ty: ty @ Type::Enum { .. },
             ..
         } => collect_referenced_usrs_in_type(ty, out),
-        Expr::Ref { .. } | Expr::This { .. } => {},
+        Expr::Ref { .. } | Expr::This { .. } => {}
         Expr::Binary { lhs, rhs, .. } => {
             collect_referenced_usrs_in_expr(lhs, out);
             collect_referenced_usrs_in_expr(rhs, out);
@@ -1251,6 +1251,15 @@ fn collect_referenced_usrs_in_expr<'a>(expr: &'a Expr, out: &mut HashSet<&'a str
         }
         Expr::Unary { operand, .. } | Expr::Convert { operand, .. } => {
             collect_referenced_usrs_in_expr(operand, out);
+        }
+        Expr::Lambda {
+            params, body, ty, ..
+        } => {
+            collect_referenced_usrs_in_type(ty, out);
+            for param in params {
+                collect_referenced_usrs_in_type(&param.ty, out);
+            }
+            collect_referenced_usrs_in_stmts(body, out);
         }
         Expr::Call {
             target,
@@ -1889,6 +1898,7 @@ fn expr_contains_this(expr: &Expr) -> bool {
         }
         Expr::Unary { operand, .. } => expr_contains_this(operand),
         Expr::Convert { operand, .. } => expr_contains_this(operand),
+        Expr::Lambda { .. } => false,
         Expr::Call { target, args, .. } => {
             target.as_ref().is_some_and(|t| expr_contains_this(t))
                 || args.iter().any(expr_contains_this)
@@ -2985,6 +2995,15 @@ fn expr_unsupported_type_spelling(expr: &Expr) -> Option<&str> {
         Expr::Unary { ty, operand, .. } => {
             unsupported_spelling(ty).or_else(|| expr_unsupported_type_spelling(operand))
         }
+        Expr::Lambda {
+            params, body, ty, ..
+        } => unsupported_spelling(ty)
+            .or_else(|| {
+                params
+                    .iter()
+                    .find_map(|param| unsupported_spelling(&param.ty))
+            })
+            .or_else(|| first_unsupported_type_in_list(body)),
         Expr::Convert { ty, operand, .. } => {
             unsupported_spelling(ty).or_else(|| expr_unsupported_type_spelling(operand))
         }
@@ -4587,6 +4606,39 @@ fn emit_expr(
                 format!("{op_text}({operand_text})")
             } else {
                 format!("{op_text}{operand_text}")
+            }
+        }
+        Expr::Lambda {
+            params,
+            body,
+            origin,
+            ..
+        } => {
+            let params_text = format_params(params, used_expr_helper, used_utf8_encode);
+            if let [
+                Stmt::Return {
+                    value: Some(value), ..
+                },
+            ] = body.as_slice()
+            {
+                let value_text = emit_expr(
+                    value,
+                    used_expr_helper,
+                    used_utf8_encode,
+                    &mut Promoted::new(),
+                );
+                format!("({params_text}) => {value_text}")
+            } else {
+                let body_text = emit_body(
+                    params,
+                    None,
+                    body,
+                    origin,
+                    used_expr_helper,
+                    used_utf8_encode,
+                    1,
+                );
+                format!("({params_text}) {{\n{body_text}}}")
             }
         }
         Expr::Convert { operand, ty, .. } => {

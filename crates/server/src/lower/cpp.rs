@@ -7575,6 +7575,10 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
         return unsafe { lower_unary_expr(cursor, project_root, origin) };
     }
 
+    if kind == clang_sys::CXCursor_LambdaExpr {
+        return unsafe { lower_lambda_expr(cursor, project_root, origin) };
+    }
+
     if kind == clang_sys::CXCursor_CallExpr {
         return unsafe { lower_call_expr(cursor, project_root, origin) };
     }
@@ -7628,6 +7632,134 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
         ty: lower_type(unsafe { clang_sys::clang_getCursorType(cursor) }),
         origin,
     }
+}
+
+unsafe fn lower_lambda_expr(
+    cursor: clang_sys::CXCursor,
+    project_root: &Path,
+    origin: ir::Origin,
+) -> ir::Expr {
+    let children = unsafe { collect_children(cursor) };
+    let param_cursors: Vec<_> = children
+        .iter()
+        .copied()
+        .filter(|child| unsafe { clang_sys::clang_getCursorKind(*child) } == clang_sys::CXCursor_ParmDecl)
+        .collect();
+    let params: Vec<ir::Param> = param_cursors
+        .iter()
+        .map(|param_cursor| ir::Param {
+            name: unsafe {
+                dart_safe_identifier(&type_catalog::cxstring_to_string(
+                    clang_sys::clang_getCursorSpelling(*param_cursor),
+                ))
+            },
+            ty: unsafe { lower_parameter_type(*param_cursor, &param_cursors) },
+            default_value: None,
+        })
+        .collect();
+    let Some(body_cursor) = children.iter().copied().find(|child| unsafe {
+        clang_sys::clang_getCursorKind(*child) == clang_sys::CXCursor_CompoundStmt
+    }) else {
+        return ir::Expr::UnsupportedTyped {
+            reason: "lambda had no compound body".to_owned(),
+            ty: ir::Type::Callback {
+                return_type: Box::new(ir::Type::Void),
+                params: params.iter().map(|param| param.ty.clone()).collect(),
+            },
+            origin,
+        };
+    };
+    let body = unsafe { lower_compound_stmt(body_cursor, project_root) };
+    let return_type = body
+        .iter()
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Return {
+                value: Some(value), ..
+            } => value.ty().cloned().or(match value {
+                ir::Expr::IntLiteral { .. } => Some(ir::Type::Int),
+                ir::Expr::DoubleLiteral { .. } => Some(ir::Type::Double),
+                ir::Expr::BoolLiteral { .. } => Some(ir::Type::Bool),
+                ir::Expr::StringLiteral { .. } => Some(ir::Type::Str),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .unwrap_or(ir::Type::Void);
+    let ty = ir::Type::Callback {
+        return_type: Box::new(return_type),
+        params: params.iter().map(|param| param.ty.clone()).collect(),
+    };
+    if !unsafe { lambda_capture_is_supported(cursor) } {
+        return ir::Expr::UnsupportedTyped {
+            reason: "lambda uses an init-capture that needs an explicit Dart binding".to_owned(),
+            ty,
+            origin,
+        };
+    }
+    ir::Expr::Lambda {
+        params,
+        body,
+        ty,
+        origin,
+    }
+}
+
+unsafe fn lambda_capture_is_supported(cursor: clang_sys::CXCursor) -> bool {
+    let translation_unit = unsafe { clang_sys::clang_Cursor_getTranslationUnit(cursor) };
+    let extent = unsafe { clang_sys::clang_getCursorExtent(cursor) };
+    let mut tokens: *mut clang_sys::CXToken = std::ptr::null_mut();
+    let mut token_count: c_uint = 0;
+    unsafe {
+        clang_sys::clang_tokenize(translation_unit, extent, &mut tokens, &mut token_count);
+    }
+    if tokens.is_null() {
+        return false;
+    }
+    let spellings: Vec<String> = (0..token_count)
+        .map(|index| unsafe {
+            type_catalog::cxstring_to_string(clang_sys::clang_getTokenSpelling(
+                translation_unit,
+                *tokens.add(index as usize),
+            ))
+        })
+        .collect();
+    unsafe { clang_sys::clang_disposeTokens(translation_unit, tokens, token_count) };
+    let Some(open) = spellings.iter().position(|token| token == "[") else {
+        return false;
+    };
+    let Some(close) = spellings[open + 1..]
+        .iter()
+        .position(|token| token == "]")
+        .map(|offset| open + 1 + offset)
+    else {
+        return false;
+    };
+    let capture = &spellings[open + 1..close];
+    if capture.is_empty() || capture == ["&"] || capture == ["="] {
+        return true;
+    }
+    // `=` mixed with any other capture is an init-capture (`x = expr`),
+    // except for a leading default capture (`[=, &x]`).
+    if capture
+        .iter()
+        .enumerate()
+        .any(|(index, token)| token == "=" && index != 0)
+    {
+        return false;
+    }
+    capture.iter().all(|token| {
+        token == ","
+            || token == "&"
+            || token == "="
+            || token == "this"
+            || token
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+                && token
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    })
 }
 
 /// `dynamic_cast<T*>(operand)` — a checked downcast, common in Verovio for
@@ -9125,9 +9257,8 @@ unsafe fn lower_call_expr(
             let init_list_cursor = unsafe { unwrap_transparent_value_cursor(arg_cursor) };
             if unsafe { clang_sys::clang_getCursorKind(init_list_cursor) }
                 == clang_sys::CXCursor_InitListExpr
-                && let Some(entries) = unsafe {
-                    map_literal_entries(init_list_cursor, key_ty, value_ty, project_root)
-                }
+                && let Some(entries) =
+                    unsafe { map_literal_entries(init_list_cursor, key_ty, value_ty, project_root) }
             {
                 return ir::Expr::MapLiteral {
                     entries,
@@ -13181,7 +13312,7 @@ unsafe fn lower_stdlib_algorithm_call(
         }),
         "sort" if arg_count == 3 => {
             let cmp_cursor = unsafe { clang_sys::clang_Cursor_getArgument(call_cursor, 2) };
-            let cmp = unsafe { lower_expr(cmp_cursor, project_root) };
+            let cmp = adapt_inline_sort_comparator(unsafe { lower_expr(cmp_cursor, project_root) });
             Some(ir::Expr::Call {
                 base_qualifier: None,
                 target: Some(Box::new(begin_receiver)),
@@ -13206,6 +13337,99 @@ unsafe fn lower_stdlib_algorithm_call(
             })
         }
         _ => Some(unsupported()),
+    }
+}
+
+/// C++ ordering predicates return `bool`, whereas Dart's `List.sort` expects
+/// a three-way `int` comparator.  Adapt the common inline-lambda shape without
+/// evaluating either operand more than once. Named comparators retain their
+/// existing lowering until call-reference adapters can synthesize bindings.
+fn adapt_inline_sort_comparator(comparator: ir::Expr) -> ir::Expr {
+    let ir::Expr::Lambda {
+        params,
+        body,
+        ty,
+        origin,
+    } = comparator
+    else {
+        return comparator;
+    };
+    let [
+        ir::Stmt::Return {
+            value: Some(value), ..
+        },
+    ] = body.as_slice()
+    else {
+        return ir::Expr::Lambda {
+            ty,
+            params,
+            body,
+            origin,
+        };
+    };
+    let ir::Expr::Binary {
+        op,
+        lhs,
+        rhs,
+        origin: comparison_origin,
+        ..
+    } = value
+    else {
+        return ir::Expr::Lambda {
+            ty,
+            params,
+            body,
+            origin,
+        };
+    };
+    if !matches!(op, ir::BinaryOp::Lt | ir::BinaryOp::Gt) {
+        return ir::Expr::Lambda {
+            ty,
+            params,
+            body,
+            origin,
+        };
+    }
+    let reverse = ir::Expr::Binary {
+        op: *op,
+        lhs: rhs.clone(),
+        rhs: lhs.clone(),
+        ty: ir::Type::Bool,
+        origin: comparison_origin.clone(),
+    };
+    let three_way = ir::Expr::Conditional {
+        condition: Box::new(value.clone()),
+        then_expr: Box::new(ir::Expr::IntLiteral {
+            value: -1,
+            origin: comparison_origin.clone(),
+        }),
+        else_expr: Box::new(ir::Expr::Conditional {
+            condition: Box::new(reverse),
+            then_expr: Box::new(ir::Expr::IntLiteral {
+                value: 1,
+                origin: comparison_origin.clone(),
+            }),
+            else_expr: Box::new(ir::Expr::IntLiteral {
+                value: 0,
+                origin: comparison_origin.clone(),
+            }),
+            ty: ir::Type::Int,
+            origin: comparison_origin.clone(),
+        }),
+        ty: ir::Type::Int,
+        origin: comparison_origin.clone(),
+    };
+    ir::Expr::Lambda {
+        ty: ir::Type::Callback {
+            return_type: Box::new(ir::Type::Int),
+            params: params.iter().map(|param| param.ty.clone()).collect(),
+        },
+        params,
+        body: vec![ir::Stmt::Return {
+            value: Some(three_way),
+            origin: origin.clone(),
+        }],
+        origin,
     }
 }
 

@@ -610,6 +610,15 @@ fn collect_expression_bailouts(expression: &Expr, inventory: &mut BailoutInvento
             collect_type_bailouts(ty, inventory);
             collect_expression_bailouts(operand, inventory);
         }
+        Expr::Lambda {
+            params, body, ty, ..
+        } => {
+            collect_type_bailouts(ty, inventory);
+            for param in params {
+                collect_type_bailouts(&param.ty, inventory);
+            }
+            collect_statement_bailouts(body, inventory);
+        }
         Expr::Call {
             target, args, ty, ..
         } => {

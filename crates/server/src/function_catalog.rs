@@ -1518,6 +1518,18 @@ impl IrRefVisitor<'_> {
                 self.visit_type(ty);
                 self.visit_expr(operand);
             }
+            ir::Expr::Lambda {
+                params, body, ty, ..
+            } => {
+                self.visit_type(ty);
+                for param in params {
+                    self.visit_type(&mut param.ty);
+                    if let Some(default) = &mut param.default_value {
+                        self.visit_expr(default);
+                    }
+                }
+                self.visit_stmts(body);
+            }
             ir::Expr::Call {
                 target, ty, args, ..
             } => {
@@ -2495,6 +2507,7 @@ fn expr_references_name(expr: &ir::Expr, name: &str) -> bool {
         ir::Expr::Unary { operand, .. } | ir::Expr::Convert { operand, .. } => {
             expr_references_name(operand, name)
         }
+        ir::Expr::Lambda { body, .. } => stmts_reference_name(body, name),
         ir::Expr::Call { target, args, .. } => {
             target
                 .as_ref()
@@ -2708,6 +2721,7 @@ fn replace_this_with_ref_in_expr(expr: &mut ir::Expr, var_name: &str) {
         ir::Expr::Unary { operand, .. } | ir::Expr::Convert { operand, .. } => {
             replace_this_with_ref_in_expr(operand, var_name);
         }
+        ir::Expr::Lambda { body, .. } => replace_this_with_ref_in_stmts(body, var_name),
         ir::Expr::Call { target, args, .. } => {
             if let Some(target) = target {
                 replace_this_with_ref_in_expr(target, var_name);
@@ -2951,6 +2965,7 @@ fn rename_calls_in_expr(expr: &mut ir::Expr, renames: &HashMap<String, String>) 
         ir::Expr::Unary { operand, .. } | ir::Expr::Convert { operand, .. } => {
             rename_calls_in_expr(operand, renames);
         }
+        ir::Expr::Lambda { body, .. } => rename_calls_in_stmts(body, renames),
         ir::Expr::Call {
             target,
             callee_usr,

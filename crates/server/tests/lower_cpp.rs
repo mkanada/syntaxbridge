@@ -3130,7 +3130,11 @@ int answer() {
     );
 
     assert!(!source.contains("if (false)"), "got:\n{source}");
-    assert_eq!(source.matches("side_effect();").count(), 0, "got:\n{source}");
+    assert_eq!(
+        source.matches("side_effect();").count(),
+        0,
+        "got:\n{source}"
+    );
     assert!(source.contains("return 42;"), "got:\n{source}");
     assert!(!source.contains("return 0;"), "got:\n{source}");
 }
@@ -3525,9 +3529,7 @@ std::vector<std::pair<std::string, std::string>> pairs() {
     );
 
     assert!(
-        source.contains(
-            "_syntaxBridgeUnsupported<SyntaxBridgePair<String, String>>('"
-        ),
+        source.contains("_syntaxBridgeUnsupported<SyntaxBridgePair<String, String>>('"),
         "expected the bailout to retain the list element type, got:\n{source}"
     );
     assert!(
@@ -6918,6 +6920,51 @@ void sort_descending(std::vector<int>& values) {
     assert!(
         !source.contains("std::sort") && !source.contains(" sort(values"),
         "got:\n{source}"
+    );
+}
+
+#[test]
+fn std_sort_accepts_an_inline_cpp_lambda_comparator() {
+    let source = lower_and_emit(
+        "lower-cpp-sort-lambda",
+        r#"
+#include <vector>
+#include <algorithm>
+void sort_descending(std::vector<int>& values) {
+    std::sort(values.begin(), values.end(), [](int a, int b) { return a > b; });
+}
+"#,
+    );
+
+    assert!(
+        source.contains("values.sort((int a, int b) => a > b ? -1 : b > a ? 1 : 0);")
+            && !source.contains("cursor kind 144")
+            && !source.contains("(lambda at"),
+        "expected a typed Dart closure instead of a lambda bailout, got:\n{source}"
+    );
+}
+
+#[test]
+fn cpp_lambda_supports_reference_capture_and_rejects_init_capture() {
+    let source = lower_and_emit(
+        "lower-cpp-lambda-captures",
+        r#"
+#include <vector>
+#include <algorithm>
+int count_below(std::vector<int>& values, int limit) {
+    return std::count_if(values.begin(), values.end(), [&](int value) { return value < limit; });
+}
+int count_below_moved(std::vector<int>& values, int limit) {
+    return std::count_if(values.begin(), values.end(), [bound = limit](int value) { return value < bound; });
+}
+"#,
+    );
+
+    assert!(
+        source.contains("values.where((int value) => value < limit).length")
+            && source.contains("lambda uses an init-capture")
+            && !source.contains("cursor kind 144"),
+        "expected ordinary captures to become closures and init-captures to stay explicit, got:\n{source}"
     );
 }
 
