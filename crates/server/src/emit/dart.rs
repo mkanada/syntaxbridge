@@ -3258,17 +3258,13 @@ fn emit_stmt(
             }
         },
         Stmt::ExprAssign {
-            target: Expr::MapIndexOrInsert {
-                target: map, index, ..
-            },
+            target: target @ Expr::MapIndexOrInsert { .. },
             value,
             ..
         } => {
-            let map_text = emit_receiver(map, used_expr_helper, used_utf8_encode, promoted);
-            let bang = receiver_bang(map, promoted);
-            let index_text = emit_expr(index, used_expr_helper, used_utf8_encode, promoted);
-            let value_text = emit_expr(value, used_expr_helper, used_utf8_encode, promoted);
-            format!("{pad}{map_text}{bang}[{index_text}] = {value_text};\n")
+            let assignment =
+                emit_map_index_write(target, value, used_expr_helper, used_utf8_encode, promoted);
+            format!("{pad}{assignment};\n")
         }
         // Assigning *through* a `T*` out-param (`(*out) = value;`, C++'s
         // idiom for a mutable output parameter — Verovio's real
@@ -3532,10 +3528,11 @@ fn emit_stmt(
         Stmt::Break { .. } => format!("{pad}break;\n"),
         Stmt::Continue { .. } => format!("{pad}continue;\n"),
         Stmt::ContinueLabel { label, .. } => format!("{pad}continue {label};\n"),
-        Stmt::ExprStmt { expr, .. } => format!(
-            "{pad}{};\n",
-            emit_expr(expr, used_expr_helper, used_utf8_encode, promoted)
-        ),
+        Stmt::ExprStmt { expr, .. } => {
+            let text = emit_map_index_increment(expr, used_expr_helper, used_utf8_encode, promoted)
+                .unwrap_or_else(|| emit_expr(expr, used_expr_helper, used_utf8_encode, promoted));
+            format!("{pad}{text};\n")
+        }
         Stmt::Throw { value, .. } => format!(
             "{pad}throw {};\n",
             emit_expr(value, used_expr_helper, used_utf8_encode, promoted)
@@ -3713,6 +3710,108 @@ fn emit_stmt(
     }
 }
 
+/// Emits a `std::map::operator[]` write without placing the read-oriented
+/// `putIfAbsent` call on the left of `++`, `--`, or an expanded compound
+/// assignment. C++ inserts the mapped type's default before reading; in a
+/// write-back expression Dart's nullable lookup plus `?? default` preserves
+/// that value without turning a method call into an assignment target.
+fn emit_map_index_write(
+    target: &Expr,
+    value: &Expr,
+    used_expr_helper: &mut bool,
+    used_utf8_encode: &mut bool,
+    promoted: &mut Promoted,
+) -> String {
+    let Expr::MapIndexOrInsert {
+        target: map,
+        index,
+        default_value,
+        ..
+    } = target
+    else {
+        unreachable!("map-index writes are only called for MapIndexOrInsert targets")
+    };
+
+    let map_text = emit_receiver(map, used_expr_helper, used_utf8_encode, promoted);
+    let bang = receiver_bang(map, promoted);
+    let index_text = emit_expr(index, used_expr_helper, used_utf8_encode, promoted);
+    let lhs_text = format!("{map_text}{bang}[{index_text}]");
+
+    if let Expr::Binary {
+        op, lhs, rhs, ty, ..
+    } = value
+        && let Expr::MapIndexOrInsert {
+            target: read_map,
+            index: read_index,
+            default_value: read_default,
+            ..
+        } = lhs.as_ref()
+        && read_map == map
+        && read_index == index
+        && read_default == default_value
+    {
+        let read_map_text = emit_receiver(read_map, used_expr_helper, used_utf8_encode, promoted);
+        let read_bang = receiver_bang(read_map, promoted);
+        let read_index_text = emit_expr(read_index, used_expr_helper, used_utf8_encode, promoted);
+        let default_text = emit_expr(
+            read_default,
+            used_expr_helper,
+            used_utf8_encode,
+            &mut promoted.clone(),
+        );
+        let rhs_text = emit_expr(rhs, used_expr_helper, used_utf8_encode, promoted);
+        return format!(
+            "{lhs_text} = ({read_map_text}{read_bang}[{read_index_text}] ?? {default_text}) {} {rhs_text}",
+            emit_binary_op(*op, ty)
+        );
+    }
+
+    let value_text = emit_expr(value, used_expr_helper, used_utf8_encode, promoted);
+    format!("{lhs_text} = {value_text}")
+}
+
+fn emit_map_index_increment(
+    expr: &Expr,
+    used_expr_helper: &mut bool,
+    used_utf8_encode: &mut bool,
+    promoted: &mut Promoted,
+) -> Option<String> {
+    let Expr::Unary { op, operand, .. } = expr else {
+        return None;
+    };
+    let Expr::MapIndexOrInsert {
+        target: map,
+        index,
+        default_value,
+        ..
+    } = operand.as_ref()
+    else {
+        return None;
+    };
+    let arithmetic = match op {
+        UnaryOp::PreIncrement | UnaryOp::PostIncrement => "+",
+        UnaryOp::PreDecrement | UnaryOp::PostDecrement => "-",
+        _ => return None,
+    };
+
+    let map_text = emit_receiver(map, used_expr_helper, used_utf8_encode, promoted);
+    let bang = receiver_bang(map, promoted);
+    let index_text = emit_expr(index, used_expr_helper, used_utf8_encode, promoted);
+    let lhs_text = format!("{map_text}{bang}[{index_text}]");
+    let read_map_text = emit_receiver(map, used_expr_helper, used_utf8_encode, promoted);
+    let read_bang = receiver_bang(map, promoted);
+    let read_index_text = emit_expr(index, used_expr_helper, used_utf8_encode, promoted);
+    let default_text = emit_expr(
+        default_value,
+        used_expr_helper,
+        used_utf8_encode,
+        &mut promoted.clone(),
+    );
+    Some(format!(
+        "{lhs_text} = ({read_map_text}{read_bang}[{read_index_text}] ?? {default_text}) {arithmetic} 1"
+    ))
+}
+
 /// A `for`-clause slot (init/increment) wants inline text with no trailing
 /// `;`/newline of its own — `emit_stmt`'s shape doesn't fit. Only
 /// `VarDecl`/`Assign`/`ExprAssign`/`ExprStmt` are real for-clause shapes from a C++
@@ -3751,18 +3850,10 @@ fn emit_for_clause(
             format!("{name} = {value_text}")
         }
         Stmt::ExprAssign {
-            target: Expr::MapIndexOrInsert {
-                target: map, index, ..
-            },
+            target: target @ Expr::MapIndexOrInsert { .. },
             value,
             ..
-        } => {
-            let map_text = emit_receiver(map, used_expr_helper, used_utf8_encode, promoted);
-            let bang = receiver_bang(map, promoted);
-            let index_text = emit_expr(index, used_expr_helper, used_utf8_encode, promoted);
-            let value_text = emit_expr(value, used_expr_helper, used_utf8_encode, promoted);
-            format!("{map_text}{bang}[{index_text}] = {value_text}")
-        }
+        } => emit_map_index_write(target, value, used_expr_helper, used_utf8_encode, promoted),
         // Same out-param dereference-assignment case `emit_stmt`'s
         // `Stmt::ExprAssign` handles — see its doc comment.
         Stmt::ExprAssign {
@@ -3786,7 +3877,8 @@ fn emit_for_clause(
             format!("{target_text} = {value_text}")
         }
         Stmt::ExprStmt { expr, .. } => {
-            emit_expr(expr, used_expr_helper, used_utf8_encode, promoted)
+            emit_map_index_increment(expr, used_expr_helper, used_utf8_encode, promoted)
+                .unwrap_or_else(|| emit_expr(expr, used_expr_helper, used_utf8_encode, promoted))
         }
         other => {
             *used_expr_helper = true;

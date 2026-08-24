@@ -1624,13 +1624,19 @@ fn map_index_compound_assignment_preserves_default_insertion() {
 
 int increment(std::map<int, int>& values, int key) {
     values[key] += 2;
+    values[key]++;
+    values[key] -= 3;
+    --values[key];
     return values[key];
 }
 "#,
     );
 
     assert!(
-        source.contains("values[key] = values.putIfAbsent(key, () => 0) + 2;")
+        source.contains("values[key] = (values[key] ?? 0) + 2;")
+            && source.contains("values[key] = (values[key] ?? 0) + 1;")
+            && source.contains("values[key] = (values[key] ?? 0) - 3;")
+            && source.contains("values[key] = (values[key] ?? 0) - 1;")
             && source.contains("return values.putIfAbsent(key, () => 0);")
             && !source
                 .contains("compound assignment target is not a simple local variable or a field"),
