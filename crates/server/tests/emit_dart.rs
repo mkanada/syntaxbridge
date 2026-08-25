@@ -2551,6 +2551,74 @@ fn a_printed_static_owner_qualifier_imports_its_declaration_file() {
     );
 }
 
+/// A method name can equal an unrelated top-level type (`filters.Add()`, a
+/// real Verovio shape). Only the identifier before `.` is a possible static
+/// owner; importing `add.dart` because the member itself is named `Add`
+/// produces an `unused_import`.
+#[test]
+fn a_member_name_collision_does_not_import_an_unrelated_record() {
+    let origin_in = |file: &str| Origin {
+        file: file.to_owned(),
+        line: 1,
+        column: 1,
+    };
+    let empty_record = |name: &str, usr: &str, file: &str| Record {
+        name: name.to_owned(),
+        usr: usr.to_owned(),
+        namespace: String::new(),
+        fields: Vec::new(),
+        static_fields: Vec::new(),
+        constructors: Vec::new(),
+        methods: Vec::new(),
+        base_class: None,
+        mixins: Vec::new(),
+        library_base: None,
+        destructor: None,
+        origin: origin_in(file),
+    };
+    let add = empty_record("Add", "c:@S@Add", "/project/input-source/src/add.cpp");
+    let filters = empty_record(
+        "Filters",
+        "c:@S@Filters",
+        "/project/input-source/src/inspect.cpp",
+    );
+    let inspect = Function {
+        name: "inspect".to_owned(),
+        usr: "c:@F@inspect#".to_owned(),
+        params: Vec::new(),
+        return_type: Type::Void,
+        body: vec![Stmt::ExprStmt {
+            expr: Expr::Call {
+                target: Some(Box::new(Expr::Ref {
+                    name: "filters".to_owned(),
+                    ty: Type::Record {
+                        usr: filters.usr.clone(),
+                        name: filters.name.clone(),
+                    },
+                    origin: origin_in("/project/input-source/src/inspect.cpp"),
+                })),
+                base_qualifier: None,
+                callee_usr: "c:@S@Filters@F@Add#".to_owned(),
+                callee_name: "Add".to_owned(),
+                args: Vec::new(),
+                ty: Type::Void,
+                origin: origin_in("/project/input-source/src/inspect.cpp"),
+            },
+            origin: origin_in("/project/input-source/src/inspect.cpp"),
+        }],
+        origin: origin_in("/project/input-source/src/inspect.cpp"),
+    };
+
+    let source = &emit_module(&Module {
+        records: vec![add, filters],
+        functions: vec![inspect],
+        enums: Vec::new(),
+    })["lib/inspect.dart"];
+
+    assert!(source.contains("filters.Add();"), "got:\n{source}");
+    assert!(!source.contains("import 'add.dart';"), "got:\n{source}");
+}
+
 /// `docs/plans/lista-de-externos.md` decision 1: "mock = valor plausível,
 /// execução segue" — a free function whose usr is in the effective external
 /// set gets a `return` of a plausible default for its type, never a

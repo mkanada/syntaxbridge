@@ -628,7 +628,7 @@ fn emit_file(
             collect_referenced_usrs_in_stmts(&function.body, &mut referenced_usrs);
         }
     }
-    let code_identifiers = dart_code_identifiers(&source);
+    let (code_identifiers, qualified_owners) = dart_code_identifiers(&source);
     let mut needed_imports: BTreeSet<&str> = referenced_usrs
         .into_iter()
         .filter(|usr| {
@@ -648,7 +648,7 @@ fn emit_file(
         if other_stem != stem
             && names
                 .iter()
-                .any(|name| code_identifiers.contains(name.as_str()))
+                .any(|name| qualified_owners.contains(name.as_str()))
         {
             needed_imports.insert(other_stem.as_str());
         }
@@ -708,9 +708,10 @@ fn emit_file(
 /// ASCII (`dart_safe_identifier`), so a compact scanner is sufficient here
 /// and avoids importing a library merely because an unsupported-message
 /// string mentions one of its declarations.
-fn dart_code_identifiers(source: &str) -> HashSet<&str> {
+fn dart_code_identifiers(source: &str) -> (HashSet<&str>, HashSet<&str>) {
     let bytes = source.as_bytes();
     let mut identifiers = HashSet::new();
+    let mut qualified_owners = HashSet::new();
     let mut index = 0;
     while index < bytes.len() {
         match bytes[index] {
@@ -750,12 +751,20 @@ fn dart_code_identifiers(source: &str) -> HashSet<&str> {
                 {
                     index += 1;
                 }
-                identifiers.insert(&source[start..index]);
+                let identifier = &source[start..index];
+                identifiers.insert(identifier);
+                let mut lookahead = index;
+                while bytes.get(lookahead).is_some_and(u8::is_ascii_whitespace) {
+                    lookahead += 1;
+                }
+                if bytes.get(lookahead) == Some(&b'.') {
+                    qualified_owners.insert(identifier);
+                }
             }
             _ => index += 1,
         }
     }
-    identifiers
+    (identifiers, qualified_owners)
 }
 
 fn emit_unsupported_helper() -> String {
