@@ -8365,12 +8365,27 @@ unsafe fn lower_initializer_element(
                 };
             };
             let declaration = unsafe { clang_sys::clang_getTypeDeclaration(record_type) };
-            let field_cursors: Vec<_> = unsafe { collect_children(declaration) }
+            let mut field_cursors: Vec<_> = unsafe { collect_children(declaration) }
                 .into_iter()
                 .filter(|field| unsafe {
                     clang_sys::clang_getCursorKind(*field) == clang_sys::CXCursor_FieldDecl
                 })
                 .collect();
+            // LLVM 21 (the Flatpak toolchain) can return an elaborated
+            // template-argument type whose declaration cursor has no field
+            // children, while the host libclang already resolves it to the
+            // record declaration. Canonicalizing reaches the same concrete
+            // declaration on both toolchains.
+            if field_cursors.is_empty() {
+                let canonical = unsafe { clang_sys::clang_getCanonicalType(record_type) };
+                let declaration = unsafe { clang_sys::clang_getTypeDeclaration(canonical) };
+                field_cursors = unsafe { collect_children(declaration) }
+                    .into_iter()
+                    .filter(|field| unsafe {
+                        clang_sys::clang_getCursorKind(*field) == clang_sys::CXCursor_FieldDecl
+                    })
+                    .collect();
+            }
             if children.len() > field_cursors.len() {
                 return ir::Expr::UnsupportedTyped {
                     reason: format!(
