@@ -260,6 +260,7 @@ struct Bucket {
 int takes_int(int value) { return value; }
 int forwards(double argument) { return takes_int(argument * 0.5); }
 int returns_int(double result) { return result * 0.5; }
+int scales_in_place(int value) { value *= 0.66; return value; }
 "#,
     );
 
@@ -274,6 +275,10 @@ int returns_int(double result) { return result * 0.5; }
     assert!(
         source.contains("return (result * 0.5).toInt();"),
         "expected return-boundary narrowing, got:\n{source}"
+    );
+    assert!(
+        source.contains("value = (value * 0.66).toInt();"),
+        "expected compound-assignment narrowing, got:\n{source}"
     );
 }
 

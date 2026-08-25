@@ -6744,13 +6744,42 @@ unsafe fn lower_compound_assign_stmt(
     };
 
     let lhs_kind = unsafe { clang_sys::clang_getCursorKind(*lhs_cursor) };
-    let ty = lower_type(unsafe { clang_sys::clang_getCursorType(cursor) });
+    let lhs = unsafe { lower_expr(*lhs_cursor, project_root) };
+    let rhs = unsafe { lower_binary_operand(*rhs_cursor, project_root) };
+    let target_ty = lhs
+        .ty()
+        .cloned()
+        .unwrap_or_else(|| lower_type(unsafe { clang_sys::clang_getCursorType(cursor) }));
+    let operation_ty = if matches!(
+        op,
+        ir::BinaryOp::Add | ir::BinaryOp::Sub | ir::BinaryOp::Mul | ir::BinaryOp::Div
+    ) && (lhs.ty() == Some(&ir::Type::Double)
+        || rhs.ty() == Some(&ir::Type::Double)
+        || matches!(rhs, ir::Expr::DoubleLiteral { .. }))
+    {
+        ir::Type::Double
+    } else {
+        target_ty.clone()
+    };
     let value = ir::Expr::Binary {
         op,
-        lhs: Box::new(unsafe { lower_expr(*lhs_cursor, project_root) }),
-        rhs: Box::new(unsafe { lower_binary_operand(*rhs_cursor, project_root) }),
-        ty,
+        lhs: Box::new(lhs.clone()),
+        rhs: Box::new(rhs),
+        ty: operation_ty.clone(),
         origin: origin.clone(),
+    };
+    // C++ compound assignment performs the arithmetic first, then converts
+    // the result back to the left operand's type. Dart's desugared `=` needs
+    // that boundary made explicit (`int_value *= 0.66` ->
+    // `(int_value * 0.66).toInt()`).
+    let value = if target_ty == ir::Type::Int && operation_ty == ir::Type::Double {
+        ir::Expr::Convert {
+            operand: Box::new(value),
+            ty: ir::Type::Int,
+            origin: origin.clone(),
+        }
+    } else {
+        value
     };
 
     if lhs_kind == clang_sys::CXCursor_DeclRefExpr {
@@ -6775,7 +6804,7 @@ unsafe fn lower_compound_assign_stmt(
         };
     }
 
-    let target = unsafe { lower_expr(*lhs_cursor, project_root) };
+    let target = lhs;
     if matches!(
         target,
         ir::Expr::Index { .. } | ir::Expr::MapIndexOrInsert { .. }
