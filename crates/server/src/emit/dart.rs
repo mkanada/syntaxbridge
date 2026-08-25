@@ -3445,7 +3445,9 @@ fn emit_stmt(
             } else {
                 source.push_str(&format!("{pad}}} else {{\n"));
                 let mut else_promoted = promoted.clone();
-                if let Some(name) = ref_null_check_name(condition, BinaryOp::Eq) {
+                let mut else_extra = Vec::new();
+                or_chain_null_check_names_when_false(condition, &mut else_extra);
+                for name in else_extra {
                     else_promoted.insert(name.to_owned());
                 }
                 source.push_str(&emit_scoped_block(
@@ -3475,10 +3477,12 @@ fn emit_stmt(
                 promoted.remove(name);
             }
 
-            if let Some(name) = ref_null_check_name(condition, BinaryOp::Eq)
-                && branch_always_exits(then_branch)
-            {
-                promoted.insert(name.to_owned());
+            if branch_always_exits(then_branch) {
+                let mut after_guard = Vec::new();
+                or_chain_null_check_names_when_false(condition, &mut after_guard);
+                for name in after_guard {
+                    promoted.insert(name.to_owned());
+                }
             }
             source
         }
@@ -4217,6 +4221,21 @@ fn emit_receiver(
 /// a promotion witness. Doesn't look inside `&&`/`||` itself; see
 /// `and_chain_null_check_names` for that.
 fn ref_null_check_name(expr: &Expr, op: BinaryOp) -> Option<&str> {
+    if let Expr::Unary {
+        op: UnaryOp::Not,
+        operand,
+        ..
+    } = expr
+    {
+        return ref_null_check_name(
+            operand,
+            match op {
+                BinaryOp::Eq => BinaryOp::Ne,
+                BinaryOp::Ne => BinaryOp::Eq,
+                _ => return None,
+            },
+        );
+    }
     let Expr::Binary {
         op: found_op,
         lhs,
@@ -4233,6 +4252,27 @@ fn ref_null_check_name(expr: &Expr, op: BinaryOp) -> Option<&str> {
         (Expr::Ref { name, .. }, Expr::NullLiteral { .. }) => Some(name.as_str()),
         (Expr::NullLiteral { .. }, Expr::Ref { name, .. }) => Some(name.as_str()),
         _ => None,
+    }
+}
+
+/// Every local/parameter proven non-null when `expr` is false. A false `||`
+/// means both operands are false, so null guards such as
+/// `!(a != null) || !(b != null)` prove both names after an early return (or
+/// inside the corresponding `else`).
+fn or_chain_null_check_names_when_false<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
+    if let Expr::Binary {
+        op: BinaryOp::Or,
+        lhs,
+        rhs,
+        ..
+    } = expr
+    {
+        or_chain_null_check_names_when_false(lhs, out);
+        or_chain_null_check_names_when_false(rhs, out);
+        return;
+    }
+    if let Some(name) = ref_null_check_name(expr, BinaryOp::Eq) {
+        out.push(name);
     }
 }
 

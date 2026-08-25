@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use syntax_bridge_server::emit::dart::{emit_module, emit_module_with_externals};
 use syntax_bridge_server::ir::{
     BaseClass, BinaryOp, Constructor, Enum, Expr, Field, Function, Method, Module, Origin, Param,
-    Record, Stmt, Type,
+    Record, Stmt, Type, UnaryOp,
 };
 
 fn origin(line: u32) -> Origin {
@@ -1823,6 +1823,73 @@ fn a_null_guard_that_returns_promotes_the_pointer_for_the_rest_of_the_function()
         source.contains(expected_body),
         "expected the guard to promote `a` for the rest of the function, got:\n{source}"
     );
+}
+
+/// Clang commonly spells `x == null` as `!(x != null)`. With more than one
+/// pointer, a guard becomes `!(a != null) || !(b != null)`: falling through
+/// an exiting then-branch proves both operands non-null.
+#[test]
+fn a_negated_or_null_guard_promotes_every_pointer_after_an_early_return() {
+    let null_guard = |name: &str, line: u32| Expr::Unary {
+        op: UnaryOp::Not,
+        operand: Box::new(Expr::Binary {
+            op: BinaryOp::Ne,
+            lhs: Box::new(nullable_ref(name, line)),
+            rhs: Box::new(Expr::NullLiteral {
+                origin: origin(line),
+            }),
+            ty: Type::Bool,
+            origin: origin(line),
+        }),
+        ty: Type::Bool,
+        origin: origin(line),
+    };
+    let processa = Function {
+        name: "Processa".to_owned(),
+        usr: "c:@F@Processa#*$@S@Nota#S0_#".to_owned(),
+        params: vec![
+            Param {
+                name: "a".to_owned(),
+                ty: nota_ref_ty(),
+                default_value: None,
+            },
+            Param {
+                name: "b".to_owned(),
+                ty: nota_ref_ty(),
+                default_value: None,
+            },
+        ],
+        return_type: Type::Void,
+        body: vec![
+            Stmt::If {
+                condition: Expr::Binary {
+                    op: BinaryOp::Or,
+                    lhs: Box::new(null_guard("a", 3)),
+                    rhs: Box::new(null_guard("b", 3)),
+                    ty: Type::Bool,
+                    origin: origin(3),
+                },
+                then_branch: vec![Stmt::Return {
+                    value: None,
+                    origin: origin(3),
+                }],
+                else_branch: Vec::new(),
+                origin: origin(3),
+            },
+            int_var_decl("x1", altura_read(nullable_ref("a", 4), 4), 4),
+            int_var_decl("x2", altura_read(nullable_ref("b", 5), 5), 5),
+        ],
+        origin: origin(2),
+    };
+
+    let source = &emit_module(&Module {
+        records: Vec::new(),
+        functions: vec![processa],
+        enums: Vec::new(),
+    })["lib/aritmetica.dart"];
+
+    assert!(source.contains("int x1 = a.altura;"), "got:\n{source}");
+    assert!(source.contains("int x2 = b.altura;"), "got:\n{source}");
 }
 
 /// `then_expr` and `else_expr` are mutually exclusive, exactly like an
