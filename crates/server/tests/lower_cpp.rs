@@ -1911,6 +1911,31 @@ int g(Base* b) {
     );
 }
 
+/// C++ constness on a reference has no Dart counterpart. `const_cast` may
+/// therefore erase only that qualifier; it must not introduce a runtime cast
+/// or change the record identity the way a real downcast does.
+#[test]
+fn const_cast_is_transparent_without_becoming_a_record_downcast() {
+    let source = lower_and_emit(
+        "lower-cpp-transparent-const-cast",
+        r#"
+struct Node { int value; };
+
+Node* mutable_node(const Node* node) {
+    return const_cast<Node*>(node);
+}
+"#,
+    );
+
+    assert!(
+        source.contains("Node? mutable_node(Node? node)")
+            && source.contains("return node;")
+            && !source.contains("cursor kind 127")
+            && !source.contains("node as Node"),
+        "expected const_cast to preserve the same nullable record value, got:\n{source}"
+    );
+}
+
 /// F13/tarefa 12
 /// (`docs/prompts/2026-08-21-12-overloads-const-e-colisoes-de-nome.md`):
 /// a call to a member *operator template* instantiation (jsonxx's real

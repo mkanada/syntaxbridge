@@ -5000,6 +5000,7 @@ fn is_known_expression_kind(kind: clang_sys::CXCursorKind) -> bool {
             // case for `(void)fmt;` once `const char*` stopped being
             // `Unsupported`.)
             | clang_sys::CXCursor_CXXStaticCastExpr
+            | clang_sys::CXCursor_CXXConstCastExpr
             | clang_sys::CXCursor_CStyleCastExpr
     )
 }
@@ -6902,6 +6903,10 @@ fn is_transparent_wrapper(kind: clang_sys::CXCursorKind) -> bool {
             // unwraps exactly like any other sugar wrapper here.
             | clang_sys::CXCursor_CXXFunctionalCastExpr
             | clang_sys::CXCursor_CXXStaticCastExpr
+            // Dart references have no const-qualified type. The outer/child
+            // comparison in `lower_expr` still proves this cast did not
+            // change the lowered record identity.
+            | clang_sys::CXCursor_CXXConstCastExpr
             | clang_sys::CXCursor_CStyleCastExpr
     )
 }
