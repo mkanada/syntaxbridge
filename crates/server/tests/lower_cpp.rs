@@ -3578,6 +3578,25 @@ std::vector<std::vector<int>> rows() {
     );
 }
 
+#[test]
+fn a_nested_aggregate_initializer_constructs_record_fields_in_order() {
+    let source = lower_and_emit(
+        "lower-cpp-nested-record-init-list",
+        r#"
+#include <vector>
+struct Point { int x; double y; bool active; };
+std::vector<Point> points() {
+    return {{1, 2.5, true}};
+}
+"#,
+    );
+
+    assert!(
+        source.contains("<Point>[Point(1, 2.5, true)]") && !source.contains("cursor kind 119"),
+        "expected aggregate fields to initialize the generated positional constructor, got:\n{source}"
+    );
+}
+
 /// Real trigger: `midifunctor.cpp`/`iocmme.cpp`'s static const lookup
 /// tables, `static const std::map<int, data_DURATION> durationEq{ { a, b },
 /// ... };`. Unlike `std::vector`'s flat initializer list, each of

@@ -7606,20 +7606,17 @@ unsafe fn lower_expr(cursor: clang_sys::CXCursor, project_root: &Path) -> ir::Ex
     }
 
     if kind == clang_sys::CXCursor_InitListExpr {
-        let ty = lower_type(unsafe { clang_sys::clang_getCursorType(cursor) });
-        // Only the `List<T>` destination is handled here (a brace initializer
-        // for a `std::vector`/`std::array`/`std::initializer_list`, the
-        // shape libclang's own `clang_getCursorType` on the `InitListExpr`
-        // cursor already resolves to `List<T>` for). Aggregate structs,
-        // `Set`/`Map` and fixed C arrays resolve to a different `ty` here
-        // and stay an explicit bailout below rather than guessing a Dart
-        // literal shape from an unverified type.
-        if let ir::Type::List(element_ty) = &ty {
-            let items = unsafe { collect_children(cursor) }
-                .into_iter()
-                .map(|child| unsafe { lower_initializer_element(child, element_ty, project_root) })
-                .collect();
-            return ir::Expr::ListLiteral { items, ty, origin };
+        let cx_type = unsafe { clang_sys::clang_getCursorType(cursor) };
+        let ty = lower_type(cx_type);
+        // Lists recurse against their element type; pairs, tuples and plain
+        // aggregate records recurse against their positional components or
+        // fields. Sets/maps and fixed C arrays retain their separate rules
+        // (or an explicit bailout) rather than borrowing list semantics.
+        if matches!(
+            ty,
+            ir::Type::List(_) | ir::Type::Pair(_, _) | ir::Type::Tuple(_) | ir::Type::Record { .. }
+        ) {
+            return unsafe { lower_initializer_element(cursor, &ty, Some(cx_type), project_root) };
         }
     }
 
@@ -8222,6 +8219,7 @@ fn preserve_expected_bailout_type(expr: ir::Expr, expected: &ir::Type) -> ir::Ex
 unsafe fn lower_initializer_element(
     cursor: clang_sys::CXCursor,
     expected: &ir::Type,
+    expected_cx_type: Option<clang_sys::CXType>,
     project_root: &Path,
 ) -> ir::Expr {
     let cursor = unsafe { unwrap_transparent_value_cursor(cursor) };
@@ -8238,7 +8236,14 @@ unsafe fn lower_initializer_element(
         ir::Type::List(element_ty) => ir::Expr::ListLiteral {
             items: children
                 .into_iter()
-                .map(|child| unsafe { lower_initializer_element(child, element_ty, project_root) })
+                .map(|child| unsafe {
+                    lower_initializer_element(
+                        child,
+                        element_ty,
+                        expected_cx_type.and_then(|ty| template_type_argument(ty, 0)),
+                        project_root,
+                    )
+                })
                 .collect(),
             ty: expected.clone(),
             origin,
@@ -8260,8 +8265,22 @@ unsafe fn lower_initializer_element(
                 callee_usr: String::new(),
                 callee_name: "SyntaxBridgePair".to_owned(),
                 args: vec![
-                    unsafe { lower_initializer_element(*first_cursor, first_ty, project_root) },
-                    unsafe { lower_initializer_element(*second_cursor, second_ty, project_root) },
+                    unsafe {
+                        lower_initializer_element(
+                            *first_cursor,
+                            first_ty,
+                            expected_cx_type.and_then(|ty| template_type_argument(ty, 0)),
+                            project_root,
+                        )
+                    },
+                    unsafe {
+                        lower_initializer_element(
+                            *second_cursor,
+                            second_ty,
+                            expected_cx_type.and_then(|ty| template_type_argument(ty, 1)),
+                            project_root,
+                        )
+                    },
                 ],
                 ty: expected.clone(),
                 origin,
@@ -8272,8 +8291,15 @@ unsafe fn lower_initializer_element(
                 values: children
                     .into_iter()
                     .zip(element_types)
-                    .map(|(child, element_ty)| unsafe {
-                        lower_initializer_element(child, element_ty, project_root)
+                    .enumerate()
+                    .map(|(index, (child, element_ty))| unsafe {
+                        lower_initializer_element(
+                            child,
+                            element_ty,
+                            expected_cx_type
+                                .and_then(|ty| template_type_argument(ty, index as c_uint)),
+                            project_root,
+                        )
                     })
                     .collect(),
                 origin,
@@ -8288,12 +8314,85 @@ unsafe fn lower_initializer_element(
             ty: expected.clone(),
             origin,
         },
+        ir::Type::Record { usr, name } => {
+            let record_type = expected_cx_type.or_else(|| {
+                let cursor_type = unsafe { clang_sys::clang_getCursorType(cursor) };
+                (lower_type(cursor_type) == *expected).then_some(cursor_type)
+            });
+            let Some(record_type) = record_type else {
+                return ir::Expr::UnsupportedTyped {
+                    reason: format!("record initializer has no recoverable declaration for {name}"),
+                    ty: expected.clone(),
+                    origin,
+                };
+            };
+            let declaration = unsafe { clang_sys::clang_getTypeDeclaration(record_type) };
+            let field_cursors: Vec<_> = unsafe { collect_children(declaration) }
+                .into_iter()
+                .filter(|field| unsafe {
+                    clang_sys::clang_getCursorKind(*field) == clang_sys::CXCursor_FieldDecl
+                })
+                .collect();
+            if children.len() > field_cursors.len() {
+                return ir::Expr::UnsupportedTyped {
+                    reason: format!(
+                        "record initializer for {name} had {} elements but only {} fields",
+                        children.len(),
+                        field_cursors.len()
+                    ),
+                    ty: expected.clone(),
+                    origin,
+                };
+            }
+            let fields = field_cursors
+                .into_iter()
+                .enumerate()
+                .map(|(index, field_cursor)| {
+                    let field_cx_type = unsafe { clang_sys::clang_getCursorType(field_cursor) };
+                    let field_ty = lower_type(field_cx_type);
+                    let value = if let Some(child) = children.get(index) {
+                        unsafe {
+                            lower_initializer_element(
+                                *child,
+                                &field_ty,
+                                Some(field_cx_type),
+                                project_root,
+                            )
+                        }
+                    } else {
+                        unsafe { default_field_value(&field_ty, field_cx_type, &origin, 1) }
+                    };
+                    (unsafe { dart_member_name(field_cursor) }, value)
+                })
+                .collect();
+            ir::Expr::RecordConstruct {
+                type_usr: usr.clone(),
+                type_name: name.clone(),
+                fields,
+                origin,
+            }
+        }
         _ => ir::Expr::UnsupportedTyped {
             reason: format!("nested initializer has no construction rule for {expected:?}"),
             ty: expected.clone(),
             origin,
         },
     }
+}
+
+unsafe fn template_type_argument(
+    cx_type: clang_sys::CXType,
+    index: c_uint,
+) -> Option<clang_sys::CXType> {
+    if unsafe { clang_sys::clang_Type_getNumTemplateArguments(cx_type) } <= index as i32 {
+        return None;
+    }
+    let argument = unsafe { clang_sys::clang_Type_getTemplateArgumentAsType(cx_type, index) };
+    (!matches!(
+        argument.kind,
+        clang_sys::CXType_Invalid | clang_sys::CXType_Void
+    ))
+    .then_some(argument)
 }
 
 /// A map literal's declared key type (`ir::Type::Map`'s first component)
