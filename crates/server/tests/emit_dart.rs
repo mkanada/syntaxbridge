@@ -1233,9 +1233,17 @@ fn a_field_access_never_promotes_even_when_read_twice_in_the_same_body() {
 /// `element!.IsClassId(…) && chord != null && chord!.HasAdjacentNotesInStaff(staff)`.
 #[test]
 fn a_null_check_conjunct_promotes_the_rest_of_the_and_chain_and_the_then_branch() {
+    let non_null_chord = |line: u32| Expr::Convert {
+        operand: Box::new(nullable_ref("chord", line)),
+        ty: Type::Record {
+            usr: "c:@S@Nota".to_owned(),
+            name: "Nota".to_owned(),
+        },
+        origin: origin(line),
+    };
     let has_notes = |line: u32| Expr::Call {
         base_qualifier: None,
-        target: Some(Box::new(nullable_ref("chord", line))),
+        target: Some(Box::new(non_null_chord(line))),
         callee_usr: "c:@S@Nota@F@HasNotes#".to_owned(),
         callee_name: "HasNotes".to_owned(),
         args: Vec::new(),
@@ -1244,7 +1252,7 @@ fn a_null_check_conjunct_promotes_the_rest_of_the_and_chain_and_the_then_branch(
     };
     let other_thing = |line: u32| Expr::Call {
         base_qualifier: None,
-        target: Some(Box::new(nullable_ref("chord", line))),
+        target: Some(Box::new(non_null_chord(line))),
         callee_usr: "c:@S@Nota@F@OtherThing#".to_owned(),
         callee_name: "OtherThing".to_owned(),
         args: Vec::new(),
@@ -1439,7 +1447,7 @@ fn an_or_nested_inside_an_and_is_parenthesized_so_dart_reads_the_same_tree_this_
 
     assert!(
         source.contains(
-            "return reh != null && (reh!.HasTstamp() && reh.GetStart()!.IsClassId() \
+            "return reh != null && (reh.HasTstamp() && reh.GetStart()!.IsClassId() \
              || reh.GetStart()!.IsClassId());"
         ),
         "expected the '||' to stay parenthesized inside the '&&' so Dart parses the \

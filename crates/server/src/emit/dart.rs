@@ -4259,6 +4259,20 @@ fn and_chain_null_check_names<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
     }
     if let Some(name) = ref_null_check_name(expr, BinaryOp::Ne) {
         out.push(name);
+    } else if let Expr::Convert {
+        operand,
+        ty: Type::Bool,
+        ..
+    } = expr
+        && let Expr::Ref {
+            name,
+            ty: Type::Nullable(_),
+            ..
+        } = operand.as_ref()
+    {
+        // A bare C++ pointer condition lowers to `x != null`; when true it
+        // carries the same Dart promotion witness as a written comparison.
+        out.push(name);
     }
 }
 
@@ -4747,10 +4761,21 @@ fn emit_expr(
                         Type::Double | Type::Int | Type::Bool | Type::Nullable(_)
                     ))
             {
-                format!(
-                    "{}!",
-                    emit_convert_operand(operand, used_expr_helper, used_utf8_encode, promoted)
-                )
+                let operand_text =
+                    emit_convert_operand(operand, used_expr_helper, used_utf8_encode, promoted);
+                let needs_bang = match operand.as_ref() {
+                    Expr::Ref {
+                        name,
+                        ty: Type::Nullable(_),
+                        ..
+                    } => promoted.insert(name.clone()),
+                    _ => true,
+                };
+                if needs_bang {
+                    format!("{operand_text}!")
+                } else {
+                    operand_text
+                }
             } else {
                 match ty {
                     Type::Double => format!(
