@@ -2414,6 +2414,68 @@ fn a_type_used_only_as_unprinted_expression_metadata_is_not_imported() {
     );
 }
 
+#[test]
+fn a_printed_static_owner_qualifier_imports_its_declaration_file() {
+    let origin_in = |file: &str| Origin {
+        file: file.to_owned(),
+        line: 1,
+        column: 1,
+    };
+    let syl = Record {
+        name: "Syl".to_owned(),
+        usr: "c:@S@Syl".to_owned(),
+        namespace: String::new(),
+        fields: Vec::new(),
+        static_fields: Vec::new(),
+        constructors: Vec::new(),
+        methods: Vec::new(),
+        base_class: None,
+        mixins: Vec::new(),
+        library_base: None,
+        destructor: None,
+        origin: origin_in("/project/input-source/src/syl.cpp"),
+    };
+    let inspect = Function {
+        name: "inspect".to_owned(),
+        usr: "c:@F@inspect#".to_owned(),
+        params: Vec::new(),
+        return_type: Type::Void,
+        body: vec![Stmt::ExprStmt {
+            expr: Expr::Call {
+                target: Some(Box::new(Expr::Ref {
+                    name: "Syl".to_owned(),
+                    ty: Type::Record {
+                        usr: "c:@S@Syl".to_owned(),
+                        name: "Syl".to_owned(),
+                    },
+                    origin: origin_in("/project/input-source/src/inspect.cpp"),
+                })),
+                base_qualifier: None,
+                callee_usr: "c:@S@Syl@F@StaticCheck#".to_owned(),
+                callee_name: "StaticCheck".to_owned(),
+                args: Vec::new(),
+                ty: Type::Bool,
+                origin: origin_in("/project/input-source/src/inspect.cpp"),
+            },
+            origin: origin_in("/project/input-source/src/inspect.cpp"),
+        }],
+        origin: origin_in("/project/input-source/src/inspect.cpp"),
+    };
+
+    let files = emit_module(&Module {
+        records: vec![syl],
+        functions: vec![inspect],
+        enums: Vec::new(),
+    });
+    let source = &files["lib/inspect.dart"];
+
+    assert!(source.contains("Syl.StaticCheck();"), "got:\n{source}");
+    assert!(
+        source.contains("import 'syl.dart';"),
+        "a printed static owner must import its declaration, got:\n{source}"
+    );
+}
+
 /// `docs/plans/lista-de-externos.md` decision 1: "mock = valor plausível,
 /// execução segue" — a free function whose usr is in the effective external
 /// set gets a `return` of a plausible default for its type, never a

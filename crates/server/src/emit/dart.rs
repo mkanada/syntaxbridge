@@ -139,14 +139,34 @@ pub fn emit_module_with_externals(
     // that record — see `emit_file`'s doc comment on the one gap this
     // leaves: a cross-file *method* call, which no fixture exercises yet).
     let mut usr_to_stem: HashMap<&str, String> = HashMap::new();
+    let mut usr_to_name: HashMap<&str, &str> = HashMap::new();
+    let mut declaration_names_by_stem: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for record in &module.records {
-        usr_to_stem.insert(record.usr.as_str(), file_stem(&record.origin.file));
+        let stem = file_stem(&record.origin.file);
+        usr_to_stem.insert(record.usr.as_str(), stem.clone());
+        usr_to_name.insert(record.usr.as_str(), record.name.as_str());
+        declaration_names_by_stem
+            .entry(stem)
+            .or_default()
+            .push(record.name.clone());
     }
     for function in &module.functions {
-        usr_to_stem.insert(function.usr.as_str(), file_stem(&function.origin.file));
+        let stem = file_stem(&function.origin.file);
+        usr_to_stem.insert(function.usr.as_str(), stem.clone());
+        usr_to_name.insert(function.usr.as_str(), function.name.as_str());
+        declaration_names_by_stem
+            .entry(stem)
+            .or_default()
+            .push(function.name.clone());
     }
     for enum_decl in &module.enums {
-        usr_to_stem.insert(enum_decl.usr.as_str(), file_stem(&enum_decl.origin.file));
+        let stem = file_stem(&enum_decl.origin.file);
+        usr_to_stem.insert(enum_decl.usr.as_str(), stem.clone());
+        usr_to_name.insert(enum_decl.usr.as_str(), enum_decl.name.as_str());
+        declaration_names_by_stem
+            .entry(stem)
+            .or_default()
+            .push(enum_decl.name.clone());
     }
 
     let mut functions_by_stem: BTreeMap<String, Vec<&Function>> = BTreeMap::new();
@@ -233,6 +253,8 @@ pub fn emit_module_with_externals(
                     &mixin_usrs,
                     &records_by_usr,
                     &usr_to_stem,
+                    &usr_to_name,
+                    &declaration_names_by_stem,
                     &enums_by_usr,
                     &copy_reasons,
                     &mock,
@@ -539,6 +561,8 @@ fn emit_file(
     mixin_usrs: &HashSet<&str>,
     records_by_usr: &HashMap<&str, &Record>,
     usr_to_stem: &HashMap<&str, String>,
+    usr_to_name: &HashMap<&str, &str>,
+    declaration_names_by_stem: &BTreeMap<String, Vec<String>>,
     enums_by_usr: &HashMap<&str, &Enum>,
     copy_reasons: &HashMap<&str, Option<String>>,
     mock: &MockContext<'_>,
@@ -604,12 +628,31 @@ fn emit_file(
             collect_referenced_usrs_in_stmts(&function.body, &mut referenced_usrs);
         }
     }
-    let needed_imports: BTreeSet<&str> = referenced_usrs
+    let code_identifiers = dart_code_identifiers(&source);
+    let mut needed_imports: BTreeSet<&str> = referenced_usrs
         .into_iter()
-        .filter_map(|usr| usr_to_stem.get(usr))
-        .map(String::as_str)
+        .filter(|usr| {
+            usr_to_name
+                .get(usr)
+                .is_some_and(|name| code_identifiers.contains(*name))
+        })
+        .filter_map(|usr| usr_to_stem.get(usr).map(String::as_str))
         .filter(|other_stem| *other_stem != stem)
         .collect();
+    // A static method call prints its owning type as a qualifier (`Syl.foo`),
+    // but method USRs deliberately do not live in `usr_to_stem`. Recover that
+    // dependency from identifiers that are actually present in Dart code.
+    // String literals and comments are excluded by `dart_code_identifiers`,
+    // so diagnostic text cannot manufacture an import.
+    for (other_stem, names) in declaration_names_by_stem {
+        if other_stem != stem
+            && names
+                .iter()
+                .any(|name| code_identifiers.contains(name.as_str()))
+        {
+            needed_imports.insert(other_stem.as_str());
+        }
+    }
 
     let mut import_lines: Vec<String> = Vec::new();
     if used_utf8_encode {
@@ -658,6 +701,61 @@ fn emit_file(
         source = format!("{}\n\n{source}", import_lines.join("\n"));
     }
     source
+}
+
+/// Returns ASCII Dart identifiers that occur in executable/declarative code,
+/// excluding comments and string literals. Generated identifiers are always
+/// ASCII (`dart_safe_identifier`), so a compact scanner is sufficient here
+/// and avoids importing a library merely because an unsupported-message
+/// string mentions one of its declarations.
+fn dart_code_identifiers(source: &str) -> HashSet<&str> {
+    let bytes = source.as_bytes();
+    let mut identifiers = HashSet::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' | b'"' => {
+                let quote = bytes[index];
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'\\' {
+                        index = (index + 2).min(bytes.len());
+                    } else if bytes[index] == quote {
+                        index += 1;
+                        break;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index = (index + 2).min(bytes.len());
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let start = index;
+                index += 1;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+                {
+                    index += 1;
+                }
+                identifiers.insert(&source[start..index]);
+            }
+            _ => index += 1,
+        }
+    }
+    identifiers
 }
 
 fn emit_unsupported_helper() -> String {
