@@ -609,7 +609,7 @@ subconjunto.
 
 **Fechamento da T14 (2026-08-24/25).** A rodada final de
 `just verovio-diagnosis`, dentro do Flatpak, foi executada no commit
-`bde5788`: 317 arquivos Dart, 10.791 erros, 4.324 avisos e 8 arquivos que não
+`bddc68f`: 317 arquivos Dart, 10.796 erros, 4.317 avisos e 8 arquivos que não
 parseiam. O ponto de partida do prompt deixou de ser diretamente comparável
 durante a execução: as tarefas anteriores do mesmo lote materializaram muitos
 corpos que antes eram bailouts integrais, aumentando a superfície que o
@@ -621,7 +621,7 @@ causa.
 | --- | ---: | --- |
 | 14.1 | 0 `illegal_assignment_to_non_assignable`; 8/317 não parseiam | A forma inválida `putIfAbsent(...)++` foi eliminada. Os oito arquivos atuais falham por tipos ponteiro-duplo impressos como `T??`, uma fronteira de tipos distinta. |
 | 14.2 | 4 `use_of_void_result` | A família de 226 stubs `void` em literais tipados foi eliminada. Os quatro resíduos são colisões nome de método/construtor (`OpenTie`/`CloseTie`/`OpenSlur`/`CloseSlur`) em `iomusxml.dart`. |
-| 14.3 | 3.188 `unnecessary_non_null_assertion` | Os três fluxos pedidos têm regressões próprias, incluindo guardas negados e cadeias `||`. Na superfície atual, a contagem observada durante T14 caiu de 4.604 para 3.188; o restante inclui formas de fluxo/tipagem fora desses três padrões. |
+| 14.3 | 3.189 `unnecessary_non_null_assertion` | Os três fluxos pedidos têm regressões próprias, incluindo guardas negados e cadeias `||`. Na superfície atual, a contagem observada durante T14 caiu de 4.604 para 3.189; o restante inclui formas de fluxo/tipagem fora desses três padrões. |
 | 14.4 | 7 `unused_import` | Caiu de 132 na primeira rodada desta execução para 7. Um é consequência do arquivo sintaticamente inválido `getopt_ext.dart`; os seis restantes exigem tornar a coleta de dependências emitidas totalmente orientada a símbolos, pois adaptadores e homônimos ainda deixam metadados de USR sem uso textual. |
 | 14.5 | 39 `dead_code` | Caiu de 55 para 39. Literais falsos e caudas após salto direto ou `if/else` terminal são removidos; os resíduos observados dependem de bailouts/out-params que mudaram o fluxo (ou de condições que o Dart prova constantes), e removê-los isoladamente esconderia perda semântica. |
 | 14.6 | 13 `invalid_assignment` `double`→`int` | Inicializadores de campo, argumentos, retornos e atribuições compostas aplicam a conversão na fronteira. Dez resíduos estão no `pugixml.dart` que não parseia e são diagnósticos de recuperação sobre aritmética inteira; os outros três envolvem o modelo numérico de tipos inteiros largos/expressões condicionais. |
@@ -631,10 +631,11 @@ causa.
 | 14.10 | 23 bailouts IR `expression cursor kind 119`, 0 stubs textuais emitidos | Listas, maps, pares, tuples e agregados aninhados comuns foram materializados (356→23). Os 23 restantes só aparecem em corpos posteriormente colapsados por outro bailout e precisam de outras formas de tipo inicializável; não foram apagados nem retipados como `dynamic`. |
 | 14.11 | 0 bailouts `expression cursor kind 127` | `const_cast` é transparente; os testes de downcast continuam passando. |
 
-As três contagens globais de bailout na rodada final foram 1.621 tipos, 5.863
-expressões e 618 statements. Elas ficaram idênticas entre as duas últimas
-rodadas (os últimos complementos alteraram somente emissão), portanto nenhuma
-categoria subiu silenciosamente no fechamento.
+As três contagens globais de bailout na rodada final foram 1.621 tipos, 5.852
+expressões e 618 statements. Os complementos exclusivos de emissão mantiveram
+as três contagens estáveis; a canonicalização de agregados no LLVM 21 reduziu
+expressões de 5.863 para 5.852. Nenhuma categoria subiu silenciosamente no
+fechamento.
 
 ## 5. O que "funcionar" quer dizer, e o que ainda não existe para medir isso
 
