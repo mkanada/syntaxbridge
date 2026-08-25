@@ -3164,6 +3164,33 @@ int answer() {
     assert!(!source.contains("return 0;"), "got:\n{source}");
 }
 
+/// A conditional whose two arms leave the enclosing block is itself an
+/// unconditional terminator. C++ still exposes the following statements in
+/// the AST, but emitting them makes Dart report `dead_code`.
+#[test]
+fn statements_after_an_if_whose_two_branches_exit_are_not_emitted() {
+    let source = lower_and_emit(
+        "lower-cpp-dead-code-after-if",
+        r#"
+void side_effect();
+
+int choose(bool first) {
+    if (first) {
+        return 1;
+    } else {
+        return 2;
+    }
+    side_effect();
+    return 0;
+}
+"#,
+    );
+
+    assert!(source.contains("if (first)"), "got:\n{source}");
+    assert!(!source.contains("side_effect();"), "got:\n{source}");
+    assert!(!source.contains("return 0;"), "got:\n{source}");
+}
+
 /// `int a = 1, b = 2;` — one `DeclStmt` cursor with multiple `VarDecl`
 /// children, C++'s comma-separated multi-declarator form. `DeclStmt had N
 /// declarators, expected exactly 1` was the single largest statement-level

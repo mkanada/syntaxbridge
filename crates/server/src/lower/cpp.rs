@@ -4282,10 +4282,10 @@ unsafe fn lower_switch_stmt(
     }
 }
 
-/// Drops every statement after a case body's first terminator
-/// (`break`/`continue`/`return`/`throw`) — anything past it is unreachable,
-/// most commonly a redundant `break;` right after a `return` (see the doc
-/// comment at this function's call site).
+/// Drops every statement after a block's first unconditional terminator — a
+/// direct jump, or an `if` whose two branches both terminate. Anything past
+/// it is unreachable, most commonly a redundant `break;` right after a
+/// `return`, or a fallback after an `if` whose arms both return.
 fn truncate_after_case_terminator(body: &mut Vec<ir::Stmt>) {
     if let Some(index) = body.iter().position(is_case_terminator) {
         body.truncate(index + 1);
@@ -4300,6 +4300,15 @@ fn is_case_terminator(stmt: &ir::Stmt) -> bool {
             | ir::Stmt::ContinueLabel { .. }
             | ir::Stmt::Return { .. }
             | ir::Stmt::Throw { .. }
+    ) || matches!(
+        stmt,
+        ir::Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } if !else_branch.is_empty()
+            && then_branch.last().is_some_and(is_case_terminator)
+            && else_branch.last().is_some_and(is_case_terminator)
     )
 }
 
